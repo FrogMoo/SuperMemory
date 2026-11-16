@@ -1,0 +1,4 @@
+# SuperMemory bundle layer — inserts the memory plugin.
+- insert:
+    - id: supermemory
+      name: dsh-supermemory

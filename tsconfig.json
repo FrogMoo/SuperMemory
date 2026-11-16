@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "types": ["node"],
+    "paths": {
+      "@deepseek-ai/cordis": ["./_dsh_src/deepseek-ai-cordis-4.1.0/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-agent": ["./_dsh_src/deepseek-ai-dsh-agent-0.2.2-rc.3/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-llm": ["./_dsh_src/deepseek-ai-dsh-llm-0.2.2-rc.3/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-storage-domain": ["./_dsh_src/deepseek-ai-dsh-storage-domain-0.2.2-rc.3/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-tools": ["./_dsh_src/deepseek-ai-dsh-tools-0.2.2-rc.3/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-user-questions": ["./_dsh_src/deepseek-ai-dsh-user-questions-0.2.2-rc.3/package/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-workspace": ["./_dsh_src/deepseek-ai-dsh-workspace-0.2.2-rc.3/package/lib/types/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts"]
+}
