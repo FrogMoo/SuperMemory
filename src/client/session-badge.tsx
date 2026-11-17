@@ -65,18 +65,22 @@ export function SupermemorySessionBadge(props: SupermemorySessionBadgeProps): Re
   const [badge, setBadge] = useState<SessionBadge | undefined>(() => badgeCache.get(sessionId))
   useEffect(() => {
     let alive = true
-    const cached = badgeCache.get(sessionId)
-    if (cached !== undefined) {
-      setBadge(cached)
-      return () => { alive = false }
+    try {
+      const cached = badgeCache.get(sessionId)
+      if (cached !== undefined) {
+        setBadge(cached)
+        return () => { alive = false }
+      }
+      void api.sessionBadge(sessionId).then(
+        (result) => {
+          badgeCache.set(sessionId, result)
+          if (alive) setBadge(result)
+        },
+        () => { /* an unreadable row stays unmarked: never fabricate a badge */ },
+      )
+    } catch {
+      // A broken API surface must never take a sidebar row down.
     }
-    void api.sessionBadge(sessionId).then(
-      (result) => {
-        badgeCache.set(sessionId, result)
-        if (alive) setBadge(result)
-      },
-      () => { /* an unreadable row stays unmarked: never fabricate a badge */ },
-    )
     return () => { alive = false }
   }, [api, sessionId])
   if (!badge || badge.kind !== 'branch') return null
