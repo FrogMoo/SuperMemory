@@ -286,6 +286,38 @@ export async function editCompositeTool(
 }
 
 /**
+ * R6+: delete one composite tool for good. Unregisters the live tool when it
+ * is registered, drops the durable definition, and drops the sequence signal
+ * that created it — so the same flow must cross the threshold AGAIN before a
+ * new composite may be registered (a delete is not a silent retire).
+ */
+export async function deleteCompositeTool(
+  ctx: Context,
+  store: Store,
+  id: string,
+): Promise<{ status: 'ok' | 'error'; message: string; id?: string }> {
+  const record = store.toolMemory.get(id)
+  if (!record || record.kind !== 'composite') {
+    return { status: 'error', message: '组合工具不存在。' }
+  }
+  let name = id
+  try {
+    name = (JSON.parse(record.entry) as CompositeSpec).name ?? id
+  } catch {
+    // a broken definition still unregisters under its row id fallback
+  }
+  const dispose = liveComposites.get(name)
+  if (dispose) { try { dispose() } catch { /* best-effort */ } }
+  liveComposites.delete(name)
+  liveCompositeSpecs.delete(name)
+  await store.toolMemory.delete(id)
+  if (record.trigger) {
+    try { await store.signals.delete(record.trigger) } catch { /* the signal row is advisory */ }
+  }
+  return { status: 'ok', message: `已删除组合工具 ${name}。`, id }
+}
+
+/**
  * Composite near-miss hints moved to src/activity.ts: tools/post-execute can
  * carry additionalContexts for the next request, tools/pre-execute cannot.
  */

@@ -30,7 +30,7 @@ export interface SupermemorySessionBadgeProps {
 }
 
 const BADGE_CSS = [
-  '.sm-sb-badge{display:inline-flex;align-items:center;gap:3px;flex:none;box-sizing:border-box;height:16px;padding:0 6px 0 4px;border-radius:99px;border:1px solid var(--dsh-color-border,#3a3a42);background:var(--dsh-color-bg-soft,#222228);color:var(--dsh-color-text,#c9c9d1);font-size:10px;line-height:14px;opacity:.8;cursor:default;user-select:none;vertical-align:middle}',
+  '.sm-sb-badge{display:inline-flex;align-items:center;gap:3px;flex:none;box-sizing:border-box;height:16px;padding:0 6px 0 4px;border-radius:99px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:var(--dsw-alias-label-secondary,#cfd3d6);font-size:10px;line-height:14px;opacity:.8;cursor:default;user-select:none;vertical-align:middle}',
   '.sm-sb-badge:hover{opacity:1}',
   '.sm-sb-badge svg{display:block;flex:none}',
 ].join('\n')

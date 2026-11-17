@@ -1,16 +1,71 @@
-/* SuperMemory 管理台 — 暗色主题（Plan A） */
+/* SuperMemory 管理台 — 主题与 DSH 保持一致（Plan A）
+ *
+ * 调色板不再是插件私有的暗色近似值，而是 DSH 设计平台（dsh-client-ui-theme
+ * 的 design-platform.css）的同一组语义变量：明色为默认，跟随系统
+ * prefers-color-scheme 切到暗色——与宿主 boot-theme 的行为一致
+ * （宿主默认偏好 system；显式 light/dark 偏好无法从宿主读入这个独立文档，
+ * 属于已知限制，见 DEV-NOTES §14）。变量名与 DSH 的 --dsw-alias-* 对齐，
+ * 面板（src/client/*.tsx）用的是同一套名字。 */
 :root {
-  --bg: #0f1115;
-  --panel: #171a21;
-  --panel-2: #1d212b;
-  --border: #262b36;
-  --text: #e6e8ee;
-  --muted: #8b93a7;
-  --accent: #4f8cff;
-  --ok: #3fb27f;
-  --danger: #e5534b;
-  --warn: #d29922;
+  color-scheme: light;
+  /* DSH light palette（design-platform.css 的 body 块） */
+  --dsw-alias-bg-base: #fff;
+  --dsw-alias-bg-layer-1: #fff;
+  --dsw-alias-bg-layer-2: #fff;
+  --dsw-alias-card-fill: #fafafa;
+  --dsw-alias-border-l1: rgba(0, 0, 0, 0.04);
+  --dsw-alias-border-l2: rgba(0, 0, 0, 0.1);
+  --dsw-alias-label-primary: #0f1115;
+  --dsw-alias-label-secondary: #61666b;
+  --dsw-alias-label-tertiary: #81858c;
+  --dsw-alias-label-primary-foreground: #fff;
+  --dsw-alias-button-primary-fill: #0f1115;
+  --dsw-alias-button-primary-hover: #434446;
+  --dsw-specific-input-major: #fff;
+  --dsw-alias-interactive-bg-hover: rgba(38, 49, 72, 0.06);
+  --dsw-alias-link: #4176e6;
+  --dsw-alias-state-success-primary: #22c55e;
+  --dsw-alias-state-error-primary: #ec1313;
+  --dsw-alias-state-warn-primary: #f59e0b;
+
+  /* console aliases bound to the DSH vocabulary */
+  --bg: var(--dsw-alias-bg-base);
+  --panel: var(--dsw-alias-card-fill);
+  --panel-2: var(--dsw-alias-bg-layer-2);
+  --border: var(--dsw-alias-border-l2);
+  --text: var(--dsw-alias-label-primary);
+  --muted: var(--dsw-alias-label-secondary);
+  --accent: var(--dsw-alias-link);
+  --ok: var(--dsw-alias-state-success-primary);
+  --danger: var(--dsw-alias-state-error-primary);
+  --warn: var(--dsw-alias-state-warn-primary);
+  --primary-bg: var(--dsw-alias-button-primary-fill);
+  --primary-fg: var(--dsw-alias-label-primary-foreground);
   --radius: 8px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    /* DSH dark palette（design-platform.css 的 body[data-ds-dark-theme] 块） */
+    --dsw-alias-bg-base: #151517;
+    --dsw-alias-bg-layer-1: #232324;
+    --dsw-alias-bg-layer-2: #2c2c2e;
+    --dsw-alias-card-fill: #212121;
+    --dsw-alias-border-l1: rgba(255, 255, 255, 0.06);
+    --dsw-alias-border-l2: rgba(255, 255, 255, 0.12);
+    --dsw-alias-label-primary: #f9fafb;
+    --dsw-alias-label-secondary: #cfd3d6;
+    --dsw-alias-label-tertiary: #adb2b8;
+    --dsw-alias-label-primary-foreground: #0f1115;
+    --dsw-alias-button-primary-fill: #f9fafb;
+    --dsw-alias-button-primary-hover: #ebeef2;
+    --dsw-specific-input-major: #2c2c2e;
+    --dsw-alias-interactive-bg-hover: rgba(255, 255, 255, 0.08);
+    --dsw-alias-link: #7aaaff;
+    --dsw-alias-state-success-primary: #22c55e;
+    --dsw-alias-state-error-primary: #f25a5a;
+    --dsw-alias-state-warn-primary: #f59e0b;
+  }
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; height: 100%; }
@@ -38,7 +93,7 @@ body {
 }
 .nav-item:hover { background: var(--panel-2); color: var(--text); }
 .nav-item.active { background: var(--panel-2); color: var(--text); box-shadow: inset 2px 0 0 var(--accent); }
-.nav-foot { margin-top: auto; padding: 8px; color: #5b6373; font-size: 11px; line-height: 1.5; }
+.nav-foot { margin-top: auto; padding: 8px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 
 /* 主区 */
 #main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -49,7 +104,7 @@ body {
 }
 #topbar select, #topbar input[type="checkbox"] { accent-color: var(--accent); }
 select, input[type="text"], textarea {
-  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  background: var(--dsw-specific-input-major, var(--panel-2)); color: var(--text); border: 1px solid var(--border);
   border-radius: 6px; padding: 5px 8px; font: inherit;
 }
 select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
@@ -62,15 +117,18 @@ input[type="text"] { width: 100%; }
   border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; white-space: nowrap;
 }
 .btn:hover { border-color: var(--accent); }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.danger { color: var(--danger); border-color: #4a2b2a; }
+.btn.primary { background: var(--primary-bg); border-color: var(--primary-bg); color: var(--primary-fg); }
+.btn.primary:hover { border-color: var(--accent); }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, transparent); }
 .btn.danger:hover { border-color: var(--danger); }
 .btn.small { padding: 2px 8px; font-size: 12px; }
 .btn:disabled { opacity: .5; cursor: default; }
 
 .banner {
   margin: 10px 14px 0; padding: 8px 12px; border-radius: var(--radius);
-  background: #2a1d1d; border: 1px solid #5a2f2c; color: #f2b8b3;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+  color: var(--danger);
 }
 
 /* 卡片与表格 */
@@ -92,12 +150,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 
 .badge {
   display: inline-block; padding: 0 7px; border-radius: 99px; font-size: 11px;
-  border: 1px solid var(--border); color: var(--muted); background: var(--panel-2); white-space: nowrap;
+  border: 1px solid color-mix(in srgb, currentColor 35%, transparent); color: var(--muted); background: var(--panel-2); white-space: nowrap;
 }
-.badge.ok, .badge.active, .badge.live, .badge.delivered, .badge.confirmed, .badge.open { color: var(--ok); border-color: #23453a; }
-.badge.warn, .badge.queued, .badge.dispatched, .badge.observed, .badge.summarized, .badge.pending, .badge.relayed { color: var(--warn); border-color: #4a3a1e; }
-.badge.danger, .badge.failed, .badge.superseded, .badge.retired, .badge.declined { color: var(--danger); border-color: #4a2b2a; }
-.badge.info, .badge.idle, .badge.archived, .badge.closed, .badge.accepted { color: var(--accent); border-color: #27405f; }
+.badge.ok, .badge.active, .badge.live, .badge.delivered, .badge.confirmed, .badge.open { color: var(--ok); }
+.badge.warn, .badge.queued, .badge.dispatched, .badge.observed, .badge.summarized, .badge.pending, .badge.relayed { color: var(--warn); }
+.badge.danger, .badge.failed, .badge.superseded, .badge.retired, .badge.declined { color: var(--danger); }
+.badge.info, .badge.idle, .badge.archived, .badge.closed, .badge.accepted { color: var(--accent); }
 
 .row { border-bottom: 1px solid var(--border); padding: 8px 0; }
 .row:last-child { border-bottom: 0; }

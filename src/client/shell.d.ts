@@ -25,7 +25,12 @@ declare module '@deepseek-ai/cordis' {
     /** Client-side session navigation owned by the shell. */
     uiWorkspace: {
       openSession(sessionId: unknown): void
-      startSession(): void
+      /**
+       * Start a New Session. The optional workspace id targets one workspace;
+       * omission lets the shell inherit the current/most-recent workspace
+       * (dsh-client-ui-workspace navigation contract).
+       */
+      startSession(workspaceId?: unknown): void
     }
   }
 }

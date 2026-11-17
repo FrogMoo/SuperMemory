@@ -62,10 +62,15 @@ function buildApi(ctx: Context): PanelApi | undefined {
     createTopicSet: (cwd, title) => call('createTopicSet', cwd, title),
     activate: async (sessionId, topicSetId) => call('activate', sessionId, topicSetId),
     updateTopicSetSummary: (id, summary) => call('updateTopicSetSummary', id, summary),
-    createTopicSetSession: (cwd, ids) => call('createTopicSetSession', cwd, ids),
+    createTopicSetSession: (cwd, ids, options) => call('createTopicSetSession', cwd, ids, options),
+    createHubSession: (cwd, options) => call('createHubSession', cwd, options),
     followupTopicSet: (cwd, topicSetId, text) => call('followupTopicSet', cwd, topicSetId, text),
     listTools: () => call('listTools'),
     editTool: (id, patch) => call('editTool', id, patch),
+    deleteTool: (id) => call('deleteTool', id),
+    listAgentPresets: () => call('listAgentPresets'),
+    listModelCatalog: () => call('listModelCatalog'),
+    listPermissions: () => call('listPermissions'),
     sessionBadge: (sessionId) => call<SessionBadge>('sessionBadge', sessionId),
     // The shell owns both navigations; a missing service must not throw inside
     // a click handler (ctx.get is typed as possibly-undefined).

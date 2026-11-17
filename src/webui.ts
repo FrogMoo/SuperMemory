@@ -252,8 +252,10 @@ function injectToken(html: string, token: string): string {
 
 /** Shown when the bundle ships without `src/web/`. */
 function fallbackHtml(): string {
+  // DSH dark palette (design-platform.css body[data-ds-dark-theme]) so the
+  // degraded shell still matches the host theme.
   return '<!doctype html><html><head><meta charset="utf-8"><title>SuperMemory</title></head>'
-    + '<body style="background:#0f1115;color:#e6e8ee;font-family:system-ui;padding:24px">'
+    + '<body style="background:#151517;color:#f9fafb;font-family:system-ui;padding:24px">'
     + '<h3>SuperMemory 管理台</h3><p>静态资源缺失：请在插件目录保留 <code>src/web/</code>（index.html / app.js / style.css）。</p></body></html>'
 }
 

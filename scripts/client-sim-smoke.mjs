@@ -2,6 +2,7 @@
 // a fake __ModuleLoader__ with a stub react, then runs apply() against a mock
 // Cordis context and checks every slot registration succeeds.
 import { readFileSync } from 'node:fs'
+import assert from 'node:assert/strict'
 import vm from 'node:vm'
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
@@ -99,6 +100,27 @@ if (manifest.exports?.['./client'] === undefined) {
 if (manifest.dsh?.client?.platform !== 'web') {
   throw new Error('package.json dsh.client.platform must be "web": clientModules would skip the client half')
 }
+
+// Theme contract (2026-11-18 round 7): the plugin CSS must ride DSH's REAL
+// theme vocabulary (--dsw-alias-*, defined by dsh-client-ui-theme's
+// design-platform.css). The old --dsh-color-* names exist nowhere in the host,
+// so a regression to them silently renders the hardcoded fallbacks and the
+// panel stops following the host light/dark theme. Checked on the BUILT
+// bundle (what the browser actually loads) and on the console stylesheet.
+const clientSource = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
+assert.ok(!clientSource.includes('--dsh-color'), 'the bundle must not use the non-existent --dsh-color-* variables')
+const consoleCss = readFileSync(new URL('../src/web/style.css', import.meta.url), 'utf8')
+assert.ok(!consoleCss.includes('--dsh-color'), 'the console stylesheet must not use the non-existent --dsh-color-* variables')
+for (const name of [
+  '--dsw-alias-label-primary', '--dsw-alias-label-secondary', '--dsw-alias-bg-base',
+  '--dsw-alias-bg-layer-1', '--dsw-alias-bg-layer-2', '--dsw-alias-border-l2',
+  '--dsw-alias-button-primary-fill', '--dsw-alias-label-primary-foreground',
+  '--dsw-alias-state-error-primary', '--dsw-alias-state-success-primary', '--dsw-alias-link',
+]) {
+  assert.ok(clientSource.includes(name), 'the bundle must ride the DSH theme variable ' + name)
+  assert.ok(consoleCss.includes(name), 'the console stylesheet must define the DSH theme variable ' + name)
+}
+assert.ok(/prefers-color-scheme:\s*dark/.test(consoleCss), 'the console must follow the system color scheme like the host boot theme')
 
 console.log('SIM SMOKE OK')
 console.log('  name:', moduleExports.name)

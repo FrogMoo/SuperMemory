@@ -408,6 +408,126 @@ const fakeCtx = (services) => ({
   ok('E3 降级路径：typert 缺失/注册抛错只 warn 不静默，无 store 时空挂载')
 }
 
+// ---- requirement R7: hub quick launcher (catalogs + session options) ----
+// Drives the real SupermemoryPanelService with a fake context: the catalog
+// readers, the option-carrying session creation and the composite-tool delete
+// must behave (and degrade) without a DSH host.
+const { SupermemoryPanelService } = await import('../src/panel.ts')
+const { deleteCompositeTool } = await import('../src/composite.ts')
+
+const serviceCtx = (services = {}) => ({
+  get: (name) => services[name],
+  agents: services.agents ?? { create: async () => ({}), get: () => undefined },
+  sessions: services.sessions ?? { get: () => undefined },
+  workspaceRegistry: services.workspaceRegistry,
+  sessionTitle: services.sessionTitle,
+})
+
+{
+  const created = []
+  const applied = []
+  const services = {
+    agents: {
+      create: async (options) => { created.push(options); return { agent: { session: { id: options.sessionId } } } },
+      get: (id) => ({ id, session: { id } }),
+    },
+    agentPresets: {
+      defaultId: 'default-preset',
+      list: async () => [
+        { id: 'default-preset', name: '默认模式', description: 'd' },
+        { id: 'plan', name: '计划模式' },
+        { id: 'broken', broken: 'mount failed' },
+      ],
+    },
+    llm: {
+      listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+      listModels: async (provider) => [{ provider, id: 'step-5', name: 'Step 5' }],
+    },
+    permissionPresets: {
+      catalog: () => ({ options: [{ value: 'workspace-write', name: 'workspace-write', description: 'w' }, { value: 'danger-full-access', name: 'danger-full-access' }], defaultPreset: 'workspace-write' }),
+      set: (session, name) => { applied.push([session.id, name]) },
+    },
+    sessions: { get: (id) => ({ id, append: () => {} }) },
+    workspaceRegistry: { resolveByPath: async () => ({ attachSession: async () => {} }) },
+  }
+  const service = new SupermemoryPanelService(fakeStore(), serviceCtx(services))
+  const presets = await service.listAgentPresets()
+  assert.deepEqual(presets.map((p) => [p.id, p.isDefault]), [['default-preset', true], ['plan', false], ['broken', false]], 'the roster keeps declaration order and marks the default')
+  const catalog = await service.listModelCatalog()
+  assert.deepEqual(catalog.models, [{ provider: 'deepseek', id: 'step-5', name: 'Step 5' }], 'the model catalog comes from the runtime llm service')
+  const permissions = await service.listPermissions()
+  assert.equal(permissions.defaultPreset, 'workspace-write')
+  assert.deepEqual(permissions.options.map((o) => o.value), ['workspace-write', 'danger-full-access'])
+  const hub = await service.createHubSession('F:\\ws', { agentPreset: 'plan', model: { provider: 'deepseek', model: 'step-5' }, permission: 'danger-full-access' })
+  assert.equal(hub.status, 'ok', 'a hub session is created')
+  assert.ok(hub.id.startsWith('session-'), 'the hub session id uses the session prefix')
+  assert.equal(created.length, 1, 'exactly one agent is created')
+  assert.equal(created[0].meta.cwd, 'F:\\ws')
+  assert.equal(created[0].meta.agentPreset, 'plan', 'the preset rides the creation metadata')
+  assert.deepEqual(created[0].agentOptions, { provider: 'deepseek', model: 'step-5' }, 'the model rides the agent options')
+  assert.deepEqual(applied, [[created[0].sessionId, 'danger-full-access']], 'the permission preset is applied to the created session')
+  const bare = await service.createHubSession('', {})
+  assert.equal(bare.status, 'error', 'a missing workspace is refused')
+  const noCtx = new SupermemoryPanelService(fakeStore(), undefined)
+  assert.equal((await noCtx.createHubSession('F:\\ws')).status, 'error', 'no host context is reported, not thrown')
+  ok('F1 快速启动目录与选项：预设/模型/权限目录映射 + 中枢会话携带 agentPreset/model/permission')
+}
+
+{
+  const services = {}
+  const service = new SupermemoryPanelService(fakeStore(), serviceCtx(services))
+  assert.deepEqual(await service.listAgentPresets(), [], 'a missing preset service degrades to an empty roster')
+  assert.deepEqual(await service.listModelCatalog(), { providers: [], models: [] }, 'a missing llm service degrades to an empty catalog')
+  assert.deepEqual(await service.listPermissions(), { options: [], defaultPreset: '' }, 'a missing permission service degrades to an empty catalog')
+  ok('F2 降级：宿主目录服务缺失时快速启动仍可用（各自为空，不抛错）')
+}
+
+{
+  const store = fakeStore({ topicsets: [['ts-1', { workspaceKey: 'ws', title: '话题一', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }]] })
+  const created = []
+  const services = {
+    agents: { create: async (options) => { created.push(options); return {} }, get: () => undefined },
+    sessions: { get: (id) => ({ id, append: () => {} }) },
+    workspaceRegistry: { resolveByPath: async () => ({ attachSession: async () => {} }) },
+  }
+  const service = new SupermemoryPanelService(store, serviceCtx(services))
+  const result = await service.createTopicSetSession('F:\\ws', ['ts-1', 'ts-missing'], { agentPreset: 'plan', permission: 'workspace-write' })
+  assert.equal(result.status, 'ok', 'a topic-set session is created')
+  assert.equal(created[0].meta.agentPreset, 'plan', 'the topic-set path forwards the preset too')
+  const member = store.topicsets.get('ts-1').members[0]
+  assert.equal(member.sessionId, result.id, 'the session joins the topic set')
+  assert.equal(member.title, '话题一', 'the member row is named')
+  const none = await service.createTopicSetSession('F:\\ws', [], {})
+  assert.equal(none.status, 'error', 'no valid topic set is refused')
+  ok('F3 话题集会话：选项透传 + 成员登记 + 空选择拒绝')
+}
+
+{
+  // deleteCompositeTool: durable row + trigger signal + live registration.
+  const disposed = []
+  const spec = { name: 'sm_composite_a_b', description: 'd', steps: [{ tool: 'a', arguments: {} }], parameters: [] }
+  const store = fakeStore({
+    toolMemory: [['tm-1', { kind: 'composite', trigger: 'ws/ws/seq/a>b', description: 'd', entry: JSON.stringify(spec), useCount: 0, status: 'retired' }]],
+    signals: [['ws/ws/seq/a>b', { workspaceKey: 'ws', pattern: 'a>b', count: 3, lastSeen: now, examples: [], sequence: ['a', 'b'], samples: [], proposedAt: now, proposalStatus: 'accepted' }]],
+  })
+  const missing = await deleteCompositeTool(serviceCtx(), store, 'tm-nope')
+  assert.equal(missing.status, 'error', 'an unknown tool is refused')
+  const done = await deleteCompositeTool(serviceCtx(), store, 'tm-1')
+  assert.equal(done.status, 'ok')
+  assert.equal(store.toolMemory.size, 0, 'the durable row is gone')
+  assert.equal(store.signals.size, 0, 'the creating signal is gone (a repeat must cross the threshold again)')
+  // A LIVE registration is unregistered through the same dispose path the
+  // retire button uses (editCompositeTool); the real registerComposite needs
+  // the host @deepseek-ai/dsh-tools module, which this host-free smoke cannot
+  // import, so the live branch is covered by the panel retire flow instead.
+  const broken = fakeStore({ toolMemory: [['tm-3', { kind: 'composite', trigger: '', description: 'd', entry: '{oops', useCount: 0, status: 'active' }]] })
+  const brokenResult = await deleteCompositeTool(serviceCtx(), broken, 'tm-3')
+  assert.equal(brokenResult.status, 'ok', 'a broken definition still deletes')
+  assert.equal(broken.toolMemory.size, 0, 'the broken row is gone too')
+  assert.deepEqual(disposed, [], 'no live registration exists to dispose in this smoke')
+  ok('F4 组合工具删除：行 + 信号 + 损坏定义均可删除，未知 id 拒绝')
+}
+
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 process.exit(0)

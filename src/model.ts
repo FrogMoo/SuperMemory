@@ -36,7 +36,17 @@ export function hubSelection(agent: unknown): ModelSelection | undefined {
 
 /** Runtime enumeration of provider/model options for the question UI. */
 export async function enumerateModels(ctx: Context): Promise<{ providers: Array<{ id: string; name: string }>; models: Array<{ provider: string; id: string; name: string }> }> {
-  const llm = (ctx as unknown as { llm?: LlmRuntimeLike }).llm
+  // ctx.get (never the ctx.llm property): the cordis proxy getter throws
+  // "cannot get property without inject" for a service this plugin does not
+  // declare, and 'llm' is not in src/index.ts's inject list — the property
+  // read used to throw inside every caller's try/catch and degrade to an
+  // empty catalog. ctx.get has no inject requirement.
+  let llm: LlmRuntimeLike | undefined
+  try {
+    llm = (ctx as unknown as { get?(name: string): unknown }).get?.('llm') as LlmRuntimeLike | undefined
+  } catch {
+    llm = undefined
+  }
   if (!llm) return { providers: [], models: [] }
   const providers = llm.listProviders()
   const models: Array<{ provider: string; id: string; name: string }> = []

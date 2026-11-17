@@ -20,7 +20,8 @@ import {
 import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles } from './dispatch.ts'
-import { editCompositeTool, liveCompositeSpecs } from './composite.ts'
+import { deleteCompositeTool, editCompositeTool, liveCompositeSpecs } from './composite.ts'
+import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
 
 export interface TopicSetView {
@@ -50,6 +51,43 @@ export interface ToolView {
   useCount: number
   status: string
   live: boolean
+}
+
+/** One agent-preset row for the hub quick launcher (R7). */
+export interface AgentPresetView {
+  id: string
+  name?: string
+  description?: string
+  isDefault: boolean
+}
+
+/** Runtime provider/model catalog for the hub quick launcher (R7). */
+export interface ModelCatalogView {
+  providers: Array<{ id: string; name: string }>
+  models: Array<{ provider: string; id: string; name: string }>
+}
+
+/** One permission-preset option of the process-level catalog (R7). */
+export interface PermissionPresetView {
+  value: string
+  name: string
+  description?: string
+}
+
+/** The permission catalog the hub quick launcher renders (R7). */
+export interface PermissionCatalogView {
+  options: PermissionPresetView[]
+  defaultPreset: string
+}
+
+/** Choices applied to a session the plugin creates (R7); every field optional. */
+export interface SessionOptions {
+  /** Agent preset id (rides the creation metadata). */
+  agentPreset?: string
+  /** Provider/model route (rides the agent options). */
+  model?: { provider: string; model: string; reasoningEffort?: string }
+  /** Permission preset value (applied right after creation). */
+  permission?: string
 }
 
 /**
@@ -296,19 +334,17 @@ export class SupermemoryPanelService {
    * R3: create a session bound to one or more topic sets (话题集会话).
    * The session is a fresh root member of every selected topic set.
    */
-  async createTopicSetSession(cwd: string, topicSetIds: string[]): Promise<MutationResult> {
+  async createTopicSetSession(cwd: string, topicSetIds: string[], options: SessionOptions = {}): Promise<MutationResult> {
     const ctx = this.ctx
     if (!ctx) return { status: 'error', message: '宿主上下文不可用，无法创建会话。' }
     const ids = (topicSetIds ?? []).filter((id) => this.store.topicsets.get(id))
     if (ids.length === 0) return { status: 'error', message: '请至少选择一个有效话题集。' }
     if (!cwd) return { status: 'error', message: '无法确定工作区。' }
     const titles = ids.map((id) => this.store.topicsets.get(id)?.title ?? id)
+    const created = await this.createSessionWithOptions(cwd, options)
+    if ('error' in created) return { status: 'error', message: created.error }
+    const sessionId = created.sessionId
     try {
-      const sessionId = newId('tsession')
-      await ctx.agents.create({
-        sessionId: sessionId as never,
-        meta: { cwd },
-      })
       // Requirement C: one stable title for the session AND every member row.
       const named = await ensureMemberTitle(this.store, ids[0], { sessionId, kind: 'root' }, titles.join('、'), '')
       for (const id of ids.slice(1)) {
@@ -323,6 +359,139 @@ export class SupermemoryPanelService {
       return { status: 'ok', message: `已创建话题集会话（${titles.join('、')}）。`, id: sessionId }
     } catch (error) {
       return { status: 'error', message: `创建会话失败：${String(error).slice(0, 200)}` }
+    }
+  }
+
+  /**
+   * R7: create one plain hub session carrying the quick-launcher choices. The
+   * session belongs to NO topic set; it is named, attached to its workspace
+   * and opened by the client. An empty option set reproduces the shell's
+   * plain new session (host defaults for preset/model/permission).
+   */
+  async createHubSession(cwd: string, options: SessionOptions = {}): Promise<MutationResult> {
+    const created = await this.createSessionWithOptions(cwd, options)
+    if ('error' in created) return { status: 'error', message: created.error }
+    // A short id suffix keeps several hub sessions distinguishable in the
+    // sidebar list (requirement C naming, hub flavour).
+    const title = '新会话 · ' + created.sessionId.slice(-4)
+    await this.finishSession(created.sessionId, cwd, title)
+    return { status: 'ok', message: '已创建中枢会话。', id: created.sessionId }
+  }
+
+  /**
+   * R7: create the bare session with the quick-launcher choices applied. The
+   * agent preset rides the creation metadata; the model rides the agent
+   * options (route fallback until the session records a selection); the
+   * permission preset is applied right after creation because its service
+   * owns the session knob events. Every choice is optional.
+   */
+  private async createSessionWithOptions(
+    cwd: string,
+    options: SessionOptions,
+  ): Promise<{ sessionId: string } | { error: string }> {
+    const ctx = this.ctx
+    if (!ctx) return { error: '宿主上下文不可用，无法创建会话。' }
+    if (!cwd) return { error: '无法确定工作区。' }
+    const sessionId = newId('session')
+    const meta: Record<string, unknown> = { cwd }
+    if (options.agentPreset) meta.agentPreset = options.agentPreset
+    const agentOptions: Record<string, unknown> = {}
+    if (options.model?.provider && options.model?.model) {
+      agentOptions.provider = options.model.provider
+      agentOptions.model = options.model.model
+      if (options.model.reasoningEffort) agentOptions.reasoningEffort = options.model.reasoningEffort
+    }
+    try {
+      await ctx.agents.create({
+        sessionId: sessionId as never,
+        meta: meta as never,
+        ...(Object.keys(agentOptions).length > 0 ? { agentOptions: agentOptions as never } : {}),
+      })
+    } catch (error) {
+      return { error: `创建会话失败：${String(error).slice(0, 200)}` }
+    }
+    this.applyPermission(sessionId, options.permission)
+    return { sessionId }
+  }
+
+  /** Name the host session and attach it to its workspace (best-effort). */
+  private async finishSession(sessionId: string, cwd: string, title: string): Promise<void> {
+    const ctx = this.ctx
+    if (!ctx) return
+    applySessionTitle(ctx, sessionId, title, { warn: () => {} })
+    try {
+      await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
+    } catch { /* workspace attach is best-effort */ }
+  }
+
+  /**
+   * R7: apply one permission preset to a just-created session. The preset
+   * value comes from the host catalog (listPermissions); an unknown value or
+   * a missing service is reported, never faked.
+   */
+  private applyPermission(sessionId: string, preset: string | undefined): void {
+    if (!preset) return
+    const ctx = this.ctx
+    if (!ctx) return
+    try {
+      const service = ctx.get('permissionPresets') as { set?(session: unknown, name: string): void } | undefined
+      const agent = ctx.agents.get(sessionId as never) as { session?: unknown } | undefined
+      if (!service || typeof service.set !== 'function' || !agent?.session) return
+      service.set(agent.session, preset)
+    } catch (error) {
+      console.warn('supermemory: permission preset apply failed: ' + String(error).slice(0, 160))
+    }
+  }
+
+  /** R7: the agent-preset roster for the hub quick launcher. */
+  async listAgentPresets(): Promise<AgentPresetView[]> {
+    const ctx = this.ctx
+    if (!ctx) return []
+    try {
+      const service = ctx.get('agentPresets') as {
+        list?(): Promise<Array<{ id: string; name?: string; description?: string; broken?: string }>>
+        defaultId?: string
+      } | undefined
+      if (!service || typeof service.list !== 'function') return []
+      const rows = await service.list()
+      const defaultId = service.defaultId
+      return rows.map((row) => ({
+        id: row.id,
+        ...(row.name ? { name: row.name } : {}),
+        ...(row.description ? { description: row.description } : {}),
+        isDefault: row.id === defaultId,
+      }))
+    } catch (error) {
+      console.warn('supermemory: agent preset roster unavailable: ' + String(error).slice(0, 160))
+      return []
+    }
+  }
+
+  /** R7: the runtime provider/model catalog for the hub quick launcher. */
+  async listModelCatalog(): Promise<ModelCatalogView> {
+    const ctx = this.ctx
+    if (!ctx) return { providers: [], models: [] }
+    try {
+      return await enumerateModels(ctx)
+    } catch (error) {
+      console.warn('supermemory: model catalog unavailable: ' + String(error).slice(0, 160))
+      return { providers: [], models: [] }
+    }
+  }
+
+  /** R7: the process-level permission catalog for the hub quick launcher. */
+  async listPermissions(): Promise<PermissionCatalogView> {
+    const ctx = this.ctx
+    if (!ctx) return { options: [], defaultPreset: '' }
+    try {
+      const service = ctx.get('permissionPresets') as
+        | { catalog?(): PermissionCatalogView }
+        | undefined
+      if (!service || typeof service.catalog !== 'function') return { options: [], defaultPreset: '' }
+      return service.catalog()
+    } catch (error) {
+      console.warn('supermemory: permission catalog unavailable: ' + String(error).slice(0, 160))
+      return { options: [], defaultPreset: '' }
     }
   }
 
@@ -434,6 +603,16 @@ export class SupermemoryPanelService {
   }): Promise<MutationResult> {
     if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法修改工具。' }
     return editCompositeTool(this.ctx, this.store, id, patch)
+  }
+
+  /**
+   * R6+: delete one composite tool for good (unregister + durable row + the
+   * sequence signal that created it). The panel's delete button; a retired
+   * tool is deleted the same way.
+   */
+  async deleteTool(id: string): Promise<MutationResult> {
+    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法删除工具。' }
+    return deleteCompositeTool(this.ctx, this.store, id)
   }
 
   /**
@@ -579,7 +758,39 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'topicSetIds', wire: 'topicSetIds', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#TopicSetIds', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'options', wire: 'options', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionOptions', create: () => ({ parse: (v: unknown) => v }) } },
     ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/createHubSession',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'createHubSession',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'options', wire: 'options', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionOptions', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/listAgentPresets',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listAgentPresets',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#AgentPresetViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/listModelCatalog',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listModelCatalog',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#ModelCatalogView', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/listPermissions',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listPermissions',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#PermissionCatalogView', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [],
   },
   {
     id: 'dsh-supermemory#supermemoryPanel/followupTopicSet',
@@ -607,6 +818,15 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#ToolPatch', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/deleteTool',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'deleteTool',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

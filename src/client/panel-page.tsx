@@ -37,6 +37,40 @@ export interface ToolView {
   live: boolean
 }
 
+/** One agent-preset row of the host roster (hub quick launcher). */
+export interface AgentPresetView {
+  id: string
+  name?: string
+  description?: string
+  isDefault: boolean
+}
+
+/** Runtime provider/model catalog (hub quick launcher). */
+export interface ModelCatalogView {
+  providers: Array<{ id: string; name: string }>
+  models: Array<{ provider: string; id: string; name: string }>
+}
+
+/** One permission-preset option of the host catalog (hub quick launcher). */
+export interface PermissionPresetView {
+  value: string
+  name: string
+  description?: string
+}
+
+/** The host permission catalog (hub quick launcher). */
+export interface PermissionCatalogView {
+  options: PermissionPresetView[]
+  defaultPreset: string
+}
+
+/** Quick-launcher choices applied to the created session (R7). */
+export interface SessionOptions {
+  agentPreset?: string
+  model?: { provider: string; model: string; reasoningEffort?: string }
+  permission?: string
+}
+
 export interface HubState {
   sessionId: string
   workspaceKey: string
@@ -71,14 +105,19 @@ export interface PanelApi {
   createTopicSet(cwd: string, title: string): Promise<MutationResult>
   activate(sessionId: string, topicSetId: string): Promise<boolean>
   updateTopicSetSummary(id: string, summary: string): Promise<MutationResult>
-  createTopicSetSession(cwd: string, ids: string[]): Promise<MutationResult>
+  createTopicSetSession(cwd: string, ids: string[], options?: SessionOptions): Promise<MutationResult>
+  createHubSession(cwd: string, options?: SessionOptions): Promise<MutationResult>
   followupTopicSet(cwd: string, topicSetId: string, text: string): Promise<MutationResult>
   listTools(): Promise<ToolView[]>
   editTool(id: string, patch: Record<string, unknown>): Promise<MutationResult>
+  deleteTool(id: string): Promise<MutationResult>
   sessionBadge(sessionId: string): Promise<SessionBadge>
   openSession(sessionId: string): void
   startSession(): void
   loadTopicSets(cwd: string): Promise<TopicSetView[]>
+  listAgentPresets(): Promise<AgentPresetView[]>
+  listModelCatalog(): Promise<ModelCatalogView>
+  listPermissions(): Promise<PermissionCatalogView>
 }
 
 export interface PanelPageProps {
@@ -91,36 +130,42 @@ export interface PanelPageProps {
 type View = { kind: 'hub' } | { kind: 'topic'; id: string } | { kind: 'memories' } | { kind: 'tools' }
 
 const PANEL_CSS = `
-.sm-panel{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsh-color-text,#e8e8ea);background:var(--dsh-color-bg,#17171a);font-size:13px}
+.sm-panel{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary,#f9fafb);background:var(--dsw-alias-bg-base,#151517);font-size:13px}
 .sm-panel *{box-sizing:border-box}
-.sm-head{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--dsh-color-border,#2c2c31)}
+.sm-head{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
 .sm-head h1{font-size:15px;margin:0;font-weight:600}
 .sm-counts{margin-left:auto;opacity:.65;font-size:11px}
-.sm-tabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--dsh-color-border,#2c2c31)}
+.sm-tabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
 .sm-tab{padding:6px 12px;border:none;background:transparent;color:inherit;opacity:.6;cursor:pointer;border-radius:6px 6px 0 0;font-size:12px}
-.sm-tab[data-active="true"]{opacity:1;background:var(--dsh-color-bg-soft,#1f1f24);font-weight:600}
+.sm-tab[data-active="true"]{opacity:1;background:var(--dsw-alias-bg-layer-1,#232324);font-weight:600}
 .sm-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
-.sm-card{border:1px solid var(--dsh-color-border,#2c2c31);border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--dsh-color-bg-soft,#1c1c20)}
+.sm-card{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-1,#232324)}
 .sm-card h3{margin:0 0 4px;font-size:13px}
 .sm-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .sm-muted{opacity:.6;font-size:11px}
-.sm-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--dsh-color-border,#3a3a42);background:var(--dsh-color-bg,#222228);color:inherit;cursor:pointer;font-size:12px}
-.sm-btn:hover{border-color:var(--dsh-color-primary,#5b8def)}
-.sm-btn[data-variant="primary"]{background:var(--dsh-color-primary,#3d6fd8);border-color:transparent;color:#fff}
-.sm-btn[data-variant="danger"]{border-color:#a8443c;color:#e0736a}
+.sm-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:inherit;cursor:pointer;font-size:12px}
+.sm-btn:hover{border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-btn[data-variant="primary"]{background:var(--dsw-alias-button-primary-fill,#f9fafb);border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#0f1115)}
+.sm-btn[data-variant="primary"]:hover{border-color:transparent;background:var(--dsw-alias-button-primary-hover,#ebeef2)}
+.sm-btn[data-variant="danger"]{border-color:var(--dsw-alias-state-error-primary,#f25a5a);color:var(--dsw-alias-state-error-primary,#f25a5a)}
 .sm-btn:disabled{opacity:.45;cursor:default}
-.sm-input{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsh-color-border,#3a3a42);background:var(--dsh-color-bg,#121215);color:inherit;font-size:12px;font-family:inherit}
-.sm-textarea{width:100%;min-height:56px;padding:6px 8px;border-radius:6px;border:1px solid var(--dsh-color-border,#3a3a42);background:var(--dsh-color-bg,#121215);color:inherit;font-size:12px;font-family:inherit;resize:vertical}
+.sm-input{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}
+.sm-select{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}
+.sm-textarea{width:100%;min-height:56px;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit;resize:vertical}
+.sm-field{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
+.sm-field .sm-field-label{font-size:11px;opacity:.6}
+.sm-check{display:flex;gap:8px;align-items:center;padding:4px 6px;border-radius:6px;cursor:pointer;font-size:12px}
+.sm-check:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}
 .sm-list{display:flex;flex-direction:column;gap:6px}
-.sm-item{border:1px solid var(--dsh-color-border,#2c2c31);border-radius:8px;padding:8px 10px;background:var(--dsh-color-bg-soft,#1c1c20)}
+.sm-item{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1,#232324)}
 .sm-item[data-clickable="true"]{cursor:pointer}
-.sm-item[data-clickable="true"]:hover{border-color:var(--dsh-color-primary,#5b8def)}
+.sm-item[data-clickable="true"]:hover{border-color:var(--dsw-alias-link,#7aaaff)}
 .sm-item .sm-title{font-weight:600;font-size:12.5px}
 .sm-item .sm-sub{opacity:.6;font-size:11px;margin-top:2px;word-break:break-all}
 .sm-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
-.sm-error{color:#e0736a;font-size:12px;padding:8px 0}
-.sm-ok{color:#6fbf73;font-size:12px;padding:4px 0}
-.sm-badge{display:inline-block;padding:1px 6px;border-radius:99px;font-size:10px;border:1px solid var(--dsh-color-border,#3a3a42);opacity:.8;margin-right:4px}
+.sm-error{color:var(--dsw-alias-state-error-primary,#f25a5a);font-size:12px;padding:8px 0}
+.sm-ok{color:var(--dsw-alias-state-success-primary,#22c55e);font-size:12px;padding:4px 0}
+.sm-badge{display:inline-block;padding:1px 6px;border-radius:99px;font-size:10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));opacity:.8;margin-right:4px}
 .sm-empty{opacity:.55;padding:16px 0;text-align:center}
 .sm-form{display:flex;gap:6px;margin-bottom:10px}
 .sm-form .sm-input{flex:1}
@@ -172,6 +217,20 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
   const [editingMemory, setEditingMemory] = useState<{ id: string; text: string } | undefined>()
   const [editingTool, setEditingTool] = useState<{ id: string; description: string } | undefined>()
+  const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
+  // R7 quick launcher (中枢会话页签): the new-session-page choices — workspace,
+  // agent preset, model, permission — beside the topic-set selection.
+  const [presets, setPresets] = useState<AgentPresetView[]>([])
+  const [catalog, setCatalog] = useState<ModelCatalogView | undefined>()
+  const [permissions, setPermissions] = useState<PermissionCatalogView | undefined>()
+  const [launchWorkspace, setLaunchWorkspace] = useState('')
+  const [launchPreset, setLaunchPreset] = useState('')
+  const [launchModel, setLaunchModel] = useState('')
+  const [launchPermission, setLaunchPermission] = useState('')
+  const [launchSets, setLaunchSets] = useState<TopicSetView[]>([])
+  const [launchSelected, setLaunchSelected] = useState<string[]>([])
+  const [launchNewTitle, setLaunchNewTitle] = useState('')
+  const [launching, setLaunching] = useState(false)
 
   const workspaces = props.useWorkspaces((state) => state.items)
   const sessionId = props.useSessions((state) => {
@@ -230,6 +289,89 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
 
+  // R7: the host catalogs behind the quick launcher (agent presets, model
+  // routes, permission presets), read once per mount. A failure leaves the
+  // corresponding selector empty — the launcher still works with defaults.
+  useEffect(() => {
+    let alive = true
+    void api.listAgentPresets().then((rows) => { if (alive) setPresets(rows) }, () => { /* keep the default option */ })
+    void api.listModelCatalog().then((rows) => { if (alive) setCatalog(rows) }, () => { /* keep the default option */ })
+    void api.listPermissions().then((rows) => { if (alive) setPermissions(rows) }, () => { /* keep the default option */ })
+    return () => { alive = false }
+  }, [api])
+
+  // The launcher defaults to the workspace the panel itself points at (the
+  // main-view session's cwd, else the first open workspace).
+  useEffect(() => {
+    if (launchWorkspace) return
+    if (cwd) setLaunchWorkspace(cwd)
+    else if (workspaces.length > 0) setLaunchWorkspace(workspaces[0].path)
+  }, [cwd, launchWorkspace, workspaces])
+
+  // The launcher's topic sets belong to the SELECTED workspace, not to the
+  // panel's own cwd; a selection that no longer exists is dropped.
+  useEffect(() => {
+    if (!launchWorkspace) return
+    let alive = true
+    void api.loadTopicSets(launchWorkspace).then((rows) => {
+      if (!alive) return
+      setLaunchSets(rows)
+      setLaunchSelected((current) => current.filter((id) => rows.some((row) => row.id === id)))
+    }, () => { if (alive) setLaunchSets([]) })
+    return () => { alive = false }
+  }, [api, launchWorkspace])
+
+  const launchCwd = launchWorkspace || cwd
+
+  const launchCreateSet = async (): Promise<void> => {
+    const title = launchNewTitle.trim()
+    if (!title || !launchCwd) return
+    setError(undefined)
+    try {
+      const created = await api.createTopicSet(launchCwd, title)
+      if (created.status !== 'ok' || !created.id) { setError(created.message); return }
+      const id = created.id
+      setLaunchNewTitle('')
+      const rows = await api.loadTopicSets(launchCwd)
+      setLaunchSets(rows)
+      setLaunchSelected((current) => (current.includes(id) ? current : [...current, id]))
+      void refreshHub()
+    } catch (createError) {
+      setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
+    }
+  }
+
+  const startLaunch = async (): Promise<void> => {
+    if (!launchCwd) { setError(t('launch.needWorkspace')); return }
+    setLaunching(true)
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      const options: SessionOptions = {}
+      if (launchPreset) options.agentPreset = launchPreset
+      if (launchModel) {
+        const slash = launchModel.indexOf('/')
+        if (slash > 0) options.model = { provider: launchModel.slice(0, slash), model: launchModel.slice(slash + 1) }
+      }
+      if (launchPermission) options.permission = launchPermission
+      const result = launchSelected.length > 0
+        ? await api.createTopicSetSession(launchCwd, launchSelected, options)
+        : await api.createHubSession(launchCwd, options)
+      if (result.status === 'ok' && result.id) {
+        setNotice(result.message)
+        setLaunchSelected([])
+        api.openSession(result.id)
+        void refreshHub()
+      } else {
+        setError(result.message)
+      }
+    } catch (launchError) {
+      setError(`${t('error.generic')}: ${String(launchError instanceof Error ? launchError.message : launchError)}`)
+    } finally {
+      setLaunching(false)
+    }
+  }
+
   const activeTopicSet = hub?.topicSets.find((topicSet) => topicSet.id === hub.activeTopicSetId)
   const currentTopicSet = view.kind === 'topic'
     ? hub?.topicSets.find((topicSet) => topicSet.id === view.id)
@@ -255,7 +397,108 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     onClick: () => setView(kind === 'hub' ? { kind: 'hub' } : kind === 'memories' ? { kind: 'memories' } : kind === 'tools' ? { kind: 'tools' } : { kind: 'hub' }),
   })
 
+  // R7: the quick launcher — the new-session-page choices (workspace,
+  // agent preset, model, permission) beside the topic-set selection. No topic
+  // set selected creates a plain hub session; any selection creates a
+  // topic-set session bound to the chosen sets.
+  const launchView: ReactNode = h('div', { key: 'launch', className: 'sm-card' },
+    h('h3', null, t('launch.title')),
+    h('div', { key: 'ws', className: 'sm-field' },
+      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.workspace')),
+      h('select', {
+        key: 'select', className: 'sm-select', value: launchCwd,
+        onChange: (event: { target: { value: string } }) => setLaunchWorkspace(event.target.value),
+      },
+        workspaces.length === 0
+          ? h('option', { key: 'current', value: launchCwd }, launchCwd || '—')
+          : workspaces.map((workspace) =>
+              h('option', { key: workspace.id, value: workspace.path }, workspace.title || workspace.path),
+            ),
+      ),
+    ),
+    h('div', { key: 'preset', className: 'sm-field' },
+      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.preset')),
+      h('select', {
+        key: 'select', className: 'sm-select', value: launchPreset,
+        onChange: (event: { target: { value: string } }) => setLaunchPreset(event.target.value),
+      },
+        h('option', { key: 'default', value: '' }, t('launch.default')),
+        presets.map((preset) =>
+          h('option', {
+            key: preset.id, value: preset.id,
+            title: preset.description || undefined,
+          }, (preset.name || preset.id) + (preset.isDefault ? `（${t('launch.defaultMark')}）` : '')),
+        ),
+      ),
+    ),
+    h('div', { key: 'model', className: 'sm-field' },
+      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.model')),
+      h('select', {
+        key: 'select', className: 'sm-select', value: launchModel,
+        onChange: (event: { target: { value: string } }) => setLaunchModel(event.target.value),
+      },
+        h('option', { key: 'default', value: '' }, t('launch.default')),
+        (catalog?.models ?? []).map((model) =>
+          h('option', {
+            key: `${model.provider}/${model.id}`, value: `${model.provider}/${model.id}`,
+            title: model.name || undefined,
+          }, `${model.provider}/${model.id}`),
+        ),
+      ),
+    ),
+    h('div', { key: 'permission', className: 'sm-field' },
+      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.permission')),
+      h('select', {
+        key: 'select', className: 'sm-select', value: launchPermission,
+        onChange: (event: { target: { value: string } }) => setLaunchPermission(event.target.value),
+      },
+        h('option', {
+          key: 'default', value: '',
+          title: (permissions?.options ?? []).find((option) => option.value === permissions?.defaultPreset)?.description || undefined,
+        }, permissions?.defaultPreset ? `${t('launch.default')}（${permissions.defaultPreset}）` : t('launch.default')),
+        (permissions?.options ?? []).map((option) =>
+          h('option', { key: option.value, value: option.value, title: option.description || undefined }, option.name || option.value),
+        ),
+      ),
+    ),
+    h('div', { key: 'sets', className: 'sm-field' },
+      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.sets')),
+      h('div', { key: 'list', className: 'sm-list' },
+        launchSets.length === 0
+          ? h('div', { key: 'empty', className: 'sm-empty' }, t('hub.empty'))
+          : launchSets.map((topicSet) =>
+              h('label', { key: topicSet.id, className: 'sm-check' },
+                h('input', {
+                  key: 'box', type: 'checkbox', checked: launchSelected.includes(topicSet.id),
+                  onChange: () => setLaunchSelected((current) =>
+                    current.includes(topicSet.id) ? current.filter((entry) => entry !== topicSet.id) : [...current, topicSet.id]),
+                }),
+                h('span', { key: 'name' }, topicSet.title),
+              ),
+            ),
+      ),
+    ),
+    h('div', { key: 'newset', className: 'sm-form' },
+      h('input', {
+        key: 'input', className: 'sm-input', value: launchNewTitle,
+        placeholder: t('newSession.create'),
+        onChange: (event: { target: { value: string } }) => setLaunchNewTitle(event.target.value),
+      }),
+      h(Button, { key: 'add', label: t('topic.create'), disabled: !launchNewTitle.trim() || !launchCwd, onClick: () => void launchCreateSet() }),
+    ),
+    h('div', { key: 'actions', className: 'sm-actions' },
+      h(Button, {
+        key: 'start', variant: 'primary',
+        label: launchSelected.length > 0 ? t('launch.startSets') : t('launch.start'),
+        disabled: launching || !launchCwd,
+        onClick: () => void startLaunch(),
+      }),
+      h('span', { key: 'hint', className: 'sm-muted' }, t('launch.hint')),
+    ),
+  )
+
   const hubView: ReactNode = [
+    launchView,
     h('div', { key: 'current', className: 'sm-card' },
       h('h3', null, t('hub.current')),
       h('div', { className: 'sm-row' },
@@ -469,11 +712,30 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                     h('div', { className: 'sm-sub' }, `${t('tool.desc.edit')}：${tool.description || '—'}`),
                     h('div', { className: 'sm-actions' },
                       h(Button, { key: 'edit', label: t('tool.desc.edit'), onClick: () => setEditingTool({ id: tool.id, description: tool.description }) }),
+                      // A retired tool had no way back through the old UI: the
+                      // enable button re-registers it (status -> active).
                       tool.status === 'active'
                         ? h(Button, {
                             key: 'retire', variant: 'danger', label: t('tool.retire'),
                             onClick: () => void run(async () => api.editTool(tool.id, { status: 'retired' }), () => void refreshTools()),
                           })
+                        : h(Button, {
+                            key: 'enable', variant: 'primary', label: t('tool.enable'),
+                            onClick: () => void run(async () => api.editTool(tool.id, { status: 'active' }), () => void refreshTools()),
+                          }),
+                      // Delete is destructive and irreversible, so it asks once
+                      // inline (no native dialog inside the shell).
+                      confirmDeleteTool === tool.id
+                        ? h(Button, {
+                            key: 'delYes', variant: 'danger', label: t('tool.deleteConfirm'),
+                            onClick: () => void run(async () => api.deleteTool(tool.id), () => { setConfirmDeleteTool(undefined); void refreshTools(); void refreshHub() }),
+                          })
+                        : h(Button, {
+                            key: 'del', variant: 'danger', label: t('tool.delete'),
+                            onClick: () => setConfirmDeleteTool(tool.id),
+                          }),
+                      confirmDeleteTool === tool.id
+                        ? h(Button, { key: 'delNo', label: t('memory.cancel'), onClick: () => setConfirmDeleteTool(undefined) })
                         : null,
                     ),
                   ),

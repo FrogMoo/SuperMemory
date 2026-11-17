@@ -188,6 +188,40 @@
 - **卸载/回滚**：插件页移除 dsh-supermemory，或删 profile package.json 的依赖+bundles 条目后
   `pnpm install`；patch 备份可直接还原 dev 加载方式。
 
+## 6.1 插件页看不到插件：根因与修复（2026-11-17 晚）
+
+用户报「侧边栏插件页里看不到这个插件」。审查结论与修复：
+
+- **根因**：工作区从 `G:\09 - dsh\SuperMemory` 搬到 `F:\10-SuperMemory` 后，§6 的
+  link bundle 安装失效，安装方式退化为 profile `cordis.patch.yml` 的**路径行 insert**
+  （`name: 'F:/10-SuperMemory/lib/supermemory.js'`）。插件照常加载、功能正常，
+  但**插件页只列 profile 依赖 + `dsh.profile.bundles`**（源码级结论：
+  `@deepseek-ai/dsh-plugin-manager` 的 `readBundles()` 每次调用实时读
+  `profile/package.json`，列目条件是「dependencies 里有这个名字」；patch 路径行
+  从来不进依赖表，所以页面上永远看不到——§6 早已记载「patch 路径行插入不显示」，
+  这次是退化安装踩中）。
+- **修复（已完成）**：重新按 bundle 形态安装——
+  profile package.json 增加 `"dsh-supermemory": "link:F:/10-SuperMemory"` 并加入
+  `dsh.profile.bundles`（末位）；删除 profile patch 里的路径行 insert 块
+  （否则与 bundle 自带 cordis.patch.yml 的 `id: supermemory` 重复注册）；
+  profile 目录 `pnpm install` 建好符号链接。备份：
+  `package.json.bak-2026-11-1714494-bundle-fix`、`cordis.patch.yml.bak-2026-11-1714494-bundle-fix`。
+  静态验证 9/9 通过（模拟 readBundles：installed/enabled/removable=true、
+  availability=profile、rows=[{supermemory, dsh-supermemory}]、engines 满足、
+  平台无限制、patch 与入口均可达）。
+- **生效方式**：列目是实时读盘，**刷新 GUI 插件页立即可见**；loader 真正加载该 bundle
+  与客户端 bundle 图（window.__DSH_BOOT__）需**重启 DSH Desktop**（或插件页禁用→启用
+  触发 hmr.reconcileProfile）。
+- **后续导入的保证**：新增 `scripts/install-into-dsh.mjs`（`pnpm install:dsh`）——
+  幂等的规范化安装：前置检查（dsh.bundle.patch/入口/client 入口）→ 备份 →
+  写依赖+bundles → 清理路径行 insert → pnpm install → 5 项验证。
+  工作区再搬家只需重跑一次。已用合成旧态 profile 端到端测试通过
+  （自动把失效 link 改为新路径、自动清路径行）。GUI 插件页导入本地绝对路径同样
+  走 bundle 自动激活（reconcileProfilePlugins），但本脚本是唯一保证路径。
+- **副作用记录**：pnpm install 重跑 ssh2 的可选原生构建（本机无 VS，与既往一致地
+  失败并回退纯 JS，ssh2 require 测试通过）；cpu-features 目录被 pnpm 当可选依赖剪掉，
+  不影响功能。
+
 ## 7. 应用内 SuperMemory 面板 + 新会话选项 + 工具编辑（2026-11-17 第二轮）
 
 应用户 6 项需求落地。宿主侧改 src/{route,index,tools,commands,panel,composite}.ts，
@@ -651,3 +685,92 @@ requirement"）。
 client-sim OK；`pnpm build` 成功；`lib/supermemory.js` 含 `ctx.get("typert")`/
 `typertRemote`/`sessionBadge`，`lib/client.js` 含 `sessionBadge` 与
 `sidebar.session.row.leading`。
+
+## 14. 主题对齐 DSH + 中枢页签快速启动 + 组合工具启用/删除（2026-11-18 第七轮）
+
+应用户 3 项 GUI 需求。宿主侧改 src/{panel,composite,model}.ts，客户端改
+src/client/{panel-page,new-session,session-badge,remote,index,shell.d.ts,locales}.ts，
+管理台改 src/web/style.css + src/webui.ts。
+
+### 14.1 需求①：主题颜色与 DSH 一致（根因：变量名根本不存在）
+
+- **根因**：插件全部 CSS 用 `var(--dsh-color-primary,#3d6fd8)` 这类变量，而 DSH 设计平台
+  （`@deepseek-ai/dsh-client-ui-theme` 的 `src/styles/design-platform.css`，app.asar 内
+  可读）定义的语义变量是 `--dsw-alias-*` / `--dsw-static-*`，**没有任何 `--dsh-color-*`**。
+  即插件一直在渲染自己的硬编码回退色，明暗主题都不跟随（DSH 默认偏好还是 system）。
+- **修法（面板/新会话层/徽标，src/client/*.tsx）**：改绑真实词汇表，回退值取 DSH 暗色值：
+  - 文本 `--dsw-alias-label-primary`、次要 `--dsw-alias-label-secondary`
+  - 背景 `--dsw-alias-bg-base`（#151517）、卡片 `--dsw-alias-bg-layer-1`（#232324）、
+    输入/次级面 `--dsw-specific-input-major` / `--dsw-alias-bg-layer-2`（#2c2c2e）
+  - 边框 `--dsw-alias-border-l2`（rgba(255,255,255,.12)）、悬停强调 `--dsw-alias-link`（#7aaaff）
+  - 主按钮按 DSH 语义对：`--dsw-alias-button-primary-fill` +
+    `--dsw-alias-label-primary-foreground`（暗色=白底黑字，与宿主主按钮一致）
+  - 错误 `--dsw-alias-state-error-primary`（#f25a5a）、成功 `--dsw-alias-state-success-primary`（#22c55e）
+- **管理台（src/web/style.css）**：独立文档（侧边栏 browser tab 是沙箱 iframe，拿不到父文档
+  变量），改为自带 DSH 双调色板：`:root` 明色 + `@media (prefers-color-scheme: dark)` 暗色，
+  变量名与 `--dsw-alias-*` 对齐（值逐项取自 design-platform.css 的 body 明/暗两块），
+  `color-scheme` 同步声明；硬编码的暗色专用值（banner/徽标边框/nav-foot）改为
+  currentColor 的 color-mix 派生，明暗自适应。
+  **已知限制**：宿主显式 light/dark 偏好无法读入该独立文档（主题 preference 是主题插件
+  volatile config，无跨插件读取面），故跟随系统 scheme——与宿主默认偏好 system 一致。
+- **实测（ego-browser + CDP setEmulatedMedia，两套 scheme 逐项 getComputedStyle）**：
+  面板与徽标在明/暗下全部命中 DSH 设计值（暗：底 #151517、文 #f9fafb、卡 #232324、
+  输入 #2c2c2e、主按钮 #f9fafb/#0f1115、危险 #f25a5a、链接 #7aaaff；明：底 #fff、
+  文 #0f1115、主按钮 #0f1115/#fff、危险 #ec1313、链接 #4176e6）。
+
+### 14.2 需求②：中枢会话页签 = 快速新建会话（参考新建会话页面）
+
+- **面板（src/client/panel-page.tsx）**：中枢页签顶部新增「快速新建会话」卡片——
+  工作区 / Agent 模式 / 模型 / 权限 四个下拉 + 话题集多选（保留原有选择话题集能力，
+  含当场新建并自动加入选择）+ 开始按钮。不选话题集→创建普通中枢会话；选中→创建绑定
+  这些话题集的话题集会话。创建后自动打开并刷新面板。
+  - 工作区下拉走框架标准 hook `useWorkspaces`（state.items），默认指向面板当前工作区；
+    切换工作区时，卡片内话题集列表按**所选工作区**重新加载（api.loadTopicSets），
+    失效选择自动剔除——不再把别的工作区的话题集建进来。
+  - Agent 模式/模型/权限三个目录由宿主只读枚举（见下），下拉均带「跟随默认」项。
+- **宿主（src/panel.ts）**：新增 3 个只读目录 + 1 个创建入口，全部走 ctx.get（不新增 inject）：
+  - `listAgentPresets()` → `ctx.get('agentPresets').list()`（id/name/description/isDefault）；
+  - `listModelCatalog()` → `enumerateModels(ctx)`（`ctx.get('llm').listProviders/listModels`）；
+  - `listPermissions()` → `ctx.get('permissionPresets').catalog()`（options/defaultPreset）；
+  - `createHubSession(cwd, options)` → `ctx.agents.create({ sessionId, meta:{cwd, agentPreset}, agentOptions:{provider, model, reasoningEffort} })` + 命名 + attachBranchToWorkspace；
+  - `createTopicSetSession(cwd, ids, options?)` 扩展同款 options（旧调用不传即旧行为）；
+  - 权限预设落地：创建后 `permissionPresets.set(agent.session, preset)`（该服务拥有
+    permission/preset 与 knob 事件；agent/created 时宿主已 pin 默认值，显式选择随后覆盖）。
+- **顺手修的真 bug（src/model.ts）**：`enumerateModels` 读的是 `ctx.llm` **属性**——cordis
+  代理对未 inject 的服务属性访问直接抛 "cannot get property without inject"，`'llm'` 不在
+  src/index.ts 的 inject 列表里，于是每次枚举都抛错、被 askDefaultModel 的 try/catch 吞成
+  空目录（/memory model 一直走自由输入回退）。改为 `ctx.get('llm')`（无 inject 要求）。
+- **合同**：新增 5 个描述符（createHubSession / listAgentPresets / listModelCatalog /
+  listPermissions / deleteTool）+ createTopicSetSession 增加 options 参数；
+  src/client/remote.ts 同步同 id 集合（mechanism-smoke E1 的 parity 断言把关）。
+  shell.d.ts 的 uiWorkspace.startSession 补上可选 workspaceId（与
+  dsh-client-ui-workspace 的 navigation 契约一致）。
+
+### 14.3 需求③：组合工具停用后可启用 + 可删除
+
+- **启用**：面板工具页对 status != active 的行显示「启用」主按钮 →
+  `editTool(id, { status: 'active' })`（editCompositeTool 的非 retired 分支会反注册旧句柄、
+  重新注册并置 active——停用态重新上线）。
+- **删除**：新增 `deleteTool(id)`（宿主 `deleteCompositeTool`）：反注册在线工具（若在册）→
+  删 tool_memory 行 → **连带删除创建它的 sequence 信号行**（删除不是静默停用：同一流程
+  要再跨阈值才可能重新固化）。破坏的 JSON 定义同样可删。面板用两段式内联确认
+  （删除→确认删除/取消），不弹原生对话框。
+- 管理台（src/web/app.js）的工具表本就是只读展示，本次不改。
+
+### 14.4 回归闸门与实测
+
+- `scripts/mechanism-smoke.mjs` 新增 F1–F4：目录映射与选项透传（含 agentPreset 进 meta、
+  model 进 agentOptions、permission 落到 session）、三个目录服务缺失时的降级、
+  话题集会话选项透传 + 成员登记 + 空选择拒绝、删除（行+信号+损坏定义+未知 id）。
+- 闸门：`pnpm typecheck` 0 错；`pnpm smoke` = core 5 + mechanism 26（+4）+ webui 26 +
+  client-sim OK；`pnpm build` 成功（lib/supermemory.js 219.82 kB、lib/client.js 60.48 kB）。
+- 主题契约闸门（`scripts/client-sim-smoke.mjs`）：构建产物与管理台 CSS 不得出现
+  `--dsh-color-*`（宿主不存在的变量名），必须骑行 11 个 `--dsw-alias-*` 主题变量，且管理台
+  必须带 `prefers-color-scheme: dark` 明暗切换——防回归到硬编码回退色。
+- 产物标记核验：宿主包含 createHubSession/listAgentPresets/listModelCatalog/
+  listPermissions/deleteTool/permissionPresets/agentPresets；客户端包含快速启动键与
+  deleteTool，且 `--dsh-color` 归零、`--dsw-alias` 31 处。
+- **生效方式（重要）**：插件已按 link bundle 装在 desktop profile
+  （~/.dsh/profiles/desktop/package.json 依赖 link:F:/10-SuperMemory）。宿主侧改动需
+  **插件重载**（插件页禁用→启用，或重启 DSH Desktop）；客户端改动需**重启后刷新页面**。
+  重载只能在 hub 会话或 GUI 执行（§12 事故教训）。
