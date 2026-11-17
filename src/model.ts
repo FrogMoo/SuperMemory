@@ -102,6 +102,14 @@ function parseFreeInput(raw: string | undefined): ModelSelection | undefined {
   return undefined
 }
 
+/** The topic set that lists one session as a branch (undefined when none). */
+function findMemberTopicSet(store: Store, sessionId: string): string | undefined {
+  for (const [topicSetId, record] of store.topicsets.entries()) {
+    if (record.members.some((member) => member.sessionId === sessionId)) return topicSetId
+  }
+  return undefined
+}
+
 /** Apply a model selection to a live agent and/or persist it as an override. */
 export async function applyModelSelection(
   deps: ModelDeps,
@@ -112,16 +120,22 @@ export async function applyModelSelection(
   let live = false
   if (target.branchSessionId) {
     const agent = ctx.agents.get(target.branchSessionId as never)
+    const owner = (target.topicSetId && store.topicsets.get(target.topicSetId) ? target.topicSetId : undefined)
+      ?? findMemberTopicSet(store, target.branchSessionId)
+    // A branch that exists neither live nor as a persisted member cannot record
+    // anything: reporting "applied" made /memory model and memory_set_model lie.
+    if (!agent && !owner) return { applied: '', live: false }
     if (agent) {
       agent.model.select(selection as never)
       live = true
     }
-    if (target.topicSetId) {
-      await updateMember(store, target.topicSetId, target.branchSessionId, { model: `${selection.provider}/${selection.model}`, modelOverridden: true })
+    if (owner) {
+      await updateMember(store, owner, target.branchSessionId, { model: `${selection.provider}/${selection.model}`, modelOverridden: true })
     }
     return { applied: target.branchSessionId, live }
   }
   if (target.topicSetId) {
+    if (!store.topicsets.get(target.topicSetId)) return { applied: '', live: false }
     await setTopicSetModel(store, target.topicSetId, { ...selection })
     const topicSet = store.topicsets.get(target.topicSetId)
     for (const member of topicSet?.members ?? []) {

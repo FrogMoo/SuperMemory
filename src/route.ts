@@ -23,7 +23,8 @@ export interface RouteConfig {
   enabled: boolean
   driftTurns: number
   driftThreshold: number
-  confirm: boolean
+  /** 关键词命中时注入静默提示卡片（不询问、不切换激活话题集）。 */
+  hint: boolean
   llmFallback: boolean
 }
 
@@ -84,11 +85,16 @@ export async function routeBatch(
   const tokens = new Set(tokenize(text))
 
   // ---- 1. explicit: @话题集名 ----
-  const mention = text.match(/@([^\s@,，。;；]{1,30})/)
+  // Require a boundary before the @ so e-mail addresses never count as a
+  // mention, and require a non-trivial title on both sides: an empty or
+  // one-character title would otherwise match EVERY @-mention.
+  const mention = text.match(/(?:^|[^\w@])@([^\s@,，。;；]{1,30})/)
   if (mention) {
     const name = mention[1]
     for (const [id, topicSet] of listTopicSets(store, workspaceKey)) {
-      if (topicSet.title === name || topicSet.title.includes(name) || name.includes(topicSet.title)) {
+      const title = topicSet.title.trim()
+      if (title.length < 2) continue
+      if (title === name || title.includes(name) || name.includes(title)) {
         await setRouting(store, sessionId, { activeTopicSetId: id, driftCount: 0 })
         await touchTopicSet(store, id)
         return { topicSetId: id, card: renderCard(getTopicSet(store, id)) }
@@ -113,97 +119,30 @@ export async function routeBatch(
         return { topicSetId: routing.activeTopicSetId, card: renderCard(active) }
       }
       // drifted for K consecutive turns → fall through to search
-      setRouting(store, sessionId, { driftCount: 0 })
+      await setRouting(store, sessionId, { driftCount: 0 })
     }
   }
 
-  // ---- 3. keyword search ----
+  // ---- 3. keyword search: silent hint only (§R1) ----
+  // 直接对话时模型就在当前上下文继续：不询问、不切换激活话题集；
+  // 仅把相似话题作为提示卡片注入，激活只来自 @显式、面板或 /memory switch。
+  if (!config.hint) return {}
   const candidates = listTopicSets(store, workspaceKey)
     .map(([id, topicSet]) => ({ id, topicSet, score: scoreTopicSet(topicSet, tokens) }))
     .filter((c) => c.score > 0)
     .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
 
-  if (candidates.length > 0) {
-    const best = candidates[0]
-    if (config.confirm) {
-      const answer = await askConfirm(ctx, logger, agent, signal,
-        `检测到相似话题『${best.topicSet.title}』（${best.topicSet.summary || '暂无梗概'}）？当前消息可能属于该话题。`,
-        best.topicSet.title)
-      if (answer === 'continue') {
-        await setRouting(store, sessionId, { activeTopicSetId: best.id, driftCount: 0 })
-        await touchTopicSet(store, best.id)
-        return { topicSetId: best.id, card: renderCard(best.topicSet) }
-      }
-      if (answer === 'new') return await createAndActivate(ctx, deps, sessionId, workspaceKey, text)
-      return {} // 都不对 → no routing this turn
-    }
-    await setRouting(store, sessionId, { activeTopicSetId: best.id, driftCount: 0 })
-    return { topicSetId: best.id, card: renderCard(best.topicSet) }
+  if (candidates.length === 0) return {}
+  const lines = candidates.map((c) => `- 『${c.topicSet.title}』${c.topicSet.summary ? `：${c.topicSet.summary.slice(0, 80)}` : ''}`)
+  return {
+    card: [
+      '[SuperMemory 话题提示]',
+      '检测到可能与当前对话相关的历史话题（未切换，当前对话继续）：',
+      ...lines,
+      '需要切换时：在消息里 @话题集名，或在 SuperMemory 面板中点击激活。',
+    ].join('\n'),
   }
-
-  // ---- 4. no candidate: ask whether to create ----
-  if (config.confirm) {
-    const answer = await askConfirm(ctx, logger, agent, signal,
-      '没有检测到相似的历史话题。要为当前讨论新建一个话题集吗？', '')
-    if (answer === 'new' || answer === 'continue') {
-      return await createAndActivate(ctx, deps, sessionId, workspaceKey, text)
-    }
-  }
-  return {}
-}
-
-async function createAndActivate(
-  ctx: Context,
-  deps: RouteDeps,
-  sessionId: string,
-  workspaceKey: string,
-  text: string,
-): Promise<RouteOutcome> {
-  const title = deriveTitle(text)
-  const id = await createTopicSet(deps.store, { workspaceKey, title, keywords: [...new Set(tokenize(text))].slice(0, 12) })
-  setRouting(deps.store, sessionId, { activeTopicSetId: id, driftCount: 0 })
-  deps.logger.info(`supermemory: topic set created ${id} (${title})`)
-  return { topicSetId: id, created: id, card: renderCard(getTopicSet(deps.store, id)) }
-}
-
-/** Ask the routing confirmation through the host's user-question channel. */
-async function askConfirm(
-  ctx: Context,
-  logger: { warn: (msg: string) => void },
-  agent: unknown,
-  signal: AbortSignal | undefined,
-  question: string,
-  topicTitle: string,
-): Promise<'continue' | 'new' | 'none' | undefined> {
-  try {
-    const answer = await ctx.userQuestions.ask({
-      questions: [{
-        id: 'supermemory-route',
-        header: '话题路由',
-        question,
-        options: [
-          { label: topicTitle ? `继续该话题` : '新建话题集', description: topicTitle ? `激活『${topicTitle}』` : '为当前讨论新建话题集' },
-          ...(topicTitle ? [{ label: '新建话题集', description: '为当前讨论新建话题集' }] : []),
-          { label: '都不对', description: '本次不进行话题路由' },
-        ],
-      }],
-      ...(agent ? { agent: agent as never } : {}),
-      ...(signal ? { signal } : {}),
-    })
-    const selected = answer?.answers?.[0]?.selected?.[0] ?? ''
-    if (selected === '继续该话题') return 'continue'
-    if (selected === '新建话题集') return 'new'
-    return 'none'
-  } catch (error) {
-    logger.warn(`supermemory: routing confirmation unavailable: ${String(error).slice(0, 160)}`)
-    return undefined
-  }
-}
-
-/** First ~12 chars of the user text as a provisional title. */
-function deriveTitle(text: string): string {
-  const line = text.split('\n').map((s) => s.trim()).find(Boolean) ?? '新话题'
-  return line.slice(0, 12) || '新话题'
 }
 
 /** True when the session is one of this plugin's branch sessions. */

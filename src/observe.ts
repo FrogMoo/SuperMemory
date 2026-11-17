@@ -32,8 +32,16 @@ export interface ObserveDeps {
 interface ColdEvent {
   type: string
   seq: number
+  /** Event commit time (used for the episode's real time window). */
+  time: number
   data: unknown
 }
+
+/** Per-branch settle chain: concurrent settles (live turn/end + startup
+ * reconcile) must not both episode + relay the same dispatch, and a trigger that
+ * arrives while one is running must still get its own pass afterwards (dropping
+ * it would leave a later turn's dispatch unsettled until the next event). */
+const settlingBranches = new Map<string, Promise<void>>()
 
 type MessageFactory = (input: { content: Array<{ type: 'text'; text: string }>; source: Record<string, unknown> }) => UserMessageLike
 
@@ -62,7 +70,7 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number, until
     const out: ColdEvent[] = []
     for (const event of events) {
       if (untilSeq !== undefined && event.seq > untilSeq) break
-      out.push({ type: event.type, seq: event.seq, data: event.data })
+      out.push({ type: event.type, seq: event.seq, time: event.time, data: event.data })
     }
     return out
   } finally {
@@ -70,23 +78,31 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number, until
   }
 }
 
-/** Locate the dispatch's own input message and the first turn/end after it. */
+/** True when a committed user message is this plugin's dispatch input. */
+export function isDispatchInput(message: UserMessageLike): boolean {
+  if (message.source?.kind !== 'supermemory') return false
+  // Recall/notice cards are also appended as user/message; they are context, not
+  // an input, and must never own a turn.
+  const form = message.source?.form
+  return form !== 'recall' && form !== 'notice'
+}
+
+/**
+ * Locate the dispatch's own input message and the first turn/end after it.
+ *
+ * Ownership is the CLAIMED user/message only. followup() durably appends an
+ * agent/inbox/spliced the moment it is called — even while the branch is
+ * mid-turn — so treating a splice as the input attributed the PREVIOUS turn's
+ * answer to this dispatch (and then lost the real answer). The host appends the
+ * claimed message as user/message at the start of the owning step
+ * (agent-loop agent.ts step()).
+ */
 function locateOwnership(events: ColdEvent[], startSeq: number): { messageSeq: number; turnEndSeq: number; reason: unknown } | undefined {
   let messageSeq: number | undefined
   for (const event of events) {
-    // startSeq is the branch log position at dispatch time; the input lands AT
-    // that position (the next append), so only strictly-earlier events skip.
     if (event.seq < startSeq) continue
-    // The dispatch input lands as an inbox splice (claimed later into the
-    // turn); a committed user/message is the success-path equivalent.
-    if (event.type === 'agent/inbox/spliced') {
-      const data = event.data as { inserted?: Array<{ source?: { kind?: string } }> }
-      if (data.inserted?.some((m) => m.source?.kind === 'supermemory')) { messageSeq = event.seq; break }
-    }
-    if (event.type === 'user/message') {
-      const message = event.data as UserMessageLike
-      if (message.source?.kind === 'supermemory') { messageSeq = event.seq; break }
-    }
+    if (event.type !== 'user/message') continue
+    if (isDispatchInput(event.data as UserMessageLike)) { messageSeq = event.seq; break }
   }
   if (messageSeq === undefined) return undefined
   for (const event of events) {
@@ -99,7 +115,9 @@ function locateOwnership(events: ColdEvent[], startSeq: number): { messageSeq: n
 }
 
 /** Rule-based episode from the branch's owned turn (no LLM in the loop). */
-function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: string, branchSessionId: string, timeStart: number, timeEnd: number): Episode {
+function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: string, branchSessionId: string): Episode {
+  const timeStart = events[0]?.time ?? Date.now()
+  const timeEnd = events[events.length - 1]?.time ?? timeStart
   const assistantTexts: string[] = []
   const decisions: string[] = []
   const files: string[] = []
@@ -156,7 +174,10 @@ export function attachObserve(ctx: Context, deps: ObserveDeps): () => void {
   const off = ctx.on('session/event', (session, event: SessionEventLike) => {
     if (event.type !== 'turn/end') return
     const branchSessionId = String(session.id)
+    // Detached on purpose, but never an unhandled rejection: a settle failure
+    // must not escape into the session-event waterfall.
     void settleOpenDispatches(deps, branchSessionId, event.seq)
+      .catch((error) => logger.warn("supermemory: settle failed: " + String(error).slice(0, 160)))
   })
 
   // outbox confirmation: a relay message landing in the hub log confirms it
@@ -183,6 +204,21 @@ export function attachObserve(ctx: Context, deps: ObserveDeps): () => void {
  * plugin was down still settles exactly once.
  */
 export async function settleOpenDispatches(deps: ObserveDeps, branchSessionId: string, turnEndSeq?: number): Promise<void> {
+  // Wait for the branch's previous settle, then run so this trigger's own
+  // turn/end bound is honoured (serialised, not dropped).
+  const inFlight = settlingBranches.get(branchSessionId)
+  if (inFlight) await inFlight.catch(() => { /* the previous pass reported its own failure */ })
+  const run = settleBranch(deps, branchSessionId, turnEndSeq)
+  settlingBranches.set(branchSessionId, run)
+  try {
+    await run
+  } finally {
+    if (settlingBranches.get(branchSessionId) === run) settlingBranches.delete(branchSessionId)
+  }
+}
+
+/** The settle body; runs under the per-branch lock above. */
+async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndSeq?: number): Promise<void> {
   const { ctx, store, logger } = deps
   const open: Array<[string, Dispatch]> = []
   for (const [dispatchId, record] of store.dispatches.entries()) {
@@ -209,7 +245,7 @@ export async function settleOpenDispatches(deps: ObserveDeps, branchSessionId: s
       const reason = (ownership.reason as { kind?: string } | undefined)?.kind ?? 'error'
 
       if (reason === 'completed' || (reason === 'max-tokens' && deps.config.maxTokensPolicy === 'deliver-partial')) {
-        const episode = buildEpisode(owned, dispatchId, record.topicSetId ?? '', branchSessionId, Date.now() - 1, Date.now())
+        const episode = buildEpisode(owned, dispatchId, record.topicSetId ?? '', branchSessionId)
         const episodeId = newId('epi')
         await store.episodes.put(episodeId, episode)
         // D6: group members never relay individually — the group summary does.
@@ -255,7 +291,10 @@ async function deliver(
   input: { dispatchId: string; record: { hubSessionId: string }; text: string; groupId?: string },
 ): Promise<void> {
   const { ctx, store, logger } = deps
-  const deliveryId = newId('dlv')
+  // STABLE idempotency key (file header contract): one relay per dispatch or
+  // group, so a retried delivery overwrites its outbox row instead of piling up
+  // duplicates and the hub's confirmation can match it.
+  const deliveryId = input.groupId ? "dlv-grp-" + input.groupId : "dlv-" + input.dispatchId
   await store.outbox.put(deliveryId, {
     dispatchId: input.groupId ? undefined : input.dispatchId,
     groupId: input.groupId,
@@ -281,3 +320,77 @@ async function deliver(
     logger.warn(`supermemory: relay ${deliveryId} failed: ${String(error).slice(0, 160)}`)
   }
 }
+
+/**
+ * Self-healing delivery pass (the at-least-once contract).
+ *
+ * Two windows used to strand results permanently:
+ *   - a group whose members ALL became terminal right before a crash/reload
+ *     never got its single relay (the live path only scans groups touched by
+ *     the current settle, and startup reconcile returned early when no
+ *     dispatch was open);
+ *   - an outbox row whose hub was not live stayed pending forever, because the
+ *     only retry attempt was one startup pass.
+ * Called from startup reconciliation and from the periodic sweep in apply().
+ */
+export async function flushObserve(deps: ObserveDeps): Promise<void> {
+  const { ctx, store, logger } = deps
+
+  // ---- 1. completed groups whose relay row is missing ----
+  const groupIds = new Set<string>()
+  for (const [, record] of store.dispatches.entries()) {
+    if (record.groupId) groupIds.add(record.groupId)
+  }
+  for (const groupId of groupIds) {
+    try {
+      if (!groupComplete(store, groupId) || groupRelayExists(store, groupId)) continue
+      const members = groupMembers(store, groupId)
+      const hubSessionId = members[0]?.[1].hubSessionId
+      if (!hubSessionId) continue
+      await deliver(deps, {
+        dispatchId: groupId,
+        record: { hubSessionId },
+        text: groupRelayText(store, groupId, groupEpisodeSummaries(store, groupId)),
+        groupId,
+      })
+      logger.info("supermemory: group " + groupId + " relayed by flush")
+    } catch (error) {
+      logger.warn("supermemory: group flush " + groupId + " failed: " + String(error).slice(0, 160))
+    }
+  }
+
+  // ---- 2. pending outbox rows whose hub is live again ----
+  for (const [deliveryId, item] of [...store.outbox.entries()]) {
+    if (item.status !== 'pending') continue
+    const hubSessionId = item.dispatchId
+      ? store.dispatches.get(item.dispatchId)?.hubSessionId
+      : (item.groupId ? groupMembers(store, item.groupId)[0]?.[1].hubSessionId : undefined)
+    if (!hubSessionId) continue
+    const hub = ctx.agents.get(hubSessionId as never) as
+      | {
+          followup?: (message: unknown) => void
+          inbox?: {
+            nextTurn?: Array<{ source?: { deliveryId?: string } }>
+            nextStep?: Array<{ source?: { deliveryId?: string } }>
+          }
+        }
+      | undefined
+    if (!hub?.followup) continue
+    // Already queued in the hub's pending inbox: it confirms when claimed.
+    const queued = [...(hub.inbox?.nextTurn ?? []), ...(hub.inbox?.nextStep ?? [])]
+      .some((message) => message.source?.deliveryId === deliveryId)
+    if (queued) continue
+    try {
+      const factory = await messageFactory()
+      hub.followup(factory({
+        content: [{ type: 'text', text: item.payload }],
+        source: { kind: 'supermemory', form: 'relay', deliveryId },
+      }) as never)
+      await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
+      logger.info("supermemory: flushed pending delivery " + deliveryId)
+    } catch (error) {
+      logger.warn("supermemory: flush delivery " + deliveryId + " failed: " + String(error).slice(0, 160))
+    }
+  }
+}
+

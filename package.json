@@ -6,6 +6,7 @@
   "main": "lib/supermemory.js",
   "exports": {
     ".": "./lib/supermemory.js",
+    "./client": "./lib/client.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
@@ -38,7 +39,13 @@
     "dsh": ">=0.2.0 <0.3.0"
   },
   "scripts": {
-    "build": "tsdown"
+    "build": "tsdown && tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
+    "build:host": "tsdown",
+    "build:client": "tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
+    "smoke:webui": "node scripts/webui-smoke.mjs",
+    "smoke:core": "node scripts/core-smoke.mjs",
+    "smoke": "node scripts/core-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs"
   },
   "dsh": {
     "bundle": {

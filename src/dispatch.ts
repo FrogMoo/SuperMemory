@@ -62,6 +62,14 @@ async function messageFactory(): Promise<typeof CreateUserMessage> {
   return createMessage
 }
 
+/** Parse the "provider/model" text stored on a topic-set member. */
+function parseMemberModel(raw: string | undefined): ModelSelection | undefined {
+  if (!raw) return undefined
+  const slash = raw.indexOf('/')
+  if (slash <= 0 || slash === raw.length - 1) return undefined
+  return { provider: raw.slice(0, slash), model: raw.slice(slash + 1) }
+}
+
 function agentCwd(agent: unknown): string | undefined {
   return (agent as { session?: { header?: { cwd?: string } } })?.session?.header?.cwd
 }
@@ -192,8 +200,14 @@ async function dispatchOne(
   }))
 
   // ---- membership + workspace visibility ----
-  if (!topicSet.members.some((m) => m.sessionId === branchSessionId)) {
-    await addMember(store, topicSetId, { sessionId: branchSessionId, kind, title: task.slice(0, 16) })
+  // Bookkeeping only: a failed member write must not lose the dispatch that is
+  // already recorded and about to be woken.
+  try {
+    if (!topicSet.members.some((m) => m.sessionId === branchSessionId)) {
+      await addMember(store, topicSetId, { sessionId: branchSessionId, kind, title: task.slice(0, 16) })
+    }
+  } catch (error) {
+    logger.warn(`supermemory: addMember failed for ${branchSessionId}: ${String(error).slice(0, 160)}`)
   }
   try {
     await attachBranchToWorkspace(ctx, branchSessionId, cwd, logger)
@@ -212,15 +226,23 @@ async function dispatchOne(
       }],
       source: { kind: 'supermemory' },
     })
+    if (!handle) throw new Error('分支句柄缺失（acquireBranch 未返回 handle）')
     const seqBefore = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq
-    handle!.agent.followup(message as UserMessage)
+    handle.agent.followup(message as UserMessage)
     await new Promise((r) => setTimeout(r, 300))
     const seqAfter = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq
-    logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} input landed (seq ${seqBefore} → ${seqAfter})`)
-    if (seqAfter === seqBefore) {
-      // the input never reached the log — surface it instead of a false receipt
-      await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', updatedAt: Date.now() }))
-      return { status: 'error', dispatchId, ...(groupId ? { groupId } : {}), branchSessionId, message: '分支唤醒后输入未落账（followup 未生效）。' }
+    if (typeof seqBefore === 'number' && typeof seqAfter === 'number' && seqAfter > seqBefore) {
+      // §2.2: the dispatch input landed at seqBefore+1, so the ownership window
+      // must start at that pre-append position — otherwise a later turn/end
+      // would be matched against a stale (often 0) startSeq.
+      await store.dispatches.update(dispatchId, (r) => ({ ...r, startSeq: seqBefore, updatedAt: Date.now() }))
+      logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} input landed (seq ${seqBefore} → ${seqAfter})`)
+    } else {
+      // A busy branch may queue the followup past this 300ms probe. Failing the
+      // dispatch here stranded work that DID land later (observe settled only
+      // open dispatches). Leave it dispatched: observe settles it when the
+      // turn/end arrives, and reconcile path 3 re-follows an untraced input.
+      logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} input not observed yet (seq ${seqBefore} → ${seqAfter}); leaving it to observation/reconciliation`)
     }
   } catch (error) {
     logger.warn(`supermemory: branch followup threw: ${String(error).slice(0, 300)}`)
@@ -251,9 +273,12 @@ async function acquireBranch(
   const ranked = rankMembers(topicSet, taskTokens)
   const agentOptions = topicSet.defaultModel ?? hubModel
 
-  if (mode === 'fork' || (mode === 'auto' && ranked.length > 0 && ranked[0].kind === 'fork')) {
-    const parent = ranked[0]
-    const forked = await forkFromParent(ctx, parent.sessionId, cwd, topicSet.defaultModel, logger)
+  // A fork needs a parent member. With an empty topic set (or no ranked
+  // member) there is nothing to fork from, so fall through to a fresh branch
+  // instead of dereferencing an absent member.
+  const forkParent = ranked[0]
+  if (forkParent && (mode === 'fork' || (mode === 'auto' && forkParent.kind === 'fork'))) {
+    const forked = await forkFromParent(ctx, forkParent.sessionId, cwd, topicSet.defaultModel, logger)
     if (forked) return { ...forked, kind: 'fork' as const }
   }
 
@@ -262,14 +287,30 @@ async function acquireBranch(
     // live handle held by this plugin
     const held = branchHandles.get(target.sessionId)
     if (held) return { sessionId: target.sessionId, handle: held, kind: target.kind }
-    // live registry agent
+    // Live registry agent (e.g. the user opened this branch session in the
+    // GUI, or a topic-set session was created through the panel). It is
+    // host-owned, so it must be driven without being disposed — and the caller
+    // REQUIRES a handle: returning none made dispatchOne dereference undefined
+    // and fail the dispatch with a TypeError.
     const live = ctx.agents.get(target.sessionId as never)
-    if (live) return { sessionId: target.sessionId, kind: target.kind }
+    if (live) {
+      await updateMember(store, topicSetId, target.sessionId, { status: 'live' })
+      return {
+        sessionId: target.sessionId,
+        handle: { agent: live, dispose: async () => { /* host-owned: never disposed here */ } },
+        kind: target.kind,
+      }
+    }
     // resume the persisted session
     try {
+      // A per-member model override (panel / `/memory model branch`) only exists
+      // as durable text: it must WIN on resume, otherwise the recorded override
+      // silently degrades to the topic-set default.
+      const memberModel = parseMemberModel(target.model)
+      const resumeOptions = memberModel ?? agentOptions
       const handle = await ctx.agents.resume({
         resumeSessionId: target.sessionId as never,
-        ...(agentOptions ? { agentOptions: { ...agentOptions } } : {}),
+        ...(resumeOptions ? { agentOptions: { ...resumeOptions } } : {}),
       })
       const branch: BranchHandle = { agent: handle.agent, dispose: () => handle.dispose() }
       branchHandles.set(target.sessionId, branch)

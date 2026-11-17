@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="sm-token" content="">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SuperMemory 管理台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/supermemory/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="nav">
+    <div class="brand">SuperMemory</div>
+    <nav id="sections"></nav>
+    <div class="nav-foot">Plan A · 宿主路由<br>无客户端 bundle</div>
+  </aside>
+  <div id="main">
+    <header id="topbar">
+      <select id="ws-select" title="选择工作区"></select>
+      <span id="gen-at" class="muted"></span>
+      <span class="grow"></span>
+      <label class="auto"><input type="checkbox" id="auto-refresh"> 自动刷新</label>
+      <button id="refresh" class="btn" type="button">刷新</button>
+    </header>
+    <div id="banner" class="banner hidden" role="alert"></div>
+    <main id="content"></main>
+  </div>
+</div>
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/supermemory/app.js" defer></script>
+</body>
+</html>

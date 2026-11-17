@@ -27,7 +27,7 @@ export interface SequenceSample {
   args: Array<Record<string, unknown>>
 }
 
-interface CompositeSpec {
+export interface CompositeSpec {
   name: string
   description: string
   steps: Array<{ tool: string; arguments: Record<string, unknown> }>
@@ -82,8 +82,37 @@ export function compileComposite(signal: Signal, samples: SequenceSample[]): Com
   return { name, description: `组合工具：${latest.tools.join(' → ')}（由重复流程 ${signal.count} 次后固化）`, steps, parameters }
 }
 
+/** Live composite registrations: spec name -> disposer (for edit/re-register). */
+const liveComposites = new Map<string, () => void>()
+
+/** Names of currently registered composite tools (for panel liveness). */
+export const liveCompositeSpecs = new Set<string>()
+
+/** Increment one composite's durable use counter (matched by spec name). */
+function bumpCompositeUse(store: Store, name: string): void {
+  for (const [id, record] of store.toolMemory.entries()) {
+    if (record.kind !== 'composite' || !record.entry) continue
+    try {
+      if ((JSON.parse(record.entry) as CompositeSpec).name !== name) continue
+    } catch {
+      continue
+    }
+    void store.toolMemory.update(id, (r) => ({ ...r, useCount: r.useCount + 1 })).catch(() => { /* counter is advisory */ })
+    return
+  }
+}
+
 /** Register one composite tool; returns its disposer. */
 export async function registerComposite(ctx: Context, store: Store, spec: CompositeSpec): Promise<() => void> {
+  // Two signals can normalise to the same composite name, and a restart rebuild
+  // re-registers every durable definition: dispose the previous handle first so
+  // a re-registration replaces instead of leaking the old one.
+  const previous = liveComposites.get(spec.name)
+  if (previous) {
+    try { previous() } catch { /* the old registration may already be gone */ }
+    liveComposites.delete(spec.name)
+    liveCompositeSpecs.delete(spec.name)
+  }
   const tools = await loadHostModule('@deepseek-ai/dsh-tools') as typeof Tools
   // normalise legacy records (arguments persisted as JSON strings)
   const steps = spec.steps.map((step) => ({ tool: step.tool, arguments: parseArgs(step.arguments) }))
@@ -141,9 +170,14 @@ export async function registerComposite(ctx: Context, store: Store, spec: Compos
           return { status: 'failed' as const, steps: completed, summary: `第 ${index + 1} 步 ${step.tool} 异常：${String(error).slice(0, 160)}` }
         }
       }
+      // Usage is durable (panel + /memory tools surface it); best-effort so a
+      // counter write can never fail an otherwise successful composite run.
+      bumpCompositeUse(store, spec.name)
       return { status: 'completed' as const, steps: completed, summary: `${spec.description}：${texts.join('，')}` }
     },
   }))
+  liveComposites.set(spec.name, disposer)
+  liveCompositeSpecs.add(spec.name)
   return disposer
 }
 
@@ -174,6 +208,81 @@ export async function rebuildComposites(ctx: Context, store: Store): Promise<num
     } catch { /* a broken definition is skipped, never blocks boot */ }
   }
   return registered
+}
+
+/**
+ * R6: edit one composite tool in place. Applies the patch to the durable
+ * definition, re-registers the tool (so the model sees the new description
+ * and behaviour immediately) and persists the change. The tool NAME is
+ * stable — renaming a registered tool is not supported.
+ */
+export async function editCompositeTool(
+  ctx: Context,
+  store: Store,
+  id: string,
+  patch: {
+    description?: string
+    steps?: Array<{ tool: string; arguments: Record<string, unknown> }>
+    parameters?: Array<{ name: string; step: number; key: string; description: string }>
+    status?: string
+  },
+): Promise<{ status: 'ok' | 'error'; message: string; id?: string }> {
+  const record = store.toolMemory.get(id)
+  if (!record || record.kind !== 'composite') {
+    return { status: 'error', message: '组合工具不存在。' }
+  }
+  let spec: CompositeSpec
+  try {
+    spec = JSON.parse(record.entry) as CompositeSpec
+  } catch {
+    return { status: 'error', message: '工具定义损坏，无法编辑。' }
+  }
+  if (!spec || !Array.isArray(spec.steps) || spec.steps.length === 0) {
+    return { status: 'error', message: '工具定义缺少步骤，无法编辑。' }
+  }
+  const next: CompositeSpec = {
+    ...spec,
+    ...(patch.description !== undefined ? { description: String(patch.description).slice(0, 500) } : {}),
+    ...(patch.steps !== undefined
+      ? { steps: patch.steps.map((step) => ({ tool: String(step.tool ?? ''), arguments: parseArgs(step.arguments ?? {}) })) }
+      : {}),
+    ...(patch.parameters !== undefined
+      ? { parameters: patch.parameters.map((p) => ({ name: String(p.name ?? ''), step: Number(p.step) || 0, key: String(p.key ?? ''), description: String(p.description ?? '') })) }
+      : {}),
+  }
+  if (next.steps.length === 0 || next.steps.some((step) => !step.tool)) {
+    return { status: 'error', message: '步骤不能为空，且每步都需要工具名。' }
+  }
+  if (patch.status !== undefined && patch.status !== 'active' && patch.status !== 'retired') {
+    return { status: 'error', message: 'status 仅支持 active / retired。' }
+  }
+  // retire: unregister and persist without re-registering
+  if (patch.status === 'retired') {
+    const dispose = liveComposites.get(next.name)
+    if (dispose) { try { dispose() } catch { /* best-effort */ } }
+    liveComposites.delete(next.name)
+    liveCompositeSpecs.delete(next.name)
+    await store.toolMemory.update(id, (r) => ({ ...r, status: 'retired', description: next.description }))
+    return { status: 'ok', message: `已停用组合工具 ${next.name}（重启后不会重新注册）。`, id }
+  }
+  try {
+    const previous = liveComposites.get(next.name)
+    if (previous) { try { previous() } catch { /* best-effort */ } }
+    liveComposites.delete(next.name)
+    liveCompositeSpecs.delete(next.name)
+    const dispose = await registerComposite(ctx, store, next)
+    liveComposites.set(next.name, dispose)
+    liveCompositeSpecs.add(next.name)
+  } catch (error) {
+    return { status: 'error', message: `重新注册失败：${String(error).slice(0, 200)}` }
+  }
+  await store.toolMemory.update(id, (r) => ({
+    ...r,
+    description: next.description,
+    entry: JSON.stringify(next),
+    status: 'active',
+  }))
+  return { status: 'ok', message: `已更新组合工具 ${next.name}。`, id }
 }
 
 /**

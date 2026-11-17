@@ -49,6 +49,15 @@ export function listTopicSets(store: Store, workspaceKey: string): Array<[string
   return out
 }
 
+/** Topic-set ids of one workspace (episodes/dispatches join through them). */
+export function topicSetIdsOf(store: Store, workspaceKey: string): Set<string> {
+  const ids = new Set<string>()
+  for (const [id, record] of store.topicsets.entries()) {
+    if (record.workspaceKey === workspaceKey) ids.add(id)
+  }
+  return ids
+}
+
 export async function touchTopicSet(store: Store, topicSetId: string): Promise<void> {
   const existing = store.topicsets.get(topicSetId)
   if (!existing) return
@@ -133,7 +142,10 @@ export function rankMembers(
 ): TopicSet['members'] {
   return [...topicSet.members].sort((a, b) => {
     const score = (m: TopicSet['members'][number]) => {
-      const bag = new Set([...m.title, ...m.summary].join(' ').toLowerCase().split(/[\s,，。.;；:：]+/).filter(Boolean))
+      // NOTE: the old [...m.title, ...m.summary] spread the STRINGS into single
+      // characters, so bag.has(wordToken) was always false and ranking silently
+      // degraded to lastActiveAt (which also broke the auto/fork decision).
+      const bag = new Set([m.title, m.summary].join(' ').toLowerCase().split(/[\s,，。.;；:：]+/).filter(Boolean))
       let hits = 0
       for (const token of taskTokens) if (bag.has(token)) hits++
       return hits

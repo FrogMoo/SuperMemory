@@ -39,11 +39,14 @@ export function roleOf(relPath: string): string {
   return '其他'
 }
 
-/** D4 key encoding: ws/<workspaceKey hash>/<path-safe>. */
+/** D4 key encoding: ws/<workspaceKey hash>/<path hash>-<path-safe>. */
 function filemapKey(workspaceKey: string, relPath: string): string {
   const hash = createHash('sha1').update(workspaceKey).digest('hex').slice(0, 16)
+  // The path hash keeps distinct paths distinct: a plain separator->'_' rewrite
+  // made src/a.ts and src_a.ts share one key, so each scan overwrote the other.
+  const pathHash = createHash('sha1').update(relPath).digest('hex').slice(0, 12)
   const safe = relPath.replace(/[\\/:*?"<>|]+/g, '_')
-  return `ws/${hash}/${safe}`
+  return `ws/${hash}/${pathHash}-${safe}`
 }
 
 /** Walk the workspace and refresh the filemap; returns counts. */
@@ -51,8 +54,13 @@ export async function scanWorkspace(store: Store, cwd: string): Promise<{ scanne
   const workspaceKey = workspaceKeyOf(cwd)
   const root = resolve(cwd)
   const files: string[] = []
+  // A truncated walk must never drive the "file vanished" deletion below: it
+  // only saw part of the tree, and deleting unseen entries made every scan past
+  // the budget delete + re-add the same rows.
+  let truncated = false
   const walk = (dir: string, depth: number) => {
-    if (depth > 6 || files.length >= MAX_FILES) return
+    if (depth > 6) { truncated = true; return }
+    if (files.length >= MAX_FILES) { truncated = true; return }
     let entries: string[]
     try {
       entries = readdirSync(dir)
@@ -60,7 +68,7 @@ export async function scanWorkspace(store: Store, cwd: string): Promise<{ scanne
       return
     }
     for (const name of entries) {
-      if (files.length >= MAX_FILES) return
+      if (files.length >= MAX_FILES) { truncated = true; return }
       const full = join(dir, name)
       let isDir = false
       let size = 0
@@ -118,12 +126,14 @@ export async function scanWorkspace(store: Store, cwd: string): Promise<{ scanne
       if (existing.hash === hash && existing.role !== roleOf(posix)) updated++
     }
   }
-  // invalidate entries whose file vanished
-  for (const [key, entry] of [...store.filemap.entries()]) {
-    if (entry.workspaceKey !== workspaceKey) continue
-    if (seenKeys.has(key)) continue
-    await store.filemap.delete(key)
-    stale++
+  // invalidate entries whose file vanished — only after a COMPLETE walk
+  if (!truncated) {
+    for (const [key, entry] of [...store.filemap.entries()]) {
+      if (entry.workspaceKey !== workspaceKey) continue
+      if (seenKeys.has(key)) continue
+      await store.filemap.delete(key)
+      stale++
+    }
   }
   return { scanned: files.length, added, updated, stale }
 }

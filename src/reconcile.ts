@@ -14,11 +14,14 @@ import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { loadHostModule } from './host.ts'
 import type { Store } from './store.ts'
 import { branchHandles } from './dispatch.ts'
+import { flushObserve, isDispatchInput, settleOpenDispatches } from './observe.ts'
 
 export interface ReconcileDeps {
   ctx: Context
   store: Store
   logger: { warn: (msg: string) => void; info: (msg: string) => void }
+  /** Live observe configuration: a restart must settle with the SAME policy. */
+  observe: { enabled: boolean; maxTokensPolicy: 'deliver-partial' | 'fail' }
 }
 
 async function coldRead(ctx: Context, sessionId: string, afterSeq: number): Promise<SessionEventLike[]> {
@@ -37,27 +40,31 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number): Prom
   }
 }
 
-/** Send one failure delivery to the hub (explicit failure, never disguised). */
-async function failureDelivery(deps: ReconcileDeps, record: { hubSessionId: string; task: string; branchSessionId: string }, reason: string): Promise<void> {
-  const { ctx, logger } = deps
-  const hub = ctx.agents.get(record.hubSessionId as never)
-  if (!hub) {
-    logger.info(`supermemory: failure delivery for ${record.branchSessionId.slice(0, 13)} stays undelivered (hub not live)`)
-    return
-  }
-  try {
-    const llm = await loadHostModule('@deepseek-ai/dsh-llm')
-    const make = llm.createUserMessage as (input: { content: Array<{ type: 'text'; text: string }>; source: Record<string, unknown> }) => unknown
-    hub.followup(make({
-      content: [{
-        type: 'text',
-        text: `[supermemory-relay ${record.branchSessionId}]\n任务：${record.task}\n结果：${reason}`,
-      }],
-      source: { kind: 'supermemory', form: 'relay', deliveryId: `dlv-${record.branchSessionId}-failed` },
-    }) as never)
-  } catch (error) {
-    logger.warn(`supermemory: failure delivery failed: ${String(error).slice(0, 160)}`)
-  }
+/**
+ * Record one failure delivery (explicit failure, never disguised).
+ *
+ * The row is persisted FIRST and actually sent by the flush pass: the old code
+ * returned early when the hub was not live, and since the dispatch was already
+ * terminal nothing ever retried it — a restart-time failure was lost forever.
+ */
+async function failureDelivery(
+  deps: ReconcileDeps,
+  dispatchId: string,
+  record: { hubSessionId: string; task: string; branchSessionId: string },
+  reason: string,
+): Promise<void> {
+  const { store, logger } = deps
+  const deliveryId = 'dlv-fail-' + record.branchSessionId
+  if (store.outbox.get(deliveryId)) return
+  const payload = '[supermemory-relay ' + record.branchSessionId + ']\n任务：' + record.task + '\n结果：' + reason
+  await store.outbox.put(deliveryId, {
+    dispatchId,
+    kind: 'single',
+    payload,
+    status: 'pending',
+    enqueuedAt: Date.now(),
+  })
+  logger.info('supermemory: failure delivery ' + deliveryId + ' queued for the hub')
 }
 
 /** Run all three reconciliation paths once, detached from apply(). */
@@ -78,12 +85,11 @@ export function runReconciliation(deps: ReconcileDeps): void {
     for (const [dispatchId, record] of [...store.dispatches.entries()]) {
       if (record.status !== 'dispatched' && record.status !== 'queued') continue
       if (!record.branchSessionId) continue
+      if (!deps.observe.enabled) continue
       try {
-        const { settleOpenDispatches } = await import('./observe.ts')
-        await settleOpenDispatches({
-          ...deps,
-          config: { enabled: true, maxTokensPolicy: 'deliver-partial' },
-        }, record.branchSessionId)
+        // The restart pass must settle with the USER'S policy, not a hard-coded
+        // 'deliver-partial' (observe.maxTokensPolicy / enabled are configurable).
+        await settleOpenDispatches({ ctx, store, logger, config: deps.observe }, record.branchSessionId)
         const after = store.dispatches.get(dispatchId)
         if (after && after.status !== record.status) {
           logger.info(`supermemory: reconcile ${dispatchId}: settled from ${record.status} → ${after.status}`)
@@ -93,17 +99,21 @@ export function runReconciliation(deps: ReconcileDeps): void {
       }
     }
 
-    // ---- path 3: queued dispatches whose branch never saw the input ----
+    // ---- path 3: queued dispatches whose branch never consumed the input ----
     for (const [dispatchId, record] of [...store.dispatches.entries()]) {
       if (record.status !== 'queued' && record.status !== 'dispatched') continue
       if (!record.branchSessionId) continue
       try {
-        const events = await coldRead(ctx, record.branchSessionId, -1)
-        // The dispatch input lands as an inbox splice (or a committed
-        // user/message on the success path) with a supermemory source.
-        const traced = events.some((e) => (e.type === 'agent/inbox/spliced'
-          && ((e.data as { inserted?: Array<{ source?: { kind?: string } }> })?.inserted?.some((m) => m.source?.kind === 'supermemory') ?? false))
-          || (e.type === 'user/message' && (e.data as UserMessageLike)?.source?.kind === 'supermemory'))
+        const events = (await coldRead(ctx, record.branchSessionId, -1))
+          // Only THIS dispatch's window: an older dispatch's splice must not make
+          // a new dispatch look "already traced" (which stranded it forever).
+          .filter((e) => e.seq > record.startSeq)
+        const spliced = (e: SessionEventLike) => e.type === 'agent/inbox/spliced'
+          && ((e.data as { inserted?: Array<{ source?: { kind?: string } }> })?.inserted?.some((m) => m.source?.kind === 'supermemory') ?? false)
+        // followup() splices the input immediately, but only the CLAIMED
+        // user/message proves the branch actually consumed it.
+        const claimedAt = events.findIndex((e) => e.type === 'user/message' && isDispatchInput(e.data as UserMessageLike))
+        const traced = claimedAt >= 0 || events.some(spliced)
         const branch = ctx.agents.get(record.branchSessionId as never) ?? branchHandles.get(record.branchSessionId)?.agent
         if (!traced) {
           let target = branch
@@ -120,7 +130,7 @@ export function runReconciliation(deps: ReconcileDeps): void {
           }
           if (!target) {
             await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', turnEndReason: 'branch-died', updatedAt: Date.now() }))
-            await failureDelivery(deps, record, '分支在执行前已不存在（重启/重载导致），未伪装成答案。')
+            await failureDelivery(deps, dispatchId, record, '分支在执行前已不存在（重启/重载导致），未伪装成答案。')
             continue
           }
           const make = await ensureFactory()
@@ -137,14 +147,11 @@ export function runReconciliation(deps: ReconcileDeps): void {
         // traced but no owning turn/end yet: either still working, or the
         // branch died with the input on disk (e.g. plugin remount). A dead
         // branch must not strand the dispatch forever.
-        const inputSeq = events.findIndex((e) => (e.type === 'agent/inbox/spliced'
-          && ((e.data as { inserted?: Array<{ source?: { kind?: string } }> })?.inserted?.some((m) => m.source?.kind === 'supermemory') ?? false))
-          || (e.type === 'user/message' && (e.data as UserMessageLike)?.source?.kind === 'supermemory'))
-        const turnEndAfter = inputSeq >= 0 && events.some((e, index) => index > inputSeq && e.type === 'turn/end')
-        if (turnEndAfter || branch) continue
+        const finished = claimedAt >= 0 && events.some((e, index) => index > claimedAt && e.type === 'turn/end')
+        if (finished || branch) continue
         logger.info(`supermemory: reconcile ${dispatchId}: branch dead with input on disk; failing dispatch`)
         await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', turnEndReason: 'branch-died', updatedAt: Date.now() }))
-        await failureDelivery(deps, record, '分支在执行中消失（重启/重载导致），未伪装成答案。')
+        await failureDelivery(deps, dispatchId, record, '分支在执行中消失（重启/重载导致），未伪装成答案。')
       } catch (error) {
         logger.warn(`supermemory: reconcile path3 ${dispatchId} failed: ${String(error).slice(0, 160)}`)
       }
@@ -196,18 +203,12 @@ export function runReconciliation(deps: ReconcileDeps): void {
       }
     }
 
-    // ---- path 1: pending outbox with terminal dispatch → advance summary ----
-    for (const [deliveryId, item] of [...store.outbox.entries()]) {
-      if (item.status !== 'pending') continue
-      const record = item.dispatchId ? store.dispatches.get(item.dispatchId) : undefined
-      if (!record || (record.status !== 'delivered' && record.status !== 'failed')) continue
-      try {
-        await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
-        logger.info(`supermemory: reconcile ${deliveryId}: dispatch already ${record.status}; marked relayed`)
-      } catch (error) {
-        logger.warn(`supermemory: reconcile path1 ${deliveryId} failed: ${String(error).slice(0, 160)}`)
-      }
-    }
+    // ---- self-healing: completed groups without a relay row, and any outbox
+    // row still pending because its hub was offline. The old shortcut marked
+    // those rows "relayed" without ever sending them, destroying branch results.
+    await flushObserve({ ctx, store, logger, config: deps.observe })
     logger.info('supermemory: reconciliation pass complete')
-  })()
+  })().catch((error) => {
+    deps.logger.warn(`supermemory: reconciliation pass failed: ${String(error).slice(0, 200)}`)
+  })
 }

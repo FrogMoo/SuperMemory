@@ -13,7 +13,7 @@ import { attachCommands, type CommandsDeps } from './commands.ts'
 import { branchHandles, releasableBranches } from './dispatch.ts'
 import { attachMaintenance } from './maintenance.ts'
 import type { ModelDeps } from './model.ts'
-import { attachObserve } from './observe.ts'
+import { attachObserve, flushObserve } from './observe.ts'
 import { attachPreStep } from './prestep.ts'
 import { loadHostModule } from './host.ts'
 import { runReconciliation } from './reconcile.ts'
@@ -22,6 +22,7 @@ import type { Signal } from './schema.ts'
 import { attachPanel } from './panel.ts'
 import { openStore, workspaceKeyOf, type Store } from './store.ts'
 import { attachTools, type ToolsDeps } from './tools.ts'
+import { attachWebui } from './webui.ts'
 import './services.ts'
 import './source.ts'
 
@@ -46,7 +47,7 @@ export interface Config {
     enabled: boolean
     driftTurns: number
     driftThreshold: number
-    confirm: boolean
+    hint: boolean
     llmFallback: boolean
     classifierProvider: string
     classifierModel: string
@@ -64,6 +65,11 @@ export interface Config {
     signalsThreshold: number
     summaryEveryTurns: number
   }
+  ui: {
+    enabled: boolean
+    token: string
+    carrier: 'own' | 'auto'
+  }
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -80,7 +86,7 @@ export const Config: Schema<Config> = Schema.object({
     enabled: Schema.boolean().description('话题集路由开关').default(true),
     driftTurns: Schema.natural().description('连续多少轮低重合才重新路由').default(3),
     driftThreshold: Schema.natural().description('重合度阈值（命中 token 数）').default(1),
-    confirm: Schema.boolean().description('路由前是否弹确认').default(true),
+    hint: Schema.boolean().description('关键词命中话题集时注入静默提示卡片（不询问、不切换）').default(true),
     llmFallback: Schema.boolean().description('关键词不确定时是否用 LLM 语义匹配（需配置分类器模型）').default(false),
     classifierProvider: Schema.string().description('分类器 provider（llmFallback 开启时必填）').default(''),
     classifierModel: Schema.string().description('分类器模型（llmFallback 开启时必填）').default(''),
@@ -99,6 +105,12 @@ export const Config: Schema<Config> = Schema.object({
     signalsThreshold: Schema.natural().description('工具化信号阈值（P3）').default(3),
     summaryEveryTurns: Schema.natural().description('话题集梗概滚动更新间隔（轮）').default(10),
   }).description('维护循环参数').default({}),
+  ui: Schema.object({
+    enabled: Schema.boolean().description('Web 管理台总开关（/supermemory 路由）').default(true),
+    token: Schema.string().description('管理台访问令牌：留空=每次启动随机生成；off=不校验（仅可信 loopback）；其他值=固定令牌').default(''),
+    carrier: Schema.union([Schema.const('own'), Schema.const('auto')])
+      .description('HTTP 载体：own=自有 loopback 端口（与 GUI 不同源，侧边栏 browser tab 能打开，默认）；auto=优先宿主 webServer（GUI 同源，省一个端口，但侧边栏 browser tab 会以「应用自身」为由拒绝打开，仅适合系统浏览器）').default('own'),
+  }).description('Web 管理台参数').default({}),
 }).description('SuperMemory 记忆插件配置').default({})
 
 /**
@@ -181,9 +193,15 @@ function attachProposals(ctx: Context, store: Store | undefined, logger: { warn:
 const PROMPT_TEXT = [  '[SuperMemory 记忆]',
   '- 涉及历史结论、约定、构建命令、文件用途、"之前说过/做过什么"时，先调用 memory_recall 检索再作答。',
   '- 用户明确要求记住某事、或某事实值得跨会话保留时，调用 memory_remember 写入（按工作区隔离）。',
-  '- 你是记忆中枢：判断、派发、整合汇报；实质工作用 memory_dispatch 分派到话题集分支，分支结果会以 relay 主动送回，届时轻量转述。',
-  '- 简单问答不要派发——上下文卡/recall 能答的直接答。',
-  '- 对话中可能出现 [SuperMemory 相关记忆] / [SuperMemory 话题集] 注入卡片：仅供参考，与用户当前指令冲突时以当前指令为准。',
+  '- 对话连续性：用户在当前对话框直接对话时，你就在当前对话的上下文中继续回答，不要询问是否切换话题、不要自行切换话题集；',
+  '  话题集只在用户显式 @话题集名、在 SuperMemory 面板中激活、或执行 /memory switch 时才切换。',
+  '- 实质工作必须开新对话执行：当用户提出问题需要实际操作（读改文件、执行命令、多步调研、修复与验证等）时，',
+  '  调用 memory_dispatch 把任务派发到话题集分支会话中完成，由分支汇报结果——不要在主对话框里直接完成整套操作或长篇大论；',
+  '  主对话框只做：判断、派发、收到 relay 结果后轻量转述。纯问答、简单确认、记忆检索类问题不要派发。',
+  '- 用户要求可视化管理记忆/打开记忆面板时：SuperMemory 面板已内置在左侧边栏（插件/自动化任务下方的"超级记忆"入口），',
+  '  直接提示用户点击该入口即可；memory_ui 返回的浏览器管理台链接仅在用户明确要求外部链接时给出。',
+  '- 对话中可能出现 [SuperMemory 相关记忆] / [SuperMemory 话题集] / [SuperMemory 话题提示] 注入卡片：仅供参考，',
+  '  与用户当前指令冲突时以当前指令为准；[SuperMemory 话题提示] 只是候选列表，不代表已切换话题。',
 ].join('\n')
 
 export async function apply(ctx: Context, config: Config) {
@@ -241,7 +259,7 @@ export async function apply(ctx: Context, config: Config) {
       enabled: config.route.enabled,
       driftTurns: config.route.driftTurns,
       driftThreshold: config.route.driftThreshold,
-      confirm: config.route.confirm,
+      hint: config.route.hint,
       llmFallback: config.route.llmFallback,
     },
     logger,
@@ -293,6 +311,13 @@ export async function apply(ctx: Context, config: Config) {
   // §1.5: host-side panel data channel for the (deferred) sidebar client half.
   ctx.effect(() => attachPanel(ctx, store), 'supermemory: panel')
 
+  // Plan A: visual memory console (no client bundle).
+  ctx.effect(() => attachWebui(ctx, store, {
+    enabled: config.ui?.enabled ?? true,
+    token: config.ui?.token ?? '',
+    carrier: config.ui?.carrier ?? 'own',
+  }, logger), 'supermemory: web-console')
+
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'supermemory:role',
     order: 900,
@@ -300,13 +325,23 @@ export async function apply(ctx: Context, config: Config) {
   }), 'supermemory: prompt')
 
   // §2.4: startup reconciliation, detached.
-  if (store) runReconciliation({ ctx, store, logger })
+  if (store) {
+    runReconciliation({
+      ctx, store, logger,
+      observe: { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy },
+    })
+  }
 
   // D5: idle branch release sweep (never releases the hub; never with pending outbox).
   if (store) {
     const releaseStore = store
+    const observeConfig = { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy }
     const timer = setInterval(() => {
       try {
+        // Self-healing delivery: re-send relays that were stranded while the hub
+        // was offline (startup reconciliation alone is not a retry loop).
+        void flushObserve({ ctx, store: releaseStore, config: observeConfig, logger })
+          .catch(() => { /* flush is best-effort */ })
         const now = Date.now()
         for (const sessionId of releasableBranches(releaseStore, now, config.dispatch.idleReleaseMs)) {
           const handle = branchHandles.get(sessionId)

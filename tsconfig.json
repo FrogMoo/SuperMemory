@@ -21,5 +21,8 @@
       "@deepseek-ai/dsh-workspace": ["./_dsh_src/deepseek-ai-dsh-workspace-0.2.2-rc.3/package/lib/types/index.d.ts"]
     }
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  // The browser half is not resolvable against the host's node_modules; it has
+  // its own config (tsconfig.client.json) with src/client/ambient.d.ts.
+  "exclude": ["src/client"]
 }

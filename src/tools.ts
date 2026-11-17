@@ -15,7 +15,7 @@ import { recallMemories, type RecallOptions } from './recall.ts'
 import type { Episode, FileMapEntry, Memory, Requirement, Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
-import { createTopicSet, listTopicSets, setRouting } from './topicsets.ts'
+import { createTopicSet, listTopicSets, setRouting, topicSetIdsOf } from './topicsets.ts'
 
 export interface ToolsDeps {
   ctx: Context
@@ -182,8 +182,14 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       for (const item of recallMemories(memories, query, options)) {
         items.push({ kind: 'memory', id: item.memoryId, text: item.text, score: item.score, createdAt: item.createdAt })
       }
+      // Workspace isolation (D4): episodes have no workspaceKey of their own —
+      // they join through their topic set. Without this filter a recall in
+      // workspace A surfaced workspace B's archived summaries.
+      const ownTopicSetIds = topicSetIdsOf(store, workspaceKey)
       const episodes: Array<[string, Episode]> = []
       for (const entry of store.episodes.entries()) {
+        const topicSetId = entry[1].topicSetId
+        if (!topicSetId || !ownTopicSetIds.has(topicSetId)) continue
         if (entry[1].summary) episodes.push([entry[0], entry[1]])
       }
       for (const item of recallMemories(
@@ -341,7 +347,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_dispatch',
-    description: '把实质工作异步派发到话题集的分支会话：插件先落账，随即唤醒分支并立即返回回执，'
+    description: '把实质工作异步派发到话题集的分支会话（在全新对话中执行，不在主对话框直接完成操作）：插件先落账，随即唤醒分支并立即返回回执，'
       + '本会话（中枢）不阻塞。分支完成后结果会以 relay 形式主动送回本会话。'
       + '简单问答不要派发——上下文卡/recall 能答的中枢直接答。mode=auto 时插件自行判定继续/新建；'
       + '需要从父分支最近已完成轮次开新分支时用 mode=fork。传 tasks[]（2 个以上）走并行组：每个任务一个分支，'
@@ -378,7 +384,14 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       },
     },
     async execute(args: { task?: string; tasks?: string[]; topicSetId?: string; mode?: 'auto' | 'continue' | 'fork' | 'new' }, exec: ToolExec): Promise<DispatchResult> {
-      return await runDispatch(deps.dispatch, args, exec)
+      // The tool contract is a receipt/error VALUE, never a thrown exception:
+      // an unexpected storage/agent failure must not surface as a tool crash.
+      try {
+        return await runDispatch(deps.dispatch, args, exec)
+      } catch (error) {
+        deps.logger.warn(`supermemory: memory_dispatch threw: ${String(error).slice(0, 200)}`)
+        return { status: 'error', message: `派发异常：${String(error).slice(0, 200)}` }
+      }
     },
   })))
 
@@ -512,38 +525,56 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       if (!cwd) return { status: 'error' as const, message: '无法确定当前工作区。' }
       try {
         const { writeFileSync } = await import('node:fs')
-        const { filemapEntries } = await import('./filemap.ts')
-        const { openRequirements } = await import('./requirements.ts')
+        const { buildExport } = await import('./export.ts')
         const workspaceKey = workspaceKeyOf(cwd)
-        const lines: string[] = ['# SuperMemory 导出', '']
-        const routing = store.routing.get(String(exec.agent?.id ?? ''))
-        const topicSet = routing?.activeTopicSetId ? store.topicsets.get(routing.activeTopicSetId) : undefined
-        if (topicSet) {
-          lines.push(`## 话题集：${topicSet.title}`, '', topicSet.summary || '（暂无梗概）', '')
-        }
-        const mems: string[] = []
-        for (const [, record] of store.memories.entries()) {
-          if (record.workspaceKey === workspaceKey && record.status === 'active') mems.push(`- ${record.text}`)
-        }
-        if (mems.length) lines.push('## 事实记忆', '', ...mems, '')
-        const reqs = openRequirements(store, workspaceKey)
-        if (reqs.length) lines.push('## 未完成需求', '', ...reqs.map(([, r]) => `- ${r.text}`), '')
-        const eps: string[] = []
-        for (const [, episode] of store.episodes.entries()) {
-          if (episode.summary) eps.push(`- ${episode.summary}`)
-        }
-        if (eps.length) lines.push('## 归档梗概', '', ...eps.slice(-20), '')
-        const files = filemapEntries(store, workspaceKey)
-        if (files.length) {
-          lines.push('## 项目文件地图', '')
-          for (const [, entry] of files) lines.push(`- \`${entry.path}\` — ${entry.role}${entry.summary ? '：' + entry.summary : ''}`)
-          lines.push('')
-        }
+        const activeTopicSetId = store.routing.get(String(exec.agent?.id ?? ''))?.activeTopicSetId
+        const result = buildExport(store, workspaceKey, activeTopicSetId)
         const target = `${cwd.replace(/[\\/]+$/, '')}/.supermemory-export.md`
-        writeFileSync(target, lines.join('\n'), 'utf8')
-        return { status: 'exported' as const, path: target, memories: mems.length, requirements: reqs.length, files: files.length }
+        writeFileSync(target, result.text, 'utf8')
+        return { status: 'exported' as const, path: target, memories: result.memories, requirements: result.requirements, files: result.files }
       } catch (error) {
         return { status: 'error' as const, message: `导出失败：${String(error).slice(0, 200)}` }
+      }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_ui',
+    description: '打开 SuperMemory 可视化管理台（Plan A）：返回当前可用的管理台 URL（含一次性令牌）。'
+      + '用户要求「可视化管理记忆 / 打开记忆面板 / 记忆管理台」时调用本工具，并把返回的 URL 原样作为 Markdown 链接交付；'
+      + '管理台未启用时不要反复重试，退回 /memory 命令族即可。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['ready', 'unavailable'], required: true },
+          url: { type: 'string' },
+          port: { type: 'integer' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; url?: string; message?: string }
+        return [{ type: 'text', text: v.status === 'ready' ? `记忆管理台：${v.url}` : (v.message ?? '管理台不可用。') }]
+      },
+    },
+    async execute(_args: Record<string, never>, exec: ToolExec) {
+      const { getWebui } = await import('./webui.ts')
+      const webui = getWebui()
+      if (!webui?.enabled) {
+        return {
+          status: 'unavailable' as const,
+          message: '管理台未启用（ui.enabled=false）。可用 /memory 命令族替代。',
+        }
+      }
+      const cwd = exec.agent?.session?.header?.cwd
+      const sessionId = String(exec.agent?.id ?? '') || undefined
+      return {
+        status: 'ready' as const,
+        url: webui.url(sessionId, cwd ? workspaceKeyOf(cwd) : undefined),
+        port: webui.port,
       }
     },
   })))

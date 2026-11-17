@@ -1,0 +1,14 @@
+{
+  // Browser half: checked separately because it targets the SHELL's runtime
+  // (react as a platform external, the host's client-side Cordis context) whose
+  // types are not installable. See src/client/ambient.d.ts.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "jsx": "preserve",
+    "noImplicitAny": false,
+    "types": ["node"]
+  },
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx", "src/client/*.d.ts"],
+  "exclude": []
+}

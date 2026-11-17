@@ -118,16 +118,25 @@ export function attachMaintenance(
     let users = (buffers.get(task.sessionId) ?? []).filter((u) => u.seq > cursor)
     let workspaceKey: string | undefined
     const live = ctx.sessions.get(task.sessionId)
-    if (live) workspaceKey = workspaceKeyOf(live.header?.cwd)
+    // Only a REAL cwd may seed the key: workspaceKeyOf(undefined) yields the
+    // literal 'unknown' workspace, which would strand these facts outside every
+    // workspace filter instead of taking the cold-read fallback below.
+    const liveCwd = live?.header?.cwd
+    if (liveCwd) workspaceKey = workspaceKeyOf(liveCwd)
     if (users.length === 0 || workspaceKey === undefined) {
       // Catch-up / cold path: read the durable log for this turn's user input.
       const cold = await coldRead(task.sessionId, cursor, task.seq)
       if (cold) {
         if (users.length === 0) users = cold.users
         workspaceKey ??= cold.workspaceKey
+      } else if (users.length === 0 || workspaceKey === undefined) {
+        // A transient read failure must NOT advance the durable cursor: doing so
+        // silently dropped those turns' facts/requirements forever. Keep the
+        // buffer (and the cursor) so the next turn replays this window.
+        logger.warn(`supermemory: cold read failed for ${task.sessionId}@${task.seq}; cursor kept at ${cursor}`)
+        return
       }
     }
-    buffers.set(task.sessionId, [])
     if (workspaceKey === undefined || users.length === 0) {
       cursors.set(task.sessionId, task.seq)
       await persistCursor(task.sessionId, task.seq)
@@ -256,7 +265,10 @@ function rollSummary(
   if (!topicSet) return
   const count = (summaryTurns.get(sessionId) ?? 0) + 1
   summaryTurns.set(sessionId, count)
-  if (count % Math.max(1, everyNTurns) !== 0 && users.length === 0) return
+  // Debounced by TURN COUNT. The old guard (count % N !== 0 && users.length === 0)
+  // could never debounce: this path always has users, so the summary was
+  // rewritten on every single turn and grew to its 300-char cap.
+  if (count % Math.max(1, everyNTurns) !== 0) return
   const last = users[users.length - 1]?.text?.trim() ?? ''
   if (!last) return
   const snippet = last.replace(/\s+/g, ' ').slice(0, 60)

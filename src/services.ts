@@ -74,5 +74,18 @@ declare module '@deepseek-ai/cordis' {
       resolveByPath(path: string): Promise<{ attachSession(sessionId: string): Promise<void> } | undefined>
       create(path: string, title?: string): Promise<{ attachSession(sessionId: string): Promise<void> }>
     }
+    /**
+     * Host HTTP server — the Web GUI's own carrier (dsh-host-webserver).
+     * Optional: absent in headless/CLI profiles, so read it with ctx.get().
+     */
+    webServer?: {
+      readonly port: number
+      readonly protocol: string
+      register(route: {
+        kind: 'exact' | 'prefix'
+        path: string
+        handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => void | Promise<void>
+      }): () => void
+    }
   }
 }
