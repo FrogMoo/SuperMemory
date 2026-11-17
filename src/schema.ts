@@ -135,7 +135,9 @@ export async function buildSchemas() {
     hubSessionId: z.string(),
     startSeq: z.number().int().nonnegative(),
     turnEndReason: z.string().optional(),
-    status: z.enum(['queued', 'dispatched', 'observed', 'summarized', 'delivered', 'failed']).default('queued'),
+    status: z.enum(['queued', 'dispatched', 'observed', 'summarized', 'delivered', 'failed', 'interrupted']).default('queued'),
+    // D: last heartbeat while the branch was still working (timeout judgement)
+    lastActivityAt: z.number().int().optional(),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })

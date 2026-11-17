@@ -17,6 +17,7 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
+import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles } from './dispatch.ts'
 import { editCompositeTool, liveCompositeSpecs } from './composite.ts'
@@ -299,14 +300,14 @@ export class SupermemoryPanelService {
         sessionId: sessionId as never,
         meta: { cwd },
       })
-      for (const id of ids) {
-        if (!getTopicSet(this.store, id)!.members.some((m) => m.sessionId === sessionId)) {
-          await addMember(this.store, id, {
-            sessionId, kind: 'root', title: `话题集会话：${titles.join('、').slice(0, 24)}`,
-          })
-        }
+      // Requirement C: one stable title for the session AND every member row.
+      const named = await ensureMemberTitle(this.store, ids[0], { sessionId, kind: 'root' }, titles.join('、'), '')
+      for (const id of ids.slice(1)) {
+        await addMember(this.store, id, { sessionId, kind: 'root', title: named })
         await touchTopicSet(this.store, id)
       }
+      await touchTopicSet(this.store, ids[0])
+      applySessionTitle(ctx, sessionId, named, { warn: () => {} })
       try {
         await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
       } catch { /* workspace attach is best-effort */ }
@@ -361,7 +362,8 @@ export class SupermemoryPanelService {
       } catch (error) {
         return { status: 'error', message: `创建分支失败：${String(error).slice(0, 200)}` }
       }
-      await addMember(this.store, topicSetId, { sessionId, kind: 'root', title: '面板回复' })
+      const named = await ensureMemberTitle(this.store, topicSetId, { sessionId, kind: 'root' }, topicSet.title, body)
+      applySessionTitle(ctx, sessionId, named, { warn: () => {} })
       try {
         await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
       } catch { /* best-effort */ }

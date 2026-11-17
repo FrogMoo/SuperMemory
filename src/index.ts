@@ -13,7 +13,7 @@ import { attachCommands, type CommandsDeps } from './commands.ts'
 import { branchHandles, releasableBranches } from './dispatch.ts'
 import { attachMaintenance } from './maintenance.ts'
 import type { ModelDeps } from './model.ts'
-import { attachObserve, flushObserve } from './observe.ts'
+import { attachObserve, flushObserve, settleInterruptedDispatches } from './observe.ts'
 import { attachToolActivity } from './activity.ts'
 import { createTracker } from './inrequest.ts'
 import { attachPreStep } from './prestep.ts'
@@ -74,6 +74,7 @@ export interface Config {
   observe: {
     enabled: boolean
     maxTokensPolicy: 'deliver-partial' | 'fail'
+    interruptAfterMs: number
   }
   maintenance: {
     enabled: boolean
@@ -146,6 +147,7 @@ export const Config: Schema<Config> = Schema.object({
     enabled: Schema.boolean().description('分支观察与投递开关').default(true),
     maxTokensPolicy: Schema.union([Schema.const('deliver-partial'), Schema.const('fail')])
       .description('max-tokens 终态处理').default('deliver-partial'),
+    interruptAfterMs: Schema.natural().description('需求 D：派发超过多少毫秒没有任何分支活动就判定中断并补发回执（默认 15 分钟）').default(900000),
   }).description('观察投递参数').default({}),
   maintenance: Schema.object({
     enabled: Schema.boolean().description('维护循环开关').default(true),
@@ -405,20 +407,30 @@ export async function apply(ctx: Context, config: Config) {
   if (store) {
     runReconciliation({
       ctx, store, logger,
-      observe: { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy },
+      observe: { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy, interruptAfterMs: config.observe.interruptAfterMs },
     })
+    // D: a dispatch that died before it could relay (crash/reload between settle and
+    // deliver) is backfilled here; open dispatches wait for the periodic sweep.
+    void settleInterruptedDispatches(
+      { ctx, store, config: { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy, interruptAfterMs: config.observe.interruptAfterMs }, logger },
+      { timeoutMs: 0, terminalOnly: true, reason: '启动对账补发历史中断' },
+    ).catch(() => { /* startup backfill is best-effort */ })
   }
 
   // D5: idle branch release sweep (never releases the hub; never with pending outbox).
   if (store) {
     const releaseStore = store
-    const observeConfig = { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy }
+    const observeConfig = { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy, interruptAfterMs: config.observe.interruptAfterMs }
     const timer = setInterval(() => {
       try {
         // Self-healing delivery: re-send relays that were stranded while the hub
         // was offline (startup reconciliation alone is not a retry loop).
         void flushObserve({ ctx, store: releaseStore, config: observeConfig, logger })
           .catch(() => { /* flush is best-effort */ })
+        // D: a branch that died (stop/crash/reload) never emits turn/end, so the
+        // timeout sweep is the only thing that turns silence into a relay.
+        void settleInterruptedDispatches({ ctx, store: releaseStore, config: observeConfig, logger }, { timeoutMs: config.observe.interruptAfterMs })
+          .catch(() => { /* interrupt sweep is best-effort */ })
         const now = Date.now()
         for (const sessionId of releasableBranches(releaseStore, now, config.dispatch.idleReleaseMs)) {
           const handle = branchHandles.get(sessionId)
@@ -431,6 +443,15 @@ export async function apply(ctx: Context, config: Config) {
       } catch { /* sweep is best-effort */ }
     }, 300000)
     ctx.effect(() => () => clearInterval(timer), 'supermemory: release-sweep')
+
+    // D: disposing the plugin (reload/disable) kills live branch handles, so the
+    // hub must learn about it instead of waiting forever for a turn/end.
+    ctx.effect(() => () => {
+      void settleInterruptedDispatches(
+        { ctx, store: releaseStore, config: observeConfig, logger },
+        { timeoutMs: 0, reason: '插件重载/卸载导致分支中断' },
+      ).catch(() => { /* dispose settlement is best-effort */ })
+    }, 'supermemory: settle-on-dispose')
   }
 
   logger.info(`supermemory: active (store=${store ? 'open' : 'degraded'})`)

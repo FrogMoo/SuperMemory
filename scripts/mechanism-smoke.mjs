@@ -42,6 +42,7 @@ const fakeStore = (seed = {}) => ({
   memories: table(seed.memories ?? []),
   toolMemory: table(seed.toolMemory ?? []),
   signals: table(seed.signals ?? []),
+  topicsets: table(seed.topicsets ?? []),
 })
 const obs = (name, text, isError = false) => ({ name, args: {}, text, isError })
 const quiet = { ...repeat, hotSignal: false }
@@ -198,6 +199,104 @@ const makeDeps = (log) => ({
   assert.equal(store.signals.get('ws/ws-s/seq/read>edit').proposalStatus, 'accepted')
   assert.equal(await sweepAutoToolize({}, fakeStore(), { ...toolize, enabled: false }, logger, makeDeps([])), 0)
   ok('B6 启动扫描：已达阈值的 pending 信号自动固化（关闭时不动）')
+}
+
+// ---- requirement C: session naming ----
+const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, applySessionTitle } = await import('../src/title.ts')
+
+{
+  const title = sessionTitleFor('导出功能', '## 修复 **CSV** 导出' + String.fromCharCode(10) + '第二行说明', [])
+  assert.equal(title.startsWith('导出功能 · '), true, 'title must join topic and task')
+  assert.equal(title.includes('##'), false, 'heading markup must be stripped')
+  assert.equal(title.includes('**'), false, 'emphasis markup must be stripped')
+  assert.equal(Array.from(title).length <= 40, true, 'title must stay within 40 chars')
+  assert.equal(Array.from(sessionTitleFor('', '一'.repeat(60))).length, 16, 'task snippet is capped at 16 chars')
+  assert.equal(sessionTitleFor('', ''), '新会话', 'empty input falls back to a readable default')
+  assert.equal(cleanTitleText('- [ ] 待办事项'), '待办事项', 'task box and bullet stripped')
+  ok('C1 命名规则：去标记 / 首行截断 16 / 总长 40 / 空任务兜底')
+}
+
+{
+  const first = sessionTitleFor('导出功能', '修复导出', [])
+  const second = sessionTitleFor('导出功能', '修复导出', [first])
+  const third = sessionTitleFor('导出功能', '修复导出', [first, second])
+  assert.equal(second.endsWith('（2）'), true, 'a duplicate appends an ordinal')
+  assert.equal(third.endsWith('（3）'), true, 'the ordinal keeps counting')
+  assert.equal(Array.from(second).length <= 40, true, 'the ordinal never overflows the cap')
+  ok('C2 去重：同话题集重名追加序号且不超长')
+}
+
+{
+  const store = fakeStore({ topicsets: [['ts-1', { workspaceKey: 'ws', title: '导出功能', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }]] })
+  const title = await ensureMemberTitle(store, 'ts-1', { sessionId: 'branch-1', kind: 'root' }, '导出功能', '# 修复 CSV 导出')
+  assert.equal(title, '导出功能 · 修复 CSV 导出')
+  const member = store.topicsets.get('ts-1').members[0]
+  assert.equal(member.sessionId, 'branch-1')
+  assert.equal(member.title, title, 'the dispatch member title must be persisted')
+  const again = await ensureMemberTitle(store, 'ts-1', { sessionId: 'branch-1', kind: 'root' }, '导出功能', '完全不同的任务')
+  assert.equal(again, title, 'reuse keeps the first stable name')
+  ok('C3 dispatch 后 member title 被设置（复用保持首次命名）')
+}
+
+{
+  const calls = []
+  const session = { append(type, data) { calls.push([type, data]) } }
+  const host = { sessions: { get: () => session }, get: () => ({ get: () => undefined, rename: (_s, t) => { calls.push(['rename', t]) } }) }
+  assert.equal(applySessionTitle(host, 's', '标题 · 任务', logger), 'host')
+  assert.deepEqual(calls[0], ['rename', '标题 · 任务'])
+  const already = { sessions: { get: () => session }, get: () => ({ get: () => ({ title: '旧标题' }), rename: () => { throw new Error('must not rename') } }) }
+  assert.equal(applySessionTitle(already, 's', '新标题', logger), 'already')
+  const fallback = { sessions: { get: () => session }, get: () => undefined }
+  assert.equal(applySessionTitle(fallback, 's', '回退标题', logger), 'fallback')
+  assert.deepEqual(calls[calls.length - 1][0], 'session/title')
+  assert.equal(calls[calls.length - 1][1].source.kind, 'user')
+  assert.equal(applySessionTitle({ sessions: { get: () => undefined } }, 's', 'x', logger), 'none')
+  ok('C4 宿主命名优先；无服务时回退 session/title 日志事件；已有标题不覆盖')
+}
+
+// ---- requirement D: interrupted settlement (abort / timeout / reload) ----
+const { settleInterruptedDispatches } = await import('../src/observe.ts')
+const dDeps = (dispatches, options = {}) => {
+  const store = { dispatches: table(dispatches), outbox: table(), episodes: table(), ...options }
+  return { deps: { ctx: { agents: { get: () => undefined } }, store, config: { enabled: true, maxTokensPolicy: 'deliver-partial' }, logger }, store }
+}
+
+{
+  const stale = now - 3600000
+  const { deps, store } = dDeps([['dsp-1', { branchSessionId: 'b1', task: '任务甲', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: stale, updatedAt: stale }]])
+  const first = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now, reason: '超时未结算' })
+  assert.equal(first.length, 1)
+  assert.equal(store.dispatches.get('dsp-1').status, 'interrupted')
+  const row = store.outbox.get('dlv-dsp-1')
+  assert.equal(!!row, true, 'the interrupt must enqueue a relay')
+  assert.equal(row.payload.includes('分支中断'), true)
+  assert.equal(row.payload.includes('超时未结算'), true)
+  const second = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now })
+  assert.equal(second.length, 0, 'a second sweep must not duplicate')
+  assert.equal(store.outbox.size, 1)
+  ok('D1 超时无终态 → 标记 interrupted 并补发一次回执（幂等）')
+}
+
+{
+  const stale = now - 3600000
+  const { deps, store } = dDeps([['dsp-2', { branchSessionId: 'b2', task: '任务乙', hubSessionId: 'hub', startSeq: 0, status: 'failed', turnEndReason: 'aborted', createdAt: stale, updatedAt: stale }]])
+  const settled = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now })
+  assert.equal(settled.length, 1, 'a failed dispatch that never reached the hub is backfilled')
+  assert.equal(store.outbox.get('dlv-dsp-2').payload.includes('aborted'), true)
+  ok('D2 已 failed 但从未送达 → 启动对账补发回执')
+}
+
+{
+  const fresh = now - 1000
+  const { deps: freshDeps, store: freshStore } = dDeps([['dsp-3', { branchSessionId: 'b3', task: '任务丙', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', lastActivityAt: fresh, createdAt: fresh, updatedAt: fresh }]])
+  const quietRun = await settleInterruptedDispatches(freshDeps, { timeoutMs: 60000, now })
+  assert.equal(quietRun.length, 0, 'a live branch with recent activity is untouched')
+  assert.equal(freshStore.dispatches.get('dsp-3').status, 'dispatched')
+  // dispose path: timeout 0 interrupts anything still open
+  const drained = await settleInterruptedDispatches(freshDeps, { timeoutMs: 0, now, reason: '插件重载/卸载导致分支中断' })
+  assert.equal(drained.length, 1)
+  assert.equal(freshStore.outbox.get('dlv-dsp-3').payload.includes('插件重载/卸载'), true)
+  ok('D3 活跃分支不误伤；插件卸载时 timeout=0 立即结算在途派发')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

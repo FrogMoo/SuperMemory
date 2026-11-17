@@ -20,6 +20,8 @@ import { updateMember } from './topicsets.ts'
 export interface ObserveConfig {
   enabled: boolean
   maxTokensPolicy: 'deliver-partial' | 'fail'
+  /** D: silence longer than this marks an open dispatch as interrupted. */
+  interruptAfterMs?: number
 }
 
 export interface ObserveDeps {
@@ -160,7 +162,10 @@ function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: strin
 function relayText(dispatch: { task: string; branchSessionId: string }, episode: Episode | undefined, failure?: string): string {
   const head = `[supermemory-relay ${dispatch.branchSessionId}]`
   if (failure) {
-    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。以上为失败事实，未伪装成答案。`
+    // D: an aborted turn still produced work — keep the partial summary so the
+    // hub learns what DID land before the branch died.
+    const partial = episode?.summary ? `\n已完成部分：${episode.summary}` : ''
+    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。${partial}\n以上为失败事实，未伪装成答案。`
   }
   const body = episode?.summary || '（分支已完成，但未生成摘要）'
   return `${head}\n任务：${dispatch.task}\n分支结果：\n${body}`
@@ -194,7 +199,32 @@ export function attachObserve(ctx: Context, deps: ObserveDeps): () => void {
     }
   })
 
-  return () => { off(); offConfirm() }
+  // D heartbeat: while a branch is working it emits events, so a dispatch that
+  // stopped receiving them is provably silent (used by the timeout sweep).
+  const lastBeat = new Map<string, number>()
+  const openOf = (branchSessionId: string): Array<[string, Dispatch]> => {
+    const rows: Array<[string, Dispatch]> = []
+    for (const [dispatchId, record] of store.dispatches.entries()) {
+      if (record.branchSessionId !== branchSessionId) continue
+      if (record.status === 'delivered' || record.status === 'failed' || record.status === 'interrupted') continue
+      rows.push([dispatchId, record])
+    }
+    return rows
+  }
+  const offBeat = ctx.on('session/event', (session, _event: SessionEventLike) => {
+    const branchSessionId = String(session.id)
+    const now = Date.now()
+    if (now - (lastBeat.get(branchSessionId) ?? 0) < 30000) return
+    const open = openOf(branchSessionId)
+    if (open.length === 0) return
+    lastBeat.set(branchSessionId, now)
+    for (const [dispatchId] of open) {
+      void store.dispatches.update(dispatchId, (r) => ({ ...r, lastActivityAt: now }))
+        .catch(() => { /* heartbeat is best-effort */ })
+    }
+  })
+
+  return () => { off(); offConfirm(); offBeat() }
 }
 
 /**
@@ -257,8 +287,12 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
         logger.info(`supermemory: dispatch ${dispatchId} completed → episode ${episodeId}${record.groupId ? ' (group member)' : ''}`)
       } else {
         const failure = reason === 'max-tokens' ? '输出达到上限被截断' : `分支终态 ${reason}`
+        // D: summarize what the aborted turn managed to do (never disguised).
+        const partial = owned.length > 0
+          ? buildEpisode(owned, dispatchId, record.topicSetId ?? '', branchSessionId)
+          : undefined
         if (!record.groupId) {
-          await deliver(deps, { dispatchId, record, text: relayText(record, undefined, failure) })
+          await deliver(deps, { dispatchId, record, text: relayText(record, partial, failure) })
         }
         await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', turnEndReason: reason, updatedAt: Date.now() }))
         await updateMember(store, record.topicSetId ?? '', branchSessionId, { status: 'idle' })
@@ -391,6 +425,87 @@ export async function flushObserve(deps: ObserveDeps): Promise<void> {
     } catch (error) {
       logger.warn("supermemory: flush delivery " + deliveryId + " failed: " + String(error).slice(0, 160))
     }
+  }
+}
+
+/** Options of one interrupt-settlement pass (D). */
+export interface InterruptOptions {
+  /** No activity for longer than this marks an open dispatch as interrupted. */
+  timeoutMs: number
+  /** Clock override for tests. */
+  now?: number
+  /** Cause written into the relay (default: 超时未结算). */
+  reason?: string
+  /** Startup pass: only backfill terminal dispatches, never interrupt live ones. */
+  terminalOnly?: boolean
+}
+
+/**
+ * D: turn silence into a relay.
+ *
+ * A branch that is stopped / crashes / is unloaded never emits `turn/end`, so the
+ * live settle path can never fire and the hub waits forever. This pass runs from
+ * the periodic sweep, from plugin disposal and from startup reconciliation:
+ *  - an open dispatch whose heartbeat is older than `timeoutMs` is marked
+ *    `interrupted` and relayed once (idempotent through the outbox key);
+ *  - a terminal dispatch that never reached the hub (crash between settle and
+ *    deliver) is backfilled with the same one-shot relay.
+ * Group members are skipped: their single relay belongs to the group.
+ */
+export async function settleInterruptedDispatches(
+  deps: ObserveDeps,
+  options: InterruptOptions,
+): Promise<string[]> {
+  const { store, logger } = deps
+  const now = options.now ?? Date.now()
+  const settled: string[] = []
+  for (const [dispatchId, record] of [...store.dispatches.entries()]) {
+    if (record.status === 'delivered') continue
+    const deliveryId = 'dlv-' + dispatchId
+    // Already relayed / queued: flushObserve owns retries, never duplicate here.
+    if (store.outbox.get(deliveryId)) continue
+    const idleSince = record.lastActivityAt ?? record.updatedAt
+    const stale = now - idleSince >= options.timeoutMs
+    const terminal = record.status === 'failed' || record.status === 'interrupted'
+    // A terminal dispatch that never reached the hub is always backfilled; an
+    // open one is interrupted only when it is stale (or when the caller wants it).
+    if (!terminal) {
+      if (options.terminalOnly) continue
+      if (!stale) continue
+    }
+    const reason = terminal
+      ? `分支中断（${record.turnEndReason ? '终态 ' + record.turnEndReason : (options.reason ?? '未结算')}）`
+      : `分支中断（${options.reason ?? '超时未结算'}）`
+    try {
+      const partial = await partialSummary(deps, record)
+      if (!record.groupId) {
+        await deliver(deps, { dispatchId, record, text: relayText(record, partial, reason) })
+      }
+      await store.dispatches.update(dispatchId, (r) => ({
+        ...r,
+        status: 'interrupted',
+        turnEndReason: r.turnEndReason ?? (options.reason ?? 'silent'),
+        updatedAt: Date.now(),
+      }))
+      settled.push(dispatchId)
+      logger.info(`supermemory: dispatch ${dispatchId} interrupted (${reason})`)
+    } catch (error) {
+      logger.warn(`supermemory: interrupt settle ${dispatchId} failed: ${String(error).slice(0, 160)}`)
+    }
+  }
+  return settled
+}
+
+/** Best-effort partial episode for an interrupted branch (never blocks a relay). */
+async function partialSummary(deps: ObserveDeps, record: Dispatch): Promise<Episode | undefined> {
+  const persistence = (deps.ctx as unknown as { sessionPersistence?: unknown }).sessionPersistence
+  if (!persistence || !record.branchSessionId) return undefined
+  try {
+    const events = await coldRead(deps.ctx, record.branchSessionId, record.startSeq)
+    if (events.length === 0) return undefined
+    return buildEpisode(events, record.branchSessionId, record.topicSetId ?? '', record.branchSessionId)
+  } catch {
+    return undefined
   }
 }
 

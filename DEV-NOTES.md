@@ -448,5 +448,72 @@ dsh.client 是**宿主启动时**读的，运行中改清单不会重建 boot �
 验证顺序：左侧出现「超级记忆」入口 → 点开是面板页（默认中枢会话）→
 点「新建会话」出现 中枢会话/话题集会话 选择层。
 
+## 10. 硬机制：过程内再召回 + 组合工具自动固化（需求 A/B，2026-11-18，已提交 ee58034）
+
+宿主事件面结论（源码级，`@deepseek-ai/dsh-agent` / `@deepseek-ai/dsh-tools` 0.2.2-rc.3）：
+
+- `agent/pre-step` 是**每一步**的 waterfall；`enter` 决策的 `messages` 是插件唯一可写、会落日志的
+  模型可见通道。工具续跑步不 claim 任何 user 消息——旧守卫「只有含 user 批次才注入」因此每个请求
+  只注入一次。
+- `tools/pre-execute` 的 `PreToolDecision` 只有 allow/deny/cancel/ask，**没有 context 字段**
+  （旧 `attachCompositeHint` 往这里塞 additionalContexts 是死代码，已删）；`tools/post-execute`
+  接受 additionalContexts 给下一请求；`tools/result` 是隔离 observer。
+- 结论：过程内注入 = 每步 pre-step；即时提示/近失 = post-execute。
+
+实现：
+
+- `src/inrequest.ts`：纯逻辑 + tracker（触发：工具调用数 ≥ everySteps，或高信号=报错 / 新路径且
+  记忆关键词重合上升；dedupe、卡片/字符上限、查询拼装、独立卡片标题）。
+- `src/prestep.ts`：每步注入口（首卡保持原样，过程内卡带「· 过程内补充」标题 + 组合工具目录）。
+- `src/activity.ts`：post-execute 观察根调用、记录近失信号（`ws/…/nearmiss/<tool>`）、同请求内
+  同窗口重复 ≥ 阈值立即自动固化、可附加一条组合工具提示。
+- `src/toolize.ts`：滑动窗口（2–4 步）计数、阈值自动固化（cooldown / maxActive / minSteps /
+  minDistinctTools / 重复与未注册拒绝）、启动扫描、零使用回收（默认关）、结构化目录。
+- `src/maintenance.ts`：每回合改为滑动窗口 + 短整串计数，跨阈值自动固化（失败留 pending 走人工路径）。
+- Config：`recall.repeat.*`、`maintenance.autoToolize / toolizeCooldownMs / toolizeMax /
+  toolizeMinSteps / toolizeMinDistinctTools / nearMissHint / recycleIdleToolDays`（中文 description）。
+
+实测（真实 GUI 会话 `branch-mwk8lbxu-5vyivl`，turn 2 内）：出现多条 `form: recall` 的
+「过程内补充」卡片；一条 `form: notice` 组合工具提示；目录卡列出已注册组合工具；
+「memory_scan → memory_topicsets」在同一请求内重复 3 轮后被**自动固化**并出现在工具表
+（`sm_composite_memory_scan_memory_topic`）。
+
+已知限制：① 全同工具的复合（run_code×4）会让前缀匹配对任意 run_code 调用都命中，提示噪声，
+建议后续在 catalog/hint 侧要求 ≥2 种不同工具；② 自动固化描述里的「N 次」恒为 1
+（`signalOf` 用 count=1），纯文案问题。
+
+## 11. 会话命名（需求 C，2026-11-18）
+
+宿主能力结论：
+
+- 有写入 API：`ctx.sessionTitle.rename(session, title)`（`@deepseek-ai/dsh-session-title`）→ 追加
+  log-only `session/title`（`source:{kind:'user'}`，并 pin 住标题，自动生成不再覆盖）；
+  `get(session)` 读回。API 网关另有 `SessionService.rename` Remote（仅客户端显式 rename）。
+- Session header **没有** title 字段（header 是创建期不可变）；GUI 会话列表读的是 `title` projection
+  （`~/.dsh/storages/session_projcache/sessions/<id>.json` 的 `record.rows.title.val`），
+  插件创建的分支此前恒为 `null` → 「未命名」。
+- 降级：无 sessionTitle 服务时按 rename 的精确事件形状直接 `session.append('session/title', …)`；
+  都不可用则仅插件层命名（成员/面板），GUI 仍显示未命名——如实报告，不伪造。
+
+实现：
+
+- `src/title.ts`：`sessionTitleFor`（去 markdown/方括号 → 首行 → 任务 16 字截断 →
+  `<话题> · <任务>` → 40 字上限 → 同集重名 `（2）`）；`ensureMemberTitle`（首次命名并持久化，
+  复用保持首次命名）；`applySessionTitle`（host rename 优先 → append 回退 → already/none）。
+- 接入：`dispatch.ts`（新分支 / resume / continue / fork 统一命名）、`panel.ts`（话题集会话 +
+  面板回复新建分支）、`reconcile.ts`（重启恢复 resume 时补命名）。
+- `services.ts`：按实际能力扩充 `sessions.append/seq` 与**可选** `sessionTitle` 声明
+  （注释标明宿主内部结构、compile-time only、不 shadow 宿主）。
+
+实测（真实 GUI，话题集「命名验证」派发两次）：
+
+- member title：`命名验证 · 只回复 OK。` / `命名验证 · 只回复 OK。（2）`
+- 分支日志 `session/title`：`{"title":"命名验证 · 只回复 OK。","messageSeqs":[],"source":{"kind":"user"}}`
+- 投影缓存 `title.val`：`命名验证 · 只回复 OK。`（GUI 侧栏读此值，原先为 null）
+- 重载证据：`memory_ui` 端口 61327 → 禁用后工具 `unknown tool "memory_ui"` → 启用后端口 61390。
+
+闸门：`npx tsc --noEmit` 0 错；`pnpm smoke` = 5 + 16 + 26 + SIM SMOKE OK；`pnpm build` 成功；
+profile patch 原子改后已还原（无 supermemory 条目）。
+
 
 

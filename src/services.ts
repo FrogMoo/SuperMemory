@@ -20,9 +20,15 @@ declare module '@deepseek-ai/cordis' {
   }
 
   interface Context {
-    /** Live in-memory session store. */
+    /**
+     * Live in-memory session store. A session exposes its log `append` method:
+     * the shape required by the `session/title` fallback in title.ts.
+     */
     sessions: {
-      get(id: string): (SessionLike & Record<string, unknown>) | undefined
+      get(id: string): (SessionLike & {
+        readonly seq?: number
+        append?(type: string, data: unknown): unknown
+      } & Record<string, unknown>) | undefined
     }
     /** Durable session-log persistence seam. */
     sessionPersistence: {
@@ -31,6 +37,16 @@ declare module '@deepseek-ai/cordis' {
         read(offset?: number, length?: number): Promise<{ events: SessionEventLike[] }>
         close(): Promise<void>
       }>
+    }
+    /**
+     * Log-backed session titles (`@deepseek-ai/dsh-session-title`). Host-internal
+     * and OPTIONAL: read it with `ctx.get('sessionTitle')` so a profile without the
+     * seam degrades to the log-append fallback instead of leaving the fiber pending.
+     * `rename` appends a `session/title` event with `source: { kind: 'user' }`.
+     */
+    sessionTitle?: {
+      get(session: unknown): { title: string; eventSeq?: number; updatedAt?: number } | undefined
+      rename(session: unknown, title: string): unknown
     }
     /** Slash-command runtime. */
     commands: {

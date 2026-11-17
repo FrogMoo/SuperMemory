@@ -14,6 +14,7 @@ import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { loadHostModule } from './host.ts'
 import type { Store } from './store.ts'
 import { branchHandles } from './dispatch.ts'
+import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { flushObserve, isDispatchInput, settleOpenDispatches } from './observe.ts'
 
 export interface ReconcileDeps {
@@ -21,7 +22,7 @@ export interface ReconcileDeps {
   store: Store
   logger: { warn: (msg: string) => void; info: (msg: string) => void }
   /** Live observe configuration: a restart must settle with the SAME policy. */
-  observe: { enabled: boolean; maxTokensPolicy: 'deliver-partial' | 'fail' }
+  observe: { enabled: boolean; maxTokensPolicy: 'deliver-partial' | 'fail'; interruptAfterMs?: number }
 }
 
 async function coldRead(ctx: Context, sessionId: string, afterSeq: number): Promise<SessionEventLike[]> {
@@ -124,6 +125,15 @@ export function runReconciliation(deps: ReconcileDeps): void {
               target = handle.agent
               branchHandles.set(record.branchSessionId, { agent: handle.agent, dispose: () => handle.dispose() })
               logger.info(`supermemory: reconcile ${dispatchId}: resumed dead branch`)
+              // Requirement C: a resumed branch that was never named (pre-C
+              // dispatch) gets its title on this recovery path too.
+              if (record.topicSetId) {
+                try {
+                  const topicTitle = store.topicsets.get(record.topicSetId)?.title ?? ''
+                  const named = await ensureMemberTitle(store, record.topicSetId, { sessionId: record.branchSessionId, kind: 'root' }, topicTitle, record.task)
+                  applySessionTitle(ctx, record.branchSessionId, named, logger)
+                } catch { /* naming is best-effort on recovery */ }
+              }
             } catch (error) {
               logger.warn(`supermemory: reconcile ${dispatchId}: resume failed: ${String(error).slice(0, 160)}`)
             }

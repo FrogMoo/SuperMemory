@@ -13,8 +13,9 @@ import type { Dispatch, TopicSet } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
 import {
-  addMember, createTopicSet, getRouting, getTopicSet, rankMembers, setRouting, touchTopicSet, updateMember,
+  createTopicSet, getRouting, getTopicSet, rankMembers, setRouting, touchTopicSet, updateMember,
 } from './topicsets.ts'
+import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
 import { groupComplete, groupEpisodeSummaries, groupRelayExists, groupRelayText, newGroupId } from './group.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
@@ -199,15 +200,20 @@ async function dispatchOne(
     updatedAt: Date.now(),
   }))
 
-  // ---- membership + workspace visibility ----
+  // ---- membership + naming + workspace visibility ----
   // Bookkeeping only: a failed member write must not lose the dispatch that is
-  // already recorded and about to be woken.
+  // already recorded and about to be woken. Requirement C: the member title AND
+  // the host session title are set here, so a NEW branch, a resumed branch and a
+  // fork all leave the unnamed state behind (a reused member keeps its first
+  // stable title; the host title is only applied while the session has none).
   try {
-    if (!topicSet.members.some((m) => m.sessionId === branchSessionId)) {
-      await addMember(store, topicSetId, { sessionId: branchSessionId, kind, title: task.slice(0, 16) })
+    const named = await ensureMemberTitle(store, topicSetId, { sessionId: branchSessionId, kind }, topicSet.title, task)
+    const applied = applySessionTitle(ctx, branchSessionId, named, logger)
+    if (applied === 'host' || applied === 'fallback') {
+      logger.info(`supermemory: named branch ${branchSessionId.slice(0, 20)} 「${named}」 via ${applied}`)
     }
   } catch (error) {
-    logger.warn(`supermemory: addMember failed for ${branchSessionId}: ${String(error).slice(0, 160)}`)
+    logger.warn(`supermemory: branch naming failed for ${branchSessionId}: ${String(error).slice(0, 160)}`)
   }
   try {
     await attachBranchToWorkspace(ctx, branchSessionId, cwd, logger)
