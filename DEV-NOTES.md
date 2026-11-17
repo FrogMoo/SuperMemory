@@ -22,8 +22,13 @@
 - **工具定义**：宿主 `defineTool`（loadHostModule 取得），parameters/output.schema 用
   dsh-tools 的 **DSL**（`{ type, required?: true, enum?, properties? }`），执行入口 `execute`。
 - **Remote 服务（侧边栏数据通道）**：普通类 + `ctx.provide('supermemoryPanel', service)` +
-  `ctx.typert.register({ package, face:'host', schemas:[], model:{...}, invocations })`
+  实例上挂 `typertRemote` 绑定（`{ service, serviceKey, namespace }`，即
+  `bindTypertRemote(this,'supermemoryPanel')` 的等价形状）+
+  `ctx.get('typert').register({ package, face:'host', schemas:[], model:{...}, invocations })`
   （descriptor 形状见 `src/panel.ts`，参照 dsh-ops 的 runtime-host 模式）。
+  **不要写 `ctx.typert.register(...)`**：ctx 是代理，读未 inject 的服务属性会抛
+  "cannot get property 'typert' without inject"；`ctx.get()` 不受 inject 限制。
+  注册失败必须 console.warn，不许静默 catch——静默正是 2026-11-18 面板 404 的根因（见 §13）。
 
 ## 2. 开发回路（live reload 的坑）
 
@@ -562,3 +567,87 @@ webui 26 + client-sim OK；`npx tsdown` 构建成功（lib/supermemory.js 208.93
 
 
 
+
+## 13. 面板 404 / 话题集列表为空 / 中枢与分支无区分（2026-11-18 第六轮）
+
+用户报三个 GUI 现象：① 超级记忆面板显示但报「加载失败: client api:
+supermemoryPanel/listTools failed: transport failure for
+/api/supermemoryPanel/listTools: HTTP 404」；② 新建会话→话题集会话→选择话题集时显示
+「当前工作区还没有话题集。」（实际有 10 个话题集）；③ 中枢会话与分支会话在 GUI 侧边栏
+没有任何区分。
+
+### 13.1 根因：①② 同一个——typert 描述符从未注册成功
+
+**结论（真实宿主源码 + 进程内 cordis 实验双重证实）**：`src/panel.ts` 的 `attachPanel()` 用
+`(ctx as ...).typert?.register({...})` 注册 Remote 描述符。cordis 4 的 ctx 是代理：
+属性访问 `ctx.typert` 要求插件 inject 声明该服务，否则 getter 抛错
+（`ReflectService.handler.get` → "cannot get property 'typert' without inject"，
+见 `@deepseek-ai/cordis` lib/index.js）。本插件 `src/index.ts` 的 inject 没有 'typert'，
+于是每次注册都抛错，被 `attachPanel` 的 `try { } catch {}` 静默吞掉 → typert local
+registry 里从来没有 `supermemoryPanel/*` 描述符 → 宿主 API Gateway 不认领
+POST /api/supermemoryPanel/* 路由 → 浏览器调用 404 → 面板所有远程调用失败（①）；
+新会话选择层的 `api.loadTopicSets()` 失败后回落 `setTopicSets([])`，
+显示「当前工作区还没有话题集。」（②）。
+
+**源码级证据**（app.asar 内 `@deepseek-ai/dsh-api-gateway/src/index.ts`）：
+
+- `TypertGatewayService.claimsEndpoint(endpoint)`：先查
+  `this.ctx.typert.local.get(endpoint)` / `hasSeen(endpoint)`，再查 `collectSrcClaims()`
+  （后者只认带 `@Remote` 装饰器的方法标记，普通类没有）→ 描述符没注册就 404。
+- `validateBinding()` / `readBinding()`：调用前要求服务实例暴露
+  `typertRemote` 绑定，且 `binding.service === originalOf(receiver)`、
+  `binding.serviceKey === 服务键`、`typeof binding.namespace === 'string'`，
+  否则抛 `gateway/binding-invalid`。即
+  `@deepseek-ai/dsh-typert-protocol` 的 `bindTypertRemote(this,'supermemoryPanel')`
+  产物形状 `{ service, serviceKey, namespace }`。
+- `dsh-typert-loader/src/index.ts` 明确写着："Manual `ctx.typert.register()`
+  remains available for contributions that do not use a `./typert` artifact
+  (hand-written wire schemas...)" —— 手写描述符的插件走手动 register 是官方路径。
+- `dsh-typert-registry/src/service.ts` 的 `validateInvocation()`：id 非空、service 为
+  segment（无 '#'）、namespace/method 匹配 `/^[A-Za-z0-9_$.-]+$/`、strict codec 必须有
+  typeSymbol + create()。
+
+**进程内实验**：插件子 fiber 里 `ctx.provide('supermemoryPanel', service)` 对根 ctx
+可见（Gateway 用根 `ctx.get` 能解析到）；`ctx.get('typert')` 不受 inject 限制
+（cordis reflect.d.ts 注释 "Read a service from the store without the inject
+requirement"）。
+
+### 13.2 修法
+
+- `src/panel.ts` `attachPanel()`：`ctx.get('typert')?.register(...)` 取代
+  `ctx.typert?.register(...)`；typert 缺失或 register 抛错都 `console.warn`（不再静默）；
+  在 `ctx.provide` 前给实例挂非枚举 `typertRemote` 冻结绑定。
+- 新增 `sessionBadge(sessionId)` + 描述符 `dsh-supermemory#supermemoryPanel/sessionBadge`
+  （问题③的数据面）。
+- `src/client/{remote,index,panel-page,locales}.ts` + 新文件 `src/client/session-badge.tsx`：
+  客户端半边补 `sessionBadge` 调用、`sidebar.session.row.leading` 槽的第 4 处注册
+  （id `supermemory-branch`，order 30，与宿主 dsh-client-ui-schedule 的 clock mark
+  同槽同手法）与「分支」徽标组件；`resolveCwd()` 改为优先取主视图会话自己的
+  `cwd`/`header.cwd`（与 panel-page.tsx 同源），再回落 `workspaces[0].path`。
+- 徽标门控是上游行为（`dsh-client-ui-workspace` 的 Rows 组件）：
+  `!row.archived && !row.blank && (showStatus ? 状态点 : renderSlot('sidebar.session.row.leading',
+  { sessionId }))` —— 忙碌/待审批的会话行仍显示状态点，不显示徽标。
+
+### 13.3 回归闸门
+
+- `scripts/mechanism-smoke.mjs` 新增 E1–E3（脚本自行 re-exec 加
+  `--experimental-transform-types`，因为 `src/panel.ts` 用了 TS 参数属性，
+  strip-only 模式不支持）：假 typert registry + 假 store 直接跑真实 `attachPanel()`，
+  断言 register 只调一次、`typertRemote.serviceKey/service` 正确且非枚举、
+  每条描述符都过 `validateInvocation` 规则、host 侧 invocations 与 client 侧
+  `PANEL_REMOTE.descriptors` 的 id 集合完全一致（合同 parity）、
+  `sessionBadge` 的分支/归档/未知判定、以及 typert 缺失/注册抛错都只 warn 不静默。
+- `scripts/client-sim-smoke.mjs` 的期望注册表加第 4 条
+  `sidebar.session.row.leading:supermemory-branch`。
+
+### 13.4 生效方式（重要）
+
+宿主侧改动（`lib/supermemory.js`）必须插件重载才生效；客户端改动
+（`lib/client.js`）在宿主重启后刷新页面即生效（boot 图宿主启动时构建）。
+**重载只能在 hub 会话或 GUI 执行：在分支会话内禁用→启用会杀死分支 agent 自己**
+（fiber 销毁 → 回执永不送达，见 §12 事故）。
+
+闸门：`pnpm typecheck` 0 错；`pnpm smoke` = core 5 + mechanism 22 + webui 26 +
+client-sim OK；`pnpm build` 成功；`lib/supermemory.js` 含 `ctx.get("typert")`/
+`typertRemote`/`sessionBadge`，`lib/client.js` 含 `sessionBadge` 与
+`sidebar.session.row.leading`。

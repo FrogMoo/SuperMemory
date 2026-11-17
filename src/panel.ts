@@ -52,6 +52,15 @@ export interface ToolView {
   live: boolean
 }
 
+/**
+ * Sidebar badge projection for one session (GUI 问题③): a topic-set branch
+ * (with the set it belongs to and the member live status) or a plain hub
+ * session. Consumed by the client half session-row badge.
+ */
+export type SessionBadge =
+  | { kind: 'hub' }
+  | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+
 export interface PanelCounts {
   memories: number
   requirements: number
@@ -426,6 +435,29 @@ export class SupermemoryPanelService {
     if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法修改工具。' }
     return editCompositeTool(this.ctx, this.store, id, patch)
   }
+
+  /**
+   * Sidebar badge projection (GUI 问题③): which topic set, if any, owns this
+   * session. A member row of a non-archived topic set marks the session as a
+   * branch; every other session (hub sessions, archived sets, unknown ids) is
+   * a hub. Multiple hits resolve to the newest lastActiveAt.
+   */
+  sessionBadge(sessionId: string): SessionBadge {
+    let best: { topicSetId: string; title: string; status: string; lastActiveAt: number } | undefined
+    for (const [topicSetId, topicSet] of this.store.topicsets.entries()) {
+      // status here is the TOPIC SET own status (active | archived); a member
+      // row is live | idle (schema.ts) and never active.
+      if (topicSet.status !== 'active') continue
+      for (const member of topicSet.members) {
+        if (member.sessionId !== sessionId) continue
+        if (!best || member.lastActiveAt > best.lastActiveAt) {
+          best = { topicSetId, title: topicSet.title, status: member.status, lastActiveAt: member.lastActiveAt }
+        }
+      }
+    }
+    if (!best) return { kind: 'hub' }
+    return { kind: 'branch', topicSetId: best.topicSetId, topicSetTitle: best.title, status: best.status }
+  }
 }
 
 /** Remote descriptors for the panel service (wire contract). */
@@ -577,21 +609,67 @@ const PANEL_DESCRIPTORS = Object.freeze([
       { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#ToolPatch', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/sessionBadge',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'sessionBadge',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionBadge', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionId', create: () => ({ parse: (v: unknown) => v }) } }],
+  },
 ])
 
-/** Mount the panel service + register its remote descriptors. */
+/**
+ * Mount the panel service and register its remote descriptors.
+ *
+ * Two host contracts make the panel reachable from the browser, and BOTH used
+ * to be silently missing (2026-11-18: every panel call answered HTTP 404):
+ *
+ * 1. `ctx.typert` is a proxy property. Reading it requires 'typert' in this
+ *    plugin's `inject`; without it the getter throws "cannot get property
+ *    'typert' without inject" (cordis ReflectService.handler.get). The old code
+ *    read `ctx.typert?.register(...)` inside `try { } catch {}`, so the throw was
+ *    swallowed on every call, the descriptors never reached the typert local
+ *    registry, and the API Gateway (claimsEndpoint reads
+ *    `ctx.typert.local.get(endpoint)`) answered 404 for POST
+ *    /api/supermemoryPanel/*. `ctx.get('typert')` has no inject requirement, and
+ *    every failure is now logged instead of swallowed.
+ * 2. The Gateway's validateBinding/readBinding requires the service instance to
+ *    expose `typertRemote` = `{ service, serviceKey, namespace }` — exactly what
+ *    `bindTypertRemote(this, 'supermemoryPanel')` from
+ *    @deepseek-ai/dsh-typert-protocol produces. It is attached here by hand
+ *    because this plugin takes no static dependency on that package (host
+ *    packages resolve only through the loadHostModule anchor).
+ */
 export function attachPanel(ctx: Context, store: Store | undefined): () => void {
   if (!store) return () => {}
   const service = new SupermemoryPanelService(store, ctx)
+  // Gateway validateBinding: the binding must point at THIS instance, and the
+  // original it reads is the instance itself (no symbols.original on a plain
+  // class instance), so a non-enumerable own property is enough.
+  Object.defineProperty(service, 'typertRemote', {
+    value: Object.freeze({ service, serviceKey: 'supermemoryPanel', namespace: 'supermemoryPanel' }),
+    enumerable: false,
+  })
   ctx.provide('supermemoryPanel', service)
+  // ctx.get (never ctx.typert): the proxy getter throws without inject.
+  const typert = ctx.get('typert') as { register?: (contribution: unknown) => unknown } | undefined
+  if (!typert || typeof typert.register !== 'function') {
+    console.warn('supermemory: typert registry unavailable; panel remote descriptors not registered')
+    return () => { /* service disposal is fiber-scoped */ }
+  }
   try {
-    (ctx as unknown as { typert?: { register: (entry: unknown) => void } }).typert?.register({
+    typert.register({
       package: 'dsh-supermemory',
       face: 'host',
       schemas: [],
       model: { services: [], events: [], objects: [] },
       invocations: PANEL_DESCRIPTORS,
     })
-  } catch { /* typert registration is best-effort in hosts without it */ }
+  } catch (error) {
+    // Loud on purpose: a duplicate package-face/endpoint registration (this
+    // plugin re-enabled over root-owned registry entries) lands here. A silent
+    // catch is exactly what produced the 404 panel.
+    console.warn('supermemory: typert register failed for the panel descriptors', error)
+  }
   return () => { /* service disposal is fiber-scoped */ }
 }

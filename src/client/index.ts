@@ -3,7 +3,8 @@
  * src/panel.ts), registers the left-sidebar "超级记忆" panel launcher, the
  * main-column panel page (hub session by default; topic sets and their
  * sessions at the second level; memory browsing/management; composite-tool
- * editing), and the New-session choice layer (中枢会话 / 话题集会话).
+ * editing), the New-session choice layer (中枢会话 / 话题集会话), and a 「分支」 badge
+ * on topic-set sessions in the sidebar (hub vs branch at a glance).
  * @module supermemory/client
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -13,8 +14,9 @@ import { PANEL_REMOTE } from './remote.ts'
 import { en, NS, zh } from './locales.ts'
 import { SupermemoryIcon } from './icon.tsx'
 import { SupermemoryPanelPage } from './panel-page.tsx'
-import type { MutationResult, PanelApi, TopicSetView } from './panel-page.tsx'
+import type { MutationResult, PanelApi, SessionBadge, TopicSetView } from './panel-page.tsx'
 import { NewSessionChoice } from './new-session.tsx'
+import { SupermemorySessionBadge } from './session-badge.tsx'
 
 export const name = 'dsh-supermemory-client'
 
@@ -64,6 +66,7 @@ function buildApi(ctx: Context): PanelApi | undefined {
     followupTopicSet: (cwd, topicSetId, text) => call('followupTopicSet', cwd, topicSetId, text),
     listTools: () => call('listTools'),
     editTool: (id, patch) => call('editTool', id, patch),
+    sessionBadge: (sessionId) => call<SessionBadge>('sessionBadge', sessionId),
     // The shell owns both navigations; a missing service must not throw inside
     // a click handler (ctx.get is typed as possibly-undefined).
     openSession: (sessionId) => { ctx.get('uiWorkspace')?.openSession(sessionId as never) },
@@ -74,11 +77,28 @@ function buildApi(ctx: Context): PanelApi | undefined {
 
 /**
  * Resolve the workspace path the New-session dialog should create sessions in.
- * The `workspaces` service is the one the shell exposes to client plugins
- * (same shape dsh-vscode-mode reads); an empty string falls back to the host's
- * default workspace resolution.
+ *
+ * The MAIN-VIEW session own cwd wins: with more than one workspace open,
+ * `workspaces.items[0].path` points the dialog — and every write it triggers —
+ * at the wrong project (the same trap fixed in panel-page.tsx). The row shape
+ * is the client `sessions` list snapshot (`cwd`, or `header.cwd` on rows that
+ * only carry a header); `workspaces.list` is the fallback, and '' lets the host
+ * resolve its default workspace.
  */
 function resolveCwd(ctx: Context): string {
+  try {
+    const sessions = ctx.get('sessions') as
+      | { list?: { getSnapshot?: () => { byId?: Record<string, { retainedBy?: { mainView?: number }; cwd?: unknown; header?: { cwd?: unknown } }> } } }
+      | undefined
+    const byId = sessions?.list?.getSnapshot?.()?.byId ?? {}
+    for (const session of Object.values(byId)) {
+      if ((session?.retainedBy?.mainView ?? 0) <= 0) continue
+      const cwd = session.cwd ?? session.header?.cwd
+      if (typeof cwd === 'string' && cwd) return cwd
+    }
+  } catch {
+    // The service is absent on older shells; the dialog still works with ''.
+  }
   try {
     const workspaces = ctx.get('workspaces') as
       | { list?: { getSnapshot?: () => { items?: Array<{ path?: unknown }> } } }
@@ -171,5 +191,20 @@ export async function apply(ctx: Context): Promise<void> {
       locale: NS,
       inject: () => ({ api, cwd: () => resolveCwd(ctx) }),
     }, NewSessionChoice as never)), 'supermemory: new-session choice')
+  })
+
+  // 4. the sidebar session-row branch badge (问题③): a 「分支」 mark on every
+  //    session that belongs to a SuperMemory topic set, so hub sessions and
+  //    the branches they dispatched to are distinguishable in the sidebar.
+  //    Same slot, order band and inject shape the host dsh-client-ui-schedule
+  //    uses for its clock mark (id 'schedule-mark', order 10).
+  contribute('session badge', () => {
+    ctx.effect(() => ctx.slots.inject('sidebar.session.row.leading', () => ctx.slots.register({
+      name: 'sidebar.session.row.leading',
+      id: 'supermemory-branch',
+      order: 30,
+      locale: NS,
+      inject: () => ({ api }),
+    }, SupermemorySessionBadge as never)), 'supermemory: session badge')
   })
 }

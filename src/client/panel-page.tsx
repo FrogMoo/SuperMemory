@@ -52,6 +52,14 @@ export interface MutationResult {
   id?: string
 }
 
+/**
+ * Sidebar badge projection for one session (mirrors the host SessionBadge):
+ * a topic-set branch with the set it belongs to, or a plain hub session.
+ */
+export type SessionBadge =
+  | { kind: 'hub' }
+  | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+
 /** Injected face: host-panel calls plus navigation, built in apply(). */
 export interface PanelApi {
   loadHub(cwd: string, sessionId: string): Promise<HubState>
@@ -67,6 +75,7 @@ export interface PanelApi {
   followupTopicSet(cwd: string, topicSetId: string, text: string): Promise<MutationResult>
   listTools(): Promise<ToolView[]>
   editTool(id: string, patch: Record<string, unknown>): Promise<MutationResult>
+  sessionBadge(sessionId: string): Promise<SessionBadge>
   openSession(sessionId: string): void
   startSession(): void
   loadTopicSets(cwd: string): Promise<TopicSetView[]>

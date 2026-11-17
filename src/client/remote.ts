@@ -1,7 +1,9 @@
 /**
  * Client half of the SuperMemory panel wire contract. Mirrors the host-side
- * PANEL_DESCRIPTORS in src/panel.ts (registered through ctx.typert with
- * face 'host'); mounted here so the browser can call the panel service.
+ * PANEL_DESCRIPTORS in src/panel.ts (registered through
+ * ctx.get('typert').register with face 'host'); mounted here so the browser can call the
+ * panel service. The id set must stay identical on both halves —
+ * scripts/mechanism-smoke.mjs asserts that parity.
  * Shape follows the dsh-ops runtime-host pattern ({package, descriptors}).
  * @module supermemory/client/remote
  */
@@ -50,5 +52,6 @@ export const PANEL_REMOTE = Object.freeze({
     method('followupTopicSet', [param('cwd'), param('topicSetId'), param('text')]),
     method('listTools', []),
     method('editTool', [param('id'), param('patch')]),
+    method('sessionBadge', [param('sessionId')]),
   ]),
 })

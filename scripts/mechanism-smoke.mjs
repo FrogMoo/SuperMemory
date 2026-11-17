@@ -3,10 +3,25 @@
  * requirement B (auto tool-ization + structured composite catalog).
  *
  * Host-free: the pure helpers and the injectable auto-toolize seam are driven
- * directly, so these invariants hold without a DSH host.
+ * directly, so these invariants hold without a DSH host. Section E drives the
+ * real attachPanel() with a fake typert registry, which is the regression gate
+ * for the 2026-11-18 GUI 404 (descriptors never registered, silently).
  * Usage: node scripts/mechanism-smoke.mjs
  */
+import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
+
+// src/panel.ts (section E below) uses TypeScript parameter properties, which
+// Node strip-only mode rejects. Re-exec once with the full transform; every
+// other .ts import in this script behaves the same either way.
+if (!process.execArgv.includes('--experimental-transform-types')) {
+  const child = spawnSync(
+    process.execPath,
+    ['--experimental-transform-types', process.argv[1], ...process.argv.slice(2)],
+    { stdio: 'inherit' },
+  )
+  process.exit(child.status ?? 1)
+}
 
 const {
   createTracker, observe, triggerOf, canInjectCard, freshItems, commitCard,
@@ -298,6 +313,101 @@ const dDeps = (dispatches, options = {}) => {
   assert.equal(freshStore.outbox.get('dlv-dsp-3').payload.includes('插件重载/卸载'), true)
   ok('D3 活跃分支不误伤；插件卸载时 timeout=0 立即结算在途派发')
 }
+
+// ---- panel wire contract: registration, binding, client parity ----
+// Regression gate for the 2026-11-18 GUI 404: attachPanel used to read
+// `ctx.typert.register(...)` (a proxy property that throws without inject)
+// inside a silent catch, so no descriptor ever reached the typert registry and
+// the API Gateway answered 404 for every /api/supermemoryPanel/* call.
+const { attachPanel } = await import('../src/panel.ts')
+const { PANEL_REMOTE } = await import('../src/client/remote.ts')
+
+const member = (sessionId, status, lastActiveAt) => ({ sessionId, kind: 'root', title: sessionId, summary: '', status, lastActiveAt })
+const topicSet = (id, status, members, lastActiveAt = now) => ({ workspaceKey: 'ws', title: id, summary: '', keywords: [], status, members, createdAt: now, updatedAt: now, lastActiveAt })
+const panelStore = () => fakeStore({ topicsets: [
+  ['ts-live', topicSet('ts-live', 'active', [member('branch-1', 'live', now - 1000), member('branch-2', 'idle', now)])],
+  ['ts-other', topicSet('ts-other', 'active', [member('branch-1', 'live', now - 5000)], now - 6000)],
+  ['ts-archived', topicSet('ts-archived', 'archived', [member('branch-3', 'live', now)])],
+] })
+const fakeCtx = (services) => ({
+  provide: (key, value) => { services[key] = value },
+  get: (name) => (name === 'typert' ? services.typert : services[name]),
+  effect: (fn) => { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
+})
+
+{
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')) }
+  const registered = []
+  const services = { typert: { register: (contribution) => { registered.push(contribution); return () => {} } } }
+  attachPanel(fakeCtx(services), panelStore())
+  console.warn = originalWarn
+  assert.equal(registered.length, 1, 'attachPanel must register exactly one contribution')
+  assert.equal(warnings.length, 0, 'a healthy host must not warn')
+  const contribution = registered[0]
+  assert.equal(contribution.package, 'dsh-supermemory')
+  assert.equal(contribution.face, 'host')
+  const hostIds = contribution.invocations.map((d) => d.id)
+  assert.ok(hostIds.includes('dsh-supermemory#supermemoryPanel/listTopicSets'))
+  assert.ok(hostIds.includes('dsh-supermemory#supermemoryPanel/sessionBadge'))
+  const service = services.supermemoryPanel
+  assert.ok(service, 'the panel service must be provided as supermemoryPanel')
+  assert.equal(service.typertRemote.serviceKey, 'supermemoryPanel')
+  assert.equal(service.typertRemote.service, service, 'the binding must point at the instance')
+  assert.equal(service.typertRemote.namespace, 'supermemoryPanel')
+  assert.equal(Object.keys(service).includes('typertRemote'), false, 'the binding must stay non-enumerable')
+  // every descriptor must satisfy the host validateInvocation rules
+  for (const d of contribution.invocations) {
+    assert.ok(d.id.length > 0, 'invocation id must be nonempty')
+    assert.ok(d.service.length > 0 && !d.service.includes('#'), 'service key must be a segment')
+    assert.match(d.namespace, /^[A-Za-z0-9_$.-]+$/)
+    assert.match(d.method, /^[A-Za-z0-9_$.-]+$/)
+    assert.ok(d.result.typeSymbol.length > 0)
+    assert.equal(typeof d.result.create, 'function')
+    for (const parameter of d.parameters) {
+      assert.match(parameter.name, /^[A-Za-z0-9_$.-]+$/)
+      assert.match(parameter.wire, /^[A-Za-z0-9_$.-]+$/)
+      assert.ok(parameter.codec.typeSymbol.length > 0)
+      assert.equal(typeof parameter.codec.create, 'function')
+    }
+  }
+  const clientIds = PANEL_REMOTE.descriptors.map((d) => d.id)
+  assert.deepEqual([...hostIds].sort(), [...clientIds].sort(), 'host and client descriptor id sets must match')
+  ok('E1 面板 typert 注册：ctx.get(typert) 注册一次 + typertRemote 绑定 + 描述符合法 + 合同 parity')
+}
+
+{
+  const services = { typert: { register: () => () => {} } }
+  attachPanel(fakeCtx(services), panelStore())
+  const service = services.supermemoryPanel
+  assert.deepEqual(service.sessionBadge('branch-1'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'live' }, 'two hits resolve to the newest lastActiveAt')
+  assert.deepEqual(service.sessionBadge('branch-2'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'idle' })
+  assert.deepEqual(service.sessionBadge('branch-3'), { kind: 'hub' }, 'an archived topic set never marks a branch')
+  assert.deepEqual(service.sessionBadge('hub-session'), { kind: 'hub' })
+  ok('E2 sessionBadge：活跃话题集成员→分支（最新 lastActiveAt 取胜），归档/未知→中枢')
+}
+
+{
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')) }
+  const missing = {}
+  const dispose = attachPanel(fakeCtx(missing), panelStore())
+  console.warn = originalWarn
+  assert.equal(typeof dispose, 'function')
+  assert.ok(missing.supermemoryPanel, 'the service is still provided without a registry')
+  assert.ok(warnings.some((w) => w.includes('typert registry unavailable')), 'a missing registry must warn')
+  const thrown = { typert: { register: () => { throw new Error('typert: package face is already registered') } } }
+  const warnings2 = []
+  console.warn = (...args) => { warnings2.push(args.map(String).join(' ')) }
+  attachPanel(fakeCtx(thrown), panelStore())
+  console.warn = originalWarn
+  assert.ok(warnings2.some((w) => w.includes('typert register failed')), 'a failed registration must warn')
+  assert.equal(attachPanel(fakeCtx({}), undefined)(), undefined, 'no store means a no-op')
+  ok('E3 降级路径：typert 缺失/注册抛错只 warn 不静默，无 store 时空挂载')
+}
+
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 process.exit(0)

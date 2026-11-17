@@ -78,6 +78,8 @@ const expected = [
   'sidebar.panellist:supermemory',
   'main:supermemory',
   'shell.overlay:supermemory-new-session',
+  // GUI 问题③: the branch badge on topic-set sessions in the sidebar rows.
+  'sidebar.session.row.leading:supermemory-branch',
 ]
 for (const want of expected) {
   if (!slots.includes(want)) throw new Error('missing registration: ' + want + ' (got ' + slots.join(', ') + ')')
