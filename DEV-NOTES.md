@@ -515,5 +515,50 @@ dsh.client 是**宿主启动时**读的，运行中改清单不会重建 boot �
 闸门：`npx tsc --noEmit` 0 错；`pnpm smoke` = 5 + 16 + 26 + SIM SMOKE OK；`pnpm build` 成功；
 profile patch 原子改后已还原（无 supermemory 条目）。
 
+## 12. 中断兜底（需求 D）+ 端到端实测（2026-11-17 第五轮）
+
+事故背景：分支会话执行「禁用插件」重载的第 1 步时被自身 fiber 卸载连带杀死，turn 没有
+turn/end → observe 永不 settle → dispatch 永久 dispatched、relays=0，hub 只看到“已停止”。
+
+机制（commit `918b642`）：
+
+- `schema.ts`：dispatch 状态增加 `interrupted`；新增 `lastActivityAt` 心跳字段。
+- `observe.ts`：
+  - 心跳：分支任何 `session/event`（30s 节流）刷新在途 dispatch 的 `lastActivityAt`，
+    所以“沉默”是可证明的（不是 updatedAt 陈旧误判）。
+  - 失败终态 relay 附「已完成部分」摘要（aborted 前的 assistant 文本）。
+  - `settleInterruptedDispatches(deps,{timeoutMs,now?,reason?,terminalOnly?})`：
+    终态但从未送达 → 补发；open 且心跳超时 → 标 `interrupted` 并只 relay 一次
+    （幂等键 `dlv-<dispatchId>`，已有 outbox 行即跳过）；分组只走组汇总。
+- `index.ts`：`observe.interruptAfterMs`（默认 900000）；5 分钟巡检调用；插件
+  dispose 时 `timeoutMs:0` 立即结算在途派发并 relay；启动对账后 `terminalOnly` 补发历史中断。
+
+E2E 实测（2026-11-17 14:0x，单次对照实验）：
+
+1. 派发长任务 `dsp-mwkajesy-ku55f4`（分支`branch-mwkajetk-c5miky` 跑 `sleep 180`，turn 打开）。
+2. 在 GUI 对 dsh-supermemory 执行禁用→启用（正是上次事故动作）。
+3. 结果：分支 turn 以 `aborted` 结束 → observe **1 秒内**结算：dispatch `failed` /
+   `turnEndReason=aborted`，outbox `relayed` → `confirmed`，回执原文
+   “结果：分支未成功完成（分支终态 aborted）。以上为失败事实，未伪装成答案。”
+   无「已完成部分」段——该分支只跑了一次 sleep，没有 assistant 文本可摘要。
+4. 台账：`OPEN=0`（无滞留）；重载后 `memory_recall`/`memory_dispatch` 均为 function。
+
+同时复验命名（重载后新代码）：派发 `dsp-mwkai4hb-syz2bt` → `branch-mwkai4hy-fly4iw`，
+投影 `title.val = "1、现在提出问题，它依旧 · 命名验证：直接回复一行文字「"`，成员 title 同值，
+派发 `delivered/completed` 且回执 `命名分支确认` 已 confirmed。
+
+**未实测到的两条路径**（如实记录）：
+
+- 15 分钟超时巡检（分支活着但彻底静默）——需真实等待，仅单测 D1 覆盖。
+- dispose 文案路径（`插件重载/卸载导致分支中断`）——本次 turn/end 先到，走了 abort 路径
+  （信息更全，属更好结果），仅单测 D3 覆盖。
+
+SOP（写死）：**禁用/重载插件只能在 hub 会话或 GUI 执行，分支会话内绝对禁止**；重载前若有
+在途派发，dispose 兜底会补回执，但最好让分支自然结束再重载。
+
+闸门：`npx tsc --noEmit` 0 错；`pnpm smoke` = core 5 + mechanism 19（含 C1–C4/D1–D3）+
+webui 26 + client-sim OK；`npx tsdown` 构建成功（lib/supermemory.js 208.93 kB）。
+
+
 
 
