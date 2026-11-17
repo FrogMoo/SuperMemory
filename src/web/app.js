@@ -6,26 +6,36 @@ const TOKEN = (document.querySelector('meta[name="sm-token"]') || {}).content ||
 const URL_PARAMS = new URLSearchParams(location.search)
 const URL_SESSION = URL_PARAMS.get('session') || ''
 
+// R18 需求⑥: fixed left navigation — 中枢会话/话题集/记忆/组合工具/统计 first,
+// the operational detail sections under a second group.
 const SECTIONS = [
-  ['overview', '总览'],
-  ['topicsets', '话题集'],
-  ['memories', '事实记忆'],
-  ['requirements', '需求'],
-  ['dispatch', '派发与交付'],
-  ['episodes', '归档梗概'],
-  ['filemap', '文件地图'],
-  ['signals', '信号与工具'],
+  ['hubs', '中枢会话', 'primary'],
+  ['topicsets', '话题集', 'primary'],
+  ['memories', '记忆', 'primary'],
+  ['tools', '组合工具', 'primary'],
+  ['overview', '统计', 'primary'],
+  ['requirements', '需求', 'more'],
+  ['dispatch', '派发与交付', 'more'],
+  ['episodes', '归档梗概', 'more'],
+  ['filemap', '文件地图', 'more'],
+  ['signals', '信号', 'more'],
 ]
 
 const state = {
   ws: null,
   workspaces: [],
   data: null,
-  section: (location.hash || '').replace('#', '') || 'overview',
+  section: SECTIONS.some(([id]) => id === (location.hash || '').replace('#', ''))
+    ? (location.hash || '').replace('#', '')
+    : 'hubs',
   auto: localStorage.getItem('sm-auto') !== '0',
   memQuery: '',
   memFilter: 'all',
+  // R11: 话题集按标题/标签过滤（索引检索，不扫正文）
+  tsQuery: '',
   editing: new Set(),
+  // R19 需求⑦: memory editing is a modal, exactly like the in-app panel.
+  editMem: null,
 }
 
 const $ = (sel) => document.querySelector(sel)
@@ -76,18 +86,22 @@ async function loadState() {
 }
 
 function render() {
-  $('#sections').innerHTML = SECTIONS.map(([id, label]) =>
-    `<button type="button" class="nav-item${state.section === id ? ' active' : ''}" data-action="nav" data-id="${id}">${label}</button>`).join('')
+  let group = ''
+  $('#sections').innerHTML = SECTIONS.map(([id, label, grp]) => {
+    const head = grp !== group ? `<div class="nav-group">${grp === 'primary' ? '记忆中枢' : '运维明细'}</div>` : ''
+    group = grp
+    return head + `<button type="button" class="nav-item${state.section === id ? ' active' : ''}" data-action="nav" data-id="${id}">${label}</button>`
+  }).join('')
   $('#ws-select').innerHTML = state.workspaces.map((w) =>
     `<option value="${esc(w.key)}"${w.key === state.ws ? ' selected' : ''}>${esc(w.key)}</option>`).join('')
   $('#gen-at').textContent = state.data ? '更新于 ' + fmtTime(state.data.generatedAt) : ''
   $('#auto-refresh').checked = state.auto
   const renderer = {
-    overview: renderOverview, topicsets: renderTopicsets, memories: renderMemories,
-    requirements: renderRequirements, dispatch: renderDispatch, episodes: renderEpisodes,
+    hubs: renderHubs, overview: renderOverview, topicsets: renderTopicsets, memories: renderMemories,
+    tools: renderTools, requirements: renderRequirements, dispatch: renderDispatch, episodes: renderEpisodes,
     filemap: renderFilemap, signals: renderSignals,
   }[state.section]
-  $('#content').innerHTML = renderer && state.data ? renderer(state.data) : '<div class="empty">加载中…</div>'
+  $('#content').innerHTML = (renderer && state.data ? renderer(state.data) : '<div class="empty">加载中…</div>') + memoryModal()
 }
 
 /* ---------- 分区渲染 ---------- */
@@ -96,6 +110,7 @@ function renderOverview(d) {
   const dq = d.dispatches.reduce((m, x) => { m[x.status] = (m[x.status] || 0) + 1; return m }, {})
   const cards = [
     ['话题集', d.topicsets.filter((t) => t.status === 'active').length + ' 活跃 / ' + d.topicsets.filter((t) => t.status === 'archived').length + ' 归档'],
+    ['话题集会话', d.topicsets.reduce((n, t) => n + ((t.members || []).length), 0) + ' 个会话'],
     ['事实记忆', d.memories.filter((m) => m.status === 'active').length + ' 生效 / ' + d.memories.filter((m) => m.status === 'superseded').length + ' 软删'],
     ['需求', d.requirements.filter((r) => r.status === 'open').length + ' 未完成 / ' + d.requirements.filter((r) => r.status === 'closed').length + ' 已完成'],
     ['归档梗概', d.episodes.length],
@@ -109,9 +124,13 @@ function renderOverview(d) {
   return `
   <div class="cards">${cards.map(([k, v]) => `<div class="card-stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('')}</div>
   <div class="panel"><header>会话 → 活跃话题集</header><div class="body">
-    ${d.routing.length
-      ? `<table><tr><th>会话</th><th>活跃话题集</th><th class="num">漂移计数</th><th>更新时间</th></tr>${d.routing.map((r) => `<tr><td>${short(r.sessionId)}</td><td>${esc(tsTitle(r.activeTopicSetId))}</td><td class="num">${r.driftCount}</td><td>${fmtTime(r.updatedAt)}</td></tr>`).join('')}</table>`
-      : '<div class="empty">暂无会话路由记录</div>'}
+    <div class="card-list">${d.routing.length
+      ? d.routing.map((r) => `
+        <div class="list-card">
+          <div class="list-card-head"><b>${short(r.sessionId)}</b>${badge('drift ' + r.driftCount)}<span class="grow"></span><span class="muted">${fmtTime(r.updatedAt)}</span></div>
+          <div class="row-meta"><span>活跃话题集 ${esc(tsTitle(r.activeTopicSetId))}</span></div>
+        </div>`).join('')
+      : '<div class="empty">暂无会话路由记录</div>'}</div>
   </div></div>
   <div class="panel"><header>导出</header><div class="body">
     <button class="btn" type="button" data-action="export">导出 .supermemory-export.md</button>
@@ -130,10 +149,24 @@ function renderTopicsets(d) {
       <button class="btn primary" type="submit">创建</button>
     </form>
   </div></div>`
-  const list = d.topicsets.length
-    ? d.topicsets.map((t) => topicSetCard(t, d, defaultSession)).join('')
-    : '<div class="empty">暂无话题集</div>'
-  return head + list
+  // 标题 + 标签是索引：先按索引过滤，命中数为 0 时才回退到正文（梗概）匹配。
+  const needle = (state.tsQuery || '').trim().toLowerCase()
+  const indexHit = (t) => !needle
+    || String(t.title || '').toLowerCase().includes(needle)
+    || (t.keywords || []).some((k) => String(k).toLowerCase().includes(needle))
+  const bodyHit = (t) => !needle || String(t.summary || '').toLowerCase().includes(needle)
+  const indexed = d.topicsets.filter(indexHit)
+  const shown = indexed.length > 0 ? indexed : d.topicsets.filter(bodyHit)
+  const totalSessions = d.topicsets.reduce((n, t) => n + ((t.members || []).length), 0)
+  const bar = `
+  <div class="toolbar">
+    <input type="text" id="ts-q" placeholder="按标题或标签搜索话题集…" value="${esc(state.tsQuery || '')}">
+    <span class="muted">显示 ${shown.length} / ${d.topicsets.length} 个话题集 · 共 ${totalSessions} 个会话</span>
+  </div>`
+  const list = shown.length
+    ? shown.map((t) => topicSetCard(t, d, defaultSession)).join('')
+    : '<div class="empty">没有匹配的话题集</div>'
+  return head + bar + list
 }
 
 function topicSetCard(t, d, defaultSession) {
@@ -145,6 +178,7 @@ function topicSetCard(t, d, defaultSession) {
   <div class="panel">
     <header>
       <b>${esc(t.title)}</b> ${badge(t.status)}
+      <span class="badge info">${(t.members || []).length} 个会话</span>
       <span class="muted">模型 ${esc(model)}</span>
       <span class="grow"></span>
       ${editing
@@ -176,15 +210,24 @@ function topicSetCard(t, d, defaultSession) {
 
 function renderMemories(d) {
   const q = state.memQuery.trim().toLowerCase()
+  // 标题/标签是索引：先按索引匹配；索引无命中时才扫正文（正文匹配仍会展示标题）。
+  const indexHit = (m) => !q
+    || String(m.title || '').toLowerCase().includes(q)
+    || (m.keywords || []).some((k) => String(k).toLowerCase().includes(q))
+    || String(m.key || '').toLowerCase().includes(q)
+  const bodyHit = (m) => !q || String(m.text || '').toLowerCase().includes(q)
   const list = d.memories.filter((m) =>
-    (state.memFilter === 'all' || m.status === state.memFilter)
-    && (!q || (m.text + ' ' + (m.keywords || []).join(' ') + ' ' + (m.key || '')).toLowerCase().includes(q)))
+    (state.memFilter === 'all' || m.status === state.memFilter) && (indexHit(m) || bodyHit(m)))
   const head = `
   <div class="panel"><header>新建记忆</header><div class="body">
-    <form data-form="mem-create" class="form-inline">
-      <textarea name="text" placeholder="要记住的事实（简洁自包含）" required style="min-height:44px"></textarea>
-      <input type="text" name="keywords" placeholder="关键词，逗号分隔（可选）" style="flex:1;min-width:170px">
-      <button class="btn primary" type="submit">记住</button>
+    <form data-form="mem-create">
+      <div class="toolbar" style="margin:0 0 6px">
+        <input type="text" name="title" placeholder="标题（≤48 字，检索权重最高）" style="flex:1;min-width:200px">
+        <input type="text" name="keywords" placeholder="标签，逗号分隔（用于检索）" style="flex:1;min-width:180px">
+      </div>
+      <textarea name="text" placeholder="正文：要记住的事实（简洁自包含）" required style="min-height:56px;width:100%"></textarea>
+      <div class="toolbar" style="margin-top:6px"><button class="btn primary" type="submit">记住</button>
+      <span class="muted">标题 + 标签用于检索，正文是权威内容。</span></div>
     </form>
   </div></div>
   <div class="toolbar">
@@ -201,15 +244,12 @@ function renderMemories(d) {
 }
 
 function memoryRow(m) {
-  const editing = state.editing.has('mem:' + m.id)
   return `
   <div class="row" data-id="${m.id}">
     <div class="row-main">
       <div class="row-text">
-        ${editing
-          ? `<div><textarea data-role="mem-text">${esc(m.text)}</textarea>
-               <div class="toolbar" style="margin-top:6px"><input type="text" data-role="mem-kw" value="${esc((m.keywords || []).join(', '))}" placeholder="关键词，逗号分隔"></div></div>`
-          : `<div class="clamp" title="点击展开/收起">${esc(m.text)}</div>`}
+        <div class="row-title">${esc(m.title || (m.text || '').slice(0, 48))}</div>
+        <div class="clamp" title="点击展开/收起">${esc(m.text)}</div>
         <div class="row-meta">
           ${badge(m.status)} ${kwHtml(m.keywords)}
           <span>来源 ${short(m.sourceSessionId)} #${m.sourceSeq}</span>
@@ -218,13 +258,33 @@ function memoryRow(m) {
         </div>
       </div>
       <div class="row-actions">
-        ${editing
-          ? `<button class="btn small primary" type="button" data-action="mem-save" data-id="${m.id}">保存</button><button class="btn small" type="button" data-action="edit-cancel" data-id="mem:${m.id}">取消</button>`
-          : `<button class="btn small" type="button" data-action="mem-edit" data-id="${m.id}">编辑</button>
-             ${m.status === 'active'
-               ? `<button class="btn small danger" type="button" data-action="mem-soft" data-id="${m.id}">软删</button>`
-               : `<button class="btn small" type="button" data-action="mem-restore" data-id="${m.id}">恢复</button>`}
-             <button class="btn small danger" type="button" data-action="mem-del" data-id="${m.id}">彻底删除</button>`}
+        <button class="btn small" type="button" data-action="mem-edit" data-id="${m.id}">编辑</button>
+        ${m.status === 'active'
+          ? `<button class="btn small danger" type="button" data-action="mem-soft" data-id="${m.id}">软删</button>`
+          : `<button class="btn small" type="button" data-action="mem-restore" data-id="${m.id}">恢复</button>`}
+        <button class="btn small danger" type="button" data-action="mem-del" data-id="${m.id}">彻底删除</button>
+      </div>
+    </div>
+  </div>`
+}
+
+/** R19 需求⑦: the memory edit modal (same interaction as the in-app panel). */
+function memoryModal() {
+  const m = state.editMem
+  if (!m) return ''
+  return `
+  <div class="modal-backdrop" data-action="modal-close">
+    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+      <h3>编辑记忆</h3>
+      <p class="modal-hint">只写结论性、可复用的事实/决策；过程步骤留在会话里。标题与标签用于检索。</p>
+      <div class="toolbar" style="margin:0 0 8px">
+        <input type="text" data-role="edit-title" value="${esc(m.title || '')}" placeholder="标题（≤48 字）" style="flex:1;min-width:180px">
+        <input type="text" data-role="edit-kw" value="${esc((m.keywords || []).join(', '))}" placeholder="标签，逗号分隔" style="flex:1;min-width:180px">
+      </div>
+      <textarea data-role="edit-text" style="min-height:120px;width:100%">${esc(m.text)}</textarea>
+      <div class="toolbar" style="margin-top:10px">
+        <button class="btn primary" type="button" data-action="mem-save-modal" data-id="${m.id}">保存</button>
+        <button class="btn" type="button" data-action="modal-close">取消</button>
       </div>
     </div>
   </div>`
@@ -269,18 +329,35 @@ function renderRequirements(d) {
 
 function renderDispatch(d) {
   const tsTitle = (id) => { const t = d.topicsets.find((x) => x.id === id); return t ? t.title : '—' }
-  const task = (x) => esc(x.task.length > 60 ? x.task.slice(0, 60) + '…' : x.task)
+  const task = (x) => esc(x.task.length > 90 ? x.task.slice(0, 90) + '…' : x.task)
+  const rows = d.dispatches.length
+    ? d.dispatches.map((x) => `
+      <div class="list-card">
+        <div class="list-card-head">
+          <b>${task(x)}</b>
+          ${badge(x.status)}
+          <span class="grow"></span>
+          <button class="btn small danger" type="button" data-action="dsp-del" data-id="${x.id}">删除</button>
+        </div>
+        <div class="row-meta">
+          <span>话题集 ${esc(tsTitle(x.topicSetId))}</span>
+          <span>分支 ${short(x.branchSessionId)}</span>
+          <span>创建 ${fmtTime(x.createdAt)}</span>
+          ${x.turnEndReason ? `<span>终态 ${esc(x.turnEndReason)}</span>` : ''}
+        </div>
+      </div>`).join('')
+    : '<div class="empty">暂无派发记录</div>'
+  const outbox = d.outbox.length
+    ? d.outbox.map((o) => `
+      <div class="list-card">
+        <div class="list-card-head"><b>${esc(o.kind)}</b>${badge(o.status)}<span class="grow"></span><span class="muted">入队 ${fmtTime(o.enqueuedAt)}</span></div>
+        <div class="list-card-body clamp" title="点击展开/收起">${esc(o.payload)}</div>
+        <div class="row-meta"><span>投递 ${fmtTime(o.relayedAt)}</span></div>
+      </div>`).join('')
+    : '<div class="empty">交付箱为空</div>'
   return `
-  <div class="panel"><header>派发（dispatches）</header><div class="body">
-    ${d.dispatches.length
-      ? `<table><tr><th>任务</th><th>分支</th><th>话题集</th><th>状态</th><th>终态原因</th><th>创建</th><th></th></tr>${d.dispatches.map((x) => `<tr><td title="${esc(x.task)}">${task(x)}</td><td>${short(x.branchSessionId)}</td><td>${esc(tsTitle(x.topicSetId))}</td><td>${badge(x.status)}</td><td class="muted">${esc(x.turnEndReason || '—')}</td><td>${fmtTime(x.createdAt)}</td><td><button class="btn small danger" type="button" data-action="dsp-del" data-id="${x.id}">删除</button></td></tr>`).join('')}</table>`
-      : '<div class="empty">暂无派发记录</div>'}
-  </div></div>
-  <div class="panel"><header>交付箱（outbox）</header><div class="body">
-    ${d.outbox.length
-      ? `<table><tr><th>类型</th><th>状态</th><th>内容</th><th>入队</th><th>投递</th></tr>${d.outbox.map((o) => `<tr><td>${o.kind}</td><td>${badge(o.status)}</td><td class="clamp" title="点击展开/收起">${esc(o.payload)}</td><td>${fmtTime(o.enqueuedAt)}</td><td>${fmtTime(o.relayedAt)}</td></tr>`).join('')}</table>`
-      : '<div class="empty">交付箱为空</div>'}
-  </div></div>`
+  <div class="panel"><header>派发 <span class="badge info">${d.dispatches.length}</span></header><div class="body"><div class="card-list">${rows}</div></div></div>
+  <div class="panel"><header>交付箱 <span class="badge info">${d.outbox.length}</span></header><div class="body"><div class="card-list">${outbox}</div></div></div>`
 }
 
 function renderEpisodes(d) {
@@ -307,29 +384,116 @@ function renderFilemap(d) {
     <button class="btn" type="button" data-action="scan">触发重扫</button>
     <span class="muted">按内容 hash 失效旧条目；当前共 ${d.filemap.length} 条。</span>
   </div></div>`
-  const rows = d.filemap.length
-    ? `<div class="panel"><div class="body" style="overflow-x:auto"><table>
-        <tr><th>路径</th><th>角色</th><th>说明</th><th>关键词</th><th>标注时间</th></tr>
-        ${d.filemap.map((f) => `<tr><td>${esc(f.path)}</td><td>${esc(f.role)}</td><td class="muted">${esc(f.summary || '—')}</td><td>${kwHtml(f.keywords)}</td><td>${fmtTime(f.annotatedAt)}</td></tr>`).join('')}
-      </table></div></div>`
+  const cards = d.filemap.length
+    ? `<div class="panel"><div class="body"><div class="card-list">${d.filemap.map((f) => `
+        <div class="list-card">
+          <div class="list-card-head"><b>${esc(f.path)}</b>${badge(f.role)}<span class="grow"></span><span class="muted">${fmtTime(f.annotatedAt)}</span></div>
+          <div class="list-card-body">${esc(f.summary || '—')}</div>
+          <div class="row-meta">${kwHtml(f.keywords)}</div>
+        </div>`).join('')}</div></div></div>`
     : '<div class="empty">暂无文件地图条目，先点「触发重扫」</div>'
-  return head + rows
+  return head + cards
 }
 
+/** R18: 中枢会话 — top-level sessions that belong to no topic set. */
+function renderHubs(d) {
+  const hubs = d.hubs || []
+  if (!hubs.length) {
+    return '<div class="panel"><header>中枢会话</header><div class="body"><div class="empty">'
+      + '当前工作区还没有中枢会话（无父会话、非子代理、且不属于任何话题集）'
+      + '</div></div></div>'
+  }
+  // R19 协同②③: hub → branches (the same projection the panel uses). A branch
+  // belongs to its topic set and may be shared by several hubs; the card names
+  // the owning set and the share count instead of pretending a 1:1 ownership.
+  const branches = d.hubBranches || []
+  const byHub = new Map()
+  for (const b of branches) {
+    if (!byHub.has(b.hubSessionId)) byHub.set(b.hubSessionId, [])
+    byHub.get(b.hubSessionId).push(b)
+  }
+  const stateText = (s) => s === 'working' ? '工作中' : s === 'failed' ? '失败待处理' : '空闲'
+  const cards = hubs.map((h) => {
+    const rows = byHub.get(h.sessionId) || []
+    const working = rows.filter((b) => b.status === 'working').length
+    const branchHtml = rows.length === 0
+      ? '<div class="row-meta"><span class="muted">尚未拉起分支</span></div>'
+      : `<div class="row-meta"><span>分支 ${rows.length}</span><span>工作中 ${working}</span></div>`
+        + `<div class="card-list" style="margin-top:6px">${rows.map((b) => `
+            <div class="list-card">
+              <div class="list-card-head">
+                <b>${esc(b.title)}</b>
+                <span class="badge ${b.status === 'working' ? 'ok' : b.status === 'failed' ? 'warn' : ''}">${stateText(b.status)}</span>
+                ${b.shared ? `<span class="badge info">共享 ${b.hubs.length} 中枢</span>` : ''}
+                <span class="grow"></span>
+                <span class="muted">${fmtTime(b.lastActivityAt)}</span>
+              </div>
+              <div class="row-meta">
+                <span>${b.topicSetTitle ? '话题集 ' + esc(b.topicSetTitle) : '无话题集'}</span>
+                <span>派发 ${b.dispatches}</span>
+                <span>会话 ${short(b.branchSessionId)}</span>
+              </div>
+            </div>`).join('')}</div>`
+    return `
+    <div class="list-card">
+      <div class="list-card-head">
+        <b>${esc(h.title)}</b>
+        ${h.topicSetTitle ? `<span class="badge info" title="该中枢是该话题集的 root 会话">话题集 · ${esc(h.topicSetTitle)}</span>` : ''}
+        ${h.live ? '<span class="badge ok">运行中</span>' : '<span class="badge">离线</span>'}
+        ${h.topicSetTitle ? `<span class="badge info">${esc(h.topicSetTitle)}</span>` : ''}
+        <span class="grow"></span>
+        <span class="muted">更新 ${fmtTime(h.updatedAt)}</span>
+      </div>
+      <div class="row-meta">
+        <span>会话 ${short(h.sessionId)}</span>
+        <span>创建 ${fmtTime(h.createdAt)}</span>
+      </div>
+      ${branchHtml}
+    </div>`
+  }).join('')
+  return `<div class="panel"><header>中枢会话 <span class="badge info">${hubs.length}</span><span class="muted">当前工作区 ${esc(d.workspace || '')}</span></header>`
+    + `<div class="body"><div class="card-list">${cards}</div></div></div>`
+}
+
+/** R18: 组合工具 — its own section, rendered as cards (not a table). */
+function renderTools(d) {
+  if (!d.toolMemory.length) {
+    return '<div class="panel"><header>组合工具</header><div class="body"><div class="empty">'
+      + '暂无组合工具；重复流程出现 3 次后会提议固化'
+      + '</div></div></div>'
+  }
+  const cards = d.toolMemory.map((t) => `
+    <div class="list-card">
+      <div class="list-card-head">
+        <b>${esc(t.title || t.trigger || t.kind)}</b>
+        ${badge(t.kind)} ${badge(t.status)}
+        <span class="grow"></span>
+        <span class="muted">使用 ${t.useCount} 次</span>
+      </div>
+      <div class="row-meta">${kwHtml(t.tags) || '<span class="muted">（无标签）</span>'}</div>
+      <div class="list-card-body">${esc(t.description || '—')}</div>
+    </div>`).join('')
+  return `<div class="panel"><header>组合工具 <span class="badge info">${d.toolMemory.length}</span></header>`
+    + `<div class="body"><div class="card-list">${cards}</div></div></div>`
+}
+
+/** R18: 信号 — repeated-flow candidates, as cards. */
 function renderSignals(d) {
-  const sig = d.signals.length
-    ? `<div class="panel"><header>重复流程信号</header><div class="body" style="overflow-x:auto"><table>
-        <tr><th>模式</th><th class="num">次数</th><th>提议状态</th><th>样例</th><th>最近出现</th></tr>
-        ${d.signals.map((s) => `<tr><td>${esc(s.pattern)}</td><td class="num">${s.count}</td><td>${s.proposalStatus ? badge(s.proposalStatus) : '<span class="muted">未提议</span>'}</td><td class="muted clamp" title="点击展开/收起">${esc((s.examples || []).join('；'))}</td><td>${fmtTime(s.lastSeen)}</td></tr>`).join('')}
-      </table></div></div>`
-    : '<div class="panel"><div class="empty">暂无重复流程信号</div></div>'
-  const tools = d.toolMemory.length
-    ? `<div class="panel"><header>组合工具 / 工具记忆</header><div class="body" style="overflow-x:auto"><table>
-        <tr><th>触发</th><th>类型</th><th>说明</th><th class="num">使用次数</th><th>状态</th></tr>
-        ${d.toolMemory.map((t) => `<tr><td>${esc(t.trigger)}</td><td>${t.kind}</td><td class="muted">${esc(t.description)}</td><td class="num">${t.useCount}</td><td>${badge(t.status)}</td></tr>`).join('')}
-      </table></div></div>`
-    : '<div class="panel"><div class="empty">暂无组合工具</div></div>'
-  return sig + tools
+  if (!d.signals.length) {
+    return '<div class="panel"><header>重复流程信号</header><div class="body"><div class="empty">暂无重复流程信号</div></div></div>'
+  }
+  const cards = d.signals.map((s) => `
+    <div class="list-card">
+      <div class="list-card-head">
+        <b>${esc(s.pattern)}</b>
+        ${s.proposalStatus ? badge(s.proposalStatus) : '<span class="muted">未提议</span>'}
+        <span class="grow"></span>
+        <span class="muted">${s.count} 次 · 最近 ${fmtTime(s.lastSeen)}</span>
+      </div>
+      <div class="list-card-body clamp" title="点击展开/收起">${esc((s.examples || []).join('；') || '—')}</div>
+    </div>`).join('')
+  return `<div class="panel"><header>重复流程信号 <span class="badge info">${d.signals.length}</span></header>`
+    + `<div class="body"><div class="card-list">${cards}</div></div></div>`
 }
 
 /* ---------- 事件 ---------- */
@@ -340,6 +504,8 @@ document.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('[data-action]')
   if (!btn) return
   const action = btn.dataset.action
+  // Clicking inside the dialog must not bubble to the backdrop's close action.
+  if (action === 'modal-close' && ev.target.closest('.modal')) return
   const id = btn.dataset.id || ''
   const post = (path, body) => api(path, { method: 'POST', body })
   const run = async (fn) => {
@@ -351,13 +517,25 @@ document.addEventListener('click', async (ev) => {
     case 'nav': state.section = id; location.hash = id; render(); return
     case 'ts-edit': state.editing.add('ts:' + id); render(); return
     case 'req-edit': state.editing.add('req:' + id); render(); return
-    case 'mem-edit': state.editing.add('mem:' + id); render(); return
-    case 'edit-cancel': state.editing.delete(id); render(); return
-    case 'mem-save': await run(async () => {
-      const row = btn.closest('.row')
-      await post('/memory/update', { ws: state.ws, id, text: row.querySelector('[data-role="mem-text"]').value, keywords: row.querySelector('[data-role="mem-kw"]').value })
-      state.editing.delete('mem:' + id); toast('记忆已保存')
+    case 'mem-edit': {
+      const memory = (state.data && state.data.memories || []).find((m) => m.id === id)
+      if (!memory) return
+      state.editMem = { id: memory.id, title: memory.title || '', keywords: memory.keywords || [], text: memory.text || '' }
+      render()
+      return
+    }
+    case 'modal-close': state.editMem = null; render(); return
+    case 'mem-save-modal': await run(async () => {
+      const modal = document.querySelector('.modal')
+      if (!modal) throw new Error('编辑框已关闭')
+      const title = modal.querySelector('[data-role="edit-title"]').value
+      const keywords = modal.querySelector('[data-role="edit-kw"]').value
+      const text = modal.querySelector('[data-role="edit-text"]').value
+      await post('/memory/update', { ws: state.ws, id, title, keywords, text })
+      state.editMem = null
+      toast('记忆已保存')
     }); return
+    case 'edit-cancel': state.editing.delete(id); render(); return
     case 'mem-soft':
       if (!confirm('软删除后 recall 不再命中该记忆，可在「已软删」过滤中恢复。确定？')) return
       await run(async () => { await post('/memory/status', { ws: state.ws, id, status: 'superseded' }); toast('已软删除') }); return
@@ -441,6 +619,12 @@ document.addEventListener('change', async (ev) => {
     render()
     const q = $('#mem-q')
     if (q) { q.focus(); q.setSelectionRange(pos, pos) }
+  } else if (t.id === 'ts-q') {
+    state.tsQuery = t.value
+    const pos = t.selectionStart
+    render()
+    const q = $('#ts-q')
+    if (q) { q.focus(); q.setSelectionRange(pos, pos) }
   }
 })
 
@@ -454,7 +638,7 @@ document.addEventListener('submit', async (ev) => {
     if (kind === 'mem-create') {
       const text = val('text')
       if (!text) return
-      await api('/memory/create', { method: 'POST', body: { ws: state.ws, text, keywords: val('keywords') } })
+      await api('/memory/create', { method: 'POST', body: { ws: state.ws, title: val('title'), text, keywords: val('keywords') } })
       toast('已记住')
     } else if (kind === 'ts-create') {
       const title = val('title')
@@ -480,7 +664,7 @@ document.addEventListener('submit', async (ev) => {
  * memory / topic-set form (and the row being edited).
  */
 function typingInConsole() {
-  if (state.editing.size > 0) return true
+  if (state.editing.size > 0 || state.editMem) return true
   const el = document.activeElement
   if (!el) return false
   return !!(el.closest && el.closest('#content') && /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))

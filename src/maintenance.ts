@@ -13,6 +13,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { extractFacts } from './extract.ts'
 import { extractRequirements, rememberRequirements } from './requirements.ts'
+import { deriveTitle, mergeTags } from './retrieval.ts'
 import type { Memory, Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
@@ -360,7 +361,8 @@ async function countSequenceSignal(
   }
   const memoryId = newId('mem')
   const memory: Memory = {
-    workspaceKey, text, keywords, sourceSessionId, sourceSeq,
+    workspaceKey, title: deriveTitle(text), text,
+    keywords: mergeTags([], keywords), sourceSessionId, sourceSeq,
     status: 'active', createdAt: now, updatedAt: now,
   }
   await store.memories.put(memoryId, memory)

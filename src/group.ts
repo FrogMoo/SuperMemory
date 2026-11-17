@@ -8,6 +8,7 @@
 import type { Store } from './store.ts'
 import type { Dispatch } from './schema.ts'
 import { newId } from './store.ts'
+import { openQuestionsOfGroup, renderQuestionsBlock } from './questions.ts'
 
 /** Members of one group, in creation order. */
 export function groupMembers(store: Store, groupId: string): Array<[string, Dispatch]> {
@@ -19,31 +20,53 @@ export function groupMembers(store: Store, groupId: string): Array<[string, Disp
   return out
 }
 
+/**
+ * Dispatch states that end a member's life. `interrupted` (timeout / stop /
+ * plugin reload) is terminal exactly like `failed`: excluding it kept
+ * `groupComplete` false forever, so one silent member withheld the WHOLE group's
+ * single relay. It is still annotated as an interruption, never as success.
+ */
+const TERMINAL_MEMBER_STATUSES = new Set<Dispatch['status']>([
+  'delivered',
+  'failed',
+  'interrupted',
+])
+
 /** True when every member reached a terminal state. */
 export function groupComplete(store: Store, groupId: string): boolean {
   const members = groupMembers(store, groupId)
   if (members.length === 0) return false
-  return members.every(([, record]) => record.status === 'delivered' || record.status === 'failed')
+  return members.every(([, record]) => TERMINAL_MEMBER_STATUSES.has(record.status))
 }
 
-/** The hub-facing group relay text: one line per member, failures annotated. */
+/** The hub-facing group relay text: one line per member, failures/interrupts annotated. */
 export function groupRelayText(store: Store, groupId: string, episodes: Map<string, string>): string {
   const members = groupMembers(store, groupId)
   const lines: string[] = [`[supermemory-group-relay ${groupId}]`, `共 ${members.length} 个分支任务：`]
   let ok = 0
   let failed = 0
+  let interrupted = 0
   members.forEach(([, record], index) => {
     const label = record.task.slice(0, 40)
     if (record.status === 'delivered') {
       ok++
       const summary = episodes.get(record.branchSessionId) ?? '（已完成）'
       lines.push(`${index + 1}. ✅ ${label}\n   ${summary}`)
+    } else if (record.status === 'interrupted') {
+      interrupted++
+      // R19 fix: an interrupted member is terminal, and saying so is the point:
+      // the hub must be able to tell "timed out / stopped" from "run failed".
+      lines.push(`${index + 1}. ⏹ ${label}\n   中断终态：${record.turnEndReason ?? 'unknown'}（未伪装成答案）`)
     } else {
       failed++
       lines.push(`${index + 1}. ❌ ${label}\n   失败终态：${record.turnEndReason ?? 'unknown'}（未伪装成答案）`)
     }
   })
-  lines.push(`汇总：${ok} 成功 / ${failed} 失败。`)
+  lines.push(`汇总：${ok} 成功 / ${failed} 失败 / ${interrupted} 中断。`)
+  // R20: every member's open questions travel with the ONE group relay, so the
+  // hub can aggregate them without polling each branch separately.
+  const questions = renderQuestionsBlock(openQuestionsOfGroup(store, groupId), '并行组各分支上交的问题（中枢汇总后统一向用户提问）：')
+  if (questions) lines.push('', questions)
   return lines.join('\n')
 }
 

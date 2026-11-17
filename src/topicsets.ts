@@ -28,6 +28,8 @@ export async function createTopicSet(store: Store, input: CreateTopicSetInput): 
     status: 'active',
     defaultModel: input.defaultModel,
     members: [],
+    shapeFingerprint: '',
+    shapeGeneratedAt: 0,
     createdAt: now,
     updatedAt: now,
     lastActiveAt: now,
@@ -63,6 +65,30 @@ export async function touchTopicSet(store: Store, topicSetId: string): Promise<v
   if (!existing) return
   await store.topicsets.update(topicSetId, (record) => ({ ...record, lastActiveAt: Date.now(), updatedAt: Date.now() }))
     .catch(() => { /* touch is best-effort */ })
+}
+
+/**
+ * R19 需求⑥: write the LLM-generated title + tags + body back to one set.
+ *
+ * The title is only overwritten when the generator produced a non-empty one;
+ * an absent field keeps the current value, so a partially parsed model answer
+ * can never blank the index. `fingerprint`/`generatedAt` are recorded only on a
+ * successful generation (see topic-shape.ts) — the caller decides that.
+ */
+export async function updateTopicSetShape(
+  store: Store,
+  topicSetId: string,
+  shape: { title?: string; summary?: string; keywords?: string[]; fingerprint?: string; generatedAt?: number },
+): Promise<void> {
+  await store.topicsets.update(topicSetId, (record) => ({
+    ...record,
+    ...(shape.title ? { title: shape.title } : {}),
+    ...(shape.summary !== undefined ? { summary: shape.summary } : {}),
+    ...(shape.keywords !== undefined ? { keywords: shape.keywords } : {}),
+    ...(shape.fingerprint !== undefined ? { shapeFingerprint: shape.fingerprint } : {}),
+    ...(shape.generatedAt !== undefined ? { shapeGeneratedAt: shape.generatedAt } : {}),
+    updatedAt: Date.now(),
+  })).catch(() => { /* the old values stay authoritative on a write failure */ })
 }
 
 export async function updateTopicSetSummary(store: Store, topicSetId: string, summary: string, keywords?: string[]): Promise<void> {

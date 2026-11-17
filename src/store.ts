@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Memory, type OutboxItem, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Memory, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -42,6 +42,8 @@ export interface Store {
   routing: Table<Routing>
   hotcache: Table<Hotcache>
   dispatches: Table<Dispatch>
+  /** R20: branch-raised questions awaiting the hub's single user question. */
+  questions: Table<Question>
   outbox: Table<OutboxItem>
   close(): Promise<void>
 }
@@ -62,6 +64,44 @@ export function workspaceKeyOf(cwd: string | undefined | null): string {
 /** Monotonic-ish id helper (no host import needed). */
 export function newId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** Backoff used while a disposing instance still owns the domain (plugin reload race). */
+const STORE_OPEN_RETRY_MS = Object.freeze([100, 250, 750, 2000])
+
+/**
+ * Retry an async open while the domain name is still reserved by an instance
+ * that is unloading.
+ *
+ * `storageDomain.open()` rejects `already-open` when the name is reserved by
+ * an in-flight or completed open, and a plugin reload can start the new fiber
+ * before the old fiber's domain disposer ran. Only that code is retried; every
+ * other failure (version mismatch, malformed medium, backend route, …) is the
+ * caller's to degrade on, immediately.
+ */
+export async function retryDomainOpen<T>(
+  open: () => Promise<T>,
+  logger: { warn: (msg: string) => void },
+  delays: readonly number[] = STORE_OPEN_RETRY_MS,
+): Promise<T> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await open()
+    } catch (error) {
+      const code = (error as { code?: unknown } | null | undefined)?.code
+      if (code !== 'already-open' || attempt >= delays.length) throw error
+      logger.warn(`supermemory: storage domain still owned by a disposing instance; retrying in ${delays[attempt]}ms`)
+      await new Promise(resolve => setTimeout(resolve, delays[attempt]))
+    }
+  }
+}
+
+/** Open the storage domain, riding out a reload's domain-handover window. */
+export async function openStoreWithRetry(
+  storageDomain: StorageDomain.DomainFacility,
+  logger: { warn: (msg: string) => void; info: (msg: string) => void },
+): Promise<Store> {
+  return retryDomainOpen(() => openStore(storageDomain, logger), logger)
 }
 
 /**
@@ -86,6 +126,7 @@ export async function openStore(
       tool_memory: sd.domainTable(schemas.tool_memory),
       signals: sd.domainTable(schemas.signals),
       dispatches: sd.domainTable(schemas.dispatches),
+      questions: sd.domainTable(schemas.questions),
       outbox: sd.domainTable(schemas.outbox),
       routing: sd.domainTable(schemas.routing),
       hotcache: sd.domainTable(schemas.hotcache),
@@ -106,6 +147,7 @@ export async function openStore(
     routing: table<Routing>('routing'),
     hotcache: table<Hotcache>('hotcache'),
     dispatches: table<Dispatch>('dispatches'),
+    questions: table<Question>('questions'),
     outbox: table<OutboxItem>('outbox'),
     close: () => domain.close(),
   }

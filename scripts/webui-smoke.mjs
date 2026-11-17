@@ -134,6 +134,28 @@ for (const [asset, marker] of [['app.js', 'SuperMemory 管理台'], ['style.css'
 }
 ok('app.js / style.css served from src/web')
 
+// R18 需求⑥: the console ships a fixed nav with the five memory-centre
+// sections, card lists instead of wide tables, and the responsive fold.
+const appSrc = await (await fetch(base + '/app.js')).text()
+const cssSrc = await (await fetch(base + '/style.css')).text()
+for (const marker of ['renderHubs', 'renderTools', '中枢会话', '组合工具', 'card-list']) {
+  assert.ok(appSrc.includes(marker), 'app.js must include ' + marker)
+}
+assert.ok(/renderHubs/.test(appSrc) && !/<table>/.test(appSrc.slice(appSrc.indexOf('function renderDispatch'), appSrc.indexOf('function renderEpisodes'))),
+  'dispatch renders cards, not a table')
+for (const marker of ['.card-list', '.list-card', '.nav-group', '@media (max-width: 760px)', '.modal-backdrop', '.modal ']) {
+  assert.ok(cssSrc.includes(marker), 'style.css must include ' + marker)
+}
+// R19 需求⑦: memory editing is a modal in the console too (same interaction as
+// the in-app panel): a backdrop + dialog + save action, not an inline row.
+for (const marker of ['function memoryModal', 'modal-backdrop', 'mem-save-modal', 'aria-modal="true"']) {
+  assert.ok(appSrc.includes(marker), 'app.js must include ' + marker)
+}
+assert.ok(!appSrc.includes("data-action=\"mem-save\""), 'the old inline memory editor is gone')
+ok('R19 memory editing is a modal in the console (backdrop + dialog + save action)')
+ok('console shell: five-section fixed nav + card lists + responsive fold')
+
+
 // auth
 const noAuth = await fetch(base + '/api/workspaces')
 assert.equal(noAuth.status, 401)
@@ -176,6 +198,19 @@ assert.equal(st.outbox.length, 1)
 assert.equal(st.routing[0].sessionId, 'sess-1')
 assert.equal(st.toolMemory.length, 1)
 assert.equal(st.signals.length, 1)
+// R18: the 中枢会话 section reads the same hub rule as the panel rail. This
+// stub host exposes no sessionQuery, so the section degrades to an empty list
+// (never to an error or a missing field).
+assert.deepEqual(st.hubs, [], 'a host without sessionQuery yields an empty hub list')
+// R19 协同②③: the console shows hub→branch rows even when the hub list is empty:
+// the projection is the dispatch table (branch d-1 → set ts-1 → workspace ws).
+assert.equal(Array.isArray(st.hubBranches), true, 'the state snapshot carries hubBranches')
+assert.equal(st.hubBranches.length, 1, 'the workspace branch row is projected once')
+assert.equal(st.hubBranches[0].branchSessionId, 'br-1')
+assert.equal(st.hubBranches[0].topicSetTitle, '话题集一', 'the branch names its owning topic set')
+assert.equal(st.hubBranches[0].status, 'idle', 'a delivered dispatch leaves the branch idle')
+assert.equal(st.hubBranches[0].shared, false, 'one hub is not shared')
+assert.equal(st.hubBranches[0].dispatches, 1)
 ok('state snapshot joins attached tables')
 
 const badState = await fetch(base + '/api/state', { headers: auth })
@@ -183,19 +218,26 @@ assert.equal(badState.status, 400)
 ok('state requires ws')
 
 // memory CRUD
-const created = await fetch(base + '/api/memory/create', json({ ws, text: '新记忆', keywords: 'a, b', sessionId: 'sess-1' }))
+const created = await fetch(base + '/api/memory/create', json({ ws, title: ' 测试标题 ', text: '新记忆', keywords: 'a, b', sessionId: 'sess-1' }))
 const createdBody = await created.json()
 assert.equal(createdBody.ok, true)
 const memId = createdBody.id
 assert.equal(store.memories.size, 2)
-assert.deepEqual(store.memories.get(memId).keywords, ['a', 'b'])
+assert.deepEqual(store.memories.get(memId).keywords, ['a', 'b'], 'explicit tags are kept verbatim (no auto-keyword noise)')
+assert.equal(store.memories.get(memId).title, '测试标题', 'the title column is stored (trimmed)')
 assert.equal(store.memories.get(memId).status, 'active')
 ok('memory create')
 
-const upd = await fetch(base + '/api/memory/update', json({ ws, id: memId, text: '改过的记忆', keywords: ['c'] }))
+const upd = await fetch(base + '/api/memory/update', json({ ws, id: memId, title: '改过的标题', text: '改过的记忆', keywords: ['c'] }))
 assert.equal((await upd.json()).ok, true)
 assert.equal(store.memories.get(memId).text, '改过的记忆')
 assert.deepEqual(store.memories.get(memId).keywords, ['c'])
+assert.equal(store.memories.get(memId).title, '改过的标题')
+// R10: the state snapshot the console renders must expose the index fields.
+const shapeState = await (await fetch(`${base}/api/state?ws=${encodeURIComponent(ws)}`, { headers: auth })).json()
+const shaped = shapeState.memories.find((m) => m.id === memId)
+assert.equal(shaped.title, '改过的标题')
+assert.deepEqual(shaped.tags ?? shaped.keywords, ['c'])
 ok('memory update')
 
 const soft = await fetch(base + '/api/memory/status', json({ ws, id: memId, status: 'superseded' }))

@@ -11,13 +11,30 @@ import { createElement as h, useCallback, useEffect, useMemo, useState, type Rea
 export interface TopicSetView {
   id: string
   title: string
+  /** Tags (host `keywords`): the index the 话题集 tab filters on. */
+  tags: string[]
   summary: string
-  branches: Array<{ sessionId: string; title: string; status: string; model?: string }>
+  /** Session count (R11): how many sessions this topic set holds. */
+  sessions: number
+  /** How many of those sessions are live right now. */
+  live: number
+  branches: Array<{
+    sessionId: string
+    kind: 'root' | 'fork'
+    title: string
+    status: string
+    model?: string
+    topicSetId?: string
+    topicSetTitle?: string
+    hubs?: number
+  }>
   model?: string
 }
 
 export interface MemoryView {
   id: string
+  title: string
+  tags: string[]
   text: string
   key?: string
   status: string
@@ -29,6 +46,8 @@ export interface MemoryView {
 export interface ToolView {
   id: string
   name: string
+  title: string
+  tags: string[]
   description: string
   steps: string[]
   parameters: string[]
@@ -92,26 +111,104 @@ export interface MutationResult {
  */
 export type SessionBadge =
   | { kind: 'hub' }
+  /** R19 需求③: hub conversation that is the root member of a topic set. */
+  | { kind: 'hub-set'; topicSetId: string; topicSetTitle: string }
   | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+
+/**
+ * R18 需求①: one row of the panel's left rail. A hub session is a top-level
+ * session of this workspace that belongs to no topic set — the mirror of a
+ * dispatched branch.
+ */
+export interface HubSessionView {
+  sessionId: string
+  title: string
+  live: boolean
+  updatedAt: number
+  createdAt: number
+  origin: 'hub'
+  /** R19 需求①: the row's workspace (filtered by the selected workspace). */
+  cwd: string
+  workspaceKey: string
+  /** R19 需求③: set this hub belongs to as its root conversation. */
+  topicSetId?: string
+  topicSetTitle?: string
+  /** R19 协同②: how many branches this hub started (and how many are working). */
+  branches: number
+  workingBranches: number
+}
+
+/**
+ * R19 协同②: one branch of a hub, projected from the durable dispatch table.
+ * The same shape is returned by the host's `listHubBranches`; `shared` means
+ * more than one hub dispatched into the branch (跨中枢共享, requirement ③).
+ */
+export interface HubBranchView {
+  branchSessionId: string
+  title: string
+  task: string
+  hubSessionId: string
+  topicSetId?: string
+  topicSetTitle?: string
+  status: 'working' | 'idle' | 'failed'
+  openDispatches: number
+  dispatches: number
+  groupId?: string
+  lastActivityAt: number
+  hubs: string[]
+  shared: boolean
+}
+
+/** R19 需求⑤: one chat row inside the panel. */
+export interface SessionMessageView {
+  seq: number
+  role: 'user' | 'assistant' | 'tool'
+  text: string
+  at: number
+}
+
+/** R19 需求⑤: the panel's read/send view of one session. */
+export interface SessionChatView {
+  sessionId: string
+  title: string
+  live: boolean
+  messages: SessionMessageView[]
+  truncated: boolean
+  note?: string
+}
+
+/** R18 需求②: title/tags the host derives from a memory body. */
+export interface MemoryShape {
+  title: string
+  tags: string[]
+}
 
 /** Injected face: host-panel calls plus navigation, built in apply(). */
 export interface PanelApi {
   loadHub(cwd: string, sessionId: string): Promise<HubState>
   listMemories(cwd: string, query?: string): Promise<MemoryView[]>
-  createMemory(cwd: string, text: string, key?: string): Promise<MutationResult>
-  updateMemory(cwd: string, id: string, text: string, key?: string): Promise<MutationResult>
+  createMemory(cwd: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
+  updateMemory(cwd: string, id: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   deleteMemory(cwd: string, id: string): Promise<MutationResult>
   setMemoryStatus(cwd: string, id: string, status: string): Promise<MutationResult>
-  createTopicSet(cwd: string, title: string): Promise<MutationResult>
+  createTopicSet(cwd: string, title: string, tags?: string[], summary?: string): Promise<MutationResult>
   activate(sessionId: string, topicSetId: string): Promise<boolean>
-  updateTopicSetSummary(id: string, summary: string): Promise<MutationResult>
-  createTopicSetSession(cwd: string, ids: string[], options?: SessionOptions): Promise<MutationResult>
-  createHubSession(cwd: string, options?: SessionOptions): Promise<MutationResult>
+  updateTopicSetSummary(id: string, summary: string, tags?: string[]): Promise<MutationResult>
+  createTopicSetSession(cwd: string, ids: string[], options?: SessionOptions, firstMessage?: string): Promise<MutationResult>
+  createHubSession(cwd: string, options?: SessionOptions, firstMessage?: string): Promise<MutationResult>
   followupTopicSet(cwd: string, topicSetId: string, text: string): Promise<MutationResult>
   listTools(): Promise<ToolView[]>
   editTool(id: string, patch: Record<string, unknown>): Promise<MutationResult>
   deleteTool(id: string): Promise<MutationResult>
   sessionBadge(sessionId: string): Promise<SessionBadge>
+  listHubSessions(cwd: string): Promise<HubSessionView[]>
+  /** R19 协同②: the branches one hub started (name / state / set / shared). */
+  listHubBranches(cwd: string, hubSessionId: string, limit?: number): Promise<HubBranchView[]>
+  readSessionMessages(sessionId: string, limit?: number): Promise<SessionChatView>
+  sendSessionMessage(sessionId: string, text: string): Promise<MutationResult>
+  suggestMemoryShape(text: string): Promise<MemoryShape>
+  /** R18: drop the sidebar badge cache after a refresh / dispatch receipt. */
+  invalidateBadges(sessionId?: string): void
   openSession(sessionId: string): void
   startSession(): void
   loadTopicSets(cwd: string): Promise<TopicSetView[]>
@@ -127,49 +224,162 @@ export interface PanelPageProps {
   api: PanelApi
 }
 
-type View = { kind: 'hub' } | { kind: 'topic'; id: string } | { kind: 'memories' } | { kind: 'tools' }
+type View =
+  | { kind: 'hub' }
+  | { kind: 'sets' }
+  | { kind: 'topic'; id: string }
+  | { kind: 'memories' }
+  | { kind: 'tools' }
+  | { kind: 'chat'; id: string }
 
 const PANEL_CSS = `
+/* R18 需求⑥: 8px grid, 10px cards, hover lift, underline tabs, compact head.
+   Every colour rides the host theme vocabulary (--dsw-alias-*), never a
+   hardcoded palette: the panel must follow light/dark like the shell. */
 .sm-panel{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary,#f9fafb);background:var(--dsw-alias-bg-base,#151517);font-size:13px}
 .sm-panel *{box-sizing:border-box}
-.sm-head{display:flex;align-items:center;gap:8px;padding:12px 16px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
-.sm-head h1{font-size:15px;margin:0;font-weight:600}
-.sm-counts{margin-left:auto;opacity:.65;font-size:11px}
-.sm-tabs{display:flex;gap:2px;padding:8px 12px 0;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
-.sm-tab{padding:6px 12px;border:none;background:transparent;color:inherit;opacity:.6;cursor:pointer;border-radius:6px 6px 0 0;font-size:12px}
-.sm-tab[data-active="true"]{opacity:1;background:var(--dsw-alias-bg-layer-1,#232324);font-weight:600}
-.sm-body{flex:1;min-height:0;overflow:auto;padding:12px 16px}
-.sm-card{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;padding:10px 12px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-1,#232324)}
-.sm-card h3{margin:0 0 4px;font-size:13px}
-.sm-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.sm-muted{opacity:.6;font-size:11px}
-.sm-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:inherit;cursor:pointer;font-size:12px}
-.sm-btn:hover{border-color:var(--dsw-alias-link,#7aaaff)}
-.sm-btn[data-variant="primary"]{background:var(--dsw-alias-button-primary-fill,#f9fafb);border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#0f1115)}
-.sm-btn[data-variant="primary"]:hover{border-color:transparent;background:var(--dsw-alias-button-primary-hover,#ebeef2)}
-.sm-btn[data-variant="danger"]{border-color:var(--dsw-alias-state-error-primary,#f25a5a);color:var(--dsw-alias-state-error-primary,#f25a5a)}
-.sm-btn:disabled{opacity:.45;cursor:default}
-.sm-input{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}
-.sm-select{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}
-.sm-textarea{width:100%;min-height:56px;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit;resize:vertical}
-.sm-field{display:flex;flex-direction:column;gap:4px;margin-bottom:8px}
-.sm-field .sm-field-label{font-size:11px;opacity:.6}
-.sm-check{display:flex;gap:8px;align-items:center;padding:4px 6px;border-radius:6px;cursor:pointer;font-size:12px}
-.sm-check:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}
-.sm-list{display:flex;flex-direction:column;gap:6px}
-.sm-item{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1,#232324)}
+.sm-shell{display:flex;height:100%;min-height:0;width:100%}
+
+/* ---- left rail: hub sessions (R18 需求①) ---- */
+.sm-side{display:flex;flex-direction:column;gap:8px;width:232px;flex:none;min-height:0;padding:12px 8px;border-right:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));background:var(--dsw-alias-bg-layer-1,#1c1c1e)}
+.sm-side-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 6px;font-size:11px;font-weight:600;letter-spacing:.04em;opacity:.55}
+.sm-side-count{font-weight:400;letter-spacing:0}
+.sm-side-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.sm-hub{display:flex;align-items:center;gap:6px;width:100%;padding:7px 8px;border:1px solid transparent;border-radius:8px;background:transparent;color:inherit;font-family:inherit;font-size:12px;text-align:left;cursor:pointer;transition:background .12s ease,border-color .12s ease}
+.sm-hub:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}
+.sm-hub[data-current="true"]{border-color:var(--dsw-alias-link,#7aaaff);background:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 14%,transparent)}
+.sm-hub-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sm-hub-meta{font-size:9px;opacity:.6;flex:none;max-width:72px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sm-hub-set{color:var(--dsw-alias-link,#7aaaff);opacity:.85}
+.sm-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-success-primary,#22c55e);flex:none;box-shadow:0 0 0 2px color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 18%,transparent)}
+.sm-side-empty{padding:10px 8px;font-size:11px;line-height:1.5;opacity:.5}
+.sm-side-foot{margin-top:auto;padding-top:6px;border-top:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1))}
+.sm-newhub{width:100%;justify-content:center}
+
+/* ---- right body ---- */
+.sm-main{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
+.sm-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1))}
+.sm-brand{font-size:13px;font-weight:650;letter-spacing:.01em}
+.sm-head-sub{font-size:11px;opacity:.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:240px}
+.sm-pills{display:flex;align-items:center;gap:4px;margin-left:auto;flex-wrap:wrap}
+.sm-pill{padding:1px 8px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));font-size:10px;line-height:16px;opacity:.75;white-space:nowrap}
+.sm-tabs{display:flex;align-items:stretch;gap:4px;padding:0 12px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));overflow-x:auto}
+.sm-tab{padding:8px 10px;border:none;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:inherit;opacity:.62;cursor:pointer;font-size:12px;font-family:inherit;white-space:nowrap;margin-bottom:-1px;transition:opacity .12s ease,border-color .12s ease}
+.sm-tab:hover{opacity:.9;background:transparent}
+.sm-tab[data-active="true"]{opacity:1;border-bottom-color:var(--dsw-alias-link,#7aaaff);font-weight:600;background:transparent}
+.sm-body{flex:1;min-height:0;overflow:auto;padding:12px 16px 20px}
+
+/* ---- surfaces ---- */
+.sm-card{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));border-radius:10px;padding:10px 12px;margin-bottom:8px;background:var(--dsw-alias-bg-layer-1,#1f1f21);transition:border-color .12s ease,box-shadow .12s ease}
+.sm-card:hover,.sm-item:hover{border-color:var(--dsw-alias-border-l1,rgba(255,255,255,.2))}
+.sm-card h3{margin:0 0 6px;font-size:12.5px;font-weight:600;opacity:.9}
+.sm-item{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));border-radius:10px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1,#1f1f21);transition:border-color .12s ease,transform .12s ease,box-shadow .12s ease}
 .sm-item[data-clickable="true"]{cursor:pointer}
-.sm-item[data-clickable="true"]:hover{border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-item[data-clickable="true"]:hover{border-color:var(--dsw-alias-link,#7aaaff);box-shadow:0 2px 10px rgba(0,0,0,.18)}
 .sm-item .sm-title{font-weight:600;font-size:12.5px}
-.sm-item .sm-sub{opacity:.6;font-size:11px;margin-top:2px;word-break:break-all}
-.sm-actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.sm-item .sm-sub{opacity:.58;font-size:11px;margin-top:2px;word-break:break-all}
+.sm-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sm-muted{opacity:.58;font-size:11px}
+.sm-list{display:flex;flex-direction:column;gap:8px}
+
+/* ---- buttons: three levels (primary / secondary / danger), two sizes ---- */
+.sm-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:5px 11px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:inherit;cursor:pointer;font-size:12px;font-family:inherit;line-height:1.4;transition:background .12s ease,border-color .12s ease,opacity .12s ease}
+.sm-btn:hover{border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-btn[data-size="sm"]{padding:3px 8px;font-size:11px;border-radius:7px}
+.sm-btn[data-variant="primary"]{background:var(--dsw-alias-button-primary-fill,#f9fafb);border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#0f1115);font-weight:600}
+.sm-btn[data-variant="primary"]:hover{background:var(--dsw-alias-button-primary-hover,#ebeef2);border-color:transparent}
+.sm-btn[data-variant="danger"]{border-color:var(--dsw-alias-state-error-primary,#f25a5a);color:var(--dsw-alias-state-error-primary,#f25a5a);background:transparent}
+.sm-btn[data-variant="danger"]:hover{background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#f25a5a) 12%,transparent)}
+.sm-btn:disabled{opacity:.45;cursor:default}
+
+/* ---- fields ---- */
+.sm-input,.sm-select,.sm-textarea{width:100%;padding:6px 9px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}
+.sm-input:focus,.sm-select:focus,.sm-textarea:focus{outline:none;border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-textarea{min-height:56px;resize:vertical;line-height:1.5}
+.sm-field{display:flex;flex-direction:column;gap:6px;margin-bottom:8px}
+.sm-field .sm-field-label{font-size:11px;opacity:.55}
+.sm-check{display:flex;gap:8px;align-items:center;padding:4px 6px;border-radius:8px;cursor:pointer;font-size:12px}
+.sm-check:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}
+.sm-form{display:flex;gap:8px;margin-bottom:8px}
+.sm-form .sm-input{flex:1}
+.sm-form-col{display:flex;flex-direction:column;gap:8px;margin-bottom:10px}
+.sm-form-row{display:flex;gap:8px;flex-wrap:wrap}
+.sm-form-row .sm-input{flex:1;min-width:120px}
+.sm-form-label{font-size:11px;opacity:.55}
+.sm-back{margin-bottom:8px}
+
+/* ---- feedback ---- */
+.sm-actions{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
 .sm-error{color:var(--dsw-alias-state-error-primary,#f25a5a);font-size:12px;padding:8px 0}
 .sm-ok{color:var(--dsw-alias-state-success-primary,#22c55e);font-size:12px;padding:4px 0}
-.sm-badge{display:inline-block;padding:1px 6px;border-radius:99px;font-size:10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));opacity:.8;margin-right:4px}
-.sm-empty{opacity:.55;padding:16px 0;text-align:center}
-.sm-form{display:flex;gap:6px;margin-bottom:10px}
-.sm-form .sm-input{flex:1}
-.sm-back{margin-bottom:8px}
+.sm-badge{display:inline-block;padding:1px 7px;border-radius:999px;font-size:10px;line-height:16px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));opacity:.8;margin-right:4px}
+.sm-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;padding:28px 12px;text-align:center;opacity:.6}
+.sm-empty-art{opacity:.5;margin-bottom:2px}
+.sm-empty-label{font-size:12px}
+.sm-empty-hint{font-size:11px;opacity:.75;max-width:280px;line-height:1.5}
+.sm-shape-hint{font-size:11px;opacity:.55;margin-top:-2px}
+
+/* ---- composer (hub tab) ---- */
+.sm-composer{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));border-radius:12px;padding:14px;margin-bottom:10px;background:var(--dsw-alias-bg-layer-1,#1f1f21)}
+.sm-composer-head{margin-bottom:10px}
+.sm-composer-title{margin:0 0 4px;font-size:16px;font-weight:650}
+.sm-composer-desc{margin:0;font-size:11.5px;opacity:.58;line-height:1.55}
+.sm-composer-input{width:100%;min-height:92px;padding:10px 12px;border-radius:10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:13px;font-family:inherit;resize:vertical;line-height:1.55}
+.sm-composer-input:focus{outline:none;border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-composer-bar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px}
+.sm-composer-opts{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.08))}
+.sm-opt{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:999px;background:transparent;font-size:11px}
+.sm-opt-label{opacity:.55;font-size:11px;white-space:nowrap}
+.sm-opt-select{border:none;background:transparent;color:inherit;font-size:11px;padding:1px 2px;max-width:160px}
+.sm-opt-select:focus{outline:none}
+.sm-composer-sets{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px}
+.sm-chip{padding:3px 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:transparent;color:inherit;font-size:11px;cursor:pointer;font-family:inherit}
+.sm-chip:hover{border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-chip[data-active="true"]{border-color:var(--dsw-alias-link,#7aaaff);background:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 14%,transparent)}
+.sm-chip[data-dashed="true"]{border-style:dashed;opacity:.75}
+.sm-set-created{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;font-size:11px;opacity:.85}
+.sm-receipt{border:1px solid var(--dsw-alias-link,#7aaaff);border-radius:10px;padding:10px 12px;margin-bottom:10px;font-size:12px;background:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 8%,transparent)}
+.sm-receipt .sm-sub{margin-top:4px}
+
+/* ---- retrieval shape: title + tags + body ---- */
+.sm-tags{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+.sm-tag{padding:0 7px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.18));font-size:10px;opacity:.85;line-height:16px;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sm-tag[data-hit="true"]{border-color:var(--dsw-alias-link,#7aaaff);color:var(--dsw-alias-link,#7aaaff);opacity:1}
+.sm-body-text{margin-top:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.sm-body-text[data-open="true"]{-webkit-line-clamp:unset;overflow:visible}
+
+/* ---- R19: global workspace selector, in-panel chat, memory modal ---- */
+.sm-ws{display:inline-flex;align-items:center;gap:5px;font-size:11px;opacity:.9;min-width:0}
+.sm-ws-select{max-width:280px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:999px;background:transparent;color:inherit;font-size:11px;padding:2px 7px;font-family:inherit}
+.sm-ws-select:focus{outline:none;border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-chat{display:flex;flex-direction:column;gap:8px}
+.sm-chat-head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-bottom:8px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));margin-bottom:4px}
+.sm-msg{display:flex;flex-direction:column;gap:2px;padding:8px 10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));border-radius:10px;background:var(--dsw-alias-bg-layer-1,#1f1f21)}
+.sm-msg[data-role="user"]{border-color:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 7%,transparent)}
+.sm-msg[data-role="tool"]{opacity:.72}
+.sm-msg-role{font-size:10px;opacity:.55;letter-spacing:.04em}
+.sm-msg-text{white-space:pre-wrap;word-break:break-word;font-size:12.5px;line-height:1.6}
+.sm-msg[data-role="tool"] .sm-msg-text{font-size:11px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.sm-chat-bar{display:flex;align-items:flex-end;gap:8px;margin-top:8px}
+.sm-chat-bar textarea{flex:1;min-height:60px;padding:8px 10px;border-radius:10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-family:inherit;font-size:12.5px;resize:vertical;line-height:1.5}
+.sm-chat-bar textarea:focus{outline:none;border-color:var(--dsw-alias-link,#7aaaff)}
+.sm-modal-backdrop{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.52)}
+.sm-modal{width:min(560px,100%);max-height:82vh;overflow:auto;padding:14px;border:1px solid var(--dsw-alias-border-l1,rgba(255,255,255,.2));border-radius:12px;background:var(--dsw-alias-bg-layer-1,#1f1f21);box-shadow:0 18px 48px rgba(0,0,0,.4)}
+.sm-modal h3{margin:0 0 10px;font-size:14px;font-weight:650}
+.sm-modal-hint{font-size:11px;opacity:.58;line-height:1.55;margin:-4px 0 10px}
+
+/* ---- narrow windows: the rail folds into a horizontal strip ---- */
+@media (max-width:760px){
+  .sm-shell{flex-direction:column}
+  .sm-side{width:auto;flex:none;flex-direction:row;align-items:center;gap:8px;padding:8px;border-right:none;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));overflow:hidden}
+  .sm-side-head{padding:0;white-space:nowrap}
+  .sm-side-count{display:none}
+  .sm-side-list{flex-direction:row;overflow-x:auto;overflow-y:hidden;gap:6px;min-width:0}
+  .sm-hub{width:auto;max-width:180px;flex:none}
+  .sm-side-foot{margin:0;padding:0;border:none;flex:none}
+  .sm-newhub{width:auto;white-space:nowrap}
+  .sm-body{padding:10px 12px 16px}
+}
 `
 
 let cssInstalled = false
@@ -186,17 +396,130 @@ function Button(props: {
   label: string
   onClick?: () => void
   variant?: 'primary' | 'danger'
+  size?: 'sm'
   disabled?: boolean
   title?: string
+  className?: string
 }): ReactElement {
   return h('button', {
     type: 'button',
-    className: 'sm-btn',
+    className: ['sm-btn', props.className].filter(Boolean).join(' '),
     'data-variant': props.variant,
+    'data-size': props.size,
     disabled: props.disabled,
     title: props.title,
     onClick: props.onClick,
   }, props.label)
+}
+
+/**
+ * R18 需求⑥: illustration-style empty state. A tiny inline SVG (drawn with the
+ * theme's own label colour) replaces the bare "暂无" line everywhere.
+ */
+function EmptyState(props: { label: string; hint?: string }): ReactElement {
+  return h('div', { className: 'sm-empty' },
+    h('svg', {
+      key: 'art', className: 'sm-empty-art', width: 48, height: 48, viewBox: '0 0 48 48',
+      fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round',
+      strokeLinejoin: 'round', 'aria-hidden': true, focusable: false,
+    },
+      h('rect', { key: 'a', x: 9, y: 13, width: 30, height: 23, rx: 4 }),
+      h('path', { key: 'b', d: 'M9 20h30' }),
+      h('circle', { key: 'c', cx: 15, cy: 17, r: 1.4, fill: 'currentColor', stroke: 'none' }),
+      h('path', { key: 'd', d: 'M16 27h12' }),
+      h('path', { key: 'e', d: 'M16 31h8' }),
+    ),
+    h('div', { key: 'label', className: 'sm-empty-label' }, props.label),
+    props.hint ? h('div', { key: 'hint', className: 'sm-empty-hint' }, props.hint) : null,
+  )
+}
+
+/** R19 协同②: coarse relative time for branch cards, localized (no date lib). */
+function branchAgo(at: number, t: (key: string, params?: Record<string, string | number>) => string): string {
+  if (!Number.isFinite(at) || at <= 0) return '—'
+  const delta = Math.max(0, Date.now() - at)
+  if (delta < 60_000) return t('branches.ago.just')
+  if (delta < 3_600_000) return t('branches.ago.min', { count: Math.floor(delta / 60_000) })
+  if (delta < 86_400_000) return t('branches.ago.hour', { count: Math.floor(delta / 3_600_000) })
+  return t('branches.ago.day', { count: Math.floor(delta / 86_400_000) })
+}
+
+/**
+ * R19 协同②: the hub's linked branches. One card, every consumer (hub tab and
+ * the in-panel chat of a hub) passes its own rows; a branch row opens that
+ * branch's conversation in the panel.
+ */
+function BranchList(props: {
+  rows: HubBranchView[]
+  t: (key: string, params?: Record<string, string | number>) => string
+  onOpen: (sessionId: string) => void
+  compact?: boolean
+}): ReactElement {
+  // Defensive: a host/remote failure must never blank the panel (an older host
+  // may answer a non-array), so the list renders its empty state instead.
+  const rows = Array.isArray(props.rows) ? props.rows : []
+  const { t, onOpen } = props
+  return h('div', { key: 'branches', className: 'sm-card' },
+    h('div', { key: 'head', className: 'sm-row' },
+      h('h3', { key: 'title' }, t('branches.title')),
+      h('span', { key: 'count', className: 'sm-badge' }, String(rows.length)),
+    ),
+    rows.length === 0
+      ? h(EmptyState, { key: 'empty', label: t('branches.empty'), hint: props.compact ? undefined : t('branches.empty.hint') })
+      : h('div', { key: 'list', className: 'sm-list' },
+          rows.map((row) =>
+            h('div', {
+              key: row.branchSessionId, className: 'sm-item', 'data-clickable': 'true',
+              title: `${row.title} · ${row.branchSessionId}`,
+              onClick: () => onOpen(row.branchSessionId),
+            },
+              h('div', { key: 'row', className: 'sm-row' },
+                h('span', { key: 'title', className: 'sm-title' }, row.title),
+                h('span', { key: 'state', className: 'sm-badge', 'data-state': row.status }, t(`branches.${row.status}`)),
+                row.shared
+                  ? h('span', { key: 'shared', className: 'sm-badge', title: row.hubs.join('、') }, t('branches.shared', { count: row.hubs.length - 1 }))
+                  : null,
+                row.groupId ? h('span', { key: 'grp', className: 'sm-badge' }, t('branches.group')) : null,
+              ),
+              h('div', { key: 'meta', className: 'sm-sub' },
+                `${row.topicSetTitle ? t('branches.set', { title: row.topicSetTitle }) : t('branches.noSet')} · `
+                + `${branchAgo(row.lastActivityAt, t)} · ${t('branches.dispatches', { count: row.dispatches })}`,
+              ),
+              h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
+            ),
+          ),
+        ),
+  )
+}
+
+/** Tag chips: the record's index fields, rendered beside the title. */
+function tagChips(tags: string[], needle = ''): ReactElement | null {
+  const list = (tags ?? []).filter(Boolean)
+  if (list.length === 0) return null
+  const lowered = needle.trim().toLowerCase()
+  return h('div', { className: 'sm-tags' },
+    list.map((tag) =>
+      h('span', {
+        key: tag,
+        className: 'sm-tag',
+        'data-hit': String(lowered.length > 0 && tag.toLowerCase().includes(lowered)),
+        title: tag,
+      }, tag),
+    ),
+  )
+}
+
+/** Split a tag input ("a，b c" / "a,b") into the array the host expects. */
+function splitTags(raw: string): string[] {
+  return String(raw ?? '').split(/[,，、;；\s]+/).map((tag) => tag.trim()).filter(Boolean)
+}
+
+/** Client-side title fallback for records written before titles existed. */
+function deriveTitleClient(body: string): string {
+  const clean = String(body ?? '').replace(/\s+/g, ' ').trim()
+  if (!clean) return ''
+  const clause = clean.split(/[。！？；;.!?]/)[0]?.trim() || clean
+  return clause.length <= 48 ? clause : `${clause.slice(0, 47)}…`
 }
 
 /** The SuperMemory main panel page. */
@@ -211,19 +534,27 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [error, setError] = useState<string | undefined>()
   const [notice, setNotice] = useState<string | undefined>()
   const [query, setQuery] = useState('')
+  // R11: the 话题集 tab filters on title + tags (never on every body), so a
+  // workspace with many topic sets stays searchable by index.
+  const [setsQuery, setSetsQuery] = useState('')
   const [newMemory, setNewMemory] = useState('')
-  const [newTopicTitle, setNewTopicTitle] = useState('')
+  const [newMemoryTitle, setNewMemoryTitle] = useState('')
+  const [newMemoryTags, setNewMemoryTags] = useState('')
   const [reply, setReply] = useState('')
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
-  const [editingMemory, setEditingMemory] = useState<{ id: string; text: string } | undefined>()
-  const [editingTool, setEditingTool] = useState<{ id: string; description: string } | undefined>()
+  const [summaryTagsDraft, setSummaryTagsDraft] = useState<string[] | undefined>()
+  const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string } | undefined>()
+  const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string } | undefined>()
   const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
   // R7 quick launcher (中枢会话页签): the new-session-page choices — workspace,
   // agent preset, model, permission — beside the topic-set selection.
   const [presets, setPresets] = useState<AgentPresetView[]>([])
   const [catalog, setCatalog] = useState<ModelCatalogView | undefined>()
   const [permissions, setPermissions] = useState<PermissionCatalogView | undefined>()
-  const [launchWorkspace, setLaunchWorkspace] = useState('')
+  // R19 需求②: ONE workspace source for the whole panel (left rail, hub tab,
+  // launcher, memories/topic sets). The old `launchWorkspace` was a second,
+  // independent selector; it is gone.
+  const [workspacePath, setWorkspacePath] = useState('')
   const [launchPreset, setLaunchPreset] = useState('')
   const [launchModel, setLaunchModel] = useState('')
   const [launchPermission, setLaunchPermission] = useState('')
@@ -231,6 +562,30 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [launchSelected, setLaunchSelected] = useState<string[]>([])
   const [launchNewTitle, setLaunchNewTitle] = useState('')
   const [launching, setLaunching] = useState(false)
+  // R8: the composer's opening message and the in-place launch receipt. The
+  // hub tab no longer navigates to the shell's new-session page: the session
+  // is created host-side, the message is delivered as its first turn, and the
+  // receipt is rendered right below the composer.
+  const [composerText, setComposerText] = useState('')
+  const [showNewSet, setShowNewSet] = useState(false)
+  const [receipt, setReceipt] = useState<{ id: string; message: string; kind: 'hub' | 'sets' } | undefined>()
+  // R18 需求①: the left rail's hub sessions, refreshed together with the hub
+  // state (a new session appears there without a page reload).
+  const [hubs, setHubs] = useState<HubSessionView[]>([])
+  // R19 协同②: hub → branches. `hubBranches` is the CURRENT session's list
+  // (hub tab), `chatBranches` the viewed session's list (chat view), so both
+  // surfaces answer "which branches did this hub start?".
+  const [hubBranches, setHubBranches] = useState<HubBranchView[]>([])
+  const [chatBranches, setChatBranches] = useState<HubBranchView[]>([])
+  // R18 需求②: the topic set just created (title + auto tags must be visible).
+  const [createdSet, setCreatedSet] = useState<{ title: string; tags: string[] } | undefined>()
+  // Whether the memory editor auto-filled title/tags from the body.
+  const [shapeAuto, setShapeAuto] = useState(false)
+  // R19 需求⑤: the in-panel conversation (no navigation to the shell session).
+  const [chatData, setChatData] = useState<SessionChatView | undefined>()
+  const [chatDraft, setChatDraft] = useState('')
+  const [chatSending, setChatSending] = useState(false)
+  const [chatError, setChatError] = useState<string | undefined>()
 
   const workspaces = props.useWorkspaces((state) => state.items)
   const sessionId = props.useSessions((state) => {
@@ -251,16 +606,67 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
     return ''
   })
-  const cwd = useMemo(() => sessionCwd || workspaces[0]?.path || '', [sessionCwd, workspaces])
+  const cwd = useMemo(
+    () => workspacePath || sessionCwd || workspaces[0]?.path || '',
+    [workspacePath, sessionCwd, workspaces],
+  )
+
+  // Remember the last workspace, and never keep a path that is no longer open.
+  useEffect(() => {
+    if (workspacePath) {
+      if (workspaces.length === 0 || workspaces.some((workspace) => workspace.path === workspacePath)) return
+    }
+    let remembered = ''
+    try {
+      remembered = localStorage.getItem('sm-panel-ws') || ''
+    } catch { /* private mode: the in-memory default still works */ }
+    const known = (path: string): boolean => workspaces.length === 0 || workspaces.some((workspace) => workspace.path === path)
+    const next = remembered && known(remembered) ? remembered : (sessionCwd || workspaces[0]?.path || '')
+    if (next) setWorkspacePath(next)
+  }, [sessionCwd, workspacePath, workspaces])
+
+  /** Switch the panel's one workspace and reset every workspace-scoped view. */
+  const changeWorkspace = useCallback((path: string): void => {
+    if (!path || path === workspacePath) return
+    setWorkspacePath(path)
+    try {
+      localStorage.setItem('sm-panel-ws', path)
+    } catch { /* private mode */ }
+    setHub(undefined)
+    setHubs([])
+    setHubBranches([])
+    setChatBranches([])
+    setLaunchSelected([])
+    setLaunchSets([])
+    setReceipt(undefined)
+    setCreatedSet(undefined)
+    setChatData(undefined)
+    setChatDraft('')
+    setChatError(undefined)
+    setView({ kind: 'hub' })
+  }, [workspacePath])
 
   const refreshHub = useCallback(async () => {
     if (!cwd) return
     setLoading(true)
     setError(undefined)
     try {
-      const state = await api.loadHub(cwd, sessionId)
+      // R18 需求①: the rail rides the same refresh — hub sessions are created by
+      // this very page, so a stale rail would hide the session just started.
+      // R19 协同②: the current hub's branch list rides it too.
+      const [state, hubRows, branchRows] = await Promise.all([
+        api.loadHub(cwd, sessionId),
+        api.listHubSessions(cwd).then((rows) => rows, () => [] as HubSessionView[]),
+        sessionId
+          ? api.listHubBranches(cwd, sessionId).then((rows) => rows, () => [] as HubBranchView[])
+          : Promise.resolve([] as HubBranchView[]),
+      ])
       setHub(state)
       setMemories(state.memories)
+      setHubs(hubRows)
+      setHubBranches(branchRows)
+      // R18 需求③: a refresh is exactly when membership may have changed.
+      api.invalidateBadges()
     } catch (loadError) {
       setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
     } finally {
@@ -289,6 +695,61 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
 
+  // R19 需求⑤: read one session's model-visible surface. The panel polls this
+  // method (2.5 s) instead of opening the shell session; `sessionQuery` gives
+  // the same fold the model sees, and a failure renders an explicit note.
+  const loadChat = useCallback(async (id: string): Promise<void> => {
+    try {
+      const [data, branches] = await Promise.all([
+        api.readSessionMessages(id, 80),
+        cwd ? api.listHubBranches(cwd, id).then((rows) => rows, () => [] as HubBranchView[]) : Promise.resolve([] as HubBranchView[]),
+      ])
+      setChatData(data)
+      setChatBranches(branches)
+      setChatError(undefined)
+    } catch (loadError) {
+      setChatError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  const openChat = useCallback((id: string): void => {
+    setChatData(undefined)
+    setChatDraft('')
+    setChatError(undefined)
+    setView({ kind: 'chat', id })
+  }, [])
+
+  // Poll only while the chat view is open and the document is visible.
+  useEffect(() => {
+    if (view.kind !== 'chat') return
+    const id = view.id
+    void loadChat(id)
+    const timer = setInterval(() => {
+      if (typeof document === 'undefined' || !document.hidden) void loadChat(id)
+    }, 2500)
+    return () => clearInterval(timer)
+  }, [loadChat, view])
+
+  const sendChat = async (id: string): Promise<void> => {
+    const text = chatDraft.trim()
+    if (!text) return
+    setChatSending(true)
+    setChatError(undefined)
+    try {
+      const result = await api.sendSessionMessage(id, text)
+      if (result.status === 'ok') {
+        setChatDraft('')
+        await loadChat(id)
+      } else {
+        setChatError(result.message)
+      }
+    } catch (sendError) {
+      setChatError(`${t('error.generic')}: ${String(sendError instanceof Error ? sendError.message : sendError)}`)
+    } finally {
+      setChatSending(false)
+    }
+  }
+
   // R7: the host catalogs behind the quick launcher (agent presets, model
   // routes, permission presets), read once per mount. A failure leaves the
   // corresponding selector empty — the launcher still works with defaults.
@@ -300,28 +761,36 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     return () => { alive = false }
   }, [api])
 
-  // The launcher defaults to the workspace the panel itself points at (the
-  // main-view session's cwd, else the first open workspace).
+  // R19 需求②: the launcher's topic sets belong to the SAME selected workspace
+  // (the header selector is the single source); a stale selection is dropped.
   useEffect(() => {
-    if (launchWorkspace) return
-    if (cwd) setLaunchWorkspace(cwd)
-    else if (workspaces.length > 0) setLaunchWorkspace(workspaces[0].path)
-  }, [cwd, launchWorkspace, workspaces])
-
-  // The launcher's topic sets belong to the SELECTED workspace, not to the
-  // panel's own cwd; a selection that no longer exists is dropped.
-  useEffect(() => {
-    if (!launchWorkspace) return
+    if (!cwd) return
     let alive = true
-    void api.loadTopicSets(launchWorkspace).then((rows) => {
+    void api.loadTopicSets(cwd).then((rows) => {
       if (!alive) return
       setLaunchSets(rows)
       setLaunchSelected((current) => current.filter((id) => rows.some((row) => row.id === id)))
     }, () => { if (alive) setLaunchSets([]) })
     return () => { alive = false }
-  }, [api, launchWorkspace])
+  }, [api, cwd])
 
-  const launchCwd = launchWorkspace || cwd
+  // R18 需求②: title + tags are never left for the user to invent. On blur the
+  // host derives them from the body (same rules as the write path) and fills
+  // whichever field is still empty; typed values are never overwritten.
+  const fillMemoryShape = useCallback(async () => {
+    const body = newMemory.trim()
+    if (!body) return
+    if (newMemoryTitle.trim() && newMemoryTags.trim()) return
+    try {
+      const shape = await api.suggestMemoryShape(body)
+      let filled = false
+      if (!newMemoryTitle.trim() && shape.title) { setNewMemoryTitle(shape.title); filled = true }
+      if (!newMemoryTags.trim() && shape.tags.length > 0) { setNewMemoryTags(shape.tags.join('，')); filled = true }
+      if (filled) setShapeAuto(true)
+    } catch { /* a convenience: a failed suggestion never blocks the form */ }
+  }, [api, newMemory, newMemoryTags, newMemoryTitle])
+
+  const launchCwd = cwd
 
   const launchCreateSet = async (): Promise<void> => {
     const title = launchNewTitle.trim()
@@ -335,14 +804,22 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       const rows = await api.loadTopicSets(launchCwd)
       setLaunchSets(rows)
       setLaunchSelected((current) => (current.includes(id) ? current : [...current, id]))
+      // R18 需求②: show what the host actually wrote (title + derived tags)
+      // instead of leaving the form blank after creation.
+      const createdRow = rows.find((row) => row.id === id)
+      setCreatedSet(createdRow
+        ? { title: createdRow.title, tags: createdRow.tags }
+        : { title: created.message, tags: [] })
       void refreshHub()
     } catch (createError) {
       setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
     }
   }
 
-  const startLaunch = async (): Promise<void> => {
+  const startLaunch = async (mode: 'chat' | 'bare' = 'chat'): Promise<void> => {
     if (!launchCwd) { setError(t('launch.needWorkspace')); return }
+    const text = composerText.trim()
+    if (mode === 'chat' && !text) return
     setLaunching(true)
     setError(undefined)
     setNotice(undefined)
@@ -354,13 +831,16 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         if (slash > 0) options.model = { provider: launchModel.slice(0, slash), model: launchModel.slice(slash + 1) }
       }
       if (launchPermission) options.permission = launchPermission
-      const result = launchSelected.length > 0
-        ? await api.createTopicSetSession(launchCwd, launchSelected, options)
-        : await api.createHubSession(launchCwd, options)
+      const ids = launchSelected
+      const opening = mode === 'chat' ? text : ''
+      const result = ids.length > 0
+        ? await api.createTopicSetSession(launchCwd, ids, options, opening)
+        : await api.createHubSession(launchCwd, options, opening)
       if (result.status === 'ok' && result.id) {
-        setNotice(result.message)
-        setLaunchSelected([])
-        api.openSession(result.id)
+        // In place: no api.openSession here. The user opens the conversation
+        // from the receipt only when they want to follow it in the shell.
+        setComposerText('')
+        setReceipt({ id: result.id, message: result.message, kind: ids.length > 0 ? 'sets' : 'hub' })
         void refreshHub()
       } else {
         setError(result.message)
@@ -371,6 +851,21 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       setLaunching(false)
     }
   }
+
+  const filteredSets = useMemo(() => {
+    const needle = setsQuery.trim().toLowerCase()
+    const rows = hub?.topicSets ?? []
+    if (!needle) return rows
+    const inIndex = (topicSet: TopicSetView): boolean =>
+      topicSet.title.toLowerCase().includes(needle)
+      || topicSet.tags.some((tag) => tag.toLowerCase().includes(needle))
+    // Index fields first (title, then tags), body hits last: the point of the
+    // title+tags+body shape is not having to scan every set's summary.
+    return [
+      ...rows.filter(inIndex),
+      ...rows.filter((topicSet) => !inIndex(topicSet) && topicSet.summary.toLowerCase().includes(needle)),
+    ]
+  }, [hub, setsQuery])
 
   const activeTopicSet = hub?.topicSets.find((topicSet) => topicSet.id === hub.activeTopicSetId)
   const currentTopicSet = view.kind === 'topic'
@@ -385,6 +880,9 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       if (result === true) { setNotice(t('ok.saved')); after?.(); return }
       if (result && result.status === 'ok') setNotice(result.message)
       else if (result) setError(result.message)
+      // R18 需求③: any successful mutation (activate, reply, topic-set edit) may
+      // have changed membership or titles the sidebar badge caches.
+      if (result && result.status === 'ok') api.invalidateBadges()
       after?.()
     } catch (actionError) {
       setError(`${t('error.generic')}: ${String(actionError instanceof Error ? actionError.message : actionError)}`)
@@ -394,111 +892,180 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const tabProps = (kind: View['kind']) => ({
     'data-active': String(view.kind === kind),
     className: 'sm-tab',
-    onClick: () => setView(kind === 'hub' ? { kind: 'hub' } : kind === 'memories' ? { kind: 'memories' } : kind === 'tools' ? { kind: 'tools' } : { kind: 'hub' }),
+    onClick: () => setView(
+      kind === 'hub' ? { kind: 'hub' }
+        : kind === 'sets' ? { kind: 'sets' }
+          : kind === 'memories' ? { kind: 'memories' }
+            : { kind: 'tools' },
+    ),
   })
 
-  // R7: the quick launcher — the new-session-page choices (workspace,
-  // agent preset, model, permission) beside the topic-set selection. No topic
-  // set selected creates a plain hub session; any selection creates a
-  // topic-set session bound to the chosen sets.
-  const launchView: ReactNode = h('div', { key: 'launch', className: 'sm-card' },
-    h('h3', null, t('launch.title')),
-    h('div', { key: 'ws', className: 'sm-field' },
-      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.workspace')),
-      h('select', {
-        key: 'select', className: 'sm-select', value: launchCwd,
-        onChange: (event: { target: { value: string } }) => setLaunchWorkspace(event.target.value),
+  // R8: the hub tab opens like the shell's new-session page — a title, one
+  // multiline composer and a primary action. The creation choices (workspace,
+  // agent preset, model, permission) are demoted to inline pills under the
+  // composer, and topic sets are toggle chips that bind the new session to
+  // them. Submitting creates the session host-side, DELIVERS the message as
+  // its first turn, and renders the receipt in place: no navigation to the
+  // shell's new-session page any more (the user opens it from the receipt
+  // only when they want to follow the conversation there).
+  const composerView: ReactNode = h('div', { key: 'composer', className: 'sm-composer' },
+    h('div', { key: 'head', className: 'sm-composer-head' },
+      h('h2', { key: 'title', className: 'sm-composer-title' }, t('composer.title')),
+      h('p', { key: 'desc', className: 'sm-composer-desc' }, t('composer.desc')),
+    ),
+    h('textarea', {
+      key: 'input', className: 'sm-composer-input', rows: 4,
+      value: composerText,
+      placeholder: t('composer.placeholder'),
+      onChange: (event: { target: { value: string } }) => setComposerText(event.target.value),
+      onKeyDown: (event: { key: string; ctrlKey?: boolean; metaKey?: boolean; preventDefault: () => void }) => {
+        if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+          event.preventDefault()
+          void startLaunch('chat')
+        }
       },
-        workspaces.length === 0
-          ? h('option', { key: 'current', value: launchCwd }, launchCwd || '—')
-          : workspaces.map((workspace) =>
-              h('option', { key: workspace.id, value: workspace.path }, workspace.title || workspace.path),
-            ),
-      ),
-    ),
-    h('div', { key: 'preset', className: 'sm-field' },
-      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.preset')),
-      h('select', {
-        key: 'select', className: 'sm-select', value: launchPreset,
-        onChange: (event: { target: { value: string } }) => setLaunchPreset(event.target.value),
-      },
-        h('option', { key: 'default', value: '' }, t('launch.default')),
-        presets.map((preset) =>
-          h('option', {
-            key: preset.id, value: preset.id,
-            title: preset.description || undefined,
-          }, (preset.name || preset.id) + (preset.isDefault ? `（${t('launch.defaultMark')}）` : '')),
-        ),
-      ),
-    ),
-    h('div', { key: 'model', className: 'sm-field' },
-      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.model')),
-      h('select', {
-        key: 'select', className: 'sm-select', value: launchModel,
-        onChange: (event: { target: { value: string } }) => setLaunchModel(event.target.value),
-      },
-        h('option', { key: 'default', value: '' }, t('launch.default')),
-        (catalog?.models ?? []).map((model) =>
-          h('option', {
-            key: `${model.provider}/${model.id}`, value: `${model.provider}/${model.id}`,
-            title: model.name || undefined,
-          }, `${model.provider}/${model.id}`),
-        ),
-      ),
-    ),
-    h('div', { key: 'permission', className: 'sm-field' },
-      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.permission')),
-      h('select', {
-        key: 'select', className: 'sm-select', value: launchPermission,
-        onChange: (event: { target: { value: string } }) => setLaunchPermission(event.target.value),
-      },
-        h('option', {
-          key: 'default', value: '',
-          title: (permissions?.options ?? []).find((option) => option.value === permissions?.defaultPreset)?.description || undefined,
-        }, permissions?.defaultPreset ? `${t('launch.default')}（${permissions.defaultPreset}）` : t('launch.default')),
-        (permissions?.options ?? []).map((option) =>
-          h('option', { key: option.value, value: option.value, title: option.description || undefined }, option.name || option.value),
-        ),
-      ),
-    ),
-    h('div', { key: 'sets', className: 'sm-field' },
-      h('span', { key: 'label', className: 'sm-field-label' }, t('launch.sets')),
-      h('div', { key: 'list', className: 'sm-list' },
-        launchSets.length === 0
-          ? h('div', { key: 'empty', className: 'sm-empty' }, t('hub.empty'))
-          : launchSets.map((topicSet) =>
-              h('label', { key: topicSet.id, className: 'sm-check' },
-                h('input', {
-                  key: 'box', type: 'checkbox', checked: launchSelected.includes(topicSet.id),
-                  onChange: () => setLaunchSelected((current) =>
-                    current.includes(topicSet.id) ? current.filter((entry) => entry !== topicSet.id) : [...current, topicSet.id]),
-                }),
-                h('span', { key: 'name' }, topicSet.title),
-              ),
-            ),
-      ),
-    ),
-    h('div', { key: 'newset', className: 'sm-form' },
-      h('input', {
-        key: 'input', className: 'sm-input', value: launchNewTitle,
-        placeholder: t('newSession.create'),
-        onChange: (event: { target: { value: string } }) => setLaunchNewTitle(event.target.value),
-      }),
-      h(Button, { key: 'add', label: t('topic.create'), disabled: !launchNewTitle.trim() || !launchCwd, onClick: () => void launchCreateSet() }),
-    ),
-    h('div', { key: 'actions', className: 'sm-actions' },
+    }),
+    h('div', { key: 'bar', className: 'sm-composer-bar' },
       h(Button, {
-        key: 'start', variant: 'primary',
-        label: launchSelected.length > 0 ? t('launch.startSets') : t('launch.start'),
-        disabled: launching || !launchCwd,
-        onClick: () => void startLaunch(),
+        key: 'send', variant: 'primary', label: t('composer.start'),
+        disabled: launching || !composerText.trim() || !launchCwd,
+        onClick: () => void startLaunch('chat'),
       }),
-      h('span', { key: 'hint', className: 'sm-muted' }, t('launch.hint')),
+      h(Button, {
+        key: 'bare', label: t('composer.createOnly'), title: t('composer.createOnly.hint'),
+        disabled: launching || !launchCwd,
+        onClick: () => void startLaunch('bare'),
+      }),
+      h('span', { key: 'hint', className: 'sm-muted' }, t('composer.hint')),
     ),
+    h('div', { key: 'opts', className: 'sm-composer-opts' },
+      h('label', { key: 'ws', className: 'sm-opt' },
+        h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.workspace')),
+        h('select', {
+          key: 'select', className: 'sm-opt-select', value: launchCwd,
+          onChange: (event: { target: { value: string } }) => changeWorkspace(event.target.value),
+        },
+          workspaces.length === 0
+            ? h('option', { key: 'current', value: launchCwd }, launchCwd || '—')
+            : [
+                // A cwd outside the shell's open workspaces (closed workspace)
+                // still has to be a selectable option, or the select would show
+                // a different workspace than the panel actually writes to.
+                ...(launchCwd && !workspaces.some((workspace) => workspace.path === launchCwd)
+                  ? [h('option', { key: 'current', value: launchCwd }, launchCwd)]
+                  : []),
+                ...workspaces.map((workspace) =>
+                  h('option', { key: workspace.id, value: workspace.path }, workspace.title || workspace.path),
+                ),
+              ],
+        ),
+      ),
+      h('label', { key: 'preset', className: 'sm-opt' },
+        h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.preset')),
+        h('select', {
+          key: 'select', className: 'sm-opt-select', value: launchPreset,
+          onChange: (event: { target: { value: string } }) => setLaunchPreset(event.target.value),
+        },
+          h('option', { key: 'default', value: '' }, t('launch.default')),
+          presets.map((preset) =>
+            h('option', {
+              key: preset.id, value: preset.id,
+              title: preset.description || undefined,
+            }, (preset.name || preset.id) + (preset.isDefault ? `（${t('launch.defaultMark')}）` : '')),
+          ),
+        ),
+      ),
+      h('label', { key: 'model', className: 'sm-opt' },
+        h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.model')),
+        h('select', {
+          key: 'select', className: 'sm-opt-select', value: launchModel,
+          onChange: (event: { target: { value: string } }) => setLaunchModel(event.target.value),
+        },
+          h('option', { key: 'default', value: '' }, t('launch.default')),
+          (catalog?.models ?? []).map((model) =>
+            h('option', {
+              key: `${model.provider}/${model.id}`, value: `${model.provider}/${model.id}`,
+              title: model.name || undefined,
+            }, `${model.provider}/${model.id}`),
+          ),
+        ),
+      ),
+      h('label', { key: 'permission', className: 'sm-opt' },
+        h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.permission')),
+        h('select', {
+          key: 'select', className: 'sm-opt-select', value: launchPermission,
+          onChange: (event: { target: { value: string } }) => setLaunchPermission(event.target.value),
+        },
+          h('option', {
+            key: 'default', value: '',
+            title: (permissions?.options ?? []).find((option) => option.value === permissions?.defaultPreset)?.description || undefined,
+          }, permissions?.defaultPreset ? `${t('launch.default')}（${permissions.defaultPreset}）` : t('launch.default')),
+          (permissions?.options ?? []).map((option) =>
+            h('option', { key: option.value, value: option.value, title: option.description || undefined }, option.name || option.value),
+          ),
+        ),
+      ),
+    ),
+    h('div', { key: 'sets', className: 'sm-composer-sets' },
+      h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.sets')),
+      launchSets.length === 0
+        ? h('span', { key: 'empty', className: 'sm-muted' }, t('composer.setsEmpty'))
+        : launchSets.map((topicSet) =>
+            h('button', {
+              key: topicSet.id, type: 'button', className: 'sm-chip',
+              'data-active': String(launchSelected.includes(topicSet.id)),
+              onClick: () => setLaunchSelected((current) =>
+                current.includes(topicSet.id) ? current.filter((entry) => entry !== topicSet.id) : [...current, topicSet.id]),
+            }, topicSet.title),
+          ),
+      h('button', {
+        key: 'new', type: 'button', className: 'sm-chip', 'data-dashed': 'true',
+        onClick: () => setShowNewSet((value) => !value),
+      }, t('composer.newSet')),
+    ),
+    showNewSet
+      ? h('div', { key: 'newset', className: 'sm-form', style: { marginTop: 8, marginBottom: 0 } },
+          h('input', {
+            key: 'input', className: 'sm-input', value: launchNewTitle,
+            placeholder: t('newSession.create'),
+            onChange: (event: { target: { value: string } }) => setLaunchNewTitle(event.target.value),
+          }),
+          h(Button, {
+            key: 'add', label: t('topic.create'), disabled: !launchNewTitle.trim() || !launchCwd,
+            onClick: () => void launchCreateSet(),
+          }),
+        )
+      : null,
+    createdSet
+      ? h('div', { key: 'createdSet', className: 'sm-set-created' },
+          h('span', { key: 'badge', className: 'sm-badge' }, t('sets.created')),
+          h('span', { key: 'title' }, createdSet.title),
+          createdSet.tags.length > 0 ? tagChips(createdSet.tags) : null,
+        )
+      : null,
   )
 
+  // The in-place receipt: created session + delivery state, shown where the
+  // conversation was started. 打开会话 is the only path that navigates.
+  const receiptView: ReactNode = receipt
+    ? h('div', { key: 'receipt', className: 'sm-receipt' },
+        h('div', { key: 'row', className: 'sm-row' },
+          h('span', { key: 'mark', className: 'sm-badge' }, receipt.kind === 'sets' ? t('composer.receipt.sets') : t('composer.receipt.hub')),
+          h('span', { key: 'text' }, receipt.message),
+        ),
+        h('div', { key: 'meta', className: 'sm-sub' }, receipt.id),
+        h('div', { key: 'actions', className: 'sm-actions' },
+          h(Button, { key: 'open', label: t('composer.open'), onClick: () => api.openSession(receipt.id) }),
+          h(Button, { key: 'dismiss', label: t('composer.dismiss'), onClick: () => setReceipt(undefined) }),
+        ),
+      )
+    : null
+
   const hubView: ReactNode = [
-    launchView,
+    composerView,
+    receiptView,
+    // R19 协同②: the current hub's own delegates, with state / set / sharing.
+    BranchList({ rows: hubBranches, t, onOpen: openChat }),
     h('div', { key: 'current', className: 'sm-card' },
       h('h3', null, t('hub.current')),
       h('div', { className: 'sm-row' },
@@ -515,20 +1082,9 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
           : h('span', { className: 'sm-muted' }, t('hub.none')),
       ),
     ),
-    h('div', { key: 'new', className: 'sm-form' },
-      h('input', {
-        key: 'input', className: 'sm-input', value: newTopicTitle,
-        placeholder: t('topic.create.placeholder'),
-        onChange: (event: { target: { value: string } }) => setNewTopicTitle(event.target.value),
-      }),
-      h(Button, {
-        key: 'add', variant: 'primary', label: t('topic.create'), disabled: !newTopicTitle.trim(),
-        onClick: () => void run(async () => api.createTopicSet(cwd, newTopicTitle.trim()), () => { setNewTopicTitle(''); void refreshHub() }),
-      }),
-    ),
     h('div', { key: 'list', className: 'sm-list' },
       (hub?.topicSets ?? []).length === 0
-        ? h('div', { key: 'empty', className: 'sm-empty' }, t('hub.empty'))
+        ? h(EmptyState, { key: 'empty', label: t('hub.empty'), hint: t('hub.empty.hint') })
         : (hub?.topicSets ?? []).map((topicSet) =>
             h('div', {
               key: topicSet.id, className: 'sm-item', 'data-clickable': 'true',
@@ -555,29 +1111,95 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     ),
   ]
 
+  // R11: a dedicated 话题集 tab. Each card is the record's own retrieval shape
+  // — title, tag chips, body — plus the session count the user asked to see.
+  const setsView: ReactNode = [
+    h('div', { key: 'search', className: 'sm-form' },
+      h('input', {
+        key: 'input', className: 'sm-input', value: setsQuery,
+        placeholder: t('sets.search'),
+        onChange: (event: { target: { value: string } }) => setSetsQuery(event.target.value),
+      }),
+      h(Button, { key: 'clear', label: t('sets.clear'), onClick: () => setSetsQuery('') }),
+    ),
+    h('div', { key: 'stats', className: 'sm-muted' }, t('sets.stats', {
+      shown: filteredSets.length, total: hub?.topicSets.length ?? 0,
+    })),
+    h('div', { key: 'list', className: 'sm-list' },
+      filteredSets.length === 0
+        ? h(EmptyState, { key: 'empty', label: t('sets.empty'), hint: t('sets.empty.hint') })
+        : filteredSets.map((topicSet) =>
+            h('div', {
+              key: topicSet.id, className: 'sm-item', 'data-clickable': 'true',
+              onClick: () => { setView({ kind: 'topic', id: topicSet.id }); setSummaryDraft(undefined); setSummaryTagsDraft(undefined); setReply('') },
+            },
+              h('div', { className: 'sm-row' },
+                h('span', { className: 'sm-title' }, topicSet.title),
+                hub?.activeTopicSetId === topicSet.id ? h('span', { key: 'a', className: 'sm-badge' }, t('hub.active')) : null,
+                h('span', { key: 'n', className: 'sm-badge' }, t('sets.sessions', { count: topicSet.sessions })),
+                topicSet.live > 0 ? h('span', { key: 'l', className: 'sm-badge' }, t('sets.live', { count: topicSet.live })) : null,
+                topicSet.model ? h('span', { key: 'm', className: 'sm-badge' }, topicSet.model) : null,
+              ),
+              tagChips(topicSet.tags),
+              h('div', { className: 'sm-body-text' }, topicSet.summary || t('sets.noBody')),
+              h('div', { className: 'sm-actions' },
+                h(Button, {
+                  key: 'act', label: t('hub.activate'),
+                  onClick: (event: { stopPropagation: () => void }) => {
+                    event.stopPropagation()
+                    void run(async () => api.activate(sessionId, topicSet.id), () => void refreshHub())
+                  },
+                }),
+                h(Button, {
+                  key: 'open', label: t('sets.open'),
+                  onClick: (event: { stopPropagation: () => void }) => {
+                    event.stopPropagation()
+                    setView({ kind: 'topic', id: topicSet.id })
+                    setReply('')
+                  },
+                }),
+              ),
+            ),
+          ),
+    ),
+  ]
+
   const topicView: ReactNode = currentTopicSet
     ? [
         h(Button, { key: 'back', className: 'sm-back', label: t('topic.back'), onClick: () => setView({ kind: 'hub' }) }),
         h('div', { key: 'card', className: 'sm-card' },
           h('h3', null, currentTopicSet.title),
-          h('div', { className: 'sm-row' },
+          tagChips(currentTopicSet.tags),
+          h('div', { className: 'sm-row', style: { marginTop: 6 } },
             h(Button, {
               key: 'act', variant: 'primary', label: t('hub.activate'),
               onClick: () => void run(async () => api.activate(sessionId, currentTopicSet.id), () => void refreshHub()),
             }),
+            h('span', { key: 'n', className: 'sm-badge' }, t('sets.sessions', { count: currentTopicSet.sessions })),
             currentTopicSet.model ? h('span', { key: 'm', className: 'sm-badge' }, currentTopicSet.model) : null,
           ),
         ),
         h('div', { key: 'members', className: 'sm-card' },
           h('h3', null, t('topic.members')),
           currentTopicSet.branches.length === 0
-            ? h('div', { className: 'sm-empty' }, t('topic.noMembers'))
+            ? h(EmptyState, { label: t('topic.noMembers') })
             : h('div', { className: 'sm-list' },
                 currentTopicSet.branches.map((branch) =>
-                  h('div', { key: branch.sessionId, className: 'sm-item', 'data-clickable': 'true', onClick: () => api.openSession(branch.sessionId) },
+                  h('div', { key: branch.sessionId, className: 'sm-item', 'data-clickable': 'true', onClick: () => openChat(branch.sessionId) },
                     h('div', { className: 'sm-row' },
                       h('span', { className: 'sm-title' }, branch.title || branch.sessionId.slice(0, 12)),
+                      // R19 需求③: root members are the set's own hub conversations.
+                      h('span', { key: 'k', className: 'sm-badge' }, branch.kind === 'fork' ? t('topic.branch') : t('topic.root')),
                       h('span', { key: 's', className: 'sm-badge' }, branch.status),
+                      // R19 协同③ fix: the card names its OWNING set and the
+                      // share count for every branch row (fresh dispatches are
+                      // kind 'root' members but are still branches).
+                      branch.kind === 'fork' && branch.topicSetTitle
+                        ? h('span', { key: 'own', className: 'sm-badge', title: t('branches.ownSet') }, branch.topicSetTitle)
+                        : null,
+                      branch.kind === 'fork' && (branch.hubs ?? 0) > 1
+                        ? h('span', { key: 'sh', className: 'sm-badge' }, t('branches.shared', { count: (branch.hubs ?? 1) - 1 }))
+                        : null,
                       branch.model ? h('span', { key: 'm', className: 'sm-badge' }, branch.model) : null,
                     ),
                     h('div', { className: 'sm-sub' }, branch.sessionId),
@@ -605,6 +1227,15 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         ),
         h('div', { key: 'summary', className: 'sm-card' },
           h('h3', null, t('topic.summary')),
+          h('div', { className: 'sm-form-label' }, t('memory.tags')),
+          h('input', {
+            key: 'tags', className: 'sm-input', value: (summaryTagsDraft ?? currentTopicSet.tags).join('，'),
+            placeholder: t('memory.tags.placeholder'),
+            onChange: (event: { target: { value: string } }) => setSummaryTagsDraft(
+              String(event.target.value).split(/[,，、;；\s]+/).map((tag) => tag.trim()).filter(Boolean),
+            ),
+          }),
+          h('div', { key: 'bodyLabel', className: 'sm-form-label', style: { marginTop: 6 } }, t('memory.body')),
           h('textarea', {
             key: 'input', className: 'sm-textarea', value: summaryDraft ?? currentTopicSet.summary,
             onChange: (event: { target: { value: string } }) => setSummaryDraft(event.target.value),
@@ -612,13 +1243,20 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
           h('div', { className: 'sm-actions' },
             h(Button, {
               key: 'save', label: t('topic.summary.save'),
-              onClick: () => void run(async () => api.updateTopicSetSummary(currentTopicSet.id, (summaryDraft ?? currentTopicSet.summary).slice(0, 500)), () => { setSummaryDraft(undefined); void refreshHub() }),
+              onClick: () => void run(async () => api.updateTopicSetSummary(
+                currentTopicSet.id,
+                (summaryDraft ?? currentTopicSet.summary).slice(0, 500),
+                summaryTagsDraft ?? currentTopicSet.tags,
+              ), () => { setSummaryDraft(undefined); setSummaryTagsDraft(undefined); void refreshHub() }),
             }),
           ),
         ),
       ]
-    : h('div', { key: 'missing', className: 'sm-empty' }, t('hub.empty'))
+    : h(EmptyState, { key: 'missing', label: t('hub.empty'), hint: t('hub.empty.hint') })
 
+  // R10: memories are edited and read as title + tags + body. The search box
+  // filters on every field, but the *hit source* is visible: a title/tag match
+  // is highlighted, so the user never has to scan the body to find a record.
   const memoriesView: ReactNode = [
     h('div', { key: 'search', className: 'sm-form' },
       h('input', {
@@ -627,91 +1265,125 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       }),
       h(Button, { key: 'go', label: t('hub.refresh'), onClick: () => void refreshMemories() }),
     ),
-    h('div', { key: 'new', className: 'sm-form' },
-      h('input', {
-        key: 'input', className: 'sm-input', value: newMemory, placeholder: t('memory.new.placeholder'),
+    h('div', { key: 'new', className: 'sm-form-col' },
+      h('div', { key: 'title', className: 'sm-form-row' },
+        h('input', {
+          key: 't', className: 'sm-input', value: newMemoryTitle, placeholder: t('memory.title.placeholder'),
+          onChange: (event: { target: { value: string } }) => setNewMemoryTitle(event.target.value),
+        }),
+        h('input', {
+          key: 'tags', className: 'sm-input', value: newMemoryTags, placeholder: t('memory.tags.placeholder'),
+          onChange: (event: { target: { value: string } }) => setNewMemoryTags(event.target.value),
+        }),
+      ),
+      h('textarea', {
+        key: 'body', className: 'sm-textarea', value: newMemory, placeholder: t('memory.new.placeholder'),
         onChange: (event: { target: { value: string } }) => setNewMemory(event.target.value),
+        onBlur: () => { void fillMemoryShape() },
       }),
-      h(Button, {
-        key: 'add', variant: 'primary', label: t('memory.add'), disabled: !newMemory.trim(),
-        onClick: () => void run(async () => api.createMemory(cwd, newMemory.trim()), () => { setNewMemory(''); void refreshMemories() }),
-      }),
+      shapeAuto ? h('div', { key: 'shape', className: 'sm-shape-hint' }, t('memory.shape.auto')) : null,
+      h('div', { key: 'actions', className: 'sm-actions' },
+        h(Button, {
+          key: 'add', variant: 'primary', label: t('memory.add'), disabled: !newMemory.trim(),
+          onClick: () => void run(async () => api.createMemory(
+            cwd, newMemory.trim(), undefined, newMemoryTitle.trim() || undefined, splitTags(newMemoryTags),
+          ), () => {
+            setNewMemory('')
+            setNewMemoryTitle('')
+            setNewMemoryTags('')
+            setShapeAuto(false)
+            void refreshMemories()
+          }),
+        }),
+        h('span', { key: 'hint', className: 'sm-muted' }, t('memory.shape.hint')),
+      ),
     ),
     h('div', { key: 'list', className: 'sm-list' },
       memories.length === 0
-        ? h('div', { key: 'empty', className: 'sm-empty' }, t('memory.empty'))
+        ? h(EmptyState, { key: 'empty', label: t('memory.empty'), hint: t('memory.empty.hint') })
         : memories.map((memory) =>
-            editingMemory && editingMemory.id === memory.id
-              ? h('div', { key: memory.id, className: 'sm-item' },
-                  h('textarea', {
-                    key: 'input', className: 'sm-textarea', value: editingMemory.text,
-                    onChange: (event: { target: { value: string } }) => setEditingMemory({ id: memory.id, text: event.target.value }),
-                  }),
-                  h('div', { className: 'sm-actions' },
-                    h(Button, {
-                      key: 'save', variant: 'primary', label: t('memory.save'),
-                      onClick: () => void run(async () => api.updateMemory(cwd, memory.id, editingMemory.text), () => { setEditingMemory(undefined); void refreshMemories() }),
-                    }),
-                    h(Button, { key: 'cancel', label: t('memory.cancel'), onClick: () => setEditingMemory(undefined) }),
-                  ),
-                )
-              : h('div', { key: memory.id, className: 'sm-item' },
-                  h('div', { className: 'sm-title' }, memory.text),
-                  h('div', { className: 'sm-sub' },
-                    h('span', { key: 'st', className: 'sm-badge' }, memory.status),
-                    `${t('memory.source')}：${memory.sourceSessionId || '—'}`,
-                  ),
-                  h('div', { className: 'sm-actions' },
-                    memory.sourceSessionId
-                      ? h(Button, {
-                          key: 'loc', label: t('memory.locate'),
-                          onClick: () => api.openSession(memory.sourceSessionId),
-                        })
-                      : null,
-                    h(Button, { key: 'edit', label: t('memory.edit'), onClick: () => setEditingMemory({ id: memory.id, text: memory.text }) }),
-                    h(Button, {
-                      key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
-                      onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
-                    }),
-                    h(Button, {
-                      key: 'del', variant: 'danger', label: t('memory.delete'),
-                      onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => void refreshMemories()),
-                    }),
-                  ),
-                ),
+            h('div', { key: memory.id, className: 'sm-item' },
+              h('div', { className: 'sm-title' }, memory.title || deriveTitleClient(memory.text)),
+              tagChips(memory.tags, query),
+              h('div', { className: 'sm-body-text' }, memory.text),
+              h('div', { className: 'sm-sub' },
+                h('span', { key: 'st', className: 'sm-badge' }, memory.status),
+                `${t('memory.source')}：${memory.sourceSessionId || '—'}`,
+              ),
+              h('div', { className: 'sm-actions' },
+                memory.sourceSessionId
+                  ? h(Button, {
+                      key: 'loc', label: t('memory.locate'),
+                      onClick: () => api.openSession(memory.sourceSessionId),
+                    })
+                  : null,
+                h(Button, {
+                  key: 'edit', label: t('memory.edit'),
+                  onClick: () => setEditingMemory({ id: memory.id, title: memory.title, tags: memory.tags, text: memory.text }),
+                }),
+                h(Button, {
+                  key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
+                  onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
+                }),
+                h(Button, {
+                  key: 'del', variant: 'danger', label: t('memory.delete'),
+                  onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => void refreshMemories()),
+                }),
+              ),
+            ),
           ),
     ),
   ]
 
+
+  // R10: a composite tool is read as title + tags + body too: the title and
+  // tags are the index (which flow, which tools), the description is the body
+  // that the model sees, and steps stay below as execution detail.
   const toolsView: ReactNode = [
     h('div', { key: 'list', className: 'sm-list' },
       tools.length === 0
-        ? h('div', { key: 'empty', className: 'sm-empty' }, t('tool.empty'))
+        ? h(EmptyState, { key: 'empty', label: t('tool.empty'), hint: t('tool.empty.hint') })
         : tools.map((tool) =>
             h('div', { key: tool.id, className: 'sm-item' },
               h('div', { className: 'sm-row' },
-                h('span', { className: 'sm-title' }, tool.name),
+                h('span', { className: 'sm-title' }, tool.title || tool.name),
                 h('span', { className: 'sm-badge' }, tool.status),
                 h('span', { className: 'sm-badge' }, tool.live ? t('tool.live') : t('tool.offline')),
               ),
+              tagChips(tool.tags),
               editingTool && editingTool.id === tool.id
                 ? h('div', { key: 'edit' },
+                    h('div', { key: 'title', className: 'sm-form-row' },
+                      h('input', {
+                        key: 't', className: 'sm-input', value: editingTool.title, placeholder: t('memory.title.placeholder'),
+                        onChange: (event: { target: { value: string } }) => setEditingTool({ ...editingTool, title: event.target.value }),
+                      }),
+                      h('input', {
+                        key: 'tags', className: 'sm-input', value: editingTool.tags.join('，'), placeholder: t('memory.tags.placeholder'),
+                        onChange: (event: { target: { value: string } }) => setEditingTool({ ...editingTool, tags: splitTags(event.target.value) }),
+                      }),
+                    ),
                     h('textarea', {
                       key: 'input', className: 'sm-textarea', value: editingTool.description,
-                      onChange: (event: { target: { value: string } }) => setEditingTool({ id: tool.id, description: event.target.value }),
+                      onChange: (event: { target: { value: string } }) => setEditingTool({ ...editingTool, description: event.target.value }),
                     }),
                     h('div', { className: 'sm-actions' },
                       h(Button, {
                         key: 'save', variant: 'primary', label: t('tool.desc.save'),
-                        onClick: () => void run(async () => api.editTool(tool.id, { description: editingTool.description }), () => { setEditingTool(undefined); void refreshTools() }),
+                        onClick: () => void run(async () => api.editTool(tool.id, {
+                          title: editingTool.title, tags: editingTool.tags, description: editingTool.description,
+                        }), () => { setEditingTool(undefined); void refreshTools() }),
                       }),
                       h(Button, { key: 'cancel', label: t('memory.cancel'), onClick: () => setEditingTool(undefined) }),
                     ),
                   )
                 : h('div', { key: 'desc' },
-                    h('div', { className: 'sm-sub' }, `${t('tool.desc.edit')}：${tool.description || '—'}`),
+                    h('div', { className: 'sm-body-text' }, tool.description || '—'),
                     h('div', { className: 'sm-actions' },
-                      h(Button, { key: 'edit', label: t('tool.desc.edit'), onClick: () => setEditingTool({ id: tool.id, description: tool.description }) }),
+                      h(Button, {
+                        key: 'edit', label: t('tool.desc.edit'),
+                        onClick: () => setEditingTool({ id: tool.id, title: tool.title, tags: tool.tags, description: tool.description }),
+                      }),
                       // A retired tool had no way back through the old UI: the
                       // enable button re-registers it (status -> active).
                       tool.status === 'active'
@@ -746,23 +1418,213 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     ),
   ]
 
-  const body = view.kind === 'hub' ? hubView : view.kind === 'topic' ? topicView : view.kind === 'memories' ? memoriesView : toolsView
+  // R19 需求⑤: the in-panel conversation. Reading uses the host's
+  // sessionQuery surface (the same model-visible fold); sending is a followup
+  // into the live session (or one resume for a cold one). The DSH session page
+  // stays available through 「打开会话」 but is no longer required to talk.
+  const chatView: ReactNode = view.kind === 'chat'
+    ? h('div', { key: 'chat', className: 'sm-chat' },
+        h('div', { key: 'head', className: 'sm-chat-head' },
+          h('span', { key: 'title', className: 'sm-title' }, chatData?.title || view.id.slice(-8)),
+          chatData?.live
+            ? h('span', { key: 'live', className: 'sm-badge' }, t('chat.live'))
+            : h('span', { key: 'cold', className: 'sm-badge' }, t('chat.cold')),
+          chatData?.truncated ? h('span', { key: 'tr', className: 'sm-badge' }, t('chat.truncated')) : null,
+          h('span', { key: 'grow', style: { flex: 1 } }),
+          h(Button, { key: 'refresh', size: 'sm', label: t('chat.refresh'), onClick: () => void loadChat(view.id) }),
+          h(Button, { key: 'open', size: 'sm', label: t('chat.open'), onClick: () => api.openSession(view.id) }),
+        ),
+        chatError ? h('div', { key: 'err', className: 'sm-error' }, chatError) : null,
+        chatData?.note ? h('div', { key: 'note', className: 'sm-muted' }, chatData.note) : null,
+        // R19 协同②: a hub's conversation shows its linked branches right above
+        // the messages; a branch's conversation shows none (it owns no branches).
+        chatBranches.length > 0 ? BranchList({ rows: chatBranches, t, onOpen: openChat, compact: true }) : null,
+        (chatData?.messages ?? []).length === 0 && !chatData?.note
+          ? h(EmptyState, { key: 'empty', label: t('chat.empty'), hint: t('chat.empty.hint') })
+          : h('div', { key: 'msgs', className: 'sm-list' },
+              (chatData?.messages ?? []).map((message) =>
+                h('div', { key: `${message.role}-${message.seq}`, className: 'sm-msg', 'data-role': message.role },
+                  h('span', { key: 'role', className: 'sm-msg-role' },
+                    message.role === 'user' ? t('chat.you')
+                      : message.role === 'assistant' ? t('chat.assistant')
+                        : t('chat.tool')),
+                  h('div', { key: 'text', className: 'sm-msg-text' }, message.text),
+                ),
+              ),
+            ),
+        h('div', { key: 'bar', className: 'sm-chat-bar' },
+          h('textarea', {
+            key: 'input', className: 'sm-textarea', value: chatDraft, rows: 3,
+            placeholder: t('chat.placeholder'),
+            onChange: (event: { target: { value: string } }) => setChatDraft(event.target.value),
+            onKeyDown: (event: { key: string; ctrlKey?: boolean; metaKey?: boolean; preventDefault: () => void }) => {
+              if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+                event.preventDefault()
+                void sendChat(view.id)
+              }
+            },
+          }),
+          h(Button, {
+            key: 'send', variant: 'primary', label: t('chat.send'),
+            disabled: chatSending || !chatDraft.trim(),
+            onClick: () => void sendChat(view.id),
+          }),
+        ),
+        h('div', { key: 'hint', className: 'sm-muted' }, t('chat.hint')),
+      )
+    : null
 
-  return h('div', { className: 'sm-panel', 'data-sm-panel': 'true' },
+  const body = view.kind === 'hub' ? hubView
+    : view.kind === 'sets' ? setsView
+      : view.kind === 'topic' ? topicView
+        : view.kind === 'memories' ? memoriesView
+          : view.kind === 'chat' ? chatView
+            : toolsView
+
+  // R18 需求①: the panel is a two-column shell — a hub-session rail on the
+  // left and the active view on the right. Under 760px the rail folds into a
+  // horizontal strip (pure CSS).
+  const sideRail = h('aside', { key: 'side', className: 'sm-side' },
+    h('div', { key: 'head', className: 'sm-side-head' },
+      h('span', { key: 'title' }, t('side.title')),
+      h('span', { key: 'count', className: 'sm-side-count' }, t('side.count', { count: hubs.length })),
+    ),
+    hubs.length === 0
+      ? h('div', { key: 'empty', className: 'sm-side-empty' }, `${t('side.empty')} · ${t('side.empty.hint')}`)
+      : h('div', { key: 'list', className: 'sm-side-list' },
+          hubs.map((hubRow) => {
+            // R19 需求⑤: a rail click takes over the conversation IN the panel;
+            // 「打开会话」 remains the explicit navigation path inside the chat.
+            const current = sessionId === hubRow.sessionId || (view.kind === 'chat' && view.id === hubRow.sessionId)
+            return h('button', {
+              key: hubRow.sessionId,
+              type: 'button',
+              className: 'sm-hub',
+              'data-current': String(current),
+              title: `${hubRow.title}${hubRow.topicSetTitle ? ` · 话题集 ${hubRow.topicSetTitle}` : ''} · ${hubRow.sessionId}`,
+              onClick: () => openChat(hubRow.sessionId),
+            },
+              hubRow.live
+                ? h('span', { key: 'dot', className: 'sm-dot', title: t('side.running') })
+                : null,
+              h('span', { key: 'title', className: 'sm-hub-title' }, hubRow.title || hubRow.sessionId.slice(-4)),
+              hubRow.topicSetTitle
+                ? h('span', { key: 'set', className: 'sm-hub-meta sm-hub-set', title: `${t('badge.hubSet.tip', { title: hubRow.topicSetTitle })}` }, hubRow.topicSetTitle)
+                : null,
+              hubRow.branches > 0
+                ? h('span', {
+                    key: 'branches', className: 'sm-hub-meta',
+                    title: t('side.branches', { count: hubRow.branches, working: hubRow.workingBranches }),
+                  }, hubRow.workingBranches > 0 ? `${hubRow.branches}·${hubRow.workingBranches}` : String(hubRow.branches))
+                : null,
+              current ? h('span', { key: 'cur', className: 'sm-hub-meta' }, t('side.current')) : null,
+            )
+          }),
+        ),
+    h('div', { key: 'foot', className: 'sm-side-foot' },
+      h(Button, {
+        key: 'new', className: 'sm-newhub', size: 'sm', label: t('side.new'),
+        title: t('composer.title'),
+        onClick: () => { setView({ kind: 'hub' }); setReceipt(undefined) },
+      }),
+    ),
+  )
+
+  const bodyScroll = h('div', { key: 'body', className: 'sm-body' },
+    loading ? h('div', { key: 'loading', className: 'sm-muted' }, '…') : null,
+    error ? h('div', { key: 'error', className: 'sm-error' }, error) : null,
+    notice ? h('div', { key: 'notice', className: 'sm-ok' }, notice) : null,
+    body,
+  )
+
+  // R19 需求②: the header selector is THE workspace source. A cwd that is not
+  // in the shell's workspace list (a session in a closed workspace) still
+  // appears as an option so the panel never points somewhere unselectable.
+  const wsOptions: Array<{ path: string; label: string }> = workspaces.map((workspace) => ({
+    path: workspace.path,
+    label: workspace.title || workspace.path,
+  }))
+  if (cwd && !wsOptions.some((option) => option.path === cwd)) wsOptions.unshift({ path: cwd, label: cwd })
+
+  // R19 需求⑦: memory editing is a modal, in both this panel and the web
+  // console — never an inline row that pushes the list around.
+  const memoryModal: ReactNode = editingMemory
+    ? h('div', {
+        key: 'memory-modal', className: 'sm-modal-backdrop',
+        onClick: () => setEditingMemory(undefined),
+      },
+        h('div', {
+          key: 'dialog', className: 'sm-modal', role: 'dialog', 'aria-modal': 'true',
+          onClick: (event: { stopPropagation: () => void }) => event.stopPropagation(),
+        },
+          h('h3', { key: 'title' }, t('memory.modal.title')),
+          h('p', { key: 'hint', className: 'sm-modal-hint' }, t('memory.modal.hint')),
+          h('div', { key: 'meta', className: 'sm-form-row' },
+            h('input', {
+              key: 't', className: 'sm-input', value: editingMemory.title, placeholder: t('memory.title.placeholder'),
+              onChange: (event: { target: { value: string } }) => setEditingMemory({ ...editingMemory, title: event.target.value }),
+            }),
+            h('input', {
+              key: 'tags', className: 'sm-input', value: editingMemory.tags.join('，'), placeholder: t('memory.tags.placeholder'),
+              onChange: (event: { target: { value: string } }) => setEditingMemory({ ...editingMemory, tags: splitTags(event.target.value) }),
+            }),
+          ),
+          h('textarea', {
+            key: 'body', className: 'sm-textarea', value: editingMemory.text,
+            placeholder: t('memory.new.placeholder'),
+            onChange: (event: { target: { value: string } }) => setEditingMemory({ ...editingMemory, text: event.target.value }),
+          }),
+          h('div', { key: 'actions', className: 'sm-actions' },
+            h(Button, {
+              key: 'save', variant: 'primary', label: t('memory.save'),
+              onClick: () => void run(async () => api.updateMemory(
+                cwd,
+                editingMemory.id,
+                editingMemory.text,
+                memories.find((memory) => memory.id === editingMemory.id)?.key,
+                editingMemory.title,
+                editingMemory.tags,
+              ), () => { setEditingMemory(undefined); void refreshMemories() }),
+            }),
+            h(Button, { key: 'cancel', label: t('memory.cancel'), onClick: () => setEditingMemory(undefined) }),
+          ),
+        ),
+      )
+    : null
+
+  // Compact head (R18 需求⑥): one row — brand, workspace selector, count pills.
+  const main = h('main', { key: 'main', className: 'sm-main' },
     h('div', { key: 'head', className: 'sm-head' },
-      h('h1', null, t('panel.title')),
-      hub ? h('span', { key: 'counts', className: 'sm-counts' }, t('hub.counts', hub.counts)) : null,
+      h('span', { key: 'brand', className: 'sm-brand' }, t('panel.title')),
+      wsOptions.length > 0
+        ? h('label', { key: 'ws', className: 'sm-ws' },
+            h('span', { key: 'label', className: 'sm-opt-label' }, t('workspace.label')),
+            h('select', {
+              key: 'select', className: 'sm-ws-select', value: cwd,
+              title: cwd,
+              onChange: (event: { target: { value: string } }) => changeWorkspace(event.target.value),
+            }, wsOptions.map((option) => h('option', { key: option.path, value: option.path }, option.label))),
+          )
+        : hub ? h('span', { key: 'sub', className: 'sm-head-sub' }, hub.workspaceKey) : null,
+      hub
+        ? h('div', { key: 'pills', className: 'sm-pills' },
+            h('span', { key: 'sets', className: 'sm-pill' }, `${t('tab.sets')} ${hub.topicSets.length}`),
+            h('span', { key: 'mem', className: 'sm-pill' }, `${t('tab.memories')} ${hub.counts.memories}`),
+            h('span', { key: 'tools', className: 'sm-pill' }, `${t('tab.tools')} ${hub.counts.tools}`),
+          )
+        : null,
     ),
     h('div', { key: 'tabs', className: 'sm-tabs' },
       h('button', { key: 'hub', ...tabProps('hub') }, t('tab.hub')),
+      h('button', { key: 'sets', ...tabProps('sets') }, t('tab.sets')),
       h('button', { key: 'memories', ...tabProps('memories') }, t('tab.memories')),
       h('button', { key: 'tools', ...tabProps('tools') }, t('tab.tools')),
     ),
-    h('div', { key: 'body', className: 'sm-body' },
-      loading ? h('div', { key: 'loading', className: 'sm-muted' }, '…') : null,
-      error ? h('div', { key: 'error', className: 'sm-error' }, error) : null,
-      notice ? h('div', { key: 'notice', className: 'sm-ok' }, notice) : null,
-      body,
-    ),
+    bodyScroll,
+  )
+
+  return h('div', { className: 'sm-panel', 'data-sm-panel': 'true' },
+    h('div', { key: 'shell', className: 'sm-shell' }, sideRail, main),
+    memoryModal,
   )
 }

@@ -23,9 +23,13 @@ import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
 import { buildExport } from './export.ts'
 import { scanWorkspace } from './filemap.ts'
+import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
+import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import type { Dispatch, Episode, FileMapEntry, Memory, OutboxItem, Requirement, Routing, Signal, ToolMemory, TopicSet } from './schema.ts'
 import { createTopicSet, setRouting, touchTopicSet } from './topicsets.ts'
 import { newId, workspaceKeyOf, type Store } from './store.ts'
+import { listHubSessions } from './hub-sessions.ts'
+import { listWorkspaceBranches } from './hub-branches.ts'
 
 /** Route prefix owned by this module (a host web-server named prefix route). */
 const PREFIX = '/supermemory'
@@ -83,6 +87,7 @@ type Carrier =
 export function attachWebui(ctx: Context, store: Store | undefined, config: WebuiConfig, logger: Logger): () => void {
   if (!config.enabled || !store) return () => {}
   const theStore = store
+  const theCtx = ctx
   const token = config.token === 'off' ? '' : (config.token || randomUUID())
 
   // Static assets live next to the sources; the bundle is symlinked into the
@@ -122,7 +127,7 @@ export function attachWebui(ctx: Context, store: Store | undefined, config: Webu
           }
         } else if (req.method === 'GET' && readOnly) body = Object.fromEntries(url.searchParams.entries())
         else return sendJson(res, 405, { ok: false, error: readOnly ? 'GET or POST required' : 'POST required' }, head)
-        return await handleApi(res, route, body, theStore, logger)
+        return await handleApi(res, route, body, theStore, logger, theCtx)
       }
       if (req.method !== 'GET' && !head) return sendJson(res, 405, { ok: false, error: 'GET required' }, head)
       // SECURITY: the shell used to hand the real token to ANY caller while its
@@ -264,7 +269,14 @@ function fallbackHtml(): string {
 type Json = Record<string, unknown>
 
 /** Every mutating endpoint validates the target row against `ws` first. */
-async function handleApi(res: ServerResponse, route: string, body: Json, store: Store, logger: Logger): Promise<void> {
+async function handleApi(
+  res: ServerResponse,
+  route: string,
+  body: Json,
+  store: Store,
+  logger: Logger,
+  ctx?: Context,
+): Promise<void> {
   const ws = text(body.ws)
   const fail = (error: string) => sendJson(res, 400, { ok: false, error })
   // Every mutating endpoint writes a workspace-scoped row; an empty ws used to
@@ -276,16 +288,37 @@ async function handleApi(res: ServerResponse, route: string, body: Json, store: 
       return sendJson(res, 200, { ok: true, workspaces: listWorkspaces(store) })
     case 'state': {
       if (!ws) return fail('ws 不能为空')
-      return sendJson(res, 200, { ok: true, ...buildState(store, ws) })
+      // R18: the 中枢会话 section needs the same rule the panel rail uses. A
+      // host without the session-query seam quietly yields an empty list.
+      let hubs: unknown[] = []
+      if (ctx) {
+        try {
+          hubs = await listHubSessions(ctx, store, ws)
+        } catch { /* the section renders its empty state */ }
+      }
+      // R19 协同②③: the console shows the same hub→branch relation as the panel
+      // (branch rows carry their set + how many hubs share them).
+      let hubBranches: unknown[] = []
+      try {
+        hubBranches = listWorkspaceBranches(store, ws)
+      } catch { /* the section renders without branch rows */ }
+      return sendJson(res, 200, { ok: true, ...buildState(store, ws), hubs, hubBranches })
     }
     case 'memory/create': {
       const memText = text(body.text)
       if (!memText) return fail('text 不能为空')
-      if (memText.length > 4000) return fail('text 过长（上限 4000 字符）')
+      // R19 需求⑧: every write path stores conclusions, not transcripts.
+      const verdict = assessConclusion(memText)
+      if (!verdict.ok) return fail(verdict.message)
       const id = newId('mem')
       const now = Date.now()
       const record: Memory = {
-        workspaceKey: ws, text: memText, keywords: list(body.keywords),
+        workspaceKey: ws,
+        title: text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText),
+        text: memText,
+        // The console's "keywords" field is the tags field (R10); auto keywords
+        // fill whatever the operator did not tag, so old flows stay findable.
+        keywords: mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText)),
         key: text(body.key) || undefined,
         sourceSessionId: text(body.sessionId) || 'webui', sourceSeq: 0,
         status: 'active', createdAt: now, updatedAt: now,
@@ -299,10 +332,19 @@ async function handleApi(res: ServerResponse, route: string, body: Json, store: 
       const existing = store.memories.get(id)
       if (!existing || existing.workspaceKey !== ws) return fail('记忆不存在')
       const memText = text(body.text)
+      if (memText) {
+        const verdict = assessConclusion(memText)
+        if (!verdict.ok) return fail(verdict.message)
+      }
       await store.memories.update(id, (r) => ({
         ...r,
         ...(memText ? { text: memText } : {}),
-        ...(body.keywords !== undefined ? { keywords: list(body.keywords) } : {}),
+        ...(body.title !== undefined
+          ? { title: text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText || r.text) }
+          : {}),
+        ...(body.keywords !== undefined
+          ? { keywords: mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText || r.text)) }
+          : {}),
         ...(body.key !== undefined ? { key: text(body.key) || undefined } : {}),
         updatedAt: Date.now(),
       }))
@@ -374,8 +416,21 @@ async function handleApi(res: ServerResponse, route: string, body: Json, store: 
         summary: text(body.summary) || undefined,
         keywords: list(body.keywords),
       })
+      // R19 需求⑥: the model fills the index when a layer was left empty; a
+      // failure keeps exactly what was written above.
+      try {
+        await fillTopicShapeOnCreate(
+          { ctx, store, logger: { warn: (msg) => logger.warn(msg) } },
+          id,
+          text(body.summary),
+          { tags: list(body.keywords).length === 0, summary: !text(body.summary) },
+        )
+      } catch (error) {
+        logger.warn('supermemory: webui topic-set shape generation skipped: ' + String(error).slice(0, 160))
+      }
+      const stored = store.topicsets.get(id)
       logger.info(`supermemory: webui created topic set ${id}`)
-      return sendJson(res, 200, { ok: true, id })
+      return sendJson(res, 200, { ok: true, id, title: stored?.title, keywords: stored?.keywords, summary: stored?.summary })
     }
     case 'topicset/update': {
       const id = text(body.id)
@@ -402,6 +457,8 @@ async function handleApi(res: ServerResponse, route: string, body: Json, store: 
       if (!sessionId) return fail('sessionId 不能为空')
       await setRouting(store, sessionId, { activeTopicSetId: id, driftCount: 0 })
       await touchTopicSet(store, id)
+      // R19 需求⑥: activation triggers a content-gated, throttled regeneration.
+      noteTopicSetActivated({ ctx, store, logger: { warn: (msg) => logger.warn(msg) } }, id)
       logger.info(`supermemory: webui activated ${id} for ${sessionId}`)
       return sendJson(res, 200, { ok: true })
     }

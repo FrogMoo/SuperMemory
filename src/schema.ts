@@ -47,6 +47,13 @@ export async function buildSchemas() {
       reasoningEffort: z.string().optional(),
     }).optional(),
     members: z.array(member).default([]),
+    // R19 需求⑥: the last LLM-generated topic-set shape. The fingerprint is the
+    // content snapshot that produced `title`/`keywords`/`summary`; activation
+    // only calls the model again when the snapshot changed (and the throttle
+    // elapsed), so a quiet activation costs no tokens. Records written before
+    // R19 read as ''/0 and are regenerated on their next activation.
+    shapeFingerprint: z.string().default(''),
+    shapeGeneratedAt: z.number().int().default(0),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
     lastActiveAt: z.number().int().default(0),
@@ -54,6 +61,11 @@ export async function buildSchemas() {
 
   const memories = z.object({
     workspaceKey: z.string(),
+    // R10 retrieval shape: title + tags (keywords) + body, so a query can be
+    // answered from the index instead of scanning every memory's body. Older
+    // records predate `title`; the default keeps them readable in place (the
+    // domain stays v1 — its schemas accept mixed generations on disk).
+    title: z.string().default(''),
     text: z.string(),
     key: z.string().optional(),
     keywords: z.array(z.string()).default([]),
@@ -106,6 +118,10 @@ export async function buildSchemas() {
   const toolMemory = z.object({
     workspaceKey: z.string().optional(),
     kind: z.enum(['composite', 'skill', 'workflow']).default('composite'),
+    // Same retrieval shape as memories/topic sets: a human title, tags for
+    // matching, and the description as the body.
+    title: z.string().default(''),
+    tags: z.array(z.string()).default([]),
     trigger: z.string().default(''),
     description: z.string().default(''),
     entry: z.string().default(''),
@@ -142,6 +158,35 @@ export async function buildSchemas() {
     updatedAt: z.number().int(),
   })
 
+  // R20: structured questions a BRANCH raises to the hub (never to the user).
+  // A separate table keeps dispatch status/cursor logic untouched and stays
+  // backward compatible: an old medium simply has no rows here, so every field
+  // except the identity ones is defaulted on read.
+  const questions = z.object({
+    dispatchId: z.string().optional(),
+    groupId: z.string().optional(),
+    topicSetId: z.string().optional(),
+    branchSessionId: z.string(),
+    hubSessionId: z.string().optional(),
+    /** The dispatched task label, so a hub aggregate is readable without a join. */
+    branchTask: z.string().default(''),
+    title: z.string(),
+    question: z.string(),
+    options: z.array(z.string()).default([]),
+    severity: z.enum(['low', 'medium', 'high']).default('medium'),
+    /** false = the branch keeps working under its best interpretation. */
+    blocking: z.boolean().default(false),
+    /** What the branch already finished (required for blocking=true by contract). */
+    progress: z.string().default(''),
+    /** The branch's default fallback if the user never answers. */
+    defaultPlan: z.string().default(''),
+    status: z.enum(['open', 'resolved']).default('open'),
+    /** The user's answer, filled by the hub's memory_questions resolve step. */
+    answer: z.string().optional(),
+    createdAt: z.number().int(),
+    updatedAt: z.number().int(),
+  })
+
   const outbox = z.object({
     dispatchId: z.string().optional(),
     groupId: z.string().optional(),
@@ -171,7 +216,7 @@ export async function buildSchemas() {
 
   return {
     topicsets, memories, episodes, requirements, filemap, tool_memory: toolMemory,
-    signals, dispatches, outbox, routing, hotcache,
+    signals, dispatches, questions, outbox, routing, hotcache,
   }
 }
 
@@ -185,6 +230,7 @@ export type FileMapEntry = z.infer<Schemas['filemap']>
 export type ToolMemory = z.infer<Schemas['tool_memory']>
 export type Signal = z.infer<Schemas['signals']>
 export type Dispatch = z.infer<Schemas['dispatches']>
+export type Question = z.infer<Schemas['questions']>
 export type OutboxItem = z.infer<Schemas['outbox']>
 export type Routing = z.infer<Schemas['routing']>
 export type Hotcache = z.infer<Schemas['hotcache']>

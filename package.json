@@ -1,6 +1,7 @@
 {
   "name": "dsh-supermemory",
   "version": "0.1.0",
+  "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与组合工具自动固化。",
   "private": true,
   "type": "module",
   "main": "lib/supermemory.js",
@@ -40,6 +41,7 @@
   },
   "scripts": {
     "git:sync": "node scripts/git-sync-push.mjs",
+    "install:dsh": "node scripts/install-into-dsh.mjs",
     "build": "tsdown && tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "build:host": "tsdown",

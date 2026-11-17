@@ -19,21 +19,46 @@ import {
 } from './topicsets.ts'
 import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
-import { branchHandles } from './dispatch.ts'
+import { branchHandles, compositionSetup } from './dispatch.ts'
 import { deleteCompositeTool, editCompositeTool, liveCompositeSpecs } from './composite.ts'
 import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
+import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
+import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
+import { hubsByBranch, listHubBranches, type HubBranchView } from './hub-branches.ts'
+import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 
 export interface TopicSetView {
   id: string
   title: string
+  /** Tags (the topic set's `keywords`): the cheap index a query/UI filters on. */
+  tags: string[]
+  /** Body: the topic set's running summary. */
   summary: string
-  branches: Array<{ sessionId: string; title: string; status: string; model?: string }>
+  /** Session count (R11: the 话题集 tab shows how many sessions a set holds). */
+  sessions: number
+  /** How many of those sessions are currently live. */
+  live: number
+  branches: Array<{
+    sessionId: string
+    kind: 'root' | 'fork'
+    title: string
+    status: string
+    model?: string
+    /** Owning set of this branch row (R19 协同③: the card is self-describing). */
+    topicSetId?: string
+    topicSetTitle?: string
+    /** Distinct hubs that dispatched into this branch (>=2 means 共享). */
+    hubs?: number
+  }>
   model?: string
 }
 
 export interface MemoryView {
   id: string
+  title: string
+  /** Tags (stored as `keywords`). */
+  tags: string[]
   text: string
   key?: string
   status: string
@@ -45,6 +70,8 @@ export interface MemoryView {
 export interface ToolView {
   id: string
   name: string
+  title: string
+  tags: string[]
   description: string
   steps: string[]
   parameters: string[]
@@ -97,7 +124,25 @@ export interface SessionOptions {
  */
 export type SessionBadge =
   | { kind: 'hub' }
+  /**
+   * R19 需求③: the session is a hub (a root member) of one active topic set.
+   * It keeps its hub role and gets a 「话题集」 badge with the set name instead
+   * of being mislabelled as a branch.
+   */
+  | { kind: 'hub-set'; topicSetId: string; topicSetTitle: string }
   | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+
+/**
+ * R18: the hub-session rail of the panel. Same shape as the host module's view
+ * so the wire contract and the client type stay one vocabulary.
+ */
+export type HubSessionRow = HubSessionView
+
+/** R18: auto-derived title/tags for a memory body (panel autofill). */
+export interface MemoryShapeView {
+  title: string
+  tags: string[]
+}
 
 export interface PanelCounts {
   memories: number
@@ -122,6 +167,58 @@ export interface MutationResult {
   id?: string
 }
 
+/**
+ * R19 需求⑤: one rendered message of a session's model-visible surface, as the
+ * in-panel conversation renders it. Only user/assistant/tool turns are shown;
+ * system prompts and developer/tool-declaration events stay out of the chat.
+ */
+export interface SessionMessageView {
+  seq: number
+  role: 'user' | 'assistant' | 'tool'
+  text: string
+  at: number
+}
+
+/** R19 需求⑤: a live/read-only view of one session for the in-panel chat. */
+export interface SessionChatView {
+  sessionId: string
+  title: string
+  live: boolean
+  messages: SessionMessageView[]
+  /** Older messages exist beyond the returned window. */
+  truncated: boolean
+  /** Degradation/why-this-is-empty note (host lacks sessionQuery, …). */
+  note?: string
+}
+
+/** Structural view of `ctx.sessionQuery` (already used by hub-sessions). */
+interface ChatSessionQueryLike {
+  readSurface?(sessionId: string): Promise<{ session?: { id?: string }; events?: Array<{ seq?: number; type?: string; data?: unknown }> }>
+  readTitleSnapshots?(sessionIds: readonly string[]): Promise<Array<{
+    sessionId?: string
+    status?: 'fulfilled' | 'rejected'
+    value?: { title?: { title?: string } }
+  }>>
+}
+
+/** Structural view of the live agent registry (send/resume side). */
+interface ChatAgentsLike {
+  get?(sessionId: string): { followup?(message: UserMessage): unknown } | undefined
+  resume?(options: {
+    resumeSessionId: string
+    /** Composition (preset mount) for the resumed scope; see dispatch.ts. */
+    setup?: (agentCtx: Context, agent: unknown) => Promise<void>
+  }): Promise<{ agent: { followup(message: UserMessage): unknown } }>
+}
+
+/**
+ * Sessions this panel resumed so the user can keep talking inside the panel.
+ * Deliberately NOT disposed here: `resume` makes the session live for the user,
+ * and killing it on a plugin reload would drop the conversation. DSH closes it
+ * with the app.
+ */
+const resumedChatHandles = new Map<string, { agent: { followup(message: UserMessage): unknown } }>()
+
 let createMessage: typeof CreateUserMessage | undefined
 async function messageFactory(): Promise<typeof CreateUserMessage> {
   if (!createMessage) {
@@ -129,6 +226,99 @@ async function messageFactory(): Promise<typeof CreateUserMessage> {
     createMessage = llm.createUserMessage as typeof CreateUserMessage
   }
   return createMessage
+}
+
+/**
+ * The agent handle `ctx.agents.create()` returns. This service only needs
+ * `followup`, which is how the panel pushes a hub conversation's opening
+ * message into the session it just created (R8: 就地触发中枢对话).
+ */
+interface SessionHandle {
+  agent: { followup(message: UserMessage): unknown }
+  dispose?: () => void
+}
+
+/**
+ * R18: the opening message of a 话题集会话 carries the set's three layers —
+ * title, tags, summary — before the user's own text, so the session starts from
+ * the index (and the client never has to re-send them).
+ *
+ * Exported as a pure seam: scripts/mechanism-smoke.mjs asserts the exact text
+ * without a DSH host.
+ */
+export function buildTopicSetOpening(store: Store, topicSetIds: string[], message: string | undefined): string {
+  const body = String(message ?? '').trim()
+  if (!body) return ''
+  const sets = topicSetIds
+    .map((id) => store.topicsets.get(id))
+    .filter((record): record is NonNullable<ReturnType<Store['topicsets']['get']>> => !!record)
+  const titles = sets.map((record) => record.title).join('、')
+  const tags = [...new Set(sets.flatMap((record) => record.keywords))].filter(Boolean)
+  const summary = sets.map((record) => record.summary).filter(Boolean).join(' ')
+  const lines = [
+    `[supermemory-topic-set] 话题集：${titles}${tags.length > 0 ? ` ｜标签: ${tags.join('、')}` : ''}`,
+    ...(summary ? [`话题集梗概：${summary}`] : []),
+    '',
+    `用户开场：${body}`,
+  ]
+  return lines.join('\n')
+}
+
+/** Plain text of one model content block; tool calls stay visible as a marker. */
+export function chatBlockText(block: unknown): string {
+  if (!block || typeof block !== 'object') return ''
+  const record = block as { type?: unknown; text?: unknown; name?: unknown }
+  switch (record.type) {
+    case 'text':
+      return String(record.text ?? '')
+    case 'tool-call':
+      return `（调用 ${String(record.name ?? '工具')}）`
+    case 'image':
+      return '（图片）'
+    case 'file':
+      return '（文件）'
+    // Reasoning is internal: never render it as assistant chat text.
+    default:
+      return ''
+  }
+}
+
+/** Join one message's content blocks into chat text. */
+export function chatMessageText(content: unknown, maxChars = 1200): string {
+  if (!Array.isArray(content)) return ''
+  const text = content.map(chatBlockText).filter(Boolean).join('\n').trim()
+  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
+}
+
+/**
+ * R19 需求⑤: project a `sessionQuery.readSurface()` event list onto chat rows.
+ * Only model-visible conversation events are kept (user / assistant / tool);
+ * system prompts, developer declarations and lifecycle events are excluded.
+ * Exported pure for scripts/mechanism-smoke.mjs.
+ */
+export function projectChatEvents(
+  events: ReadonlyArray<{ seq?: number; type?: string; time?: number; data?: unknown }>,
+  limit = 80,
+): { messages: SessionMessageView[]; truncated: boolean } {
+  const rows: SessionMessageView[] = []
+  for (const event of events) {
+    const type = String(event?.type ?? '')
+    const data = event?.data as { message?: { content?: unknown }; isError?: boolean } | undefined
+    if (!data || !data.message) continue
+    if (type === 'user/message') {
+      const text = chatMessageText(data.message.content)
+      if (text) rows.push({ seq: Number(event.seq ?? 0), role: 'user', text, at: Number(event.time ?? 0) })
+    } else if (type === 'assistant/message') {
+      const text = chatMessageText(data.message.content)
+      if (text) rows.push({ seq: Number(event.seq ?? 0), role: 'assistant', text, at: Number(event.time ?? 0) })
+    } else if (type === 'tool/result') {
+      const body = chatMessageText(data.message.content, 600)
+      if (body) rows.push({ seq: Number(event.seq ?? 0), role: 'tool', text: data.isError ? `（工具失败）${body}` : body, at: Number(event.time ?? 0) })
+    }
+  }
+  const cap = Math.max(1, Math.min(400, Math.floor(limit) || 80))
+  const truncated = rows.length > cap
+  return { messages: truncated ? rows.slice(-cap) : rows, truncated }
 }
 
 /** Plain data service (no host imports needed at definition time). */
@@ -143,17 +333,35 @@ export class SupermemoryPanelService {
   }
 
   private view(id: string, topicSet: ReturnType<typeof getTopicSet>): TopicSetView {
-    if (!topicSet) return { id, title: id, summary: '', branches: [] }
+    if (!topicSet) return { id, title: id, tags: [], summary: '', sessions: 0, live: 0, branches: [] }
+    // R19 协同③: a branch row names how many hubs dispatched into it. The branch
+    // belongs to the set (not to one hub), so a card showing "2 中枢共享" is the
+    // truthful projection; `undefined` means the branch has no dispatch yet.
+    const hubCounts = hubsByBranch(this.store)
     return {
       id,
       title: topicSet.title,
+      tags: topicSet.keywords,
       summary: topicSet.summary,
-      branches: topicSet.members.map((m) => ({
-        sessionId: m.sessionId,
-        title: m.title,
-        status: m.status,
-        ...(m.model ? { model: m.model } : {}),
-      })),
+      sessions: topicSet.members.length,
+      live: topicSet.members.filter((member) => member.status === 'live').length,
+      branches: topicSet.members.map((m) => {
+        // A fresh dispatch is recorded as kind 'root' but is a `branch-*` work
+        // branch; the UI label must follow the id, not the raw member kind.
+        const isBranch = m.kind === 'fork' || isPluginBranchId(m.sessionId)
+        const hubCount = isBranch ? hubCounts.get(m.sessionId)?.length : undefined
+        return {
+          sessionId: m.sessionId,
+          kind: (isBranch ? 'fork' : 'root') as 'root' | 'fork',
+          title: m.title,
+          status: m.status,
+          ...(m.model ? { model: m.model } : {}),
+          // R19 协同③ fix: a branch belongs to this set; carry the set so the
+          // branch card can say so (and show 共享 for kind-root branches too).
+          ...(isBranch ? { topicSetId: id, topicSetTitle: topicSet.title } : {}),
+          ...(hubCount ? { hubs: hubCount } : {}),
+        }
+      }),
       ...(topicSet.defaultModel ? { model: `${topicSet.defaultModel.provider}/${topicSet.defaultModel.model}` } : {}),
     }
   }
@@ -174,6 +382,10 @@ export class SupermemoryPanelService {
     if (!topicSet) return false
     await setRouting(this.store, sessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
     await touchTopicSet(this.store, topicSetId)
+    // R19 需求⑥: activation is the generation trigger, but it is fire-and-forget
+    // and content-fingerprint/throttle guarded (topic-shape.ts): a quiet
+    // activation costs no tokens and never delays the routing write.
+    noteTopicSetActivated({ ctx: this.ctx, store: this.store, logger: { warn: (msg) => console.warn(msg) } }, topicSetId)
     return true
   }
 
@@ -194,7 +406,7 @@ export class SupermemoryPanelService {
     for (const [id, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey) continue
       memories.push({
-        id, text: record.text, key: record.key, status: record.status,
+        id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
         sourceSessionId: record.sourceSessionId,
         createdAt: record.createdAt, updatedAt: record.updatedAt,
       })
@@ -206,7 +418,9 @@ export class SupermemoryPanelService {
     }
     let dispatches = 0
     for (const [, record] of this.store.dispatches.entries()) {
-      if (record.status !== 'delivered' && record.status !== 'failed') dispatches++
+      // R19 fix: `interrupted` is terminal too; counting it as "进行中" made the
+      // hub badge claim work was still running after the interrupt relay.
+      if (record.status !== 'delivered' && record.status !== 'failed' && record.status !== 'interrupted') dispatches++
     }
     const tools = [...this.store.toolMemory.entries()].filter(([, r]) => r.kind === 'composite').length
     return {
@@ -228,14 +442,22 @@ export class SupermemoryPanelService {
     const rows: Array<{ view: MemoryView; score: number }> = []
     for (const [id, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey) continue
-      const bag = new Set(tokenize(`${record.text} ${record.key ?? ''} ${record.keywords.join(' ')}`))
+      // R10: title and tags are the index; a hit there counts 4x/3x a body hit,
+      // so a title/tag filter never needs the body scan.
+      const titleBag = new Set(tokenize(record.title))
+      const tagBag = new Set(tokenize(record.keywords.join(' ')))
+      const bodyBag = new Set(tokenize(`${record.text} ${record.key ?? ''}`))
       let score = 0
-      for (const token of tokens) if (bag.has(token)) score++
+      for (const token of tokens) {
+        if (titleBag.has(token)) score += 4
+        else if (tagBag.has(token)) score += 3
+        else if (bodyBag.has(token)) score += 1
+      }
       if (tokens.size > 0 && score === 0) continue
       rows.push({
         score,
         view: {
-          id, text: record.text, key: record.key, status: record.status,
+          id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
           sourceSessionId: record.sourceSessionId,
           createdAt: record.createdAt, updatedAt: record.updatedAt,
         },
@@ -247,10 +469,12 @@ export class SupermemoryPanelService {
   }
 
   /** Create one memory (panel editor). Mirrors memory_remember semantics. */
-  async createMemory(cwd: string, text: string, key?: string): Promise<MutationResult> {
+  async createMemory(cwd: string, text: string, key?: string, title?: string, tags?: string[] | string): Promise<MutationResult> {
     const workspaceKey = this.wk(cwd)
     const body = String(text ?? '').trim()
     if (!body) return { status: 'error', message: '记忆文本不能为空。' }
+    const cleanTitle = String(title ?? '').trim().slice(0, TITLE_MAX) || deriveTitle(body)
+    const cleanTags = mergeTags(normalizeTags(tags), tagsOfBody(body))
     const stableKey = key?.trim() || undefined
     const now = Date.now()
     for (const [memoryId, record] of this.store.memories.entries()) {
@@ -267,8 +491,8 @@ export class SupermemoryPanelService {
     }
     const memoryId = newId('mem')
     const memory: Memory = {
-      workspaceKey, text: body, key: stableKey,
-      keywords: [...new Set(tokenize(body))].slice(0, 12),
+      workspaceKey, title: cleanTitle, text: body, key: stableKey,
+      keywords: cleanTags,
       // Typed in the panel: there is no source session to locate.
       sourceSessionId: '',
       sourceSeq: 0,
@@ -279,17 +503,34 @@ export class SupermemoryPanelService {
   }
 
   /** Update one memory's text (and optional key). */
-  async updateMemory(cwd: string, id: string, text: string, key?: string): Promise<MutationResult> {
+  async updateMemory(
+    cwd: string,
+    id: string,
+    text: string,
+    key?: string,
+    title?: string,
+    tags?: string[] | string,
+  ): Promise<MutationResult> {
     const workspaceKey = this.wk(cwd)
     const record = this.store.memories.get(id)
     if (!record || record.workspaceKey !== workspaceKey) return { status: 'error', message: '记忆不存在或不属于当前工作区。' }
     const body = String(text ?? '').trim()
     if (!body) return { status: 'error', message: '记忆文本不能为空。' }
+    // R19 需求⑧: editing is still a write — keep the conclusion rule here too.
+    const verdict = assessConclusion(body)
+    if (!verdict.ok) return { status: 'error', message: verdict.message }
     await this.store.memories.update(id, (r) => ({
       ...r,
       text: body,
       ...(key !== undefined ? { key: key.trim() || undefined } : {}),
-      keywords: [...new Set(tokenize(body))].slice(0, 12),
+      // An omitted title/tags keeps what the record had (the row is edited
+      // field by field); an explicit empty value re-derives it from the body.
+      ...(title !== undefined
+        ? { title: String(title).trim().slice(0, TITLE_MAX) || deriveTitle(body) }
+        : {}),
+      ...(tags !== undefined
+        ? { keywords: mergeTags(normalizeTags(tags), tagsOfBody(body)) }
+        : {}),
       updatedAt: Date.now(),
     }))
     return { status: 'ok', message: '已更新。', id }
@@ -314,27 +555,217 @@ export class SupermemoryPanelService {
     return { status: 'ok', message: status === 'active' ? '已启用。' : '已停用。', id }
   }
 
-  /** Create a topic set (panel). */
-  async createTopicSet(cwd: string, title: string): Promise<MutationResult> {
+  /**
+   * R18: hub sessions of this workspace (no parent, not a subagent, not a
+   * topic-set member). Read through the host session-query seam; a host
+   * without it degrades to the live session list, then to an empty rail.
+   */
+  listHubSessions(cwd: string): Promise<HubSessionRow[]> {
+    return listHubSessions(this.ctx, this.store, cwd)
+  }
+
+  /**
+   * R19 协同②: the hub → branch association of one hub session.
+   *
+   * The rows are projected from the durable dispatch table (`hubSessionId`), so
+   * this works for a live hub, a persisted hub, and for a branch shared by
+   * several hubs. `cwd` is the panel's current workspace: a row whose topic set
+   * belongs to another workspace is filtered out (defence in depth; the caller
+   * already scopes by workspace).
+   */
+  listHubBranches(cwd: string, hubSessionId: string, limit = 20): HubBranchView[] {
+    const id = String(hubSessionId ?? '').trim()
+    if (!id) return []
+    const workspaceKey = this.wk(cwd)
+    const rows = listHubBranches(this.store, id, limit)
+    return rows.filter((row) => {
+      if (!row.topicSetId) return true
+      const topicSet = this.store.topicsets.get(row.topicSetId)
+      return !topicSet || topicSet.workspaceKey === workspaceKey
+    })
+  }
+
+  /**
+   * R19 需求⑤: read one session's model-visible conversation for the in-panel
+   * chat. Capability evidence: `ctx.sessionQuery.readSurface(id)` returns the
+   * cloned current surface (dsh-session-query/src/index.ts:322), which is the
+   * same fold the model itself sees — no transcript mutation, no resume.
+   *
+   * A host without `sessionQuery` (older/minimal profile) degrades to an empty
+   * list with an explicit `note`, never to an error: the panel keeps working.
+   */
+  async readSessionMessages(sessionId: string, limit = 80): Promise<SessionChatView> {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return { sessionId: '', title: '', live: false, messages: [], truncated: false, note: '缺少会话 id。' }
+    const ctx = this.ctx
+    let live = false
+    let agents: ChatAgentsLike | undefined
+    try {
+      agents = ctx?.get?.('agents') as ChatAgentsLike | undefined
+      live = !!agents?.get?.(id)
+    } catch { live = false }
+    let query: ChatSessionQueryLike | undefined
+    try {
+      query = ctx?.get?.('sessionQuery') as ChatSessionQueryLike | undefined
+    } catch {
+      query = undefined
+    }
+    let title = id.slice(-4)
+    try {
+      if (query?.readTitleSnapshots) {
+        const observations = await query.readTitleSnapshots([id])
+        const observed = observations.find((row) => row.status === 'fulfilled' && row.sessionId === id)
+        const observedTitle = observed?.value?.title?.title
+        if (typeof observedTitle === 'string' && observedTitle.trim()) title = observedTitle.trim()
+      }
+    } catch { /* a title failure keeps the id suffix */ }
+    if (!query?.readSurface) {
+      return {
+        sessionId: id, title, live, messages: [], truncated: false,
+        note: '宿主未提供 sessionQuery，无法读取会话消息；可在 DSH 中打开该会话查看。',
+      }
+    }
+    try {
+      const surface = await query.readSurface(id)
+      const projected = projectChatEvents(surface?.events ?? [], limit)
+      return { sessionId: id, title, live, messages: projected.messages, truncated: projected.truncated }
+    } catch (error) {
+      return {
+        sessionId: id, title, live, messages: [], truncated: false,
+        note: `读取会话失败：${String(error).slice(0, 160)}`,
+      }
+    }
+  }
+
+  /**
+   * R19 需求⑤: send one user message directly into a hub/branch session from
+   * the panel. A live agent is used as-is (`ctx.agents.get`); a persisted but
+   * idle session is resumed once (`ctx.agents.resume({resumeSessionId})` — the
+   * documented resume entry, dsh-agent/src/index.ts:429) and kept live inside
+   * this panel so the reply can be polled. The session's own view in DSH shows
+   * the same messages: the panel is a second surface, not a parallel transcript.
+   */
+  async sendSessionMessage(sessionId: string, text: string): Promise<MutationResult> {
+    const id = String(sessionId ?? '').trim()
+    const body = String(text ?? '').trim()
+    if (!id) return { status: 'error', message: '缺少会话 id。' }
+    if (!body) return { status: 'error', message: '消息不能为空。' }
+    if (Array.from(body).length > 8000) return { status: 'error', message: '消息过长（上限 8000 字）。' }
+    const ctx = this.ctx
+    if (!ctx) return { status: 'error', message: '宿主上下文不可用。' }
+    let agents: ChatAgentsLike | undefined
+    try {
+      agents = ctx.get?.('agents') as ChatAgentsLike | undefined
+    } catch {
+      agents = undefined
+    }
+    if (!agents) return { status: 'error', message: '宿主未提供 agents 服务，无法发送消息。' }
+    let message: UserMessage
+    try {
+      const factory = await messageFactory()
+      message = factory({ content: [{ type: 'text', text: body }], source: { kind: 'supermemory' } })
+    } catch (error) {
+      return { status: 'error', message: `宿主消息工厂不可用：${String(error).slice(0, 160)}` }
+    }
+    let agent = agents.get?.(id)
+    let resumed = false
+    if (!agent) {
+      if (typeof agents.resume !== 'function') {
+        return { status: 'error', message: '该会话未运行，且宿主不支持恢复；请点「打开会话」在 DSH 中打开后再发送。' }
+      }
+      try {
+        // Mount the session's recorded agent preset on the resumed scope (the
+        // same setup a dispatch resume uses); without it a resumed conversation
+        // would come back without its preset tools. Mount failure is logged and
+        // degrades to host tools — it never blocks the send.
+        const handle = await agents.resume({
+          resumeSessionId: id,
+          setup: compositionSetup(ctx, {}, { warn: (msg) => console.warn(msg) }),
+        })
+        resumedChatHandles.set(id, handle)
+        agent = handle.agent
+        resumed = true
+      } catch (error) {
+        return {
+          status: 'error',
+          message: `会话未运行且恢复失败：${String(error).slice(0, 160)}。请点「打开会话」在 DSH 中打开后再发送。`,
+        }
+      }
+    }
+    try {
+      if (typeof agent?.followup !== 'function') return { status: 'error', message: '该会话的 agent 不可写（followup 不可用）。' }
+      agent.followup(message)
+      return { status: 'ok', message: resumed ? '会话已恢复，消息已发送。' : '消息已发送。', id }
+    } catch (error) {
+      return { status: 'error', message: `发送失败：${String(error).slice(0, 160)}` }
+    }
+  }
+
+  /**
+   * R18: derive the title + tags a memory body implies, so the panel's editor
+   * can fill the two index fields instead of leaving them blank. Pure reuse of
+   * the retrieval rules (same derivation the tool layer applies on write).
+   */
+  suggestMemoryShape(text: string): MemoryShapeView {
+    const body = String(text ?? '').trim()
+    return { title: deriveTitle(body), tags: mergeTags([], tagsOfBody(body)) }
+  }
+
+  /**
+   * Create a topic set (panel). R18: title + tags + summary are all written on
+   * creation — omitted tags fall back to the title/body vocabulary, so a set
+   * created from the panel is never index-less.
+   */
+  async createTopicSet(cwd: string, title: string, tags?: string[] | string, summary?: string): Promise<MutationResult> {
     const workspaceKey = this.wk(cwd)
     const name = String(title ?? '').trim()
     if (!name) return { status: 'error', message: '标题不能为空。' }
-    const id = await createTopicSet(this.store, { workspaceKey, title: name.slice(0, 40) })
-    return { status: 'ok', message: `已创建话题集『${name.slice(0, 40)}』。`, id }
+    const body = String(summary ?? '').slice(0, 500)
+    const explicitTags = normalizeTags(tags)
+    const keywords = mergeTags(explicitTags, tagsOfBody(`${name} ${body}`))
+    const id = await createTopicSet(this.store, {
+      workspaceKey,
+      title: name.slice(0, 40),
+      summary: body,
+      keywords,
+    })
+    // R19 需求⑥: a model fills the index. The creator-supplied title/tags/body
+    // stay authoritative; only a layer left empty is generated. A failure
+    // (no model, timeout, malformed JSON) keeps exactly what was written here.
+    let shapeNote = ''
+    try {
+      const shape = await fillTopicShapeOnCreate(
+        { ctx: this.ctx, store: this.store, logger: { warn: (msg) => console.warn(msg) } },
+        id,
+        body,
+        { tags: explicitTags.length === 0, summary: body.trim().length === 0 },
+      )
+      if (shape) shapeNote = '（已由模型补全索引）'
+    } catch (error) {
+      console.warn('supermemory: topic-set shape generation skipped: ' + String(error).slice(0, 160))
+    }
+    const stored = this.store.topicsets.get(id)
+    const finalTags = stored?.keywords ?? keywords
+    const tagText = finalTags.length > 0 ? `（标签：${finalTags.join('、')}）` : ''
+    return { status: 'ok', message: `已创建话题集『${stored?.title ?? name.slice(0, 40)}』${tagText}${shapeNote}。`, id }
   }
 
   /** Update a topic set's summary (panel). */
-  async updateTopicSetSummary(id: string, summary: string): Promise<MutationResult> {
-    if (!this.store.topicsets.get(id)) return { status: 'error', message: '话题集不存在。' }
-    await updateTopicSetSummary(this.store, id, String(summary ?? '').slice(0, 500))
-    return { status: 'ok', message: '梗概已更新。', id }
+  async updateTopicSetSummary(id: string, summary: string, tags?: string[] | string): Promise<MutationResult> {
+    const record = this.store.topicsets.get(id)
+    if (!record) return { status: 'error', message: '话题集不存在。' }
+    // `tags` is the UI-facing name of the record's `keywords`; omitting it
+    // keeps the current tags, an empty array clears them.
+    const nextKeywords = tags !== undefined ? normalizeTags(tags) : record.keywords
+    await updateTopicSetSummary(this.store, id, String(summary ?? '').slice(0, 500), nextKeywords)
+    return { status: 'ok', message: '标签与正文已更新。', id }
   }
 
   /**
    * R3: create a session bound to one or more topic sets (话题集会话).
    * The session is a fresh root member of every selected topic set.
    */
-  async createTopicSetSession(cwd: string, topicSetIds: string[], options: SessionOptions = {}): Promise<MutationResult> {
+  async createTopicSetSession(cwd: string, topicSetIds: string[], options: SessionOptions = {}, firstMessage = ''): Promise<MutationResult> {
     const ctx = this.ctx
     if (!ctx) return { status: 'error', message: '宿主上下文不可用，无法创建会话。' }
     const ids = (topicSetIds ?? []).filter((id) => this.store.topicsets.get(id))
@@ -356,7 +787,11 @@ export class SupermemoryPanelService {
       try {
         await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
       } catch { /* workspace attach is best-effort */ }
-      return { status: 'ok', message: `已创建话题集会话（${titles.join('、')}）。`, id: sessionId }
+      const delivered = await this.deliverFirstMessage(created.handle, buildTopicSetOpening(this.store, ids, firstMessage))
+      const base = `已创建话题集会话（${titles.join('、')}）`
+      if (delivered === true) return { status: 'ok', message: `${base}并发送首条消息。`, id: sessionId }
+      if (typeof delivered === 'string') return { status: 'ok', message: `${base}，但首条消息发送失败：${delivered}`, id: sessionId }
+      return { status: 'ok', message: `${base}。`, id: sessionId }
     } catch (error) {
       return { status: 'error', message: `创建会话失败：${String(error).slice(0, 200)}` }
     }
@@ -368,14 +803,40 @@ export class SupermemoryPanelService {
    * and opened by the client. An empty option set reproduces the shell's
    * plain new session (host defaults for preset/model/permission).
    */
-  async createHubSession(cwd: string, options: SessionOptions = {}): Promise<MutationResult> {
+  async createHubSession(cwd: string, options: SessionOptions = {}, firstMessage = ''): Promise<MutationResult> {
     const created = await this.createSessionWithOptions(cwd, options)
     if ('error' in created) return { status: 'error', message: created.error }
     // A short id suffix keeps several hub sessions distinguishable in the
     // sidebar list (requirement C naming, hub flavour).
     const title = '新会话 · ' + created.sessionId.slice(-4)
     await this.finishSession(created.sessionId, cwd, title)
+    const delivered = await this.deliverFirstMessage(created.handle, firstMessage)
+    if (delivered === true) return { status: 'ok', message: '已创建中枢会话并发送首条消息。', id: created.sessionId }
+    if (typeof delivered === 'string') return { status: 'ok', message: `中枢会话已创建，但首条消息发送失败：${delivered}`, id: created.sessionId }
     return { status: 'ok', message: '已创建中枢会话。', id: created.sessionId }
+  }
+
+  /**
+   * R8: push the composer's opening message into the session the panel just
+   * created, so a hub conversation can be started from the SuperMemory page
+   * without navigating to the shell's new-session page. Returns `true` when
+   * delivered, `false` when there was nothing to send, or the failure text —
+   * a failed delivery never discards the already-created session.
+   */
+  private async deliverFirstMessage(handle: SessionHandle, text: string | undefined): Promise<true | false | string> {
+    const body = String(text ?? '').trim()
+    if (!body) return false
+    try {
+      const factory = await messageFactory()
+      const message = factory({
+        content: [{ type: 'text', text: body }],
+        source: { kind: 'supermemory' },
+      })
+      handle.agent.followup(message as UserMessage)
+      return true
+    } catch (error) {
+      return String(error).slice(0, 200)
+    }
   }
 
   /**
@@ -388,7 +849,7 @@ export class SupermemoryPanelService {
   private async createSessionWithOptions(
     cwd: string,
     options: SessionOptions,
-  ): Promise<{ sessionId: string } | { error: string }> {
+  ): Promise<{ sessionId: string; handle: SessionHandle } | { error: string }> {
     const ctx = this.ctx
     if (!ctx) return { error: '宿主上下文不可用，无法创建会话。' }
     if (!cwd) return { error: '无法确定工作区。' }
@@ -401,17 +862,18 @@ export class SupermemoryPanelService {
       agentOptions.model = options.model.model
       if (options.model.reasoningEffort) agentOptions.reasoningEffort = options.model.reasoningEffort
     }
+    let handle: SessionHandle
     try {
-      await ctx.agents.create({
+      handle = await ctx.agents.create({
         sessionId: sessionId as never,
         meta: meta as never,
         ...(Object.keys(agentOptions).length > 0 ? { agentOptions: agentOptions as never } : {}),
-      })
+      }) as unknown as SessionHandle
     } catch (error) {
       return { error: `创建会话失败：${String(error).slice(0, 200)}` }
     }
     this.applyPermission(sessionId, options.permission)
-    return { sessionId }
+    return { sessionId, handle }
   }
 
   /** Name the host session and attach it to its workspace (best-effort). */
@@ -553,7 +1015,8 @@ export class SupermemoryPanelService {
         content: [{
           type: 'text',
           text: `[supermemory-panel-reply]\n话题集：${topicSet.title}\n用户回复：${body}\n\n`
-            + '你是该话题集的工作分支：按用户回复继续执行并汇报结果。不要向用户提问，遇到分歧按最合理解释执行。',
+            + '你是该话题集的工作分支：按用户回复继续执行并汇报结果。遇到分歧按最合理解释执行，不要停下来等确认；'
+            + '需要用户裁决时用 memory_raise_question 上交中枢汇总（不要在本分支里直接向用户提问）。',
         }],
         source: { kind: 'supermemory' },
       })
@@ -583,6 +1046,8 @@ export class SupermemoryPanelService {
       } catch { /* a broken definition still lists with its description */ }
       rows.push({
         id, name,
+        title: record.title || record.description.slice(0, TITLE_MAX),
+        tags: record.tags,
         description: record.description,
         steps, parameters,
         useCount: record.useCount,
@@ -596,6 +1061,8 @@ export class SupermemoryPanelService {
 
   /** R6: edit one composite tool (description / steps / parameters / status). */
   async editTool(id: string, patch: {
+    title?: string
+    tags?: string[]
     description?: string
     steps?: Array<{ tool: string; arguments: Record<string, unknown> }>
     parameters?: Array<{ name: string; step: number; key: string; description: string }>
@@ -616,26 +1083,51 @@ export class SupermemoryPanelService {
   }
 
   /**
-   * Sidebar badge projection (GUI 问题③): which topic set, if any, owns this
-   * session. A member row of a non-archived topic set marks the session as a
-   * branch; every other session (hub sessions, archived sets, unknown ids) is
-   * a hub. Multiple hits resolve to the newest lastActiveAt.
+   * Sidebar badge projection (GUI 问题③; R19 需求③④ root cause fix).
+   *
+   * Membership alone does NOT make a branch: `createTopicSetSession` adds the
+   * session it creates as `kind: 'root'` — the set's own hub conversation, which
+   * must keep its 中枢 role and be badged as 「话题集」.
+   *
+   * A branch is (a) any plugin-minted `branch-*`/`fork-*` id — a fresh dispatch
+   * is recorded as kind 'root', so the id prefix is the only reliable witness —
+   * or (b) a `kind:'fork'` member. R18 treated every member as a branch, so a
+   * hub that owned a set showed the wrong 分支 badge (and the same conflation
+   * removed it from the hub rail / disabled its hub prompt).
+   *
+   * Tiers: a branch hit wins; otherwise a root hit yields `hub-set`; otherwise a
+   * plain hub. Multiple hits inside one tier resolve to the newest
+   * `lastActiveAt`. Archived sets never badge.
    */
   sessionBadge(sessionId: string): SessionBadge {
-    let best: { topicSetId: string; title: string; status: string; lastActiveAt: number } | undefined
+    const pluginBranch = isPluginBranchId(sessionId)
+    let bestFork: { topicSetId: string; title: string; status: string; lastActiveAt: number } | undefined
+    let bestRoot: { topicSetId: string; title: string; lastActiveAt: number } | undefined
     for (const [topicSetId, topicSet] of this.store.topicsets.entries()) {
       // status here is the TOPIC SET own status (active | archived); a member
       // row is live | idle (schema.ts) and never active.
       if (topicSet.status !== 'active') continue
       for (const member of topicSet.members) {
         if (member.sessionId !== sessionId) continue
-        if (!best || member.lastActiveAt > best.lastActiveAt) {
-          best = { topicSetId, title: topicSet.title, status: member.status, lastActiveAt: member.lastActiveAt }
+        // A plugin-minted branch is a branch whatever its member kind: a fresh
+        // dispatch records kind 'root' (its own session root), and R18's
+        // kind-based reading would have turned that branch into a hub-set.
+        if (pluginBranch || member.kind === 'fork') {
+          if (!bestFork || member.lastActiveAt > bestFork.lastActiveAt) {
+            bestFork = { topicSetId, title: topicSet.title, status: member.status, lastActiveAt: member.lastActiveAt }
+          }
+        } else if (!bestRoot || member.lastActiveAt > bestRoot.lastActiveAt) {
+          bestRoot = { topicSetId, title: topicSet.title, lastActiveAt: member.lastActiveAt }
         }
       }
     }
-    if (!best) return { kind: 'hub' }
-    return { kind: 'branch', topicSetId: best.topicSetId, topicSetTitle: best.title, status: best.status }
+    if (bestFork) {
+      return { kind: 'branch', topicSetId: bestFork.topicSetId, topicSetTitle: bestFork.title, status: bestFork.status }
+    }
+    if (bestRoot) {
+      return { kind: 'hub-set', topicSetId: bestRoot.topicSetId, topicSetTitle: bestRoot.title }
+    }
+    return { kind: 'hub' }
   }
 }
 
@@ -695,6 +1187,8 @@ const PANEL_DESCRIPTORS = Object.freeze([
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'text', wire: 'text', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Text', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'key', wire: 'key', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Key', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'title', wire: 'title', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Title', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'tags', wire: 'tags', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Tags', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -707,6 +1201,8 @@ const PANEL_DESCRIPTORS = Object.freeze([
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'text', wire: 'text', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Text', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'key', wire: 'key', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Key', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'title', wire: 'title', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Title', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'tags', wire: 'tags', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Tags', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -738,6 +1234,8 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'title', wire: 'title', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Title', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'tags', wire: 'tags', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Tags', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'summary', wire: 'summary', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Summary', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -748,6 +1246,7 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'summary', wire: 'summary', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Summary', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'tags', wire: 'tags', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Tags', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -759,6 +1258,7 @@ const PANEL_DESCRIPTORS = Object.freeze([
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'topicSetIds', wire: 'topicSetIds', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#TopicSetIds', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'options', wire: 'options', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionOptions', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'firstMessage', wire: 'firstMessage', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#FirstMessage', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -769,6 +1269,7 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'options', wire: 'options', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionOptions', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'firstMessage', wire: 'firstMessage', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#FirstMessage', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {
@@ -830,6 +1331,58 @@ const PANEL_DESCRIPTORS = Object.freeze([
     ],
   },
   {
+    id: 'dsh-supermemory#supermemoryPanel/listHubSessions',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listHubSessions',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionRows', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R19 协同②: the branches one hub started (name / state / shared / set).
+    id: 'dsh-supermemory#supermemoryPanel/listHubBranches',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listHubBranches',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubBranchViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'hubSessionId', wire: 'hubSessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'limit', wire: 'limit', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Limit', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R19 需求⑤: in-panel conversation — read the model-visible surface and
+    // send a followup without navigating to the shell's session page.
+    id: 'dsh-supermemory#supermemoryPanel/readSessionMessages',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'readSessionMessages',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionChatView', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'limit', wire: 'limit', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Limit', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/sendSessionMessage',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'sendSessionMessage',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SessionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'text', wire: 'text', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Text', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/suggestMemoryShape',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'suggestMemoryShape',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MemoryShape', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'text', wire: 'text', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Text', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
     id: 'dsh-supermemory#supermemoryPanel/sessionBadge',
     service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'sessionBadge',
     invocation: { kind: 'direct' },
@@ -841,8 +1394,8 @@ const PANEL_DESCRIPTORS = Object.freeze([
 /**
  * Mount the panel service and register its remote descriptors.
  *
- * Two host contracts make the panel reachable from the browser, and BOTH used
- * to be silently missing (2026-11-18: every panel call answered HTTP 404):
+ * Three host contracts make the panel reachable from the browser, and the first
+ * two used to be silently missing (2026-11-18: every panel call answered 404):
  *
  * 1. `ctx.typert` is a proxy property. Reading it requires 'typert' in this
  *    plugin's `inject`; without it the getter throws "cannot get property
@@ -859,6 +1412,18 @@ const PANEL_DESCRIPTORS = Object.freeze([
  *    @deepseek-ai/dsh-typert-protocol produces. It is attached here by hand
  *    because this plugin takes no static dependency on that package (host
  *    packages resolve only through the loadHostModule anchor).
+ * 3. The registry keys every endpoint and remembers every endpoint it has EVER
+ *    seen (`local.hasSeen()`). Once a strict definition is withdrawn, the
+ *    Gateway refuses the descriptor-free source fallback for that endpoint for
+ *    the rest of the process:
+ *      "typert gateway: supermemoryPanel/hubState: its strict definition was
+ *       withdrawn and SRC fallback is forbidden".
+ *    A plugin reload can race the old fiber's teardown: the new instance calls
+ *    `typert.register()` while the old package face is still live, the registry
+ *    rejects the duplicate, the old fiber then withdraws, and nothing ever
+ *    re-registers — the panel is dead while every other feature still works.
+ *    The registration therefore VERIFIES its endpoints and RETRIES instead of
+ *    firing once (see attachPanelRegistration).
  */
 export function attachPanel(ctx: Context, store: Store | undefined): () => void {
   if (!store) return () => {}
@@ -871,25 +1436,133 @@ export function attachPanel(ctx: Context, store: Store | undefined): () => void 
     enumerable: false,
   })
   ctx.provide('supermemoryPanel', service)
-  // ctx.get (never ctx.typert): the proxy getter throws without inject.
-  const typert = ctx.get('typert') as { register?: (contribution: unknown) => unknown } | undefined
-  if (!typert || typeof typert.register !== 'function') {
-    console.warn('supermemory: typert registry unavailable; panel remote descriptors not registered')
-    return () => { /* service disposal is fiber-scoped */ }
+  return attachPanelRegistration(ctx)
+}
+
+/** The single package-face contribution this plugin registers (schemas stay empty: the wire codecs are hand-written). */
+interface PanelContribution {
+  package: string
+  face: 'host'
+  schemas: unknown[]
+  model: { services: unknown[]; events: unknown[]; objects: unknown[] }
+  invocations: typeof PANEL_DESCRIPTORS
+}
+
+/** The slice of `ctx.get('typert')` that the panel registration depends on. */
+interface PanelTypertRegistry {
+  register(contribution: PanelContribution): unknown
+  local?: { get(endpoint: string): unknown }
+}
+
+/** Endpoint key of one descriptor, exactly as the registry (and the Gateway) keys it. */
+function panelEndpoint(descriptor: { namespace: string; method: string }): string {
+  return `${descriptor.namespace}/${descriptor.method}`
+}
+
+/** Delays between failed registration attempts; the last value repeats. */
+const PANEL_REGISTRATION_RETRY_MS = Object.freeze([250, 750, 2000, 5000, 15000])
+/** Re-verification delays after a healthy registration, before the steady watchdog takes over. */
+const PANEL_REGISTRATION_VERIFY_MS = Object.freeze([1000, 4000])
+/** Steady-state watchdog: re-registers if the endpoints are withdrawn later in this process. */
+const PANEL_REGISTRATION_WATCHDOG_MS = 30000
+
+/**
+ * Keep the panel descriptors registered for this fiber's lifetime.
+ *
+ * `typert.register()` is transactional and rejects the whole batch on a
+ * duplicate package face or endpoint, so the only safe recovery from the reload
+ * race described on attachPanel is to retry once the old fiber has withdrawn.
+ * Each tick first verifies the live endpoints through `typert.local.get()`: a
+ * complete set is health (watchdog), a missing set is re-registered. Timers are
+ * unref'd and cleared by the returned disposer, so the plugin never keeps the
+ * process alive and a reload starts from a clean slate.
+ */
+function attachPanelRegistration(ctx: Context): () => void {
+  let closed = false
+  let failed = 0
+  let verified = 0
+  /** Set once a registration succeeded on a registry that cannot be read back (no `local` view). */
+  let healthUnverifiable = false
+  const timers = new Set<ReturnType<typeof setTimeout>>()
+  const disposers: unknown[] = []
+
+  const schedule = (delay: number) => {
+    if (closed) return
+    const timer = setTimeout(() => {
+      timers.delete(timer)
+      check()
+    }, delay)
+    timers.add(timer)
+    // A pending watchdog must never hold the Node event loop open.
+    const unrefable = timer as unknown as { unref?: () => void }
+    if (typeof unrefable.unref === 'function') unrefable.unref()
   }
-  try {
-    typert.register({
-      package: 'dsh-supermemory',
-      face: 'host',
-      schemas: [],
-      model: { services: [], events: [], objects: [] },
-      invocations: PANEL_DESCRIPTORS,
-    })
-  } catch (error) {
-    // Loud on purpose: a duplicate package-face/endpoint registration (this
-    // plugin re-enabled over root-owned registry entries) lands here. A silent
-    // catch is exactly what produced the 404 panel.
-    console.warn('supermemory: typert register failed for the panel descriptors', error)
+
+  /**
+   * Registration state read from the registry: true = every endpoint is live,
+   * false = at least one is missing, undefined = this registry exposes no
+   * `local` view (a test double or a future host), so it cannot be verified.
+   */
+  const registered = (typert: PanelTypertRegistry): boolean | undefined => {
+    const local = typert.local
+    if (!local || typeof local.get !== 'function') return undefined
+    return PANEL_DESCRIPTORS.every(descriptor => local.get(panelEndpoint(descriptor)) !== undefined)
   }
-  return () => { /* service disposal is fiber-scoped */ }
+
+  const check = () => {
+    if (closed) return
+    // ctx.get (never ctx.typert): the proxy getter throws without inject.
+    const typert = ctx.get('typert') as PanelTypertRegistry | undefined
+    if (!typert || typeof typert.register !== 'function') {
+      if (failed === 0) console.warn('supermemory: typert registry unavailable; panel remote descriptors not registered yet')
+      failed += 1
+      schedule(PANEL_REGISTRATION_RETRY_MS[Math.min(failed - 1, PANEL_REGISTRATION_RETRY_MS.length - 1)])
+      return
+    }
+    const state = registered(typert)
+    if (state === true || (state === undefined && healthUnverifiable)) {
+      failed = 0
+      verified += 1
+      schedule(verified <= PANEL_REGISTRATION_VERIFY_MS.length
+        ? PANEL_REGISTRATION_VERIFY_MS[verified - 1]
+        : PANEL_REGISTRATION_WATCHDOG_MS)
+      return
+    }
+    try {
+      const disposer = typert.register({
+        package: 'dsh-supermemory',
+        face: 'host',
+        schemas: [],
+        model: { services: [], events: [], objects: [] },
+        invocations: PANEL_DESCRIPTORS,
+      })
+      if (typeof disposer === 'function') disposers.push(disposer)
+      const after = registered(typert)
+      if (after === false) throw new Error('the registry did not keep the panel descriptors')
+      if (after === undefined) healthUnverifiable = true
+      failed = 0
+      verified = 0
+    } catch (error) {
+      // Loud on the first failure only: a duplicate package face is expected
+      // during a reload race, and the retries below are the recovery path.
+      if (failed === 0) console.warn('supermemory: typert register failed for the panel descriptors; retrying', error)
+      failed += 1
+    }
+    schedule(failed === 0
+      ? PANEL_REGISTRATION_VERIFY_MS[0]
+      : PANEL_REGISTRATION_RETRY_MS[Math.min(failed - 1, PANEL_REGISTRATION_RETRY_MS.length - 1)])
+  }
+
+  check()
+
+  return () => {
+    if (closed) return
+    closed = true
+    for (const timer of timers) clearTimeout(timer)
+    timers.clear()
+    for (const disposer of disposers) {
+      try { (disposer as () => void)() } catch { /* the owning fiber disposes the same effect */ }
+    }
+    disposers.length = 0
+  }
 }

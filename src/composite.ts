@@ -16,6 +16,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
 import { loadHostModule } from './host.ts'
 import type { Signal, ToolMemory } from './schema.ts'
+import { deriveTitle, normalizeTags } from './retrieval.ts'
 import type { Store } from './store.ts'
 import { newId } from './store.ts'
 
@@ -29,6 +30,10 @@ export interface SequenceSample {
 
 export interface CompositeSpec {
   name: string
+  /** Human title (R10): the retrieval index, rendered above the description. */
+  title?: string
+  /** Tags (R10): short labels, typically the distinct tool names of the flow. */
+  tags?: string[]
   description: string
   steps: Array<{ tool: string; arguments: Record<string, unknown> }>
   /** parameter name → step index + argument key */
@@ -79,7 +84,16 @@ export function compileComposite(signal: Signal, samples: SequenceSample[]): Com
     }
   })
   const name = `sm_composite_${signal.pattern.replace(/[^a-zA-Z0-9]+/g, '_').slice(0, 24) || 'seq'}`
-  return { name, description: `组合工具：${latest.tools.join(' → ')}（由重复流程 ${signal.count} 次后固化）`, steps, parameters }
+  // R10: title + tags are the retrieval index (steps are the body); tags are
+  // the distinct tool names of the flow, so "which composite runs bash+read?"
+  // is answerable without scanning every description.
+  const title = deriveTitle(`组合工具：${latest.tools.join(' → ')}`, name)
+  const tags = normalizeTags([...new Set(latest.tools)])
+  return {
+    name, title, tags,
+    description: `组合工具：${latest.tools.join(' → ')}（由重复流程 ${signal.count} 次后固化）`,
+    steps, parameters,
+  }
 }
 
 /** Live composite registrations: spec name -> disposer (for edit/re-register). */
@@ -186,6 +200,8 @@ export async function persistComposite(store: Store, spec: CompositeSpec, signal
   const id = newId('tm')
   const record: ToolMemory = {
     kind: 'composite',
+    title: spec.title ?? deriveTitle(spec.description, spec.name),
+    tags: normalizeTags(spec.tags ?? spec.name),
     trigger: signalKey,
     description: spec.description,
     entry: JSON.stringify(spec),
@@ -221,6 +237,8 @@ export async function editCompositeTool(
   store: Store,
   id: string,
   patch: {
+    title?: string
+    tags?: string[]
     description?: string
     steps?: Array<{ tool: string; arguments: Record<string, unknown> }>
     parameters?: Array<{ name: string; step: number; key: string; description: string }>
@@ -242,6 +260,8 @@ export async function editCompositeTool(
   }
   const next: CompositeSpec = {
     ...spec,
+    ...(patch.title !== undefined ? { title: String(patch.title).slice(0, 80) } : {}),
+    ...(patch.tags !== undefined ? { tags: normalizeTags(patch.tags) } : {}),
     ...(patch.description !== undefined ? { description: String(patch.description).slice(0, 500) } : {}),
     ...(patch.steps !== undefined
       ? { steps: patch.steps.map((step) => ({ tool: String(step.tool ?? ''), arguments: parseArgs(step.arguments ?? {}) })) }
@@ -262,7 +282,7 @@ export async function editCompositeTool(
     if (dispose) { try { dispose() } catch { /* best-effort */ } }
     liveComposites.delete(next.name)
     liveCompositeSpecs.delete(next.name)
-    await store.toolMemory.update(id, (r) => ({ ...r, status: 'retired', description: next.description }))
+    await store.toolMemory.update(id, (r) => ({ ...r, status: 'retired', description: next.description, ...(next.title !== undefined ? { title: next.title } : {}), ...(next.tags !== undefined ? { tags: next.tags } : {}) }))
     return { status: 'ok', message: `已停用组合工具 ${next.name}（重启后不会重新注册）。`, id }
   }
   try {
@@ -278,6 +298,8 @@ export async function editCompositeTool(
   }
   await store.toolMemory.update(id, (r) => ({
     ...r,
+    title: next.title ?? r.title,
+    tags: next.tags ?? r.tags,
     description: next.description,
     entry: JSON.stringify(next),
     status: 'active',

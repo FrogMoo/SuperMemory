@@ -12,9 +12,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { groupComplete, groupEpisodeSummaries, groupMembers, groupRelayExists, groupRelayText } from './group.ts'
 import { loadHostModule } from './host.ts'
-import type { Dispatch, Episode } from './schema.ts'
+import type { Dispatch, Episode, Question } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId } from './store.ts'
+import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
 import { updateMember } from './topicsets.ts'
 
 export interface ObserveConfig {
@@ -159,16 +160,23 @@ function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: strin
 }
 
 /** The hub-facing relay text for one dispatch outcome. */
-function relayText(dispatch: { task: string; branchSessionId: string }, episode: Episode | undefined, failure?: string): string {
+function relayText(
+  dispatch: { task: string; branchSessionId: string },
+  episode: Episode | undefined,
+  failure?: string,
+  questions: readonly Question[] = [],
+): string {
   const head = `[supermemory-relay ${dispatch.branchSessionId}]`
+  const questionBlock = renderQuestionsBlock(questions)
+  const tail = questionBlock ? `\n\n${questionBlock}` : ''
   if (failure) {
     // D: an aborted turn still produced work — keep the partial summary so the
     // hub learns what DID land before the branch died.
     const partial = episode?.summary ? `\n已完成部分：${episode.summary}` : ''
-    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。${partial}\n以上为失败事实，未伪装成答案。`
+    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。${partial}\n以上为失败事实，未伪装成答案。${tail}`
   }
   const body = episode?.summary || '（分支已完成，但未生成摘要）'
-  return `${head}\n任务：${dispatch.task}\n分支结果：\n${body}`
+  return `${head}\n任务：${dispatch.task}\n分支结果：\n${body}${tail}`
 }
 
 /** Attach observation + delivery; returns the effect disposer. */
@@ -253,7 +261,10 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
   const open: Array<[string, Dispatch]> = []
   for (const [dispatchId, record] of store.dispatches.entries()) {
     if (record.branchSessionId !== branchSessionId) continue
-    if (record.status === 'delivered' || record.status === 'failed') continue
+    // R19 fix: `interrupted` is terminal (it was already relayed by the interrupt
+    // sweep). A late turn/end must not rewrite that verdict back to delivered
+    // and desynchronise it from the group summary the hub already received.
+    if (record.status === 'delivered' || record.status === 'failed' || record.status === 'interrupted') continue
     if (turnEndSeq !== undefined && record.startSeq >= turnEndSeq) continue
     open.push([dispatchId, record])
   }
@@ -280,7 +291,10 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
         await store.episodes.put(episodeId, episode)
         // D6: group members never relay individually — the group summary does.
         if (!record.groupId) {
-          await deliver(deps, { dispatchId, record, text: relayText(record, episode) })
+          await deliver(deps, {
+            dispatchId, record,
+            text: relayText(record, episode, undefined, openQuestionsOfDispatch(store, dispatchId)),
+          })
         }
         await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'delivered', turnEndReason: reason, updatedAt: Date.now() }))
         await updateMember(store, record.topicSetId ?? '', branchSessionId, { status: 'idle' })
@@ -292,7 +306,10 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
           ? buildEpisode(owned, dispatchId, record.topicSetId ?? '', branchSessionId)
           : undefined
         if (!record.groupId) {
-          await deliver(deps, { dispatchId, record, text: relayText(record, partial, failure) })
+          await deliver(deps, {
+            dispatchId, record,
+            text: relayText(record, partial, failure, openQuestionsOfDispatch(store, dispatchId)),
+          })
         }
         await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', turnEndReason: reason, updatedAt: Date.now() }))
         await updateMember(store, record.topicSetId ?? '', branchSessionId, { status: 'idle' })
@@ -459,6 +476,7 @@ export async function settleInterruptedDispatches(
   const { store, logger } = deps
   const now = options.now ?? Date.now()
   const settled: string[] = []
+  const touchedGroups = new Set<string>()
   for (const [dispatchId, record] of [...store.dispatches.entries()]) {
     if (record.status === 'delivered') continue
     const deliveryId = 'dlv-' + dispatchId
@@ -476,10 +494,14 @@ export async function settleInterruptedDispatches(
     const reason = terminal
       ? `分支中断（${record.turnEndReason ? '终态 ' + record.turnEndReason : (options.reason ?? '未结算')}）`
       : `分支中断（${options.reason ?? '超时未结算'}）`
+    if (record.groupId) touchedGroups.add(record.groupId)
     try {
       const partial = await partialSummary(deps, record)
       if (!record.groupId) {
-        await deliver(deps, { dispatchId, record, text: relayText(record, partial, reason) })
+        await deliver(deps, {
+          dispatchId, record,
+          text: relayText(record, partial, reason, openQuestionsOfDispatch(store, dispatchId)),
+        })
       }
       await store.dispatches.update(dispatchId, (r) => ({
         ...r,
@@ -491,6 +513,27 @@ export async function settleInterruptedDispatches(
       logger.info(`supermemory: dispatch ${dispatchId} interrupted (${reason})`)
     } catch (error) {
       logger.warn(`supermemory: interrupt settle ${dispatchId} failed: ${String(error).slice(0, 160)}`)
+    }
+  }
+  // R19 fix: `interrupted` is a terminal member state, so this sweep must also
+  // close the group NOW (a member that stops emitting turn/end would otherwise
+  // withhold the single group relay until the next flushObserve pass — or
+  // forever, while groupComplete ignored interrupted).
+  for (const groupId of touchedGroups) {
+    try {
+      if (!groupComplete(store, groupId) || groupRelayExists(store, groupId)) continue
+      const members = groupMembers(store, groupId)
+      const hubSessionId = members[0]?.[1].hubSessionId
+      if (!hubSessionId) continue
+      await deliver(deps, {
+        dispatchId: groupId,
+        record: { hubSessionId },
+        text: groupRelayText(store, groupId, groupEpisodeSummaries(store, groupId)),
+        groupId,
+      })
+      logger.info(`supermemory: group ${groupId} relayed by interrupt sweep (${members.length} members)`)
+    } catch (error) {
+      logger.warn(`supermemory: interrupt group relay ${groupId} failed: ${String(error).slice(0, 160)}`)
     }
   }
   return settled

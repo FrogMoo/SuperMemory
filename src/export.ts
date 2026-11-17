@@ -7,6 +7,7 @@ import type { Store } from './store.ts'
 import { filemapEntries } from './filemap.ts'
 import { openRequirements } from './requirements.ts'
 import { getTopicSet, topicSetIdsOf } from './topicsets.ts'
+import { renderRecordLine } from './retrieval.ts'
 
 export interface ExportResult {
   /** The full markdown document. */
@@ -28,11 +29,16 @@ export function buildExport(store: Store, workspaceKey: string, activeTopicSetId
   const topicSet = activeTopicSetId ? getTopicSet(store, activeTopicSetId) : undefined
   const lines: string[] = ['# SuperMemory 导出', '']
   if (topicSet) {
-    lines.push(`## 话题集：${topicSet.title}`, '', topicSet.summary || '（暂无梗概）', '')
+    const tags = topicSet.keywords.length > 0 ? `
+
+标签：${topicSet.keywords.join('、')}` : ''
+    lines.push(`## 话题集：${topicSet.title}${tags}`, '', topicSet.summary || '（暂无梗概）', '')
   }
   const mems: string[] = []
   for (const [, record] of store.memories.entries()) {
-    if (record.workspaceKey === workspaceKey && record.status === 'active') mems.push(`- ${record.text}`)
+    if (record.workspaceKey === workspaceKey && record.status === 'active') {
+      mems.push(`- ${renderRecordLine({ title: record.title, text: record.text, tags: record.keywords })}`)
+    }
   }
   if (mems.length) lines.push('## 事实记忆', '', ...mems, '')
   const reqs = openRequirements(store, workspaceKey)

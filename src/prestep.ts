@@ -29,11 +29,12 @@ import {
   type RepeatConfig,
   type Tracker,
 } from './inrequest.ts'
-import { renderRecallCard, type RecallOptions } from './recall.ts'
+import { matchTopicSets, renderRecallCard, type RecallOptions } from './recall.ts'
 import './services.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
 import { activeComposites, catalogFor, renderCatalog } from './toolize.ts'
+import { isHubSession, listHubBranches, renderHubBranchesCard } from './hub-branches.ts'
 
 export interface PreStepConfig {
   enabled: boolean
@@ -83,6 +84,16 @@ export function attachPreStep(
       source: { kind: 'supermemory', form: 'recall' },
     })
   }
+  // R19 协同②: the hub↔branch card is a NOTICE, not recall: it is context about
+  // the hub's own delegates, and `form: 'notice'` keeps observe.ts from mistaking
+  // it for a dispatch input (isDispatchInput excludes recall/notice).
+  const buildNotice = async (text: string) => {
+    const factory = await ensureFactory()
+    return factory({
+      content: [{ type: 'text', text }],
+      source: { kind: 'supermemory', form: 'notice', summary: 'SuperMemory 中枢分支概览' },
+    })
+  }
 
   return ctx.on('agent/pre-step', async (payload, next) => {
     let decision: PreStepDecision
@@ -109,11 +120,31 @@ export function attachPreStep(
       if (userText) {
         const state = config.tracker.begin(sessionId, turn, step, userText)
         const items = recallScoped(activeStore, workspaceKey, userText, recallOptions(config))
-        const card = renderRecallCard(items, config.injectStyle).slice(0, config.maxChars)
-        if (!card) return decision
-        const message = await build(card)
-        commitCard(state, step, items, card.length)
-        return { ...decision, messages: [...messages, message] }
+        // R19 需求⑧: the opening card also names the topic set the matched
+        // conclusions belong to, so the hub can answer/activate immediately.
+        const topicSets = matchTopicSets([...activeStore.topicsets.entries()], userText, 3)
+        const card = renderRecallCard(items, config.injectStyle, topicSets).slice(0, config.maxChars)
+        // R19 协同②: a hub also gets a compact statement of the branches it has
+        // started (title / state / owning set / shared-with-N-hubs), so "which
+        // branches do I have?" is answerable from context instead of guesswork.
+        // Branches never receive this card (isHubSession is false for them).
+        let branchesCard = ''
+        if (isHubSession(activeStore, agent)) {
+          try {
+            branchesCard = renderHubBranchesCard(listHubBranches(activeStore, sessionId), { now: Date.now() })
+          } catch (error) {
+            logger.warn('supermemory: hub branch card skipped: ' + String(error).slice(0, 160))
+          }
+        }
+        if (!card && !branchesCard) return decision
+        const appended = []
+        if (card) {
+          const message = await build(card)
+          commitCard(state, step, items, card.length)
+          appended.push(message)
+        }
+        if (branchesCard) appended.push(await buildNotice(branchesCard))
+        return { ...decision, messages: [...messages, ...appended] }
       }
       // Tool continuation: requirement A repeat path.
       if (!config.repeat.enabled) return decision

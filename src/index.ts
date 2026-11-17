@@ -23,9 +23,10 @@ import { runReconciliation } from './reconcile.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
 import type { Signal } from './schema.ts'
 import { attachPanel } from './panel.ts'
-import { openStore, workspaceKeyOf, type Store } from './store.ts'
+import { openStoreWithRetry, workspaceKeyOf, type Store } from './store.ts'
 import { attachTools, type ToolsDeps } from './tools.ts'
 import { attachWebui } from './webui.ts'
+import { isHubSession } from './hub-branches.ts'
 import './services.ts'
 import './source.ts'
 
@@ -246,14 +247,52 @@ function attachProposals(ctx: Context, store: Store | undefined, logger: { warn:
   })
 }
 
+/**
+ * R18 需求⑤ (软约定): the hub session's role. Injected ONLY when the initiating
+ * agent is a hub of its workspace — a top-level session (no parent, not a
+ * subagent) that belongs to no topic set. Branches must never receive this
+ * text, or they would refuse the very work they were dispatched to do.
+ *
+ * Deliberately a SOFT convention: the hub keeps its tools (the user chose
+ * "soft" over removing them); the prompt only states the division of labour.
+ */
+const HUB_ROLE_TEXT = [
+  '[SuperMemory 中枢会话]',
+  '- 你是中枢会话：只做判断、派发（memory_dispatch）与汇总（收到 relay 结果后转述给用户）。',
+  '- 不要直接读改文件、执行命令、跑构建或长篇推理——这些操作交给分支会话完成；你的价值是定义清楚任务与边界，再整合结果。',
+  '- 派发时先设定能力：要改代码/跑命令用 capabilities=full；只审阅用 read；纯代码编辑用 read-write；汇总/轻量核对用 minimal。',
+  // R19 协同①: the parallel-group guidance lives in the role prompt, not only in
+  // the tool description, so the model plans the fan-out before it starts.
+  '- 需求多或复杂（多个独立子任务、多个方向调研、互相可并行的修复）时，用 memory_dispatch 的 tasks[] 一次拆成多个分支并行协同：',
+  '  每个任务一个独立分支，全部到达终态后只回送一次汇总，失败成员会单独标注；不要把一个可拆分的大任务塞进单个分支串行做。',
+  '  并行组里的每个任务必须自包含（写清目标、范围、验收），彼此不要依赖同一文件的并发修改。',
+  // R19 协同②③: hub sees its branches; branches belong to the set, not the hub.
+  '- 系统上下文会注入「[supermemory 关联分支]」卡：它列出你已拉起的分支（名称/状态/话题集/是否被多个中枢共享），先看它再决定派发。',
+  '- 分支归属话题集，可被同一话题集下的其他中枢复用/共享：继续同一条分支用 mode=continue（忙则排队），新任务用 mode=auto（复用空闲分支，否则新建）。',
+  '- 不要为同一件工作反复新建分支造成重复/分裂；已完成或空闲的分支优先续派。',
+  // R20: a branch never asks the user itself — it raises a structured question
+  // to the hub, and the hub aggregates EVERY branch's open questions into one
+  // ask_user_question. That is the only user-facing question of a round.
+  '- 分支不会直接问用户：它们的疑问通过 memory_raise_question 上交到你。收到 relay 或用户新消息时，先调用 memory_questions 查看所有未解决问题（含仍在工作的分支）。',
+  '- 汇总问题：去重、按主题合并成一份清单，标注来源分支 / 是否阻塞 / 已完成进度 / 默认备选方案，然后用 ask_user_question **一次**向用户提问；不要逐个转发。',
+  '- 用户答复后用 memory_questions 的 resolve 结清（可带 answer），再把裁决用 memory_dispatch 派回对应分支。',
+  '- 分支已按最合理解释完成、问题不阻塞时不必提问：在汇报里列出它做的假设即可。',
+  '- 纯问答、简单确认、记忆检索类问题不必派发，直接答。',
+  '- 写入记忆只记结论：memory_remember 里放可复用的事实/决策/约定（跨会话仍然成立）；不要写过程流水账（先做了什么、执行了哪些命令、第几步、工具日志）。',
+  '- recall 命中「相关话题集」时，优先直接回答或把任务派发到该话题集，不要重新检索一遍。',
+].join('\n')
+
 const PROMPT_TEXT = [  '[SuperMemory 记忆]',
   '- 涉及历史结论、约定、构建命令、文件用途、"之前说过/做过什么"时，先调用 memory_recall 检索再作答。',
-  '- 用户明确要求记住某事、或某事实值得跨会话保留时，调用 memory_remember 写入（按工作区隔离）。',
+  '- 用户明确要求记住某事、或某事实值得跨会话保留时，调用 memory_remember 写入（按工作区隔离）：',
+  '  只写结论性、可复用的事实/决策/约定（标题 + 标签 + 正文），禁止把过程流水账、临时步骤、工具调用日志写进记忆。',
   '- 对话连续性：用户在当前对话框直接对话时，你就在当前对话的上下文中继续回答，不要询问是否切换话题、不要自行切换话题集；',
   '  话题集只在用户显式 @话题集名、在 SuperMemory 面板中激活、或执行 /memory switch 时才切换。',
   '- 实质工作必须开新对话执行：当用户提出问题需要实际操作（读改文件、执行命令、多步调研、修复与验证等）时，',
   '  调用 memory_dispatch 把任务派发到话题集分支会话中完成，由分支汇报结果——不要在主对话框里直接完成整套操作或长篇大论；',
-  '  主对话框只做：判断、派发、收到 relay 结果后轻量转述。纯问答、简单确认、记忆检索类问题不要派发。',
+  '  主对话框（中枢）只做：判断、派发、收到 relay 结果后轻量转述与交付用户要的最终信息；不要直接读改文件、执行命令或长篇推理。',
+  '  派发前用 capabilities 设定分支能力边界（改代码/跑命令用 full，只审阅用 read，纯编辑用 read-write，汇总/轻量核对用 minimal）；',
+  '  纯问答、简单确认、记忆检索类问题不要派发。',
   '- 用户要求可视化管理记忆/打开记忆面板时：SuperMemory 面板已内置在左侧边栏（插件/自动化任务下方的"超级记忆"入口），',
   '  直接提示用户点击该入口即可；memory_ui 返回的浏览器管理台链接仅在用户明确要求外部链接时给出。',
   '- 对话中可能出现 [SuperMemory 相关记忆] / [SuperMemory 话题集] / [SuperMemory 话题提示] 注入卡片：仅供参考，',
@@ -270,7 +309,7 @@ export async function apply(ctx: Context, config: Config) {
   // Storage domain: a failure degrades memory features, never the session.
   let store: Store | undefined
   try {
-    store = await openStore(ctx.storageDomain, logger)
+    store = await openStoreWithRetry(ctx.storageDomain, logger)
   } catch (error) {
     logger.warn(`supermemory: storage domain unavailable, memory features disabled: ${String(error)}`)
   }
@@ -324,6 +363,7 @@ export async function apply(ctx: Context, config: Config) {
 
   const routeDeps: RouteDeps = {
     store: store as Store,
+    ...(store ? { ctx } : {}),
     config: {
       enabled: config.route.enabled,
       driftTurns: config.route.driftTurns,
@@ -402,6 +442,29 @@ export async function apply(ctx: Context, config: Config) {
     order: 900,
     text: PROMPT_TEXT,
   }), 'supermemory: prompt')
+
+  // R18 需求⑤: hub-role section (order 901, right after the memory rules). The
+  // provider reads the initiating agent at assembly time — `currentInitiator()`
+  // is the agent whose turn triggered this prompt — and contributes NOTHING
+  // when that agent is not a hub (branches, subagents, topic-set sessions).
+  ctx.effect(() => ctx.systemPrompt.section({
+    name: 'supermemory:hub-role',
+    order: 901,
+    text: (context: unknown) => {
+      let agent: unknown
+      try {
+        agent = ctx.agents.currentInitiator()
+      } catch {
+        agent = undefined
+      }
+      if (!agent) {
+        // No initiator boundary (e.g. a host that assembles outside a turn):
+        // the assembling scope is the Agent, which is the same subject.
+        agent = (context as { scope?: unknown } | undefined)?.scope
+      }
+      return isHubSession(store, agent) ? HUB_ROLE_TEXT : ''
+    },
+  }), 'supermemory: prompt (hub role)')
 
   // §2.4: startup reconciliation, detached.
   if (store) {

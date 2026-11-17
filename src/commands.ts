@@ -18,6 +18,7 @@ import { renderCard } from './route.ts'
 import type { ModelDeps } from './model.ts'
 import { askDefaultModel, applyModelSelection } from './model.ts'
 import { openRequirements } from './requirements.ts'
+import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 
 export interface CommandsDeps {
   ctx: Context
@@ -95,16 +96,27 @@ async function runMemory(
       if (!found) return { kind: 'error', text: `未找到话题集『${arg}』。` }
       await setRouting(store, sessionId, { activeTopicSetId: found[0], driftCount: 0 })
       await touchTopicSet(store, found[0])
+      // R19 需求⑥: activation regenerates the index only when content changed.
+      noteTopicSetActivated({ ctx: deps.ctx, store, logger: deps.logger }, found[0])
       return { kind: 'success', text: `已激活话题集『${found[1].title}』。\n${renderCard(found[1])}` }
     }
     case 'new': {
       if (!arg) return { kind: 'error', text: '用法：/memory new <标题>' }
       const model = await askDefaultModel(deps.model, agent)
       const id = await createTopicSet(store, { workspaceKey, title: arg.slice(0, 40), ...(model ? { defaultModel: model } : {}) })
+      // R19 需求⑥: a bare title is enough for /memory new — the model fills the
+      // tags/body index (falling back to what was written on any failure).
+      try {
+        await fillTopicShapeOnCreate({ ctx: deps.ctx, store, logger: deps.logger }, id, '', { tags: true, summary: true })
+      } catch (error) {
+        deps.logger.warn('supermemory: topic-set shape generation skipped: ' + String(error).slice(0, 160))
+      }
       await setRouting(store, sessionId, { activeTopicSetId: id, driftCount: 0 })
+      noteTopicSetActivated({ ctx: deps.ctx, store, logger: deps.logger }, id)
+      const stored = getTopicSet(store, id)
       return {
         kind: 'success',
-        text: `已创建并激活话题集『${arg.slice(0, 40)}』${model ? `（默认模型 ${model.provider}/${model.model}）` : ''}`,
+        text: `已创建并激活话题集『${stored?.title ?? arg.slice(0, 40)}』${stored && stored.keywords.length ? `（标签：${stored.keywords.join('、')}）` : ''}${model ? `（默认模型 ${model.provider}/${model.model}）` : ''}`,
       }
     }
     case 'model': {

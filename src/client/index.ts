@@ -14,9 +14,9 @@ import { PANEL_REMOTE } from './remote.ts'
 import { en, NS, zh } from './locales.ts'
 import { SupermemoryIcon } from './icon.tsx'
 import { SupermemoryPanelPage } from './panel-page.tsx'
-import type { MutationResult, PanelApi, SessionBadge, TopicSetView } from './panel-page.tsx'
+import type { HubBranchView, HubSessionView, MemoryShape, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
 import { NewSessionChoice } from './new-session.tsx'
-import { SupermemorySessionBadge } from './session-badge.tsx'
+import { SupermemorySessionBadge, invalidateBadge } from './session-badge.tsx'
 
 export const name = 'dsh-supermemory-client'
 
@@ -55,15 +55,26 @@ function buildApi(ctx: Context): PanelApi | undefined {
   return {
     loadHub: (cwd, sessionId) => call('hubState', cwd, sessionId),
     listMemories: (cwd, query) => call('listMemories', cwd, query, 200),
-    createMemory: (cwd, text, key) => call('createMemory', cwd, text, key),
-    updateMemory: (cwd, id, text, key) => call('updateMemory', cwd, id, text, key),
+    createMemory: (cwd, text, key, title, tags) => call('createMemory', cwd, text, key, title, tags),
+    updateMemory: (cwd, id, text, key, title, tags) => call('updateMemory', cwd, id, text, key, title, tags),
     deleteMemory: (cwd, id) => call('deleteMemory', cwd, id),
     setMemoryStatus: (cwd, id, status) => call('setMemoryStatus', cwd, id, status),
-    createTopicSet: (cwd, title) => call('createTopicSet', cwd, title),
+    createTopicSet: (cwd, title, tags, summary) => call('createTopicSet', cwd, title, tags, summary),
+    listHubSessions: (cwd) => call<HubSessionView[]>('listHubSessions', cwd),
+    // R19 协同②: the hub's branch association (read model over dispatches).
+    listHubBranches: (cwd, hubSessionId, limit) => call<HubBranchView[]>('listHubBranches', cwd, hubSessionId, limit),
+    // R19 需求⑤: in-panel conversation (host reads sessionQuery.readSurface).
+    readSessionMessages: (sessionId, limit) => call<SessionChatView>('readSessionMessages', sessionId, limit),
+    sendSessionMessage: (sessionId, text) => call<MutationResult>('sendSessionMessage', sessionId, text),
+    suggestMemoryShape: (text) => call<MemoryShape>('suggestMemoryShape', text),
+    // R18 需求③: the badge cache is module-level; a hub refresh / dispatch receipt
+    // is exactly when topic-set membership may have changed, so the panel asks
+    // for a re-read instead of leaving a stale hub badge in the sidebar.
+    invalidateBadges: (sessionId) => { invalidateBadge(sessionId) },
     activate: async (sessionId, topicSetId) => call('activate', sessionId, topicSetId),
-    updateTopicSetSummary: (id, summary) => call('updateTopicSetSummary', id, summary),
-    createTopicSetSession: (cwd, ids, options) => call('createTopicSetSession', cwd, ids, options),
-    createHubSession: (cwd, options) => call('createHubSession', cwd, options),
+    updateTopicSetSummary: (id, summary, tags) => call('updateTopicSetSummary', id, summary, tags),
+    createTopicSetSession: (cwd, ids, options, firstMessage) => call('createTopicSetSession', cwd, ids, options, firstMessage),
+    createHubSession: (cwd, options, firstMessage) => call('createHubSession', cwd, options, firstMessage),
     followupTopicSet: (cwd, topicSetId, text) => call('followupTopicSet', cwd, topicSetId, text),
     listTools: () => call('listTools'),
     editTool: (id, patch) => call('editTool', id, patch),

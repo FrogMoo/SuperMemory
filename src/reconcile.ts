@@ -16,6 +16,7 @@ import type { Store } from './store.ts'
 import { branchHandles } from './dispatch.ts'
 import { applySessionTitle, ensureMemberTitle } from './title.ts'
 import { flushObserve, isDispatchInput, settleOpenDispatches } from './observe.ts'
+import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
 
 export interface ReconcileDeps {
   ctx: Context
@@ -57,7 +58,9 @@ async function failureDelivery(
   const { store, logger } = deps
   const deliveryId = 'dlv-fail-' + record.branchSessionId
   if (store.outbox.get(deliveryId)) return
+  const questionBlock = renderQuestionsBlock(openQuestionsOfDispatch(store, dispatchId))
   const payload = '[supermemory-relay ' + record.branchSessionId + ']\n任务：' + record.task + '\n结果：' + reason
+    + (questionBlock ? '\n\n' + questionBlock : '')
   await store.outbox.put(deliveryId, {
     dispatchId,
     kind: 'single',
@@ -147,7 +150,7 @@ export function runReconciliation(deps: ReconcileDeps): void {
           target.followup(make({
             content: [{
               type: 'text',
-              text: `[supermemory-dispatch ${dispatchId}]\n任务：${record.task}\n\n（重启恢复：重新派发）`,
+              text: `[supermemory-dispatch ${dispatchId}]\n任务：${record.task}\n\n（重启恢复：重新派发）\n遇到分歧按最合理解释执行；需要用户裁决时用 memory_raise_question 上交中枢，不要直接向用户提问。`,
             }],
             source: { kind: 'supermemory', form: 'instructions' },
           }) as never)

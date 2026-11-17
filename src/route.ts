@@ -14,6 +14,8 @@ import { loadHostModule } from './host.ts'
 import { tokenize } from './recall.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
+import { isPluginBranchId } from './hub-sessions.ts'
+import { noteTopicSetActivated } from './topic-shape.ts'
 import {
   getRouting, getTopicSet, listTopicSets, setRouting, touchTopicSet, createTopicSet,
 } from './topicsets.ts'
@@ -32,6 +34,8 @@ export interface RouteDeps {
   store: Store
   config: RouteConfig
   logger: { warn: (msg: string) => void; info: (msg: string) => void }
+  /** Host context (R19 需求⑥: activation may refresh the set's LLM shape). */
+  ctx?: Context
 }
 
 interface RouteOutcome {
@@ -97,6 +101,7 @@ export async function routeBatch(
       if (title === name || title.includes(name) || name.includes(title)) {
         await setRouting(store, sessionId, { activeTopicSetId: id, driftCount: 0 })
         await touchTopicSet(store, id)
+        if (deps.ctx) noteTopicSetActivated({ ctx: deps.ctx, store, logger: deps.logger }, id)
         return { topicSetId: id, card: renderCard(getTopicSet(store, id)) }
       }
     }
@@ -147,8 +152,12 @@ export async function routeBatch(
 
 /** True when the session is one of this plugin's branch sessions. */
 function isBranchSession(store: Store, sessionId: string): boolean {
+  // R19 需求③④: plugin-minted branch ids are branches regardless of member
+  // kind (a fresh dispatch is `kind:'root'`); a host session that owns a set
+  // stays a routing hub.
+  if (isPluginBranchId(sessionId)) return true
   for (const [, topicSet] of store.topicsets.entries()) {
-    if (topicSet.members.some((m) => m.sessionId === sessionId)) return true
+    if (topicSet.members.some((m) => m.sessionId === sessionId && m.kind === 'fork')) return true
   }
   return false
 }
