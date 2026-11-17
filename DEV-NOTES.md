@@ -147,8 +147,10 @@
 ## 5. 当前状态（2026-11-17）
 
 - 插件运行中（bundle 安装，入口 `lib/supermemory.js`；见 §6）。
-- 域数据：topicsets 5 / memories 8 / episodes 5 / requirements 2 / filemap 50 /
-  tool_memory 1（组合工具）/ signals 7 / dispatches 6 / outbox 6 / hotcache 33。
+- 域数据（2026-11-17 清理后，本工作区 G:\09 - dsh\SuperMemory）：topicsets 10 /
+  memories 20 / episodes 9 / requirements 16 / filemap 53 / tool_memory 1（组合工具）/
+  signals 26 / dispatches 9 / outbox 9；另有第二工作区 G:\16-task。
+  清理动作见 §8.5：删掉 11-16 的失败派发（+交付行）与「派发链路」测试话题集（级联）。
 - 已验证：P0 三项验收、P1 全链路（派发→分支→relay→确认）、P2 组 relay/需求/filemap/export、
   P3 阈值提议→固化→重启后仍可用、Plan A 宿主侧 20 项冒烟（两种载体）、
   **Plan A 上线实测（2026-11-17 插件重启后）**：GUI 同源端口 200、
@@ -363,7 +365,25 @@
 - 其他：管理台 `short()` 输出统一转义（id 类字段的纵深防御）；webui-live-check 的单工作区
   假失败修正；组合工具同名重复注册先 dispose 旧句柄。
 
-验证：`pnpm typecheck` 0 错、`pnpm build`、`pnpm smoke`（5 + 25 + 1）全绿。
+验证：`pnpm typecheck` 0 错、`pnpm build`、`pnpm smoke`（5 + 26 + 1）全绿。
+
+### 8.5 数据删除能力（2026-11-17，清理需求带出的缺口）
+
+此前控制台只有 memory/requirement 的删除与 topicset 的**归档**，episodes / dispatches / outbox
+只增不减 —— 于是每轮验证都留下测试话题集、归档和派发记录，而没有任何入口能删。
+新增三个**工作区校验 + 级联**的删除路由（`src/webui.ts`），控制台相应按钮在
+`src/web/app.js`（静态文件按请求读盘，改完刷新即生效）：
+
+- `POST /api/episode/delete {ws,id}`：梗概经 topicSetId 归属校验。
+- `POST /api/dispatch/delete {ws,id}`：级联删除该派发的交付行（outbox）。
+- `POST /api/topicset/delete {ws,id}`：级联删除该集的 episodes、dispatches、它们的
+  outbox 行，以及指向它的 routing 行（否则会话会一直指向已删除的话题集）。
+
+冒烟：`webui-smoke` 新增 1 项（工作区校验 400 + 三处级联断言），共 26 项。
+
+清理时的一个判断：**同分支多条 episode 不一定是重复**——每条 dispatch 对应自己 seq 窗口的
+一条归档是正确行为（11-16 那两条 seq 4–14 / 16–22 分别属于两次真实派发），不能当重复删。
+
 
 **插件重载**：本地 tsdown 重建**不会**自动热替换（本轮实测：宿主仍在旧代码，控制台端口未变化）。
 请在「设置 → 插件管理」对 dsh-supermemory 禁用→启用（或重启 DSH Desktop），再刷新 GUI 页面。

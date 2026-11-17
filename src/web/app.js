@@ -151,7 +151,8 @@ function topicSetCard(t, d, defaultSession) {
         ? `<button class="btn small primary" type="button" data-action="ts-save" data-id="${t.id}">保存</button><button class="btn small" type="button" data-action="edit-cancel" data-id="ts:${t.id}">取消</button>`
         : `<button class="btn small" type="button" data-action="ts-edit" data-id="${t.id}">编辑</button>${t.status === 'active'
             ? `<button class="btn small" type="button" data-action="ts-archive" data-id="${t.id}">归档</button>`
-            : `<button class="btn small" type="button" data-action="ts-unarchive" data-id="${t.id}">恢复</button>`}`}
+            : `<button class="btn small" type="button" data-action="ts-unarchive" data-id="${t.id}">恢复</button>`}
+          <button class="btn small danger" type="button" data-action="ts-del" data-id="${t.id}">删除</button>`}
     </header>
     <div class="body">
       ${editing
@@ -272,7 +273,7 @@ function renderDispatch(d) {
   return `
   <div class="panel"><header>派发（dispatches）</header><div class="body">
     ${d.dispatches.length
-      ? `<table><tr><th>任务</th><th>分支</th><th>话题集</th><th>状态</th><th>终态原因</th><th>创建</th></tr>${d.dispatches.map((x) => `<tr><td title="${esc(x.task)}">${task(x)}</td><td>${short(x.branchSessionId)}</td><td>${esc(tsTitle(x.topicSetId))}</td><td>${badge(x.status)}</td><td class="muted">${esc(x.turnEndReason || '—')}</td><td>${fmtTime(x.createdAt)}</td></tr>`).join('')}</table>`
+      ? `<table><tr><th>任务</th><th>分支</th><th>话题集</th><th>状态</th><th>终态原因</th><th>创建</th><th></th></tr>${d.dispatches.map((x) => `<tr><td title="${esc(x.task)}">${task(x)}</td><td>${short(x.branchSessionId)}</td><td>${esc(tsTitle(x.topicSetId))}</td><td>${badge(x.status)}</td><td class="muted">${esc(x.turnEndReason || '—')}</td><td>${fmtTime(x.createdAt)}</td><td><button class="btn small danger" type="button" data-action="dsp-del" data-id="${x.id}">删除</button></td></tr>`).join('')}</table>`
       : '<div class="empty">暂无派发记录</div>'}
   </div></div>
   <div class="panel"><header>交付箱（outbox）</header><div class="body">
@@ -293,6 +294,7 @@ function renderEpisodes(d) {
     ${fmtTime(e.timeStart)} → ${fmtTime(e.timeEnd)}
     <span class="grow"></span>
     <span class="muted">${esc(tsTitle(e.topicSetId))} · 分支 ${short(e.branchSessionId)}</span>
+    <button class="btn small danger" type="button" data-action="ep-del" data-id="${e.id}">删除</button>
   </header><div class="body">
     <div>${e.summary ? esc(e.summary) : '<span class="muted">（无梗概）</span>'}</div>
     ${chips('决策', e.decisions)}${chips('下一步', e.nextSteps)}${chips('文件', e.files)}
@@ -373,6 +375,18 @@ document.addEventListener('click', async (ev) => {
       await run(async () => { await post('/topicset/update', { ws: state.ws, id, status: 'archived' }); toast('已归档') }); return
     case 'ts-unarchive':
       await run(async () => { await post('/topicset/update', { ws: state.ws, id, status: 'active' }); toast('已恢复') }); return
+    case 'ts-del':
+      if (!confirm('删除话题集会级联删除它的归档梗概、派发记录与交付行，且不可恢复。确定？')) return
+      await run(async () => {
+        const r = await post('/topicset/delete', { ws: state.ws, id })
+        toast('已删除话题集（梗概 ' + r.episodes + ' · 派发 ' + r.dispatches + ' · 交付 ' + r.outbox + '）')
+      }); return
+    case 'ep-del':
+      if (!confirm('删除这条归档梗概？不可恢复。')) return
+      await run(async () => { await post('/episode/delete', { ws: state.ws, id }); toast('已删除梗概') }); return
+    case 'dsp-del':
+      if (!confirm('删除这条派发记录及其交付行？不可恢复。')) return
+      await run(async () => { await post('/dispatch/delete', { ws: state.ws, id }); toast('已删除派发记录') }); return
     case 'ts-activate': await run(async () => {
       const sessionId = btn.closest('.panel').querySelector('[data-role="ts-session"]').value
       if (!sessionId) throw new Error('没有可选会话')

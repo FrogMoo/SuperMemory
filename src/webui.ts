@@ -425,6 +425,72 @@ async function handleApi(res: ServerResponse, route: string, body: Json, store: 
       logger.info(`supermemory: webui exported to ${target}`)
       return sendJson(res, 200, { ok: true, path: target, ...result })
     }
+    // ---- destructive cleanup: these rows had NO removal path before, which is
+    // how verification rounds piled up topicsets/episodes/dispatches forever.
+    case 'episode/delete': {
+      const id = text(body.id)
+      const episode = store.episodes.get(id)
+      if (!episode) return fail('梗概不存在')
+      // Workspace isolation: an episode joins through its topic set.
+      if (episode.topicSetId && !tsIdsOf(store, ws).has(episode.topicSetId)) return fail('梗概不属于当前工作区')
+      await store.episodes.delete(id)
+      logger.info(`supermemory: webui deleted episode ${id}`)
+      return sendJson(res, 200, { ok: true })
+    }
+    case 'dispatch/delete': {
+      const id = text(body.id)
+      const dispatch = store.dispatches.get(id)
+      if (!dispatch) return fail('派发记录不存在')
+      if (dispatch.topicSetId && !tsIdsOf(store, ws).has(dispatch.topicSetId)) return fail('派发记录不属于当前工作区')
+      await store.dispatches.delete(id)
+      // A relay row for a deleted dispatch is dead weight: drop it too.
+      let outbox = 0
+      for (const [outboxId, item] of [...store.outbox.entries()]) {
+        if (item.dispatchId !== id) continue
+        await store.outbox.delete(outboxId)
+        outbox++
+      }
+      logger.info(`supermemory: webui deleted dispatch ${id} (+${outbox} outbox rows)`)
+      return sendJson(res, 200, { ok: true, outbox })
+    }
+    case 'topicset/delete': {
+      const id = text(body.id)
+      const existing = store.topicsets.get(id)
+      if (!existing || existing.workspaceKey !== ws) return fail('话题集不存在')
+      // Cascade: a topic set owns its episodes, dispatches, their relay rows and
+      // every routing pointer at it.
+      let episodes = 0
+      for (const [episodeId, episode] of [...store.episodes.entries()]) {
+        if (episode.topicSetId !== id) continue
+        await store.episodes.delete(episodeId)
+        episodes++
+      }
+      const dispatchIds = new Set<string>()
+      const groupIds = new Set<string>()
+      for (const [dispatchId, dispatch] of [...store.dispatches.entries()]) {
+        if (dispatch.topicSetId !== id) continue
+        await store.dispatches.delete(dispatchId)
+        dispatchIds.add(dispatchId)
+        if (dispatch.groupId) groupIds.add(dispatch.groupId)
+      }
+      let outbox = 0
+      for (const [outboxId, item] of [...store.outbox.entries()]) {
+        const hit = (item.dispatchId !== undefined && dispatchIds.has(item.dispatchId))
+          || (item.groupId !== undefined && groupIds.has(item.groupId))
+        if (!hit) continue
+        await store.outbox.delete(outboxId)
+        outbox++
+      }
+      let routing = 0
+      for (const [sessionId, record] of [...store.routing.entries()]) {
+        if (record.activeTopicSetId !== id) continue
+        await store.routing.delete(sessionId)
+        routing++
+      }
+      await store.topicsets.delete(id)
+      logger.info(`supermemory: webui deleted topic set ${id} (episodes ${episodes}, dispatches ${dispatchIds.size}, outbox ${outbox}, routing ${routing})`)
+      return sendJson(res, 200, { ok: true, episodes, dispatches: dispatchIds.size, outbox, routing })
+    }
     default:
       return sendJson(res, 404, { ok: false, error: `unknown api route: ${route}` })
   }
@@ -531,6 +597,15 @@ function buildState(store: Store, ws: string) {
 }
 
 // ---------- small helpers ----------
+
+/** Topic-set ids of one workspace: episodes/dispatches join through them. */
+function tsIdsOf(store: Store, ws: string): Set<string> {
+  const ids = new Set<string>()
+  for (const [id, topicSet] of store.topicsets.entries()) {
+    if (topicSet.workspaceKey === ws) ids.add(id)
+  }
+  return ids
+}
 
 function countWs<V extends { workspaceKey?: string }>(entries: IterableIterator<[string, V]>, ws: string): number {
   let n = 0
