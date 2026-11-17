@@ -73,6 +73,27 @@ function buildApi(ctx: Context): PanelApi | undefined {
 }
 
 /**
+ * Resolve the workspace path the New-session dialog should create sessions in.
+ * The `workspaces` service is the one the shell exposes to client plugins
+ * (same shape dsh-vscode-mode reads); an empty string falls back to the host's
+ * default workspace resolution.
+ */
+function resolveCwd(ctx: Context): string {
+  try {
+    const workspaces = ctx.get('workspaces') as
+      | { list?: { getSnapshot?: () => { items?: Array<{ path?: unknown }> } } }
+      | undefined
+    const items = workspaces?.list?.getSnapshot?.()?.items ?? []
+    for (const item of items) {
+      if (typeof item?.path === 'string' && item.path) return item.path
+    }
+  } catch {
+    // The service is absent on older shells; the dialog still works with ''.
+  }
+  return ''
+}
+
+/**
  * Register the SuperMemory surfaces. Every registration is defensive: a
  * failure in one contribution must not take down the others (or the boot).
  * @param ctx - browser root context.
@@ -134,14 +155,21 @@ export async function apply(ctx: Context): Promise<void> {
   })
 
   // 3. the New-session choice layer (中枢会话 / 话题集会话).
-  // Standard hooks (useWorkspaces) arrive automatically; only the panel API
-  // is injected.
+  // Mounted in shell.overlay, NOT in a sidebar row slot: this shell exposes no
+  // "new session action" slot (the verified sidebar slot vocabulary is
+  // sidebar.panellist / sidebar.session.row.leading /
+  // sidebar.workspaces.session.row.action / sidebar.footer.action), so the
+  // component installs its own capture-phase document listener and intercepts
+  // the click on the shell's 新建会话 control by accessible name. Worst case
+  // (label renamed upstream) nothing is intercepted and the shell's default
+  // plain new session still runs.
   contribute('new-session choice', () => {
-    ctx.effect(() => ctx.slots.inject('sidebar.session.action', () => ctx.slots.register({
-      name: 'sidebar.session.action',
+    ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+      name: 'shell.overlay',
       id: 'supermemory-new-session',
+      order: 30,
       locale: NS,
-      inject: () => ({ api }),
+      inject: () => ({ api, cwd: () => resolveCwd(ctx) }),
     }, NewSessionChoice as never)), 'supermemory: new-session choice')
   })
 }

@@ -477,7 +477,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
 
   const body = view.kind === 'hub' ? hubView : view.kind === 'topic' ? topicView : view.kind === 'memories' ? memoriesView : toolsView
 
-  return h('div', { className: 'sm-panel' },
+  return h('div', { className: 'sm-panel', 'data-sm-panel': 'true' },
     h('div', { key: 'head', className: 'sm-head' },
       h('h1', null, t('panel.title')),
       hub ? h('span', { key: 'counts', className: 'sm-counts' }, t('hub.counts', hub.counts)) : null,

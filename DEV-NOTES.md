@@ -388,4 +388,65 @@
 **插件重载**：本地 tsdown 重建**不会**自动热替换（本轮实测：宿主仍在旧代码，控制台端口未变化）。
 请在「设置 → 插件管理」对 dsh-supermemory 禁用→启用（或重启 DSH Desktop），再刷新 GUI 页面。
 
+## 9. 客户端半边从未被加载（根因）+ 新会话接入点修正（2026-11-17 第四轮）
+
+用户报「6 项需求哪些做了哪些没做」。审查结论：**宿主逻辑已全部落地，但整个
+客户端半边（面板页 / 左侧入口 / 新会话选项 / 工具编辑页 = R2/R3/R4/R5 的界面）
+在 GUI 里根本不存在**——因为下面的根因。
+
+### 9.1 根因：package.json 缺 dsh.client
+
+- 平台扫描客户端插件的契约（对照已发布的 dsh-vscode-mode 0.30.0 实证）：
+  exports["./client"] = "./lib/client.js" **且**
+  dsh = { bundle: {…}, client: { platform: "web" } }。
+- 本文件 §7.1 写着「声明：package.json dsh.client = { platform: 'web' }」，但
+  git log -- package.json 显示该字段**从未存在过**（225a5f3 里也没有）。于是
+  clientModules 不把 dsh-supermemory 编入 window.__DSH_BOOT__：
+  /plugins/dsh-supermemory/client.js 恒 404，三处 slot 注册一次都没执行。
+  所有客户端冒烟（client-sim-smoke 直接喂 lib/client.js）都绕过了这一步，
+  所以「SIM SMOKE OK」并不能证明 GUI 里看得见。
+- 已补该字段；并在 scripts/client-sim-smoke.mjs 加了**清单守卫**：
+  exports["./client"] 与 dsh.client.platform === "web" 缺任何一个即失败。
+
+### 9.2 slot 名称实证（本机已装插件反查，不再靠猜）
+
+从 ~/.dsh/profiles/desktop/node_modules 下各插件的 client bundle 中提取到的
+**真实** slot 名：sidebar.panellist（dsh-skills-manager 用它挂左侧面板行，
+正是 R4 要的位置）、sidebar.session.row.leading、
+sidebar.workspaces.session.row.action、sidebar.footer.action、
+shell.overlay、main、conversation.view、conversation.composer.dock、
+conversation.input.right、conversation.input.model.label、
+conversation.session.header.utilities、settings.section、
+settings.section.icon、plugins.detail.section、plugins.bundle.config。
+
+→ sidebar.panellist（R4 左侧入口）与 main（R2/R5 面板页）是对的；
+**sidebar.session.action 不存在**（§7.2 的 R3 接入点一直是空注册，静默失败，
+被 client/index.ts 的 per-contribution try/catch 吞掉了）。
+
+### 9.3 R3 新会话选项的新接法
+
+- 改为挂在 shell.overlay（全局渲染槽，vscode-mode 的同款用法），组件自装
+  **捕获阶段 document 监听**，按可访问名（aria-label / title / textContent）
+  匹配 shell 的「新建会话 / New session」控件后 preventDefault + stopPropagation
+  再弹选择层。
+- 失败模式是安全方向：上游改名 → 监听不匹配 → 什么都没拦，shell 原生新建会话照旧；
+  不会出现「按钮点不动」。面板页根节点带 data-sm-panel，弹层带 .sm-ns-backdrop，
+  两者都排除在拦截之外，避免自我触发。
+- 工作区路径不再依赖 slot 注入的 useWorkspaces（overlay 槽没有它），改由
+  resolveCwd(ctx) 读 workspaces.list.getSnapshot().items（vscode-mode 同款读取）。
+
+### 9.4 顺手修的
+
+- panel.ts createMemory 把 sourceSessionId 写成字面量 "panel"，面板会据此
+  显示「定位会话」按钮并跳一个不存在的会话；改为空串（按钮自然不出现）。
+
+### 9.5 生效方式（重要）
+
+dsh.client 是**宿主启动时**读的，运行中改清单不会重建 boot 图（实测：改完
+/plugins/dsh-supermemory/client.js 仍 404）。必须**重启 DSH Desktop**
+（或在插件管理页对 dsh-supermemory 禁用→启用，若该操作会重扫清单），然后刷新 GUI 页面。
+验证顺序：左侧出现「超级记忆」入口 → 点开是面板页（默认中枢会话）→
+点「新建会话」出现 中枢会话/话题集会话 选择层。
+
+
 

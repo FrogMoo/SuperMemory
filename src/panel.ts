@@ -221,7 +221,8 @@ export class SupermemoryPanelService {
     const memory: Memory = {
       workspaceKey, text: body, key: stableKey,
       keywords: [...new Set(tokenize(body))].slice(0, 12),
-      sourceSessionId: 'panel',
+      // Typed in the panel: there is no source session to locate.
+      sourceSessionId: '',
       sourceSeq: 0,
       status: 'active', createdAt: now, updatedAt: now,
     }

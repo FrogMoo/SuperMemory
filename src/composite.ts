@@ -286,29 +286,6 @@ export async function editCompositeTool(
 }
 
 /**
- * Pre-execute soft hint (§2.3): when the model is about to call the FIRST
- * tool of a known composite by hand, attach a gentle note. Additive only —
- * the waterfall decision is passed through untouched.
+ * Composite near-miss hints moved to src/activity.ts: tools/post-execute can
+ * carry additionalContexts for the next request, tools/pre-execute cannot.
  */
-export function attachCompositeHint(ctx: Context, store: Store): () => void {
-  return ctx.on('tools/pre-execute', async (exec, next) => {
-    const decision = await next()
-    if (decision.kind !== 'allow') return decision
-    try {
-      const name = (exec as { name?: string }).name
-      if (!name) return decision
-      for (const [, record] of store.toolMemory.entries()) {
-        if (record.kind !== 'composite' || record.status !== 'active' || !record.entry) continue
-        const spec = JSON.parse(record.entry) as CompositeSpec
-        if (spec.steps[0]?.tool !== name) continue
-        const llm = await loadHostModule('@deepseek-ai/dsh-llm')
-        const hint = llm.createUserMessage({
-          content: [{ type: 'text', text: `[SuperMemory 提示] 检测到重复流程：可直接调用组合工具 ${spec.name} 一次完成（${spec.steps.map((s) => s.tool).join(' → ')}）。` }],
-          source: { kind: 'supermemory', form: 'notice', summary: '组合工具提示' },
-        })
-        return { ...decision, additionalContexts: [...((decision as { additionalContexts?: unknown[] }).additionalContexts ?? []), hint] } as never
-      }
-    } catch { /* hints are best-effort */ }
-    return decision
-  })
-}

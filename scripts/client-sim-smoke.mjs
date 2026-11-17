@@ -77,12 +77,26 @@ const slots = registrations.map((r) => r.slot + ':' + (r.entry?.options?.id ?? r
 const expected = [
   'sidebar.panellist:supermemory',
   'main:supermemory',
-  'sidebar.session.action:supermemory-new-session',
+  'shell.overlay:supermemory-new-session',
 ]
 for (const want of expected) {
   if (!slots.includes(want)) throw new Error('missing registration: ' + want + ' (got ' + slots.join(', ') + ')')
 }
 if (consoleErrors.length > 0) throw new Error('console.error during apply: ' + consoleErrors.join(' | '))
+
+// The client half only reaches the browser when the package manifest declares
+// it: dsh.client.platform 'web' makes clientModules add the package to
+// window.__DSH_BOOT__, and exports["./client"] names the artifact to serve.
+// This is the regression guard for the shipped bug of 2026-11-17: the client
+// bundle built and passed this very smoke, yet no GUI surface ever appeared
+// because the manifest field was missing.
+const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+if (manifest.exports?.['./client'] === undefined) {
+  throw new Error('package.json exports["./client"] missing: the client half cannot be served')
+}
+if (manifest.dsh?.client?.platform !== 'web') {
+  throw new Error('package.json dsh.client.platform must be "web": clientModules would skip the client half')
+}
 
 console.log('SIM SMOKE OK')
 console.log('  name:', moduleExports.name)

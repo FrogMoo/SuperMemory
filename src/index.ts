@@ -14,7 +14,10 @@ import { branchHandles, releasableBranches } from './dispatch.ts'
 import { attachMaintenance } from './maintenance.ts'
 import type { ModelDeps } from './model.ts'
 import { attachObserve, flushObserve } from './observe.ts'
+import { attachToolActivity } from './activity.ts'
+import { createTracker } from './inrequest.ts'
 import { attachPreStep } from './prestep.ts'
+import { sweepAutoToolize, type ToolizeConfig } from './toolize.ts'
 import { loadHostModule } from './host.ts'
 import { runReconciliation } from './reconcile.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
@@ -34,6 +37,10 @@ export const inject = [
   'commands', 'systemPrompt', 'userQuestions', 'agents', 'workspaceRegistry',
 ]
 
+/**
+ * Config for the profile patch: every knob is documented in Chinese because the
+ * settings page renders these descriptions verbatim.
+ */
 export interface Config {
   enabled: boolean
   recall: {
@@ -42,6 +49,14 @@ export interface Config {
     halfLifeDays: number
     maxChars: number
     injectStyle: 'gentle' | 'plain'
+    repeat: {
+      enabled: boolean
+      everySteps: number
+      maxCardsPerRequest: number
+      maxCharsPerRequest: number
+      dedupe: boolean
+      hotSignal: boolean
+    }
   }
   route: {
     enabled: boolean
@@ -64,11 +79,35 @@ export interface Config {
     enabled: boolean
     signalsThreshold: number
     summaryEveryTurns: number
+    autoToolize: boolean
+    toolizeCooldownMs: number
+    toolizeMax: number
+    toolizeMinSteps: number
+    toolizeMinDistinctTools: number
+    nearMissHint: boolean
+    recycleIdleToolDays: number
   }
   ui: {
     enabled: boolean
     token: string
     carrier: 'own' | 'auto'
+  }
+}
+
+/**
+ * Project the plugin Config onto the tool-ization knobs (one place, so the
+ * maintenance loop and the tool-activity listener never disagree).
+ */
+export function toolizeConfig(config: Config): ToolizeConfig {
+  return {
+    enabled: config.maintenance.autoToolize,
+    threshold: config.maintenance.signalsThreshold,
+    cooldownMs: config.maintenance.toolizeCooldownMs,
+    maxActive: config.maintenance.toolizeMax,
+    minSteps: config.maintenance.toolizeMinSteps,
+    minDistinctTools: config.maintenance.toolizeMinDistinctTools,
+    nearMissHint: config.maintenance.nearMissHint,
+    recycleIdleDays: config.maintenance.recycleIdleToolDays,
   }
 }
 
@@ -81,6 +120,14 @@ export const Config: Schema<Config> = Schema.object({
     maxChars: Schema.natural().description('recall 卡片字符上限').default(2400),
     injectStyle: Schema.union([Schema.const('gentle'), Schema.const('plain')])
       .description('注入语气：gentle 温和起步 / plain 直陈').default('gentle'),
+    repeat: Schema.object({
+      enabled: Schema.boolean().description('过程内再召回开关（需求 A：同一请求执行过程中继续召回，不只在开头注入一次）').default(true),
+      everySteps: Schema.natural().description('自上次召回后又执行了多少次工具调用才再次召回（默认 3，保守；每次召回后计数清零）').default(3),
+      maxCardsPerRequest: Schema.natural().description('同一请求内召回卡片总数上限（含开头那张）').default(4),
+      maxCharsPerRequest: Schema.natural().description('同一请求内召回卡片字符总量上限').default(6000),
+      dedupe: Schema.boolean().description('已注入过的 memory id 不再重复注入').default(true),
+      hotSignal: Schema.boolean().description('高信号变化提前触发：工具报错，或与已有记忆关键词重合度显著上升（新路径单独出现不算，避免每读一个文件就注入）').default(true),
+    }).description('过程内再召回参数').default({}),
   }).description('检索注入参数').default({}),
   route: Schema.object({
     enabled: Schema.boolean().description('话题集路由开关').default(true),
@@ -102,8 +149,15 @@ export const Config: Schema<Config> = Schema.object({
   }).description('观察投递参数').default({}),
   maintenance: Schema.object({
     enabled: Schema.boolean().description('维护循环开关').default(true),
-    signalsThreshold: Schema.natural().description('工具化信号阈值（P3）').default(3),
+    signalsThreshold: Schema.natural().description('工具化序列阈值（同一短流程出现次数）').default(3),
     summaryEveryTurns: Schema.natural().description('话题集梗概滚动更新间隔（轮）').default(10),
+    autoToolize: Schema.boolean().description('需求 B：达到阈值自动固化为组合工具（不再等用户确认）；关闭时保留原有人工确认路径').default(true),
+    toolizeCooldownMs: Schema.natural().description('自动固化冷却毫秒数（同一工作区两次固化之间的最小间隔，防止无限增长）').default(60000),
+    toolizeMax: Schema.natural().description('组合工具数量上限（达到后不再自动新增）').default(8),
+    toolizeMinSteps: Schema.natural().description('自动固化的最少步数（默认 2）').default(2),
+    toolizeMinDistinctTools: Schema.natural().description('自动固化要求的最少不同工具数（默认 2；同一工具重复不构成流程）').default(2),
+    nearMissHint: Schema.boolean().description('模型手工执行组合工具前几步时，注入一句可直接调用组合工具的提示（走 post-execute additionalContexts，真实可见）').default(true),
+    recycleIdleToolDays: Schema.natural().description('零使用组合工具回收天数（0=关闭，只记录不回收）').default(0),
   }).description('维护循环参数').default({}),
   ui: Schema.object({
     enabled: Schema.boolean().description('Web 管理台总开关（/supermemory 路由）').default(true),
@@ -243,7 +297,10 @@ export async function apply(ctx: Context, config: Config) {
     logger.warn(`supermemory: tool registration failed: ${String(error)}`)
   }
 
-  // pre-step: recall card (§P0) then topicset routing (P1) — both waterfall-safe.
+  // Per-step context: opening recall (P0) + in-request repeat cards (需求 A).
+  // agent/pre-step is the only supported place to append model-visible, logged
+  // messages on EVERY step of a request (see inrequest.ts header).
+  const tracker = createTracker()
   ctx.effect(() => attachPreStep(ctx, store, {
     enabled: true,
     maxItems: config.recall.maxItems,
@@ -251,7 +308,17 @@ export async function apply(ctx: Context, config: Config) {
     halfLifeDays: config.recall.halfLifeDays,
     maxChars: config.recall.maxChars,
     injectStyle: config.recall.injectStyle,
+    repeat: config.recall.repeat,
+    tracker,
   }, logger), 'supermemory: pre-step')
+
+  // Tool activity: repeat-recall input, composite near-miss records and live
+  // auto-toolization, on the supported post-execute waterfall.
+  ctx.effect(() => attachToolActivity(ctx, store, tracker, {
+    repeat: config.recall.repeat,
+    nearMissHint: config.maintenance.nearMissHint,
+    toolize: toolizeConfig(config),
+  }, logger), 'supermemory: tool-activity')
 
   const routeDeps: RouteDeps = {
     store: store as Store,
@@ -270,10 +337,13 @@ export async function apply(ctx: Context, config: Config) {
   if (store) {
     void (async () => {
       try {
-        const { rebuildComposites, attachCompositeHint } = await import('./composite.ts')
+        const { rebuildComposites } = await import('./composite.ts')
         const count = await rebuildComposites(ctx, store)
-        if (count > 0) logger.info(`supermemory: rebuilt ${count} composite tool(s)`)
-        ctx.effect(() => attachCompositeHint(ctx, store), 'supermemory: composite-hint')
+        if (count > 0) logger.info('supermemory: rebuilt ' + count + ' composite tool(s)')
+        // 需求 B: signals that crossed the threshold before autoToolize existed
+        // are fixated at boot; zero-use composites are audited there as well.
+        const sweepCreated = await sweepAutoToolize(ctx, store, toolizeConfig(config), logger)
+        if (sweepCreated > 0) logger.info('supermemory: auto-toolized ' + sweepCreated + ' composite(s) at boot')
       } catch (error) {
         logger.warn(`supermemory: composite rebuild failed: ${String(error).slice(0, 200)}`)
       }
@@ -297,6 +367,13 @@ export async function apply(ctx: Context, config: Config) {
     enabled: config.maintenance.enabled,
     signalsThreshold: config.maintenance.signalsThreshold,
     summaryEveryTurns: config.maintenance.summaryEveryTurns,
+    autoToolize: config.maintenance.autoToolize,
+    toolizeCooldownMs: config.maintenance.toolizeCooldownMs,
+    toolizeMax: config.maintenance.toolizeMax,
+    toolizeMinSteps: config.maintenance.toolizeMinSteps,
+    toolizeMinDistinctTools: config.maintenance.toolizeMinDistinctTools,
+    nearMissHint: config.maintenance.nearMissHint,
+    recycleIdleToolDays: config.maintenance.recycleIdleToolDays,
   }, logger), 'supermemory: maintenance')
 
   const commandDeps: CommandsDeps = {

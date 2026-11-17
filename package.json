@@ -45,11 +45,14 @@
     "build:client": "tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
     "smoke:webui": "node scripts/webui-smoke.mjs",
     "smoke:core": "node scripts/core-smoke.mjs",
-    "smoke": "node scripts/core-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs"
+    "smoke": "node scripts/core-smoke.mjs && node scripts/mechanism-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   }
 }

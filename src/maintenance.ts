@@ -23,6 +23,13 @@ export interface MaintenanceConfig {
   enabled: boolean
   signalsThreshold: number
   summaryEveryTurns: number
+  autoToolize: boolean
+  toolizeCooldownMs: number
+  toolizeMax: number
+  toolizeMinSteps: number
+  toolizeMinDistinctTools: number
+  nearMissHint: boolean
+  recycleIdleToolDays: number
 }
 
 interface BufferedUser {
@@ -172,7 +179,7 @@ export function attachMaintenance(
       logger.info(`supermemory: +${createdIds.length} memories, +${reqIds.length} requirements from ${task.sessionId}@${task.seq}`)
     }
     // §2.3: repeated tool sequences feed the tool-ization pipeline.
-    await countSequenceSignal(activeStore, ctx, task.sessionId, workspaceKey, cursor, task.seq, config.signalsThreshold, logger)
+    await countSequenceSignal(activeStore, ctx, task.sessionId, workspaceKey, cursor, task.seq, config, logger)
   }
 
   async function persistCursor(sessionId: string, seq: number, createdIds: string[] = []): Promise<void> {
@@ -283,9 +290,10 @@ function rollSummary(
 }
 
 /**
- * §2.3: count one turn's tool-call sequence as a tool-ization signal, and
- * raise a pending proposal once it crosses the threshold. Samples carry the
- * recorded arguments for later composite compilation.
+ * One turn's tool sequence feeds the tool-ization pipeline: sliding windows of
+ * 2..4 calls (every occurrence counts) plus the whole short turn. Crossing the
+ * threshold auto-registers the composite (需求 B) or, with autoToolize off,
+ * raises the manual pending proposal exactly as before.
  */
 async function countSequenceSignal(
   store: Store,
@@ -294,12 +302,12 @@ async function countSequenceSignal(
   workspaceKey: string,
   afterSeq: number,
   untilSeq: number,
-  threshold: number,
-  logger: { info: (msg: string) => void },
+  config: MaintenanceConfig,
+  logger: { info: (msg: string) => void; warn: (msg: string) => void },
 ): Promise<void> {
   let tools: string[] = []
   const args: Array<Record<string, unknown>> = []
-  const { sequenceKey, parseArgs } = await import('./composite.ts')
+  const { parseArgs } = await import('./composite.ts')
   try {
     const handle = await ctx.sessionPersistence.open(sessionId, 'read')
     try {
@@ -318,27 +326,20 @@ async function countSequenceSignal(
   } catch {
     return // a cold-read failure never breaks maintenance
   }
-  if (tools.length < 2) return // single-tool turns are not sequences
-  const key = sequenceKey(workspaceKey, tools)
-  const existing = store.signals.get(key)
-  const now = Date.now()
-  const samples = [...(existing?.samples ?? []), JSON.stringify({ tools, args })].slice(-3)
-  const crossed = existing?.proposedAt === undefined && (existing?.count ?? 0) + 1 >= threshold
-  const signal: Signal = {
-    workspaceKey,
-    pattern: tools.join('>'),
-    count: (existing?.count ?? 0) + 1,
-    lastSeen: now,
-    examples: [...(existing?.examples ?? []), `${tools.join(' → ')}`].slice(-3),
-    sequence: tools,
-    samples,
-    proposedAt: crossed ? now : existing?.proposedAt,
-    proposalStatus: crossed ? 'pending' as const : existing?.proposalStatus,
+  if (tools.length < 2) return
+  const { recordTurnSequences, recycleIdleComposites } = await import('./toolize.ts')
+  const toolize = {
+    enabled: config.autoToolize,
+    threshold: config.signalsThreshold,
+    cooldownMs: config.toolizeCooldownMs,
+    maxActive: config.toolizeMax,
+    minSteps: config.toolizeMinSteps,
+    minDistinctTools: config.toolizeMinDistinctTools,
+    nearMissHint: config.nearMissHint,
+    recycleIdleDays: config.recycleIdleToolDays,
   }
-  await store.signals.put(key, signal)
-  if (signal.proposalStatus === 'pending') {
-    logger.info(`supermemory: tool-ization proposal raised for ${tools.join('>')} (count=${signal.count})`)
-  }
+  await recordTurnSequences(ctx, store, workspaceKey, tools, args, toolize, logger)
+  await recycleIdleComposites(ctx, store, toolize, logger)
 }
 
 /** Write one fact, skipping exact duplicates within the workspace. */async function rememberFact(
