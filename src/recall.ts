@@ -44,12 +44,11 @@ function decay(createdAt: number, now: number, halfLifeDays: number): number {
 }
 
 /**
- * Score one memory against a query.
- * Score = matched-token weight sum × time decay; `minScore: 1` therefore means
- * "at least one matched token". No length normalisation: a long memory is not
- * penalised for being long, ranking is left to the matched-token count.
+ * Raw match score of one memory against weighted query tokens (no decay).
+ * `minScore: 1` therefore means "at least one matched token", independent of
+ * the record's age — decay only reorders the survivors.
  */
-export function scoreMemory(memory: Memory, queryTokens: Map<string, number>, options: RecallOptions): number {
+export function rawScore(memory: Memory, queryTokens: Map<string, number>): number {
   if (memory.status !== 'active') return 0
   const haystack = tokenize(`${memory.text} ${memory.keywords.join(' ')}`)
   if (haystack.length === 0) return 0
@@ -60,8 +59,7 @@ export function scoreMemory(memory: Memory, queryTokens: Map<string, number>, op
     const hits = bag.get(token)
     if (hits) raw += weight * Math.min(hits, 2)
   }
-  if (raw <= 0) return 0
-  return raw * decay(memory.createdAt, options.now, options.halfLifeDays)
+  return raw
 }
 
 /** Query token weights: tokens rarer in the query corpus weigh more. */
@@ -84,10 +82,16 @@ export function recallMemories(
   if (weights.size === 0) return []
   const scored: RecallItem[] = []
   for (const [memoryId, memory] of memories) {
-    const score = scoreMemory(memory, weights, options)
-    if (score >= options.minScore) {
-      scored.push({ memoryId, text: memory.text, score, createdAt: memory.createdAt, keywords: memory.keywords })
-    }
+    // The threshold gates on the RAW match count; decay only orders results.
+    const raw = rawScore(memory, weights)
+    if (raw < options.minScore) continue
+    scored.push({
+      memoryId,
+      text: memory.text,
+      score: raw * decay(memory.createdAt, options.now, options.halfLifeDays),
+      createdAt: memory.createdAt,
+      keywords: memory.keywords,
+    })
   }
   scored.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt)
   return scored.slice(0, options.limit)

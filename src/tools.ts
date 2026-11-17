@@ -1,19 +1,29 @@
 /**
- * Model-visible tools: `memory_remember` and `memory_recall` (P0).
- *
- * Definitions are built with the host's `defineTool` (loaded through the host
- * anchor), so argument validation, output validation and presentation all run
- * on the host's own machinery. Bodies are pure rule logic — no LLM in the
- * loop, so they cannot fail the way an LLM call can.
+ * Model-visible tools. P0 shipped `memory_remember` / `memory_recall`; P1 adds
+ * `memory_dispatch` (async fan-out), `memory_topicsets`, `memory_new_topicset`
+ * and `memory_set_model`. Definitions are built with the host's `defineTool`
+ * (loaded through the host anchor) so argument/output validation runs on the
+ * host's own machinery.
  * @module supermemory/tools
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
+import { runDispatch, type DispatchDeps } from './dispatch.ts'
 import { loadHostModule } from './host.ts'
+import { applyModelSelection, askDefaultModel, enumerateModels, type ModelDeps } from './model.ts'
 import { recallMemories, type RecallOptions } from './recall.ts'
-import type { Episode, Memory, Requirement } from './schema.ts'
+import type { Episode, FileMapEntry, Memory, Requirement, Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
+import { createTopicSet, listTopicSets, setRouting } from './topicsets.ts'
+
+export interface ToolsDeps {
+  ctx: Context
+  store: Store
+  dispatch: DispatchDeps
+  model: ModelDeps
+  logger: { warn: (msg: string) => void; info: (msg: string) => void }
+}
 
 export interface ToolsConfig {
   rememberEnabled: boolean
@@ -25,12 +35,21 @@ export interface ToolsConfig {
 }
 
 interface ToolExec {
-  agent?: { session?: { header?: { cwd?: string } } }
+  agent?: { id?: string; session?: { header?: { cwd?: string } } }
 }
 
-/** Attach the P0 tools; returns the effect disposer. */
-export async function attachTools(ctx: Context, store: Store | undefined, config: ToolsConfig): Promise<() => void> {
-  if (!store) return () => {}
+/** The receipt/error shape `memory_dispatch` returns (matches its output schema). */
+interface DispatchResult {
+  status: 'dispatched' | 'error'
+  dispatchId?: string
+  branchSessionId?: string
+  topicSetId?: string
+  message?: string
+}
+
+/** Attach all tools; returns the effect disposer. */
+export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsConfig): Promise<() => void> {
+  const { store } = deps
   const tools = await loadHostModule('@deepseek-ai/dsh-tools') as typeof Tools
   const disposers: Array<() => void> = []
 
@@ -108,8 +127,8 @@ export async function attachTools(ctx: Context, store: Store | undefined, config
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_recall',
-    description: '检索 SuperMemory：事实记忆（memories）、归档梗概（episodes）与需求（requirements），按当前工作区隔离，'
-      + '关键词 + 时间衰减规则评分。回答“之前说过什么/做过什么”类问题前先用本工具检索。',
+    description: '检索 SuperMemory：事实记忆（memories）、归档梗概（episodes）、需求（requirements）与项目文件地图（filemap），按当前工作区隔离，'
+      + '关键词 + 时间衰减规则评分。回答"之前说过什么/做过什么"类问题前先用本工具检索。',
     parameters: {
       query: { type: 'string', required: true, description: '检索问题或关键词' },
       limit: { type: 'integer', description: `返回条数上限，默认 ${config.recall.maxItems}` },
@@ -124,7 +143,7 @@ export async function attachTools(ctx: Context, store: Store | undefined, config
             items: {
               type: 'object',
               properties: {
-                kind: { type: 'string', enum: ['memory', 'episode', 'requirement'], required: true },
+                kind: { type: 'string', enum: ['memory', 'episode', 'requirement', 'file'], required: true },
                 id: { type: 'string', required: true },
                 text: { type: 'string', required: true },
                 score: { type: 'number', required: true },
@@ -155,7 +174,7 @@ export async function attachTools(ctx: Context, store: Store | undefined, config
         halfLifeDays: config.recall.halfLifeDays,
         now: Date.now(),
       }
-      const items: Array<{ kind: 'memory' | 'episode' | 'requirement'; id: string; text: string; score: number; createdAt: number }> = []
+      const items: Array<{ kind: 'memory' | 'episode' | 'requirement' | 'file'; id: string; text: string; score: number; createdAt: number }> = []
       const memories: Array<[string, Memory]> = []
       for (const entry of store.memories.entries()) {
         if (entry[1].workspaceKey === workspaceKey && entry[1].status === 'active') memories.push(entry)
@@ -163,7 +182,6 @@ export async function attachTools(ctx: Context, store: Store | undefined, config
       for (const item of recallMemories(memories, query, options)) {
         items.push({ kind: 'memory', id: item.memoryId, text: item.text, score: item.score, createdAt: item.createdAt })
       }
-      // episodes / requirements join the same rule ranking once P1/P2 fill them.
       const episodes: Array<[string, Episode]> = []
       for (const entry of store.episodes.entries()) {
         if (entry[1].summary) episodes.push([entry[0], entry[1]])
@@ -190,8 +208,422 @@ export async function attachTools(ctx: Context, store: Store | undefined, config
       )) {
         items.push({ kind: 'requirement', id: item.memoryId, text: item.text, score: item.score, createdAt: item.createdAt })
       }
+      // P2: the project file map answers "这个文件干什么".
+      const filemap: Array<[string, FileMapEntry]> = []
+      for (const entry of store.filemap.entries()) {
+        if (entry[1].workspaceKey === workspaceKey) filemap.push(entry)
+      }
+      for (const item of recallMemories(
+        filemap.map(([key, entry]) => [key, {
+          workspaceKey: entry.workspaceKey, text: `${entry.path}（${entry.role}）${entry.summary}`, keywords: entry.keywords,
+          sourceSessionId: '', sourceSeq: 0, status: 'active' as const, createdAt: entry.annotatedAt, updatedAt: entry.annotatedAt,
+        }]),
+        query, options,
+      )) {
+        items.push({ kind: 'file', id: item.memoryId, text: item.text, score: item.score, createdAt: item.createdAt })
+      }
       items.sort((a, b) => b.score - a.score || b.createdAt - a.createdAt)
       return { items: items.slice(0, options.limit), total: items.length }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_topicsets',
+    description: '列出当前工作区的话题集（标题/梗概/分支状态/默认模型），或查看单个话题集的详情。'
+      + '需要激活某个话题集时用 /memory switch，或在消息里 @话题集名。',
+    parameters: {
+      topicSetId: { type: 'string', description: '可选；提供则返回该话题集详情' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                summary: { type: 'string', required: true },
+                branches: { type: 'integer', required: true },
+                model: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          total: { type: 'integer', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const items = (value as { items?: Array<{ title: string; summary: string; branches: number; model?: string }> }).items ?? []
+        if (items.length === 0) return [{ type: 'text', text: '（当前工作区暂无话题集）' }]
+        return [{
+          type: 'text',
+          text: items.map((i) => `- ${i.title}（${i.branches} 分支${i.model ? ' · ' + i.model : ''}）${i.summary ? '：' + i.summary.slice(0, 80) : ''}`).join('\n'),
+        }]
+      },
+    },
+    async execute(args: { topicSetId?: string }, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      if (!cwd) return { items: [], total: 0 }
+      const workspaceKey = workspaceKeyOf(cwd)
+      const toItem = (id: string, topicSet: { title: string; summary: string; members: unknown[]; defaultModel?: { provider: string; model: string } }) => ({
+        id,
+        title: topicSet.title,
+        summary: topicSet.summary,
+        branches: topicSet.members.length,
+        ...(topicSet.defaultModel ? { model: `${topicSet.defaultModel.provider}/${topicSet.defaultModel.model}` } : {}),
+      })
+      if (args.topicSetId) {
+        const topicSet = store.topicsets.get(String(args.topicSetId))
+        if (!topicSet) return { items: [], total: 0 }
+        return { items: [toItem(String(args.topicSetId), topicSet)], total: 1 }
+      }
+      const items = listTopicSets(store, workspaceKey).map(([id, topicSet]) => toItem(id, topicSet))
+      return { items, total: items.length }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_new_topicset',
+    description: '为当前讨论新建一个话题集（可按提示选择默认模型），并立即激活。'
+      + '显式开新话题时使用；不确定时先 memory_topicsets 查看已有话题集。',
+    parameters: {
+      title: { type: 'string', required: true, description: '话题集标题（简短）' },
+      askModel: { type: 'boolean', description: '是否询问默认模型；默认询问' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['created', 'error'], required: true },
+          topicSetId: { type: 'string' },
+          title: { type: 'string' },
+          model: { type: 'string' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; title?: string; model?: string; message?: string }
+        if (v.status === 'created') {
+          return [{ type: 'text', text: `已创建并激活话题集『${v.title ?? ''}』${v.model ? '（默认模型 ' + v.model + '）' : ''}` }]
+        }
+        return [{ type: 'text', text: v.message ?? '创建失败。' }]
+      },
+    },
+    async execute(args: { title: string; askModel?: boolean }, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      const sessionId = String(exec.agent?.id ?? '')
+      if (!cwd || !sessionId) return { status: 'error' as const, message: '无法确定当前会话。' }
+      const workspaceKey = workspaceKeyOf(cwd)
+      let model
+      if (args.askModel !== false) {
+        model = await askDefaultModel(deps.model, exec.agent)
+      }
+      const topicSetId = await createTopicSet(store, {
+        workspaceKey,
+        title: String(args.title).slice(0, 40),
+        ...(model ? { defaultModel: model } : {}),
+      })
+      await setRouting(store, sessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
+      return {
+        status: 'created' as const,
+        topicSetId,
+        title: String(args.title).slice(0, 40),
+        ...(model ? { model: `${model.provider}/${model.model}` } : {}),
+      }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_dispatch',
+    description: '把实质工作异步派发到话题集的分支会话：插件先落账，随即唤醒分支并立即返回回执，'
+      + '本会话（中枢）不阻塞。分支完成后结果会以 relay 形式主动送回本会话。'
+      + '简单问答不要派发——上下文卡/recall 能答的中枢直接答。mode=auto 时插件自行判定继续/新建；'
+      + '需要从父分支最近已完成轮次开新分支时用 mode=fork。传 tasks[]（2 个以上）走并行组：每个任务一个分支，'
+      + '全部到达终态后只回送一次汇总（失败成员标注）。',
+    parameters: {
+      task: { type: 'string', description: '单个任务描述（自包含）；与 tasks 二选一' },
+      tasks: {
+        type: 'array',
+        description: '多个任务描述（2 个以上）→ 并行组，全部终态后单次汇总回送',
+        items: { type: 'string' },
+      },
+      topicSetId: { type: 'string', description: '目标话题集；省略则用本会话当前激活的话题集' },
+      mode: { type: 'string', enum: ['auto', 'continue', 'fork', 'new'], description: '分支获取方式；默认 auto' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['dispatched', 'error'], required: true },
+          dispatchId: { type: 'string' },
+          branchSessionId: { type: 'string' },
+          groupId: { type: 'string' },
+          topicSetId: { type: 'string' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; branchSessionId?: string; groupId?: string; message?: string }
+        if (v.status === 'dispatched') {
+          return [{ type: 'text', text: v.message ?? `已派发到分支 ${v.branchSessionId}；完成后结果会主动送回本会话。` }]
+        }
+        return [{ type: 'text', text: v.message ?? '派发失败。' }]
+      },
+    },
+    async execute(args: { task?: string; tasks?: string[]; topicSetId?: string; mode?: 'auto' | 'continue' | 'fork' | 'new' }, exec: ToolExec): Promise<DispatchResult> {
+      return await runDispatch(deps.dispatch, args, exec)
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_set_model',
+    description: '设置话题集默认模型或单个分支的模型覆盖。省略 provider/model 时返回当前可用的'
+      + 'providers/models 目录供选择（运行时枚举，可能为空——空目录时可直接自由输入）。',
+    parameters: {
+      topicSetId: { type: 'string', description: '按话题集设置（默认模型）' },
+      branchSessionId: { type: 'string', description: '按分支设置（覆盖）' },
+      provider: { type: 'string', description: '提供方 id' },
+      model: { type: 'string', description: '模型 id' },
+      reasoningEffort: { type: 'string', description: '可选推理强度' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['applied', 'catalog', 'error'], required: true },
+          applied: { type: 'string' },
+          live: { type: 'boolean' },
+          catalog: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                provider: { type: 'string', required: true },
+                id: { type: 'string', required: true },
+                name: { type: 'string', required: true },
+              },
+              additionalProperties: false,
+            },
+          },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; applied?: string; catalog?: Array<{ provider: string; id: string }>; message?: string }
+        if (v.status === 'applied') return [{ type: 'text', text: `已设置模型：${v.applied}` }]
+        if (v.status === 'catalog') {
+          const list = (v.catalog ?? []).map((m) => `${m.provider}/${m.id}`).join('、')
+          return [{ type: 'text', text: `可用模型目录：${list || '（空——可直接自由输入 provider 与 model）'}` }]
+        }
+        return [{ type: 'text', text: v.message ?? '设置失败。' }]
+      },
+    },
+    async execute(args: { topicSetId?: string; branchSessionId?: string; provider?: string; model?: string; reasoningEffort?: string }) {
+      if (!args.provider || !args.model) {
+        const { models } = await enumerateModels(deps.ctx)
+        return { status: 'catalog' as const, catalog: models.slice(0, 40) }
+      }
+      if (!args.topicSetId && !args.branchSessionId) {
+        return { status: 'error' as const, message: '必须指定 topicSetId 或 branchSessionId。' }
+      }
+      const result = await applyModelSelection(deps.model, { topicSetId: args.topicSetId, branchSessionId: args.branchSessionId }, {
+        provider: String(args.provider),
+        model: String(args.model),
+        ...(args.reasoningEffort ? { reasoningEffort: String(args.reasoningEffort) } : {}),
+      })
+      if (!result.applied) return { status: 'error' as const, message: '未找到目标。' }
+      return { status: 'applied' as const, applied: result.applied, live: result.live }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_scan',
+    description: '扫描当前工作区的文件并刷新项目地图（filemap）：规则化标注角色、按 hash 失效陈旧条目。'
+      + '之后 memory_recall 能回答"这个文件干什么"。等价于 /memory scan。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['scanned', 'error'], required: true },
+          scanned: { type: 'integer' },
+          added: { type: 'integer' },
+          stale: { type: 'integer' },
+          total: { type: 'integer' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; scanned?: number; added?: number; stale?: number; total?: number; message?: string }
+        if (v.status === 'scanned') {
+          return [{ type: 'text', text: `扫描 ${v.scanned} 个文件：新增 ${v.added}，失效/更新 ${v.stale}，当前共 ${v.total} 条。` }]
+        }
+        return [{ type: 'text', text: v.message ?? '扫描失败。' }]
+      },
+    },
+    async execute(_args: Record<string, never>, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      if (!cwd) return { status: 'error' as const, message: '无法确定当前工作区。' }
+      try {
+        const { scanWorkspace, filemapEntries } = await import('./filemap.ts')
+        const result = await scanWorkspace(store, cwd)
+        const total = filemapEntries(store, workspaceKeyOf(cwd)).length
+        return { status: 'scanned' as const, scanned: result.scanned, added: result.added, stale: result.stale, total }
+      } catch (error) {
+        return { status: 'error' as const, message: `扫描失败：${String(error).slice(0, 200)}` }
+      }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_export',
+    description: '把当前工作区的 SuperMemory 内容（激活话题集、事实记忆、未完成需求、归档梗概、项目文件地图）'
+      + '导出为 Markdown 文件（写入工作区根目录的 .supermemory-export.md），供 git 共享。等价于 /memory export。',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['exported', 'error'], required: true },
+          path: { type: 'string' },
+          memories: { type: 'integer' },
+          requirements: { type: 'integer' },
+          files: { type: 'integer' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; path?: string; message?: string }
+        return [{ type: 'text', text: v.status === 'exported' ? `已导出到 ${v.path}` : (v.message ?? '导出失败。') }]
+      },
+    },
+    async execute(_args: Record<string, never>, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      if (!cwd) return { status: 'error' as const, message: '无法确定当前工作区。' }
+      try {
+        const { writeFileSync } = await import('node:fs')
+        const { filemapEntries } = await import('./filemap.ts')
+        const { openRequirements } = await import('./requirements.ts')
+        const workspaceKey = workspaceKeyOf(cwd)
+        const lines: string[] = ['# SuperMemory 导出', '']
+        const routing = store.routing.get(String(exec.agent?.id ?? ''))
+        const topicSet = routing?.activeTopicSetId ? store.topicsets.get(routing.activeTopicSetId) : undefined
+        if (topicSet) {
+          lines.push(`## 话题集：${topicSet.title}`, '', topicSet.summary || '（暂无梗概）', '')
+        }
+        const mems: string[] = []
+        for (const [, record] of store.memories.entries()) {
+          if (record.workspaceKey === workspaceKey && record.status === 'active') mems.push(`- ${record.text}`)
+        }
+        if (mems.length) lines.push('## 事实记忆', '', ...mems, '')
+        const reqs = openRequirements(store, workspaceKey)
+        if (reqs.length) lines.push('## 未完成需求', '', ...reqs.map(([, r]) => `- ${r.text}`), '')
+        const eps: string[] = []
+        for (const [, episode] of store.episodes.entries()) {
+          if (episode.summary) eps.push(`- ${episode.summary}`)
+        }
+        if (eps.length) lines.push('## 归档梗概', '', ...eps.slice(-20), '')
+        const files = filemapEntries(store, workspaceKey)
+        if (files.length) {
+          lines.push('## 项目文件地图', '')
+          for (const [, entry] of files) lines.push(`- \`${entry.path}\` — ${entry.role}${entry.summary ? '：' + entry.summary : ''}`)
+          lines.push('')
+        }
+        const target = `${cwd.replace(/[\\/]+$/, '')}/.supermemory-export.md`
+        writeFileSync(target, lines.join('\n'), 'utf8')
+        return { status: 'exported' as const, path: target, memories: mems.length, requirements: reqs.length, files: files.length }
+      } catch (error) {
+        return { status: 'error' as const, message: `导出失败：${String(error).slice(0, 200)}` }
+      }
+    },
+  })))
+
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_toolize',
+    description: '工具化（P3）：列出待处理的组合工具提议（重复流程达阈值后产生），或接受/拒绝某个提议。'
+      + '接受会把记录到的工具序列编译成组合工具（一次调用完成确定性子序列）并持久化，重启后仍可用。',
+    parameters: {
+      accept: { type: 'boolean', description: '接受第一个待处理提议并生成组合工具' },
+      decline: { type: 'boolean', description: '拒绝（不再提示）第一个待处理提议' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'error'], required: true },
+          pending: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                pattern: { type: 'string', required: true },
+                count: { type: 'integer', required: true },
+              },
+              additionalProperties: false,
+            },
+          },
+          tool: { type: 'string' },
+          message: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => {
+        const v = value as { status: string; pending?: Array<{ pattern: string; count: number }>; tool?: string; message?: string }
+        if (v.status === 'listed') {
+          const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
+          return [{ type: 'text', text: list ? `待处理提议：\n${list}` : '（没有待处理的工具化提议）' }]
+        }
+        if (v.status === 'accepted') return [{ type: 'text', text: `已固化为组合工具 ${v.tool}。` }]
+        if (v.status === 'declined') return [{ type: 'text', text: '已拒绝该提议。' }]
+        if (v.status === 'none') return [{ type: 'text', text: '（没有待处理的工具化提议）' }]
+        return [{ type: 'text', text: v.message ?? '操作失败。' }]
+      },
+    },
+    async execute(args: { accept?: boolean; decline?: boolean }) {
+      const pending: Array<[string, Signal]> = []
+      for (const [key, signal] of store.signals.entries()) {
+        if (signal.proposalStatus === 'pending' && signal.proposedAt !== undefined) pending.push([key, signal])
+      }
+      if (!args.accept && !args.decline) {
+        return {
+          status: 'listed' as const,
+          pending: pending.map(([, s]) => ({ pattern: s.pattern, count: s.count })),
+        }
+      }
+      if (pending.length === 0) return { status: 'none' as const }
+      const [key, signal] = pending[0]
+      if (args.decline) {
+        await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'declined' }))
+        return { status: 'declined' as const }
+      }
+      try {
+        const { compileComposite, registerComposite, persistComposite } = await import('./composite.ts')
+        const samples = (signal.samples ?? []).map((raw) => {
+          try {
+            return JSON.parse(raw) as { tools: string[]; args: Array<Record<string, unknown>> }
+          } catch {
+            return undefined
+          }
+        }).filter((s): s is { tools: string[]; args: Array<Record<string, unknown>> } => s !== undefined)
+        const spec = compileComposite(signal, samples)
+        await registerComposite(ctx, store, spec)
+        await persistComposite(store, spec, key)
+        await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'accepted' }))
+        deps.logger.info(`supermemory: composite tool ${spec.name} registered via memory_toolize`)
+        return { status: 'accepted' as const, tool: spec.name }
+      } catch (error) {
+        return { status: 'error' as const, message: `生成失败：${String(error).slice(0, 200)}` }
+      }
     },
   })))
 

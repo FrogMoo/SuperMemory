@@ -1,0 +1,74 @@
+/**
+ * Parallel dispatch groups (decision D6): one round of `memory_dispatch` with
+ * `tasks[]` becomes a fixed member set sharing a `groupId`. Every member keeps
+ * its own terminal state and cursor; only after ALL members reach ANY terminal
+ * state does a single group relay go out, with failed members annotated.
+ * @module supermemory/group
+ */
+import type { Store } from './store.ts'
+import type { Dispatch } from './schema.ts'
+import { newId } from './store.ts'
+
+/** Members of one group, in creation order. */
+export function groupMembers(store: Store, groupId: string): Array<[string, Dispatch]> {
+  const out: Array<[string, Dispatch]> = []
+  for (const [dispatchId, record] of store.dispatches.entries()) {
+    if (record.groupId === groupId) out.push([dispatchId, record])
+  }
+  out.sort((a, b) => a[1].createdAt - b[1].createdAt)
+  return out
+}
+
+/** True when every member reached a terminal state. */
+export function groupComplete(store: Store, groupId: string): boolean {
+  const members = groupMembers(store, groupId)
+  if (members.length === 0) return false
+  return members.every(([, record]) => record.status === 'delivered' || record.status === 'failed')
+}
+
+/** The hub-facing group relay text: one line per member, failures annotated. */
+export function groupRelayText(store: Store, groupId: string, episodes: Map<string, string>): string {
+  const members = groupMembers(store, groupId)
+  const lines: string[] = [`[supermemory-group-relay ${groupId}]`, `共 ${members.length} 个分支任务：`]
+  let ok = 0
+  let failed = 0
+  members.forEach(([, record], index) => {
+    const label = record.task.slice(0, 40)
+    if (record.status === 'delivered') {
+      ok++
+      const summary = episodes.get(record.branchSessionId) ?? '（已完成）'
+      lines.push(`${index + 1}. ✅ ${label}\n   ${summary}`)
+    } else {
+      failed++
+      lines.push(`${index + 1}. ❌ ${label}\n   失败终态：${record.turnEndReason ?? 'unknown'}（未伪装成答案）`)
+    }
+  })
+  lines.push(`汇总：${ok} 成功 / ${failed} 失败。`)
+  return lines.join('\n')
+}
+
+/** Collect the episode summaries of a group's delivered members. */
+export function groupEpisodeSummaries(store: Store, groupId: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const members = groupMembers(store, groupId)
+  const branchIds = new Set(members.map(([, r]) => r.branchSessionId))
+  for (const [, episode] of store.episodes.entries()) {
+    if (episode.branchSessionId && branchIds.has(episode.branchSessionId) && episode.summary) {
+      out.set(episode.branchSessionId, episode.summary)
+    }
+  }
+  return out
+}
+
+/** Whether a group relay was already enqueued (idempotency guard). */
+export function groupRelayExists(store: Store, groupId: string): boolean {
+  for (const [, item] of store.outbox.entries()) {
+    if (item.groupId === groupId) return true
+  }
+  return false
+}
+
+/** Stable group id for a dispatch round. */
+export function newGroupId(): string {
+  return newId('grp')
+}

@@ -12,6 +12,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { extractFacts } from './extract.ts'
+import { extractRequirements, rememberRequirements } from './requirements.ts'
 import type { Memory, Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
@@ -21,6 +22,7 @@ import './services.ts'
 export interface MaintenanceConfig {
   enabled: boolean
   signalsThreshold: number
+  summaryEveryTurns: number
 }
 
 interface BufferedUser {
@@ -40,6 +42,9 @@ interface ColdResult {
 }
 
 const BUFFER_CAP = 50
+
+/** In-memory debounce counter for the rolling topic-set summary. */
+const summaryTurns = new Map<string, number>()
 
 /** Attach the maintenance loop; returns the effect disposer. */
 export function attachMaintenance(
@@ -131,6 +136,7 @@ export function attachMaintenance(
 
     const now = Date.now()
     const createdIds: string[] = []
+    const reqIds: string[] = []
     for (const user of users) {
       for (const fact of extractFacts(user.text)) {
         const memoryId = await rememberFact(activeStore, workspaceKey, fact.text, fact.keywords, task.sessionId, user.seq, now)
@@ -139,19 +145,25 @@ export function attachMaintenance(
           countSignal(activeStore, workspaceKey, fact.keywords[0] ?? fact.text.slice(0, 12), fact.text, now)
         }
       }
+      // P2: standing requirements (必须/需要/待办/...) join the same turn.
+      const reqTexts = extractRequirements(user.text)
+      if (reqTexts.length > 0) {
+        const created = await rememberRequirements(activeStore, workspaceKey, reqTexts, task.sessionId, user.seq, now)
+        reqIds.push(...created)
+      }
     }
     // Clear only after a successful pass: a failed extraction keeps the buffer
     // so the next turn replays those messages (text dedupe prevents doubles).
     buffers.set(task.sessionId, [])
     cursors.set(task.sessionId, task.seq)
-    try {
-      await persistCursor(task.sessionId, task.seq, createdIds)
-    } catch (error) {
-      throw error
+    await persistCursor(task.sessionId, task.seq, createdIds)
+    // §2.1 (4): rolling topic-set summary, debounced by turn count.
+    rollSummary(activeStore, task.sessionId, users, config.summaryEveryTurns, logger)
+    if (createdIds.length > 0 || reqIds.length > 0) {
+      logger.info(`supermemory: +${createdIds.length} memories, +${reqIds.length} requirements from ${task.sessionId}@${task.seq}`)
     }
-    if (createdIds.length > 0) {
-      logger.info(`supermemory: +${createdIds.length} memories from ${task.sessionId}@${task.seq}`)
-    }
+    // §2.3: repeated tool sequences feed the tool-ization pipeline.
+    await countSequenceSignal(activeStore, ctx, task.sessionId, workspaceKey, cursor, task.seq, config.signalsThreshold, logger)
   }
 
   async function persistCursor(sessionId: string, seq: number, createdIds: string[] = []): Promise<void> {
@@ -226,8 +238,98 @@ function textOfMessage(message: UserMessageLike): string {
     .filter(Boolean).join('\n')
 }
 
-/** Write one fact, skipping exact duplicates within the workspace. */
-async function rememberFact(
+/**
+ * §2.1 (4): rolling topic-set summary. Rule-based and debounced by an
+ * in-memory turn counter (a remount restarts the count — acceptable for a
+ * debounce; the durable state is the summary itself).
+ */
+function rollSummary(
+  store: Store,
+  sessionId: string,
+  users: BufferedUser[],
+  everyNTurns: number,
+  logger: { info: (msg: string) => void },
+): void {
+  const routing = store.routing.get(sessionId)
+  if (!routing?.activeTopicSetId) return
+  const topicSet = store.topicsets.get(routing.activeTopicSetId)
+  if (!topicSet) return
+  const count = (summaryTurns.get(sessionId) ?? 0) + 1
+  summaryTurns.set(sessionId, count)
+  if (count % Math.max(1, everyNTurns) !== 0 && users.length === 0) return
+  const last = users[users.length - 1]?.text?.trim() ?? ''
+  if (!last) return
+  const snippet = last.replace(/\s+/g, ' ').slice(0, 60)
+  const summary = `${topicSet.summary}${topicSet.summary ? ' / ' : ''}${snippet}`.slice(0, 300)
+  void store.topicsets.update(routing.activeTopicSetId, (record) => ({
+    ...record,
+    summary,
+    updatedAt: Date.now(),
+  })).then(() => {
+    logger.info(`supermemory: rolled summary for ${routing.activeTopicSetId}`)
+  }).catch(() => { /* summary roll is best-effort */ })
+}
+
+/**
+ * §2.3: count one turn's tool-call sequence as a tool-ization signal, and
+ * raise a pending proposal once it crosses the threshold. Samples carry the
+ * recorded arguments for later composite compilation.
+ */
+async function countSequenceSignal(
+  store: Store,
+  ctx: Context,
+  sessionId: string,
+  workspaceKey: string,
+  afterSeq: number,
+  untilSeq: number,
+  threshold: number,
+  logger: { info: (msg: string) => void },
+): Promise<void> {
+  let tools: string[] = []
+  const args: Array<Record<string, unknown>> = []
+  const { sequenceKey, parseArgs } = await import('./composite.ts')
+  try {
+    const handle = await ctx.sessionPersistence.open(sessionId, 'read')
+    try {
+      const { events } = await handle.read(afterSeq + 1)
+      for (const event of events) {
+        if (event.seq > untilSeq) break
+        if (event.type !== 'tool/call') continue
+        const data = event.data as unknown as { name?: string; arguments?: unknown }
+        if (!data.name) continue
+        tools.push(data.name)
+        args.push(parseArgs(data.arguments))
+      }
+    } finally {
+      await handle.close()
+    }
+  } catch {
+    return // a cold-read failure never breaks maintenance
+  }
+  if (tools.length < 2) return // single-tool turns are not sequences
+  const key = sequenceKey(workspaceKey, tools)
+  const existing = store.signals.get(key)
+  const now = Date.now()
+  const samples = [...(existing?.samples ?? []), JSON.stringify({ tools, args })].slice(-3)
+  const crossed = existing?.proposedAt === undefined && (existing?.count ?? 0) + 1 >= threshold
+  const signal: Signal = {
+    workspaceKey,
+    pattern: tools.join('>'),
+    count: (existing?.count ?? 0) + 1,
+    lastSeen: now,
+    examples: [...(existing?.examples ?? []), `${tools.join(' → ')}`].slice(-3),
+    sequence: tools,
+    samples,
+    proposedAt: crossed ? now : existing?.proposedAt,
+    proposalStatus: crossed ? 'pending' as const : existing?.proposalStatus,
+  }
+  await store.signals.put(key, signal)
+  if (signal.proposalStatus === 'pending') {
+    logger.info(`supermemory: tool-ization proposal raised for ${tools.join('>')} (count=${signal.count})`)
+  }
+}
+
+/** Write one fact, skipping exact duplicates within the workspace. */async function rememberFact(
   store: Store,
   workspaceKey: string,
   text: string,
@@ -259,7 +361,7 @@ function countSignal(store: Store, workspaceKey: string, pattern: string, exampl
   const existing = store.signals.get(signalKey)
   const signal: Signal = existing
     ? { ...existing, count: existing.count + 1, lastSeen: now, examples: [...existing.examples, example].slice(-5) }
-    : { workspaceKey, pattern, count: 1, lastSeen: now, examples: [example] }
+    : { workspaceKey, pattern, count: 1, lastSeen: now, examples: [example], sequence: [], samples: [] }
   void store.signals.put(signalKey, signal).catch(() => {
     // Signals are advisory; a failed count must never break maintenance.
   })

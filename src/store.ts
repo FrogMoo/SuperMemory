@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Episode, type Hotcache, type Memory, type Requirement, type Routing, type Signal, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Memory, type OutboxItem, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -36,9 +36,13 @@ export interface Store {
   memories: Table<Memory>
   episodes: Table<Episode>
   requirements: Table<Requirement>
+  filemap: Table<FileMapEntry>
+  toolMemory: Table<ToolMemory>
   signals: Table<Signal>
   routing: Table<Routing>
   hotcache: Table<Hotcache>
+  dispatches: Table<Dispatch>
+  outbox: Table<OutboxItem>
   close(): Promise<void>
 }
 
@@ -96,9 +100,13 @@ export async function openStore(
     memories: table<Memory>('memories'),
     episodes: table<Episode>('episodes'),
     requirements: table<Requirement>('requirements'),
+    filemap: table<FileMapEntry>('filemap'),
+    toolMemory: table<ToolMemory>('tool_memory'),
     signals: table<Signal>('signals'),
     routing: table<Routing>('routing'),
     hotcache: table<Hotcache>('hotcache'),
+    dispatches: table<Dispatch>('dispatches'),
+    outbox: table<OutboxItem>('outbox'),
     close: () => domain.close(),
   }
 }

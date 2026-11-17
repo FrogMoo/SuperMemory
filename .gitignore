@@ -22,3 +22,7 @@ share.config
 user.config
 Backup/
 %SystemDrive%/
+
+# transient dev-iteration builds (scripts/dev-load.sh)
+lib/dev-*.js
+.probe/

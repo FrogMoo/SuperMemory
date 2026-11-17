@@ -94,6 +94,7 @@ export async function buildSchemas() {
 
   const filemap = z.object({
     workspaceKey: z.string(),
+    path: z.string(),
     role: z.string().default(''),
     summary: z.string().default(''),
     keywords: z.array(z.string()).default([]),
@@ -118,6 +119,12 @@ export async function buildSchemas() {
     count: z.number().int().nonnegative().default(0),
     lastSeen: z.number().int(),
     examples: z.array(z.string()).default([]),
+    // P3 tool-ization: proposal lifecycle (null = not yet proposed)
+    proposedAt: z.number().int().optional(),
+    proposalStatus: z.enum(['pending', 'accepted', 'declined']).optional(),
+    // recorded tool-call sequence for composite generation
+    sequence: z.array(z.string()).default([]),
+    samples: z.array(z.string()).default([]),
   })
 
   const dispatches = z.object({

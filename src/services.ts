@@ -54,5 +54,25 @@ declare module '@deepseek-ai/cordis' {
         text: string | ((context: unknown) => string)
       }): () => void
     }
+    /** User-question service (validation + scoped answerer waterfall). */
+    userQuestions: {
+      ask(request: {
+        questions: Array<{
+          id: string
+          question: string
+          header?: string
+          detail?: string
+          options?: Array<{ label: string; description?: string }>
+          multiSelect?: boolean
+        }>
+        agent?: unknown
+        signal?: AbortSignal
+      }): Promise<{ answers: Array<{ id: string; selected: string[]; custom?: string }> }>
+    }
+    /** Workspace registry (project grouping; branch visibility). */
+    workspaceRegistry: {
+      resolveByPath(path: string): Promise<{ attachSession(sessionId: string): Promise<void> } | undefined>
+      create(path: string, title?: string): Promise<{ attachSession(sessionId: string): Promise<void> }>
+    }
   }
 }
