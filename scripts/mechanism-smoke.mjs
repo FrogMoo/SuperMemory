@@ -2468,6 +2468,155 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   ok('R25-2 派发输入实测：runDispatch 交给分支的消息 source.kind=user（无 form）')
 }
 
+// ---- R7: 重启后分支会话恢复（branch-restore：从持久台账重建分支注册表）----
+// 插件重启后 branchHandles 从空开始，而启动路径里只有 reconcile 会 resume 分支
+// （且只针对 queued/dispatched 且无执行痕迹的行）。R7 锁定新的启动恢复路径：
+// 收集器只汇总真正的分支会话；恢复只 attach 绝不 dispose/投递；失败不丢台账。
+const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreSummary } = await import('../src/branch-restore.ts')
+
+{
+  // R7-1: 收集器汇总成员 + 派发台账里的分支会话；话题集 root 成员（session-*
+  // 中枢会话）与非插件 id 的派发行都不是分支；成员事实优先；按活动倒序。
+  const stale = now - 3600000
+  const store = fakeStore({
+    topicsets: [
+      ['ts-r7a', {
+        workspaceKey: 'ws', title: '话题甲', summary: '', keywords: [], status: 'active',
+        members: [
+          { sessionId: 'branch-r7a', kind: 'root', title: '分支甲', summary: '', status: 'live', lastActiveAt: now - 1000 },
+          { sessionId: 'session-r7hub', kind: 'root', title: '中枢', summary: '', status: 'live', lastActiveAt: now },
+        ],
+        createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+      }],
+      ['ts-r7b', {
+        workspaceKey: 'ws', title: '话题乙', summary: '', keywords: [], status: 'active',
+        members: [
+          { sessionId: 'fork-r7b', kind: 'fork', title: '', summary: '', status: 'live', lastActiveAt: now - 5000 },
+        ],
+        createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+      }],
+    ],
+    dispatches: [
+      ['dsp-r7a', { topicSetId: 'ts-r7a', branchSessionId: 'branch-r7a', task: '任务甲', hubSessionId: 'hub-1', startSeq: 0, status: 'delivered', createdAt: stale, updatedAt: now - 1000 }],
+      ['dsp-r7b', { topicSetId: 'ts-r7b', branchSessionId: 'fork-r7b', task: '任务乙（续）', hubSessionId: 'hub-2', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: now - 5000 }],
+      ['dsp-r7c', { topicSetId: 'ts-r7b', branchSessionId: 'session-r7hub', task: '派到中枢', hubSessionId: 'hub-2', startSeq: 0, status: 'delivered', createdAt: stale, updatedAt: now - 50 }],
+    ],
+  })
+  const targets = collectBranchRestoreTargets(store)
+  assert.deepEqual(targets.map((t) => t.sessionId), ['branch-r7a', 'fork-r7b'],
+    'branch members + plugin-minted dispatch rows are collected; a hub root member is not a branch')
+  assert.equal(targets[0].memberTitle, '分支甲', 'member facts win over dispatch-only facts')
+  assert.equal(targets[0].task, '任务甲', 'the dispatch task rides along')
+  assert.equal(targets[0].topicSetId, 'ts-r7a')
+  assert.equal(targets[1].task, '任务乙（续）', 'a fork member inherits its dispatch task')
+  assert.equal(targets[1].topicTitle, '话题乙')
+  assert.deepEqual(collectBranchRestoreTargets(undefined), [], 'no store yields no targets')
+  ok('R7-1 收集器：成员 + 派发台账汇总分支会话（root 成员/非插件 id 排除，成员事实优先）')
+}
+
+{
+  // R7-2: 恢复路径——已 live 的直接采用；死掉的经 agents.resume 重连并登记
+  // branchHandles；绝不 dispose、绝不投递；成员状态刷新为 live。
+  const stale = now - 3600000
+  const store = fakeStore({
+    topicsets: [['ts-r7c', {
+      workspaceKey: 'ws', title: '话题丙', summary: '', keywords: [], status: 'active',
+      members: [
+        { sessionId: 'branch-r7live', kind: 'root', title: '在线分支', summary: '', status: 'idle', lastActiveAt: now - 60000 },
+        { sessionId: 'branch-r7dead', kind: 'root', title: '', summary: '', status: 'idle', lastActiveAt: now - 60000 },
+      ],
+      createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+    }]],
+    dispatches: [
+      ['dsp-r7live', { topicSetId: 'ts-r7c', branchSessionId: 'branch-r7live', task: '任务丙', hubSessionId: 'hub', startSeq: 0, status: 'delivered', createdAt: stale, updatedAt: stale }],
+      ['dsp-r7dead', { topicSetId: 'ts-r7c', branchSessionId: 'branch-r7dead', task: '任务丁', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: stale }],
+    ],
+  })
+  const liveAgent = { id: 'branch-r7live', followup: () => { throw new Error('restore must not wake a branch') } }
+  const resumed = []
+  const disposed = []
+  const ctx = {
+    get: (key) => (key === 'agents' ? {
+      get: (id) => (id === 'branch-r7live' ? liveAgent : undefined),
+      resume: async (options) => {
+        resumed.push(options.resumeSessionId)
+        return { agent: { id: options.resumeSessionId }, dispose: async () => { disposed.push(options.resumeSessionId) } }
+      },
+    } : undefined),
+    sessions: { get: () => undefined },
+  }
+  const outcome = await restoreBranchSessions({ ctx, store, logger })
+  assert.deepEqual(resumed, ['branch-r7dead'], 'only the dead branch is resumed')
+  assert.deepEqual(outcome.live, ['branch-r7live'], 'a live branch is adopted as-is')
+  assert.deepEqual(outcome.resumed, ['branch-r7dead'])
+  assert.equal(branchHandles.has('branch-r7dead'), true, 'the reconnected handle is registered again')
+  assert.deepEqual(disposed, [], 'restore never disposes a session (只 attach)')
+  assert.equal(store.topicsets.get('ts-r7c').members.find((m) => m.sessionId === 'branch-r7dead').status, 'live',
+    'the restored member is marked live')
+  assert.equal(store.topicsets.get('ts-r7c').members.find((m) => m.sessionId === 'branch-r7live').status, 'live',
+    'the adopted live member stays live')
+  assert.ok(store.topicsets.get('ts-r7c').members.find((m) => m.sessionId === 'branch-r7dead').title.length > 0,
+    'an unnamed member is titled from the ledger on restore')
+  assert.ok(renderBranchRestoreSummary(outcome).includes('resumed 1'), 'the summary names the resumed count')
+  branchHandles.delete('branch-r7dead')
+  ok('R7-2 恢复路径：live 采用 / 死分支 agents.resume 重连并登记 handle（不 dispose 不投递）')
+}
+
+{
+  // R7-3: 恢复失败不丢会话——resume 抛错记 failed、成员标记 idle（live 计数
+  // 如实），台账原样保留（memory_resume/面板后续仍可续接）。
+  const stale = now - 3600000
+  const store = fakeStore({
+    topicsets: [['ts-r7d', {
+      workspaceKey: 'ws', title: '话题丁', summary: '', keywords: [], status: 'active',
+      members: [
+        { sessionId: 'branch-r7gone', kind: 'root', title: '丢失分支', summary: '', status: 'live', lastActiveAt: now - 60000 },
+      ],
+      createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+    }]],
+    dispatches: [
+      ['dsp-r7gone', { topicSetId: 'ts-r7d', branchSessionId: 'branch-r7gone', task: '任务戊', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: stale }],
+    ],
+  })
+  const ctx = {
+    get: (key) => (key === 'agents' ? {
+      get: () => undefined,
+      resume: async () => { throw new Error('session log gone') },
+    } : undefined),
+  }
+  const outcome = await restoreBranchSessions({ ctx, store, logger })
+  assert.deepEqual(outcome.resumed, [], 'an unrecoverable branch is not resumed')
+  assert.equal(outcome.failed.length, 1)
+  assert.equal(outcome.failed[0].sessionId, 'branch-r7gone')
+  assert.equal(store.topicsets.get('ts-r7d').members[0].status, 'idle',
+    'an unrecoverable branch is marked idle so the live count stays truthful')
+  assert.equal(store.dispatches.get('dsp-r7gone').status, 'interrupted',
+    'the ledger row is untouched — memory_resume can still continue it later')
+  ok('R7-3 恢复失败不丢会话：failed 记录 + 成员 idle + 台账原样（后续可续跑）')
+}
+
+{
+  // R7-4: 宿主没有 agents 缝隙（minimal profile）时全部跳过，不炸不抛。
+  const stale = now - 3600000
+  const store = fakeStore({
+    topicsets: [['ts-r7e', {
+      workspaceKey: 'ws', title: '话题戊', summary: '', keywords: [], status: 'active',
+      members: [
+        { sessionId: 'branch-r7e', kind: 'root', title: '分支戊', summary: '', status: 'live', lastActiveAt: now - 60000 },
+      ],
+      createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+    }]],
+    dispatches: [
+      ['dsp-r7e', { topicSetId: 'ts-r7e', branchSessionId: 'branch-r7e', task: '任务己', hubSessionId: 'hub', startSeq: 0, status: 'delivered', createdAt: stale, updatedAt: stale }],
+    ],
+  })
+  const outcome = await restoreBranchSessions({ ctx: { get: () => undefined }, store, logger })
+  assert.deepEqual(outcome.resumed, [])
+  assert.deepEqual(outcome.failed, [])
+  assert.deepEqual(outcome.skipped, ['branch-r7e'], 'without the agents seam every target is skipped, not failed')
+  ok('R7-4 无 agents 缝隙：全部跳过（台账仍可在面板/管理台枚举）')
+}
+
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 
 process.exit(0)

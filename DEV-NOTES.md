@@ -1723,4 +1723,51 @@ wrap 后字符数 **87298 → 105183（+17885）**；磁盘 UTF-8 **89065 → 10
   user 语义；本次不扩大改动，如需去重留给后续轮次。
 - 编号：并行分支的话题集匹配是 R23（无独立 DEV-NOTES 小节），本需求按当前最大编号顺延为 **R25**。
 
+## 26. 工作区隔离 + 能力维护 UI 收尾（第 26 轮，2026-11-18）
+
+### 26.1 根因
+- 话题集/会话侧本就按 workspaceKey 过滤；真正漏的是：① 能力完全不隔离（面板 listTools 无 cwd、
+  memory_toolize list 全量、rebuildComposites 把各工作区能力都注册成模型可见工具、
+  capabilityHealthOf 全量）；② 面板 hubState 的 episodes/dispatches/tools 计数跨工作区累计；
+  ③ 面板 cwd 解析 workspacePath（localStorage）优先于主视图会话 cwd，shell 切工作区后面板不跟随，
+  且 changeWorkspace 不清空 tools 状态。
+- 「使用次数不刷新」根因（承接上轮）：管理台执行后只 render 不 loadState，渲染的是旧快照。
+
+### 26.2 改动（文件 + 要点）
+- `src/composite.ts`：新增 `capabilityAppliesToWorkspace`（行级归属优先 → scope 推导 → 全局）与
+  `callerWorkspaceKey`；`capabilityToolDef(store, spec, workspaceKey?)` execute 增加跨工作区门禁
+  （拒绝执行、不计数、summary 说明归属）；`registerComposite(..., workspaceKey?)`；
+  rebuildComposites / editCompositeTool / mergeBuiltinCapabilities 传行级归属；
+  `capabilityRecordsOf(store, workspaceKey?)` / `capabilityHealthOf(store, workspaceKey?)` 过滤；
+  registerCapability 同名查找按工作区分流（别的工作区的行不被误更新）；
+  `BuiltinMergeReport.changed` 改为带 workspaceKey 的条目。
+- `src/panel.ts`：`listTools(cwd?)` 按工作区过滤并透出 version/usage；`hubState` 三个计数按工作区
+  隔离（新增私有 `toolApplies`）；listTools RPC 描述符加 cwd；`runTool` 的 bump 传 result。
+- `src/tools.ts`：memory_toolize list 按会话工作区过滤 + 透出 version/lastStatus；refreshBuiltin
+  按工作区过滤并报告 otherWorkspace；输出 schema 同步补齐。
+- `src/client/panel-page.tsx` + `src/client/index.ts`：`listTools(cwd)`；refreshTools 依赖 cwd；
+  changeWorkspace 清空 tools；跟随 shell 工作区切换（useState 记录上次主视图 cwd）；
+  ToolView/branches 补 task/version/usage 与渲染。
+- `src/webui.ts`：`/tool/run` 的 bump 传 result（成败明细）。
+- `src/web/app.js`：cap-run/cap-run-do/tool-status/tool-del 成功后 `loadState()`；分支卡片渲染
+  task；能力卡片渲染 version 徽标与「最近执行」行（连续失败 warn）。
+- `scripts/workspace-scope-smoke.mjs`（新，6 项）+ package.json smoke 链登记；
+  `docs/notes/2026-11-18-workspace-isolation.md`（完整说明）。
+
+### 26.3 闸门（本分支实测）
+- `pnpm typecheck`（host + client）0 错。
+- `pnpm smoke` 全绿：core 9 / mechanism 89 / webui 32 / client-sim / capability 9 / workspace-scope 6。
+- `pnpm build` 全管线成功（前两分支按并发禁令均未构建，本分支首次构建即过）。
+
+### 26.4 生效方式与预期行为
+- 需 GUI 插件页禁用→启用重载（或重启 DSH Desktop）。
+- 重载后：面板/管理台/命令/工具输出只展示当前工作区的话题集/会话/能力；切工作区即刷新；
+  跨工作区调用能力被明确拒绝；能力卡片显示版本与最近执行状态；管理台执行后计数即时刷新；
+  分支卡片带任务摘要。
+
+### 26.5 已知边界
+- 能力工具名在宿主注册表全局唯一：跨工作区同名注册会被「已被占用」拒绝（换逻辑名或先停用另一工作区的同名能力）。
+- 无 workspaceKey 且无 scope 的旧能力行仍是全局（兼容取舍）。
+- 面板 runTool/editTool/deleteTool 的 RPC 未带 cwd（列表已过滤，界面点不到跨工作区行；如需校验给描述符加 cwd）。
+- 内置 git-sync 的 scope 是绝对路径：换机器/克隆目录后失效，健康报告报 scopeMissing。
 

@@ -32,8 +32,8 @@ import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { listHubSessions } from './hub-sessions.ts'
 import { listWorkspaceBranches } from './hub-branches.ts'
 import {
-  bumpCompositeUse, deleteCompositeTool, editCompositeTool, registerCapability,
-  runCapability, type CompositeSpec,
+  bumpCompositeUse, capabilityAppliesToWorkspace, deleteCompositeTool, editCompositeTool,
+  registerCapability, runCapability, type CompositeSpec,
 } from './composite.ts'
 
 /** Route prefix owned by this module (a host web-server named prefix route). */
@@ -577,7 +577,7 @@ async function handleApi(
       const record = store.toolMemory.get(id)
       if (!record || record.kind !== 'composite' || !record.entry) return fail('组合工具不存在')
       // 工作区隔离：能力记录按适用范围落到工作区。
-      if (record.workspaceKey && record.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      if (!toolRowInWorkspace(record, ws)) return fail('工具不属于当前工作区')
       let spec: CompositeSpec
       try {
         spec = JSON.parse(record.entry) as CompositeSpec
@@ -590,7 +590,8 @@ async function handleApi(
         ...(body.confirm === undefined ? {} : { confirm: Boolean(body.confirm) }),
       })
       // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
-      if (result.status !== 'needs-confirm') bumpCompositeUse(store, spec.name)
+      // R26 收尾：传入 result，管理台执行也记成败明细/最近一次结果。
+      if (result.status !== 'needs-confirm') void bumpCompositeUse(store, spec.name, result)
       logger.info(`supermemory: webui ran capability ${spec.name} (${result.status}, exit ${result.exitCode ?? '-'})`)
       // needs-confirm 也返回 200：前端据此弹二次确认框，再带 confirm=true 重试。
       return sendJson(res, 200, { ok: true, ...result })
@@ -602,7 +603,7 @@ async function handleApi(
       if (!status) return fail('status 必须是 active 或 retired')
       const existing = store.toolMemory.get(id)
       if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
-      if (existing.workspaceKey && existing.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      if (!toolRowInWorkspace(existing, ws)) return fail('工具不属于当前工作区')
       const result = await editCompositeTool(ctx, store, id, { status })
       if (result.status === 'error') return fail(result.message)
       logger.info(`supermemory: webui tool ${id} -> ${status}`)
@@ -613,7 +614,7 @@ async function handleApi(
       const id = text(body.id)
       const existing = store.toolMemory.get(id)
       if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
-      if (existing.workspaceKey && existing.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      if (!toolRowInWorkspace(existing, ws)) return fail('工具不属于当前工作区')
       const result = await deleteCompositeTool(ctx, store, id)
       if (result.status === 'error') return fail(result.message)
       logger.info(`supermemory: webui deleted tool ${id}`)
@@ -660,6 +661,20 @@ function findWsOfTopicSet(map: Map<string, Set<string>>, topicSetId: string): st
  * `workspaceKey`; episodes/dispatches/outbox join through their topic set;
  * routing and workspace-free tool memories stay global (session/global scope).
  */
+/**
+ * A3: 一条 tool_memory 行是否属于当前工作区。能力按行级归属或 scope 推导
+ * （composite.capabilityAppliesToWorkspace 同一语义）；序列组合工具无归属
+ * 无 scope = 全局。
+ */
+function toolRowInWorkspace(record: ToolMemory, ws: string): boolean {
+  let scope: string | undefined
+  try {
+    const spec = JSON.parse(record.entry) as { kind?: string; scope?: string }
+    if (spec.kind === 'capability') scope = spec.scope
+  } catch { /* a broken row stays global */ }
+  return capabilityAppliesToWorkspace({ scope }, ws, record.workspaceKey)
+}
+
 function buildState(store: Store, ws: string) {
   const topicsets: Array<{ id: string } & TopicSet> = []
   for (const [id, t] of store.topicsets.entries()) {
@@ -712,7 +727,9 @@ function buildState(store: Store, ws: string) {
 
   const toolMemory: Array<{ id: string } & ToolMemory> = []
   for (const [id, t] of store.toolMemory.entries()) {
-    if (t.workspaceKey && t.workspaceKey !== ws) continue
+    // A3: 与面板/memory_toolize 同一判定——能力按行级归属或 scope 推导过滤，
+    // 序列组合工具（无归属无 scope）是全局的，任何工作区都展示。
+    if (!toolRowInWorkspace(t, ws)) continue
     toolMemory.push({ id, ...t })
   }
   toolMemory.sort((a, b) => a.trigger.localeCompare(b.trigger))

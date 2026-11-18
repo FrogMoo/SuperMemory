@@ -21,6 +21,7 @@ import { sweepAutoToolize, type ToolizeConfig } from './toolize.ts'
 import { loadHostModule } from './host.ts'
 import { isPluginBranchId } from './hub-sessions.ts'
 import { runReconciliation } from './reconcile.ts'
+import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
@@ -539,6 +540,27 @@ export async function apply(ctx: Context, config: Config) {
         .catch(() => { /* startup notice is best-effort */ })
     }, 10000)
     ctx.effect(() => () => clearTimeout(noticeTimer), 'supermemory: resume-notice')
+
+    // E+（分支保留续）：重启后从持久台账重建分支注册表——把所有保留的分支会话
+    // 重新 attach 到宿主（ctx.agents.resume），分支会话因此重新出现在 GUI 会话
+    // 列表，标题与成员状态同步恢复。语义与 detachIdleBranches 一致：只 attach、
+    // 绝不 dispose，也不投递任何消息。错开对账路径 3（5s 后启动），35s 再补一次
+    // 接住启动竞态（旧实例刚释放 persistence 句柄）下的恢复失败；重跑幂等。
+    const restoreTimers: Array<ReturnType<typeof setTimeout>> = []
+    const runBranchRestore = (label: string): void => {
+      void restoreBranchSessions({ ctx, store: releaseStore, logger })
+        .then((outcome) => {
+          if (outcome.resumed.length > 0 || outcome.failed.length > 0 || outcome.live.length > 0) {
+            logger.info(renderBranchRestoreSummary(outcome) + '（' + label + '）')
+          }
+        })
+        .catch((error) => {
+          logger.warn('supermemory: branch restore failed: ' + String(error).slice(0, 160))
+        })
+    }
+    restoreTimers.push(setTimeout(() => runBranchRestore('启动恢复'), 5000))
+    restoreTimers.push(setTimeout(() => runBranchRestore('启动补恢复'), 35000))
+    ctx.effect(() => () => { for (const timer of restoreTimers) clearTimeout(timer) }, 'supermemory: branch-restore')
 
     // D: disposing the plugin (reload/disable) kills live branch handles, so the
     // hub must learn about it instead of waiting forever for a turn/end.

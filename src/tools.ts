@@ -13,6 +13,7 @@ import { listInterruptedDispatches, renderInterruptedList, resumeDispatch, type 
 import { loadHostModule } from './host.ts'
 import { applyModelSelection, askDefaultModel, enumerateModels, type ModelDeps } from './model.ts'
 import { matchTopicSets, recallMemories, type RecallOptions } from './recall.ts'
+import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, renderRecordLine, tagsOfBody } from './retrieval.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import type { Episode, FileMapEntry, Memory, Requirement, Signal } from './schema.ts'
@@ -1115,9 +1116,11 @@ ${listText}` : listText
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
     description: '工具化（P3）：① 列出待处理的组合工具提议（重复流程达阈值后产生）与已注册的能力；'
-      + '② 接受/拒绝某个提议；③ register 注册一个"能力"（capability）——入口命令 + 文档 + 适用范围 + 路由描述 + 可一键执行（默认预演，写操作需 confirm=true）。'
+      + '② 接受/拒绝某个提议；③ register 注册或更新一个"能力"（capability）——入口命令 + 文档 + 适用范围 + 路由描述 + 可一键执行（默认预演，写操作需 confirm=true）；'
+      + '④ refresh-builtin 刷新内置能力（store 缺失则播种、旧于内置版本则升级、现场更新保留）并返回差异报告与各能力健康度（使用次数/成败分列/连续失败/文档与适用范围缺失/零使用）。'
       + '接受提议会把记录到的工具序列编译成组合工具（一次调用完成确定性子序列）并持久化，重启后仍可用。'
-      + 'register 的能力同样落库（tool_memory），重启后 rebuildComposites 重建注册；仅适用于本仓库范围内注册（scope 指向本仓库目录）。',
+      + 'register 同名能力 = 原地更新（version+1、changelog 记录原因），不会报错也不会重复建行；register 的能力同样落库（tool_memory），重启后 rebuildComposites 重建注册；仅适用于本仓库范围内注册（scope 指向本仓库目录）。'
+      + CAPABILITY_ROUTING_RULES,
     parameters: {
       accept: { type: 'boolean', description: '接受第一个待处理提议并生成组合工具' },
       decline: { type: 'boolean', description: '拒绝（不再提示）第一个待处理提议' },
@@ -1132,12 +1135,14 @@ ${listText}` : listText
       dryRunArg: { type: 'string', description: '预演参数，如 "--dry-run"；定义后默认预演执行' },
       writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },
       tags: { type: 'array', description: '标签（3–8 个短词，检索索引）', items: { type: 'string' } },
+      refreshBuiltin: { type: 'boolean', description: '刷新内置能力：store 缺失则播种、旧于内置版本则升级（现场更新保留），并返回差异报告与各能力健康度' },
+      changelog: { type: 'string', description: 'register 同名更新时的一行变更说明（写入 changelog，最新在前；缺省自动生成）' },
     },
     output: {
       schema: {
         type: 'object',
         properties: {
-          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'registered', 'error'], required: true },
+          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'registered', 'refreshed', 'error'], required: true },
           pending: {
             type: 'array',
             items: {
@@ -1166,10 +1171,46 @@ ${listText}` : listText
                 writeConfirm: { type: 'boolean' },
                 status: { type: 'string' },
                 useCount: { type: 'integer' },
+                version: { type: 'integer' },
+                lastStatus: { type: 'string' },
                 live: { type: 'boolean' },
               },
               additionalProperties: false,
             },
+          },
+          builtin: {
+            type: 'object',
+            properties: {
+              seeded: { type: 'array', items: { type: 'string' } },
+              upgraded: { type: 'array', items: { type: 'string' } },
+              current: { type: 'array', items: { type: 'string' } },
+              localNewer: { type: 'array', items: { type: 'string' } },
+              otherWorkspace: { type: 'integer' },
+              health: {
+                type: 'array',
+                items: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', required: true },
+                    builtin: { type: 'boolean' },
+                    builtinVersion: { type: 'integer' },
+                    version: { type: 'integer' },
+                    entry: { type: 'string' },
+                    useCount: { type: 'integer' },
+                    successCount: { type: 'integer' },
+                    failCount: { type: 'integer' },
+                    consecutiveFailures: { type: 'integer' },
+                    lastStatus: { type: 'string' },
+                    docMissing: { type: 'boolean' },
+                    scopeMissing: { type: 'boolean' },
+                    live: { type: 'boolean' },
+                    notes: { type: 'array', items: { type: 'string' } },
+                  },
+                  additionalProperties: false,
+                },
+              },
+            },
+            additionalProperties: false,
           },
         },
         additionalProperties: false,
@@ -1181,6 +1222,43 @@ ${listText}` : listText
           tool?: string
           message?: string
           capabilities?: Array<{ name: string; title?: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string }>
+          builtin?: {
+            seeded: string[]
+            upgraded: string[]
+            current: string[]
+            localNewer: string[]
+            health: Array<{
+              name: string
+              builtin?: boolean
+              builtinVersion?: number
+              version?: number
+              entry?: string
+              useCount?: number
+              successCount?: number
+              failCount?: number
+              consecutiveFailures?: number
+              lastStatus?: string
+              docMissing?: boolean
+              scopeMissing?: boolean
+              live?: boolean
+              notes?: string[]
+            }>
+          }
+        }
+        if (v.status === 'refreshed') {
+          const b = v.builtin
+          const parts: string[] = [v.message ?? '已刷新内置能力。']
+          if (b) {
+            if (b.seeded.length) parts.push('播种：' + b.seeded.join('、'))
+            if (b.upgraded.length) parts.push('升级：' + b.upgraded.join('、'))
+            if (b.current.length) parts.push('已最新：' + b.current.join('、'))
+            if (b.localNewer.length) parts.push('现场更新（保留）：' + b.localNewer.join('、'))
+            for (const h of b.health) {
+              const head = `- ${h.name}${h.builtin ? '（内置）' : ''} v${h.version ?? 0}：使用 ${h.useCount ?? 0}（成功 ${h.successCount ?? 0}/失败 ${h.failCount ?? 0}，连续失败 ${h.consecutiveFailures ?? 0}）`
+              parts.push(head + (h.notes && h.notes.length ? '\n  ' + h.notes.join('\n  ') : ''))
+            }
+          }
+          return [{ type: 'text', text: parts.join('\n') }]
         }
         if (v.status === 'listed') {
           const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
@@ -1213,14 +1291,54 @@ ${listText}` : listText
         dryRunArg?: string
         writeConfirm?: boolean
         tags?: string[]
+        refreshBuiltin?: boolean
+        changelog?: string
       },
       exec: ToolExec,
     ) {
+      // A3: 本会话的工作区（能力列表/健康报告只覆盖适用于它的能力）。
+      const cwd = exec.agent?.session?.header?.cwd
+      const workspaceKey = cwd ? workspaceKeyOf(cwd) : undefined
+      // R26: 刷新内置能力（播种缺失/升级旧版/现场保留）+ 差异报告 + 健康度信号。
+      if (args.refreshBuiltin) {
+        const { capabilityRecordsOf, capabilityHealthOf, mergeBuiltinCapabilities, registerComposite } = await import('./composite.ts')
+        const report = await mergeBuiltinCapabilities(store, { ctx, register: registerComposite })
+        // A3: 健康信号按当前工作区过滤；别的工作区的能力只报数量不列明细。
+        const health = capabilityHealthOf(store, workspaceKey)
+        const otherWorkspace = Math.max(0, capabilityRecordsOf(store).length - health.length)
+        deps.logger.info(`supermemory: refresh-builtin (seeded ${report.seeded.length}, upgraded ${report.upgraded.length}, current ${report.current.length}, local-newer ${report.localNewer.length})`)
+        return {
+          status: 'refreshed' as const,
+          message: `内置能力已刷新：播种 ${report.seeded.length}、升级 ${report.upgraded.length}、已最新 ${report.current.length}、现场更新保留 ${report.localNewer.length}。`
+            + (otherWorkspace > 0 ? `另有 ${otherWorkspace} 个能力属于其他工作区，本工作区不暴露。` : ''),
+          builtin: {
+            seeded: report.seeded,
+            upgraded: report.upgraded,
+            current: report.current,
+            localNewer: report.localNewer,
+            health: health.map((h) => ({
+              name: h.name,
+              builtin: h.builtin,
+              ...(h.builtinVersion !== undefined ? { builtinVersion: h.builtinVersion } : {}),
+              version: h.version,
+              entry: h.entry,
+              useCount: h.useCount,
+              successCount: h.successCount,
+              failCount: h.failCount,
+              consecutiveFailures: h.consecutiveFailures,
+              ...(h.lastStatus ? { lastStatus: h.lastStatus } : {}),
+              docMissing: h.docMissing,
+              scopeMissing: h.scopeMissing,
+              live: h.live,
+              notes: h.notes,
+            })),
+          },
+        }
+      }
       // R22 能力注册：入口命令 + 文档 + 适用范围 + 路由描述，落库后可一键执行。
       if (args.register) {
         const { registerCapability } = await import('./composite.ts')
-        const cwd = exec.agent?.session?.header?.cwd
-        const ws = cwd ? workspaceKeyOf(cwd) : (args.scope ? workspaceKeyOf(args.scope) : undefined)
+        const ws = workspaceKey ?? (args.scope ? workspaceKeyOf(args.scope) : undefined)
         const result = await registerCapability(ctx, store, {
           name: String(args.name ?? ''),
           title: args.title,
@@ -1232,6 +1350,7 @@ ${listText}` : listText
           dryRunArg: args.dryRunArg,
           writeConfirm: args.writeConfirm,
           tags: args.tags,
+          changelog: args.changelog,
         }, ws)
         if (result.status === 'error') return { status: 'error' as const, message: result.message }
         deps.logger.info(`supermemory: capability ${result.name} registered via memory_toolize`)
@@ -1243,10 +1362,11 @@ ${listText}` : listText
       }
       if (!args.accept && !args.decline) {
         const { capabilityRecordsOf, liveCompositeSpecs } = await import('./composite.ts')
+        // A3: 只列出适用于当前工作区的能力（行级归属或 scope 推导）。
         return {
           status: 'listed' as const,
           pending: pending.map(([, s]) => ({ pattern: s.pattern, count: s.count })),
-          capabilities: capabilityRecordsOf(store).map((c) => ({
+          capabilities: capabilityRecordsOf(store, workspaceKey).map((c) => ({
             name: c.spec.name,
             title: c.spec.title,
             entry: c.spec.entry,
@@ -1257,6 +1377,8 @@ ${listText}` : listText
             writeConfirm: Boolean(c.spec.writeConfirm),
             status: c.status,
             useCount: c.useCount,
+            ...(typeof c.spec.version === 'number' ? { version: c.spec.version } : {}),
+            ...(c.spec.usage?.lastStatus ? { lastStatus: c.spec.usage.lastStatus } : {}),
             live: liveCompositeSpecs.has(c.spec.name),
           })),
         }

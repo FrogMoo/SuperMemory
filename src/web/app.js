@@ -436,6 +436,7 @@ function renderHubs(d) {
                 <span>派发 ${b.dispatches}</span>
                 <span>会话 ${short(b.branchSessionId)}</span>
               </div>
+              ${b.task ? `<div class="row-meta"><span class="muted">任务</span> ${esc(b.task)}</div>` : ''}
             </div>`).join('')}</div>`
     return `
     <div class="list-card">
@@ -481,6 +482,18 @@ function sequenceCard(t) {
     </div>`
 }
 
+/** R26+B4: 能力使用明细一行（成败/连续失败/最近一次执行）；无明细返回空。 */
+function capUsageLine(usage) {
+  if (!usage || !usage.lastStatus) return ''
+  const ok = usage.lastStatus === 'completed'
+  const dry = usage.lastDryRun ? '（预演）' : ''
+  const exit = usage.lastExitCode === undefined ? '—' : usage.lastExitCode
+  const fail = usage.consecutiveFailures >= 2
+    ? ` · <span class="badge warn">连续失败 ${usage.consecutiveFailures}</span>`
+    : ''
+  return `<div class="row-meta"><span class="muted">最近执行</span> ${ok ? '成功' : '失败'}${dry} · exit ${exit} · ${fmtTime(usage.lastUsedAt)} · 成功 ${usage.successCount || 0}/失败 ${usage.failCount || 0}${fail}</div>`
+}
+
 /** R22: 能力卡片 — 入口命令（可复制）/适用范围/文档/预演参数 + 运行/确认执行/启停/删除。 */
 function capabilityCard(t, spec) {
   // 写操作能力若没定义预演参数，预演无从谈起（避免把真实命令当预演跑掉）。
@@ -492,6 +505,7 @@ function capabilityCard(t, spec) {
         <span class="badge info">能力</span> ${badge(t.status)}
         ${spec.writeConfirm ? '<span class="badge warn">写操作需确认</span>' : ''}
         ${spec.runnable === false ? '<span class="badge danger">未开放执行</span>' : ''}
+        ${typeof spec.version === 'number' ? `<span class="badge" title="能力定义版本（register 同名更新 +1）">v${spec.version}</span>` : ''}
         <span class="grow"></span>
         <span class="muted">使用 ${t.useCount} 次</span>
       </div>
@@ -506,6 +520,7 @@ function capabilityCard(t, spec) {
         <span class="muted">适用范围</span> <code>${esc(spec.scope || '当前目录')}</code>
         ${spec.doc ? `<span class="muted">文档</span> <code>${esc(spec.doc)}</code>` : ''}
       </div>
+      ${capUsageLine(spec.usage)}
       <div class="row-actions">
         <button class="btn small primary" type="button" data-action="cap-run" data-id="${t.id}"${canDryRun ? '' : ' disabled title="该能力未定义预演参数，无法预演；请用确认执行"'}>运行（预演）</button>
         ${spec.writeConfirm ? `<button class="btn small danger" type="button" data-action="cap-run-confirm" data-id="${t.id}">确认执行</button>` : ''}
@@ -721,7 +736,9 @@ document.addEventListener('click', async (ev) => {
     case 'cap-run': await run(async () => {
       const r = await post('/tool/run', { ws: state.ws, id })
       state.capRun = r
-      render()
+      // B2 收尾：执行后重新拉取状态——使用次数/版本/最近执行状态即时刷新，
+      // 不再停留在页面加载时的旧快照。
+      await loadState()
     }); return
     case 'cap-run-confirm': {
       const t = (state.data && state.data.toolMemory || []).find((x) => x.id === id)
@@ -737,16 +754,18 @@ document.addEventListener('click', async (ev) => {
       const r = await post('/tool/run', { ws: state.ws, id: c.id, confirm: true })
       state.capConfirm = null
       state.capRun = r
-      render()
+      // B2 收尾：同上——确认执行后也刷新状态。
+      await loadState()
     }); return
     case 'tool-status': await run(async () => {
       const status = btn.dataset.status === 'retired' ? 'retired' : 'active'
       await post('/tool/status', { ws: state.ws, id, status })
       toast(status === 'retired' ? '已停用（重启后不会重新注册）' : '已启用')
+      await loadState()
     }); return
     case 'tool-del':
       if (!confirm('删除该固化能力/自动固化序列不可恢复，确定？')) return
-      await run(async () => { await post('/tool/delete', { ws: state.ws, id }); toast('已删除') }); return
+      await run(async () => { await post('/tool/delete', { ws: state.ws, id }); toast('已删除'); await loadState() }); return
     case 'cap-copy': {
       const copyText = btn.dataset.text || ''
       if (navigator.clipboard && navigator.clipboard.writeText) {

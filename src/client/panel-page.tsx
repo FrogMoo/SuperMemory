@@ -27,6 +27,8 @@ export interface TopicSetView {
     topicSetId?: string
     topicSetTitle?: string
     hubs?: number
+    /** 最新一次派发的任务摘要（重启后仅凭持久台账也能认出分支）。 */
+    task?: string
   }>
   model?: string
 }
@@ -54,6 +56,19 @@ export interface ToolView {
   useCount: number
   status: string
   live: boolean
+  /** R26: 能力定义版本与使用明细（面板能力卡片展示）。 */
+  version?: number
+  usage?: {
+    useCount: number
+    successCount: number
+    failCount: number
+    consecutiveFailures: number
+    lastUsedAt?: number
+    lastStatus?: 'completed' | 'failed'
+    lastDryRun?: boolean
+    lastExitCode?: number
+    lastSummary?: string
+  }
 }
 
 /** One agent-preset row of the host roster (hub quick launcher). */
@@ -197,7 +212,7 @@ export interface PanelApi {
   createTopicSetSession(cwd: string, ids: string[], options?: SessionOptions, firstMessage?: string): Promise<MutationResult>
   createHubSession(cwd: string, options?: SessionOptions, firstMessage?: string): Promise<MutationResult>
   followupTopicSet(cwd: string, topicSetId: string, text: string): Promise<MutationResult>
-  listTools(): Promise<ToolView[]>
+  listTools(cwd?: string): Promise<ToolView[]>
   editTool(id: string, patch: Record<string, unknown>): Promise<MutationResult>
   deleteTool(id: string): Promise<MutationResult>
   sessionBadge(sessionId: string): Promise<SessionBadge>
@@ -625,6 +640,15 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     if (next) setWorkspacePath(next)
   }, [sessionCwd, workspacePath, workspaces])
 
+  // A4: 跟随 shell 的工作区切换——主视图会话换到另一个工作区时面板随之切换，
+  // 不停留在旧工作区的数据上（用户显式选择过的优先，直到再次发生切换）。
+  const [lastSessionCwd, setLastSessionCwd] = useState('')
+  useEffect(() => {
+    if (!sessionCwd) return
+    if (lastSessionCwd && lastSessionCwd !== sessionCwd) setWorkspacePath(sessionCwd)
+    if (sessionCwd !== lastSessionCwd) setLastSessionCwd(sessionCwd)
+  }, [sessionCwd, lastSessionCwd])
+
   /** Switch the panel's one workspace and reset every workspace-scoped view. */
   const changeWorkspace = useCallback((path: string): void => {
     if (!path || path === workspacePath) return
@@ -640,6 +664,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     setLaunchSets([])
     setReceipt(undefined)
     setCreatedSet(undefined)
+    // A3/A4: 工具列表也是工作区视图——切换时清空，由 refreshTools 按新 cwd 重拉。
+    setTools([])
     setChatData(undefined)
     setChatDraft('')
     setChatError(undefined)
@@ -683,13 +709,15 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }, [api, cwd, query, t])
 
+  // A3: 工具列表按当前工作区拉取（cwd 变化即重新过滤，不停留在旧工作区数据）。
   const refreshTools = useCallback(async () => {
+    if (!cwd) return
     try {
-      setTools(await api.listTools())
+      setTools(await api.listTools(cwd))
     } catch (loadError) {
       setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
     }
-  }, [api, t])
+  }, [api, cwd, t])
 
   useEffect(() => { void refreshHub() }, [refreshHub])
   useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
@@ -1203,6 +1231,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                       branch.model ? h('span', { key: 'm', className: 'sm-badge' }, branch.model) : null,
                     ),
                     h('div', { className: 'sm-sub' }, branch.sessionId),
+                    // B3: 分支卡片带最新一次派发的任务摘要（无则仅显示会话 id）。
+                    branch.task ? h('div', { key: 'task', className: 'sm-sub' }, `任务：${branch.task}`) : null,
                   ),
                 ),
               ),
@@ -1413,6 +1443,16 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                   ),
               h('div', { className: 'sm-sub' }, `${t('tool.steps')}：${tool.steps.join(' → ') || '—'}`),
               h('div', { className: 'sm-sub' }, `${t('tool.params')}：${tool.parameters.join('、') || '—'} · ${t('tool.uses')}：${tool.useCount}`),
+              // R26: 能力卡片显示定义版本与使用明细（成败/连续失败/最近一次执行）。
+              tool.version !== undefined || tool.usage?.lastStatus
+                ? h('div', { key: 'capmeta', className: 'sm-sub' },
+                    `${tool.version !== undefined ? `版本 v${tool.version} · ` : ''}`
+                    + (tool.usage?.lastStatus
+                      ? `最近执行 ${tool.usage.lastStatus === 'completed' ? '成功' : '失败'}${tool.usage.lastDryRun ? '（预演）' : ''}`
+                        + ` · 成功 ${tool.usage.successCount}/失败 ${tool.usage.failCount}`
+                        + (tool.usage.consecutiveFailures >= 2 ? ` · 连续失败 ${tool.usage.consecutiveFailures}` : '')
+                      : ''))
+                : null,
             ),
           ),
     ),

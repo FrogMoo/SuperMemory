@@ -88,7 +88,7 @@ async function messageFactory(): Promise<typeof CreateUserMessage> {
 }
 
 /** Parse the "provider/model" text stored on a topic-set member. */
-function parseMemberModel(raw: string | undefined): ModelSelection | undefined {
+export function parseMemberModel(raw: string | undefined): ModelSelection | undefined {
   if (!raw) return undefined
   const slash = raw.indexOf('/')
   if (slash <= 0 || slash === raw.length - 1) return undefined

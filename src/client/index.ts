@@ -76,7 +76,7 @@ function buildApi(ctx: Context): PanelApi | undefined {
     createTopicSetSession: (cwd, ids, options, firstMessage) => call('createTopicSetSession', cwd, ids, options, firstMessage),
     createHubSession: (cwd, options, firstMessage) => call('createHubSession', cwd, options, firstMessage),
     followupTopicSet: (cwd, topicSetId, text) => call('followupTopicSet', cwd, topicSetId, text),
-    listTools: () => call('listTools'),
+    listTools: (cwd) => call('listTools', cwd),
     editTool: (id, patch) => call('editTool', id, patch),
     deleteTool: (id) => call('deleteTool', id),
     listAgentPresets: () => call('listAgentPresets'),

@@ -96,7 +96,7 @@ export function taskExcerpt(task: string, max = 32): string {
  * marks a cut with "…" (the previous call site passed 20, which clipped most
  * one-line tasks mid-word).
  */
-const BRANCH_CARD_EXCERPT_CHARS = 48
+export const BRANCH_CARD_EXCERPT_CHARS = 48
 
 /** Human relative time for cards (coarse on purpose: the card is context, not a log). */
 export function relativeAgo(at: number, now = Date.now()): string {
@@ -272,6 +272,29 @@ export function listWorkspaceBranches(
     void dispatchId
   }
   return projectSelected(store, all, selected, limit, 1000)
+}
+
+/**
+ * branchSessionId → the latest task dispatched into it (newest row wins).
+ *
+ * The panel's topic-set branch rows carry this excerpt so a preserved branch
+ * stays identifiable after a restart: title + owning set + task summary, read
+ * from the durable ledger alone (no live handle required).
+ */
+export function latestTaskByBranch(store: Store | undefined): Map<string, string> {
+  const latest = new Map<string, { task: string; at: number }>()
+  if (store) {
+    for (const [, row] of store.dispatches.entries()) {
+      const branchId = String(row.branchSessionId ?? '')
+      if (!branchId) continue
+      const at = Math.max(Number(row.updatedAt) || 0, Number(row.createdAt) || 0)
+      const current = latest.get(branchId)
+      if (!current || at >= current.at) latest.set(branchId, { task: String(row.task ?? ''), at })
+    }
+  }
+  const out = new Map<string, string>()
+  for (const [branchId, row] of latest) out.set(branchId, row.task)
+  return out
 }
 
 /** branchSessionId → the hubs that dispatched into it (panel branch cards). */

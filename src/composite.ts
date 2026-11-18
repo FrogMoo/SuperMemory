@@ -18,13 +18,17 @@
  * @module supermemory/composite
  */
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
 import { loadHostModule } from './host.ts'
 import type { Signal, ToolMemory } from './schema.ts'
 import { deriveTitle, normalizeTags } from './retrieval.ts'
 import type { Store } from './store.ts'
-import { newId } from './store.ts'
+import { newId, workspaceKeyOf } from './store.ts'
+import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
+import { CAPABILITY_ROUTING_RULES } from './route.ts'
 
 /** One recorded step of a repeated sequence. */
 export interface SequenceSample {
@@ -69,7 +73,36 @@ export interface CompositeSpec {
   writeConfirm?: boolean
   /** 路由描述：何时优先用本能力，并入模型可见的工具描述。 */
   routeNote?: string
+  // ---- 维护元数据（R26 持续维护）：版本 / 变更说明 / 使用统计 ----
+  /** 定义版本：memory_toolize register 同名更新 +1；内置升级以它判定新旧。 */
+  version?: number
+  /** 最近一次维护时间（register 更新 / 内置升级时刷新）。 */
+  updatedAt?: number
+  /** 变更说明（最新在前，最多 CAP_CHANGELOG_MAX 条）。 */
+  changelog?: string[]
+  /** 使用统计（仅 kind='capability'）：行级 useCount 之外的成败明细。 */
+  usage?: CapabilityUsage
 }
+
+/**
+ * 能力使用统计（R26）：每次执行（预演/实跑/失败都计；needs-confirm 不计）累加。
+ * useCount 与行级字段保持一致（面板/控制台/memory_toolize 直读行级值），成败
+ * 分列与连续失败是持续维护信号——refresh-builtin 健康报告的数据源。
+ */
+export interface CapabilityUsage {
+  useCount: number
+  successCount: number
+  failCount: number
+  consecutiveFailures: number
+  lastUsedAt?: number
+  lastStatus?: 'completed' | 'failed'
+  lastDryRun?: boolean
+  lastExitCode?: number
+  lastSummary?: string
+}
+
+/** changelog 上限：最新在前，超出丢弃最旧的（register 更新与内置升级共用）。 */
+const CAP_CHANGELOG_MAX = 20
 
 /** A capability spec with its fields narrowed (kind is always 'capability'). */
 export type CapabilitySpec = CompositeSpec & { kind: 'capability'; entry: string }
@@ -136,22 +169,75 @@ const liveComposites = new Map<string, () => void>()
 /** Names of currently registered composite tools (for panel liveness). */
 export const liveCompositeSpecs = new Set<string>()
 
-/** Increment one composite's durable use counter (matched by spec name). */
-export function bumpCompositeUse(store: Store, name: string): void {
+/**
+ * Increment one composite's durable use counter (matched by spec name).
+ *
+ * R26 使用统计：能力每次执行都落库——预演（dry-run）与真实执行都算，执行失败
+ * （非零退出/启动失败）也计；needs-confirm 没有执行，调用方不会进来。明细写进
+ * spec.usage（成败分列、连续失败、lastUsedAt、最近一次结果），行级 useCount 同步
+ * +1（面板/控制台/memory_toolize 直读它）。传入 result 时记明细；不传（旧调用点：
+ * 面板/控制台）只计总数。返回 Promise 供测试等待；内部 catch 保证计数写库失败
+ * 永远不会让一次本来成功的执行失败。
+ */
+export function bumpCompositeUse(store: Store, name: string, result?: CapabilityRunResult): Promise<void> {
   for (const [id, record] of store.toolMemory.entries()) {
     if (record.kind !== 'composite' || !record.entry) continue
+    let spec: CompositeSpec
     try {
-      if ((JSON.parse(record.entry) as CompositeSpec).name !== name) continue
+      spec = JSON.parse(record.entry) as CompositeSpec
     } catch {
       continue
     }
-    void store.toolMemory.update(id, (r) => ({ ...r, useCount: r.useCount + 1 })).catch(() => { /* counter is advisory */ })
-    return
+    if (spec.name !== name) continue
+    const useCount = (Number(record.useCount) || 0) + 1
+    let entry = record.entry
+    if (spec.kind === 'capability') {
+      entry = JSON.stringify({ ...spec, usage: mergeCapabilityUsage(spec.usage, record.useCount, result) })
+    }
+    return store.toolMemory.update(id, (r) => ({ ...r, useCount, entry }))
+      .catch(() => { /* counter is advisory */ })
+  }
+  return Promise.resolve()
+}
+
+/**
+ * Merge one run outcome into the durable usage stats (pure).
+ * result 缺省（旧调用点）只计总数，不动成败明细；连续失败在成功后归零。
+ */
+export function mergeCapabilityUsage(
+  previous: CapabilityUsage | undefined,
+  rowUseCount: number | undefined,
+  result?: CapabilityRunResult,
+): CapabilityUsage {
+  const base: CapabilityUsage = previous ?? {
+    useCount: Number(rowUseCount) || 0,
+    successCount: 0,
+    failCount: 0,
+    consecutiveFailures: 0,
+  }
+  const succeeded = result ? result.status === 'completed' : undefined
+  return {
+    ...base,
+    useCount: base.useCount + 1,
+    successCount: succeeded === true ? base.successCount + 1 : base.successCount,
+    failCount: succeeded === false ? base.failCount + 1 : base.failCount,
+    consecutiveFailures: succeeded === undefined
+      ? base.consecutiveFailures
+      : (succeeded ? 0 : base.consecutiveFailures + 1),
+    lastUsedAt: Date.now(),
+    ...(result && result.status !== 'needs-confirm'
+      ? {
+        lastStatus: result.status === 'completed' ? 'completed' as const : 'failed' as const,
+        lastDryRun: result.dryRun,
+        ...(typeof result.exitCode === 'number' ? { lastExitCode: result.exitCode } : {}),
+        ...(result.summary ? { lastSummary: result.summary.slice(0, 200) } : {}),
+      }
+      : {}),
   }
 }
 
 /** Register one composite tool; returns its disposer. */
-export async function registerComposite(ctx: Context, store: Store, spec: CompositeSpec): Promise<() => void> {
+export async function registerComposite(ctx: Context, store: Store, spec: CompositeSpec, workspaceKey?: string): Promise<() => void> {
   // Two signals can normalise to the same composite name, and a restart rebuild
   // re-registers every durable definition: dispose the previous handle first so
   // a re-registration replaces instead of leaking the old one.
@@ -169,7 +255,7 @@ export async function registerComposite(ctx: Context, store: Store, spec: Compos
     // 定义对象在函数内构造会加宽字面量类型（type: 'object' → string），与序列路径
     // 一样用 as never 交给 defineTool；语义由 output schema 的文字描述保证。
     const capSpec = spec as CapabilitySpec
-    const disposer = ctx.tools.register(tools.defineTool(capabilityToolDef(store, capSpec) as never))
+    const disposer = ctx.tools.register(tools.defineTool(capabilityToolDef(store, capSpec, workspaceKey) as never))
     liveComposites.set(spec.name, disposer)
     liveCompositeSpecs.add(spec.name)
     return disposer
@@ -265,15 +351,27 @@ export async function rebuildComposites(
   ctx: Context,
   store: Store,
   // 注入缝：无宿主注册器（测试/headless）时用假 register 也能验证重建拾取。
-  deps?: { register?: (ctx: Context, store: Store, spec: CompositeSpec) => Promise<() => void> },
+  deps?: {
+    register?: (ctx: Context, store: Store, spec: CompositeSpec) => Promise<() => void>
+    logger?: { info: (msg: string) => void }
+  },
 ): Promise<number> {
   const register = deps?.register ?? registerComposite
+  // R26: 内置能力先与 store 合并（缺失播种/旧版升级/现场保留），随后统一注册。
+  try {
+    const merged = await mergeBuiltinCapabilities(store)
+    if (merged.seeded.length > 0 || merged.upgraded.length > 0) {
+      deps?.logger?.info('supermemory: builtin capabilities merged — seeded ' + merged.seeded.join(',')
+        + '; upgraded ' + merged.upgraded.join(','))
+    }
+  } catch { /* 合并失败不阻塞启动：持久行照常重建 */ }
   let registered = 0
   for (const [, record] of [...store.toolMemory.entries()]) {
     if (record.kind !== 'composite' || record.status !== 'active' || !record.entry) continue
     try {
       const spec = JSON.parse(record.entry) as CompositeSpec
-      await register(ctx, store, spec)
+      // A3: 行级工作区归属随注册传入，能力工具据此做跨工作区门禁。
+      await register(ctx, store, spec, record.workspaceKey)
       registered++
     } catch { /* a broken definition is skipped, never blocks boot */ }
   }
@@ -365,7 +463,8 @@ export async function editCompositeTool(
     if (previous) { try { previous() } catch { /* best-effort */ } }
     liveComposites.delete(next.name)
     liveCompositeSpecs.delete(next.name)
-    const dispose = await registerComposite(ctx, store, next)
+    // A3: 行级工作区归属随行传入，编辑后重注册不丢跨工作区门禁。
+    const dispose = await registerComposite(ctx, store, next, record.workspaceKey)
     liveComposites.set(next.name, dispose)
     liveCompositeSpecs.add(next.name)
   } catch (error) {
@@ -444,6 +543,8 @@ export interface CapabilityInput {
   writeConfirm?: boolean
   tags?: string[]
   routeNote?: string
+  /** register 同名更新时的一行变更说明（写入 changelog，最新在前）。 */
+  changelog?: string
 }
 
 /** 合法逻辑名：字母/数字/-/_，≤41 字符（工具名再派生 sm_composite_ 前缀）。 */
@@ -457,8 +558,12 @@ export function capabilityToolName(name: string): string {
   return 'sm_composite_' + (slug || 'capability')
 }
 
-/** Build + validate one capability spec (pure: no host, no IO). */
-export function buildCapabilitySpec(input: CapabilityInput): { status: 'ok'; spec: CapabilitySpec } | { status: 'error'; message: string } {
+/**
+ * Build + validate one capability spec (pure: no host, no IO).
+ * 入参刻意不含 changelog：本函数不读它（changelog 由 register/内置合并各自记账），
+ * 这样 BuiltinCapability（changelog: string[] 版本史）也能直接传入。
+ */
+export function buildCapabilitySpec(input: Omit<CapabilityInput, 'changelog'>): { status: 'ok'; spec: CapabilitySpec } | { status: 'error'; message: string } {
   const name = String(input.name ?? '').trim()
   if (!isValidCapabilityName(name)) {
     return { status: 'error', message: '能力名称只能包含字母/数字/-/_（≤41 字符）且以字母或数字开头。' }
@@ -488,6 +593,37 @@ export function buildCapabilitySpec(input: CapabilityInput): { status: 'ok'; spe
     ...(String(input.routeNote ?? '').trim() ? { routeNote: String(input.routeNote).trim().slice(0, 500) } : {}),
   }
   return { status: 'ok', spec }
+}
+
+/**
+ * 调用方会话的工作区 key（宿主 exec.agent.session.header.cwd）。
+ * 取不到返回 undefined——没有工作区事实时不做隔离判定（测试/headless 放行）。
+ */
+function callerWorkspaceKey(exec: { agent?: unknown }): string | undefined {
+  const cwd = (exec.agent as { session?: { header?: { cwd?: string } } } | undefined)?.session?.header?.cwd
+  if (!cwd || typeof cwd !== 'string') return undefined
+  try {
+    return workspaceKeyOf(cwd)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 能力是否适用于某个工作区（A3 工作区隔离的单一判定）：
+ * - 行级归属（tool_memory.workspaceKey）优先；
+ * - 无行级归属时用 spec.scope 推导；
+ * - 两者都没有 = 全局能力（旧数据/无 scope 的注册），任何工作区适用。
+ */
+export function capabilityAppliesToWorkspace(
+  spec: Pick<CapabilitySpec, 'scope'>,
+  callerWorkspace: string | undefined,
+  rowWorkspaceKey?: string,
+): boolean {
+  if (!callerWorkspace) return true
+  const own = rowWorkspaceKey || (spec.scope ? workspaceKeyOf(spec.scope) : undefined)
+  if (!own) return true
+  return own === callerWorkspace
 }
 
 /** One capability execution result (tool output and the webui endpoint share it). */
@@ -575,20 +711,32 @@ export function runCapability(spec: CompositeSpec, options: { dryRun?: boolean; 
 }
 
 /**
- * The model-visible tool definition of one capability. The description carries
- * the routing note (when to prefer it), the entry command, the dry-run default
- * and the write-confirm rule, so the model never has to guess the semantics.
+ * The model-visible description of one capability (pure; asserted by the
+ * capability smoke). Carries the routing note (when to prefer it), the entry
+ * command, the dry-run default, the write-confirm rule and the capability
+ * routing rules, so the model never has to guess the semantics.
  */
-function capabilityToolDef(store: Store, spec: CapabilitySpec) {
+export function capabilityToolDescription(spec: CapabilitySpec): string {
   const semantics = '（能力：在适用范围 ' + (spec.scope || '当前目录') + ' 内执行入口命令 `' + spec.entry + '`；'
     + (spec.dryRunArg ? `默认追加预演参数 ${spec.dryRunArg}（只读不改）；` : '')
     + (spec.writeConfirm ? '真实执行可能写远端/改状态：confirm=true 表示确认真实执行（自动脱离预演缺省）；' : '')
     + (spec.doc ? `详细流程见 ${spec.doc}；` : '')
     + (spec.runnable === false ? '当前未开放执行。' : '')
     + '返回 exitCode/stdout/stderr/durationMs。）'
+  return spec.description + (spec.routeNote ? '。' + spec.routeNote : '') + semantics + '\n' + CAPABILITY_ROUTING_RULES
+}
+
+/**
+ * The model-visible tool definition of one capability. Exported so tests (and
+ * headless drivers) can call execute() without a live tool registry.
+ *
+ * `workspaceKey` = 持久行的工作区归属（undefined=全局能力）：execute 时按调用方
+ * 会话的 cwd 判定适用性，跨工作区调用直接拒绝——不执行、不计数（A3 隔离）。
+ */
+export function capabilityToolDef(store: Store, spec: CapabilitySpec, workspaceKey?: string) {
   return {
     name: spec.name,
-    description: spec.description + (spec.routeNote ? '。' + spec.routeNote : '') + semantics,
+    description: capabilityToolDescription(spec),
     parameters: {
       dryRun: { type: 'boolean', description: 'true=强制预演；缺省时若能力定义了预演参数（dryRunArg）则自动预演' },
       confirm: { type: 'boolean', description: '真实执行写操作能力（writeConfirm）时的二次确认，必须为 true' },
@@ -613,13 +761,23 @@ function capabilityToolDef(store: Store, spec: CapabilitySpec) {
         return [{ type: 'text', text: (v.status === 'needs-confirm' ? '需要确认：' : '') + String(v.summary ?? '') }]
       },
     },
-    async execute(args: Record<string, unknown>, _exec: { signal: AbortSignal; agent?: unknown; toolSet?: unknown }) {
+    async execute(args: Record<string, unknown>, exec: { signal: AbortSignal; agent?: unknown; toolSet?: unknown }) {
+      // 工作区隔离（A3）：跨工作区调用拒绝执行，也不计使用。
+      const callerWorkspace = callerWorkspaceKey(exec)
+      if (callerWorkspace && !capabilityAppliesToWorkspace(spec, callerWorkspace, workspaceKey)) {
+        const own = workspaceKey || (spec.scope ? workspaceKeyOf(spec.scope) : '')
+        return {
+          status: 'failed' as const, stdout: '', stderr: '', durationMs: 0, dryRun: false, command: spec.entry,
+          summary: `该能力适用于工作区 ${own || '（未知）'}，当前会话工作区是 ${callerWorkspace}：不执行（工作区隔离）。`,
+        }
+      }
       const result = runCapability(spec, {
         ...(typeof args.dryRun === 'boolean' ? { dryRun: args.dryRun } : {}),
         ...(typeof args.confirm === 'boolean' ? { confirm: args.confirm } : {}),
       })
       // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
-      if (result.status !== 'needs-confirm') bumpCompositeUse(store, spec.name)
+      // R26: 传入 result → 同时落成败分列/连续失败/最近一次结果（维护信号）。
+      if (result.status !== 'needs-confirm') void bumpCompositeUse(store, spec.name, result)
       return result
     },
   }
@@ -670,7 +828,13 @@ export async function registerCapability(
   for (const [id, record] of store.toolMemory.entries()) {
     if (record.kind !== 'composite' || !record.entry) continue
     try {
-      if ((JSON.parse(record.entry) as CompositeSpec).name === spec.name) { existingId = id; break }
+      if ((JSON.parse(record.entry) as CompositeSpec).name !== spec.name) continue
+      // A3: 同名行按工作区归属区分——传入 workspaceKey 时只更新本工作区的行，
+      // 别的工作区的同名能力不会被误更新（它也不在本工作区暴露）。
+      if (workspaceKey && record.workspaceKey && record.workspaceKey !== workspaceKey) continue
+      if (workspaceKey && !record.workspaceKey && spec.scope && workspaceKeyOf(spec.scope) !== workspaceKey) continue
+      existingId = id
+      break
     } catch { /* a broken row never blocks */ }
   }
   if (!existingId) {
@@ -684,27 +848,54 @@ export async function registerCapability(
   const hasRegistry = typeof (ctx as unknown as { tools?: { register?: unknown } }).tools?.register === 'function'
   try {
     if (existingId) {
-      disposeComposite(spec.name)
-      if (hasRegistry) await seam.register(ctx, store, spec)
+      // 同名 = 更新（R26 持续维护）：version+1、updatedAt、changelog 追加一行，
+      // usage 使用统计原样保留（更新定义不重置计数）。
+      let previous: CompositeSpec | undefined
+      try {
+        previous = JSON.parse(store.toolMemory.get(existingId)?.entry ?? '') as CompositeSpec
+      } catch { /* a broken previous definition still updates */ }
+      const version = (Number(previous?.version) || 0) + 1
+      const changeLine = String(input.changelog ?? '').trim().slice(0, 200)
+        || `更新能力定义（入口 ${spec.entry}${spec.doc ? `，文档 ${spec.doc}` : ''}）`
+      const changelog = [changeLine, ...(previous?.changelog ?? [])].slice(0, CAP_CHANGELOG_MAX)
+      const next: CapabilitySpec = {
+        ...spec,
+        version,
+        updatedAt: Date.now(),
+        changelog,
+        ...(previous?.usage ? { usage: previous.usage } : {}),
+      }
+      disposeComposite(next.name)
+      if (hasRegistry) await seam.register(ctx, store, next)
       await store.toolMemory.update(existingId, (r) => ({
         ...r,
-        title: spec.title ?? r.title,
-        tags: spec.tags ?? r.tags,
-        description: spec.description,
-        entry: JSON.stringify(spec),
+        title: next.title ?? r.title,
+        tags: next.tags ?? r.tags,
+        description: next.description,
+        entry: JSON.stringify(next),
         ...(workspaceKey ? { workspaceKey } : {}),
       }))
-      return { status: 'ok', message: `已更新能力 ${spec.name}（入口 ${spec.entry}）。`, id: existingId, name: spec.name }
+      return { status: 'ok', message: `已更新能力 ${next.name}（v${version}，入口 ${next.entry}）：${changeLine}`, id: existingId, name: next.name }
     }
-    if (hasRegistry) await seam.register(ctx, store, spec)
-    const id = await seam.persist(store, spec, 'capability/' + spec.name, workspaceKey)
+    // 新注册也从 v1 起记版本：版本是「本地是否有意修改」的唯一信号——内置升级
+    // 不覆盖版本 ≥ 内置的行，因此经 register 录入/更新的现场能力不会被内置覆盖。
+    const changeLine = String(input.changelog ?? '').trim().slice(0, 200)
+      || `注册能力（入口 ${spec.entry}${spec.doc ? `，文档 ${spec.doc}` : ''}）`
+    const stamped: CapabilitySpec = {
+      ...spec,
+      version: 1,
+      updatedAt: Date.now(),
+      changelog: [changeLine],
+    }
+    if (hasRegistry) await seam.register(ctx, store, stamped)
+    const id = await seam.persist(store, stamped, 'capability/' + stamped.name, workspaceKey)
     return {
       status: 'ok',
       message: hasRegistry
-        ? `已注册能力 ${spec.name}（入口 ${spec.entry}${spec.dryRunArg ? `，默认预演 ${spec.dryRunArg}` : ''}${spec.writeConfirm ? '，写操作需 confirm=true' : ''}）。`
-        : `已保存能力 ${spec.name}（宿主未提供工具注册器，重启/重载后生效）。`,
+        ? `已注册能力 ${stamped.name}（v1，入口 ${stamped.entry}${stamped.dryRunArg ? `，默认预演 ${stamped.dryRunArg}` : ''}${stamped.writeConfirm ? '，写操作需 confirm=true' : ''}）。`
+        : `已保存能力 ${stamped.name}（宿主未提供工具注册器，重启/重载后生效）。`,
       id,
-      name: spec.name,
+      name: stamped.name,
     }
   } catch (error) {
     return { status: 'error', message: `注册失败：${String(error).slice(0, 200)}` }
@@ -712,15 +903,226 @@ export async function registerCapability(
 }
 
 /** Every durable capability record (broken JSON skipped) — for list surfaces. */
-export function capabilityRecordsOf(store: Store): Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string }> {
+export function capabilityRecordsOf(store: Store, workspaceKey?: string): Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string }> {
   const out: Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string }> = []
   for (const [id, record] of store.toolMemory.entries()) {
     if (record.kind !== 'composite' || !record.entry) continue
     try {
       const spec = JSON.parse(record.entry) as CompositeSpec
       if (spec?.kind !== 'capability' || !spec.entry) continue
+      // A3: 只列出适用于当前工作区的能力（行级归属或 scope 推导；全局能力除外）。
+      if (!capabilityAppliesToWorkspace(spec, workspaceKey, record.workspaceKey)) continue
       out.push({ id, spec: spec as CapabilitySpec, useCount: record.useCount, status: record.status })
     } catch { /* one broken row never blocks a list */ }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// R26 内置能力（builtin capabilities）与持续维护：能力定义随插件源码分发
+// （src/builtin-capabilities.ts），启动重建时与 store 合并；使用统计与健康
+// 报告为大模型提供「能力是否满足新需求」的可读信号。
+// ---------------------------------------------------------------------------
+
+/** 内置能力与 store 合并的结果（差异报告）。 */
+export interface BuiltinMergeReport {
+  /** 现场缺失 → 已播种的工具名。 */
+  seeded: string[]
+  /** 现场旧于内置 → 已升级的工具名（定义覆盖，使用数据保留）。 */
+  upgraded: string[]
+  /** 版本一致 → 未动。 */
+  current: string[]
+  /** 现场新于内置 → 保留现场（本地维护中）。 */
+  localNewer: string[]
+  /** 本次发生变化的 spec（播种 + 升级）及其工作区归属：调用方据此重新注册。 */
+  changed: Array<{ spec: CapabilitySpec; workspaceKey?: string }>
+}
+
+/**
+ * 把内置能力合并进 store（幂等）：缺失播种、旧版升级、现场版本保留。
+ *
+ * 升级策略（覆盖而非保留现场定义）：内置定义随插件代码与文档一起发布，旧版
+ * 定义本身就是「文档与现状不符」的故障形态；唯一有意的本地修改路径是
+ * memory_toolize register（version+1 超过内置），因此版本旧于内置的行不可能是
+ * 认真的本地编辑。升级保留 useCount/usage 与 workspaceKey——不丢任何使用数据，
+ * 也不改行属于哪个工作区。
+ *
+ * opts.ctx + opts.register 提供时，变化的 spec 立即重新注册（refresh-builtin
+ * 运行时刷新用）；rebuildComposites 只做数据合并，注册交给随后的统一循环。
+ */
+export async function mergeBuiltinCapabilities(
+  store: Store,
+  opts?: {
+    ctx?: Context
+    // A3: register 可带行级工作区归属，供能力工具做跨工作区门禁。
+    register?: (ctx: Context, store: Store, spec: CompositeSpec, workspaceKey?: string) => Promise<() => void>
+  },
+): Promise<BuiltinMergeReport> {
+  const report: BuiltinMergeReport = { seeded: [], upgraded: [], current: [], localNewer: [], changed: [] }
+  for (const builtin of BUILTIN_CAPABILITIES) {
+    const toolName = capabilityToolName(builtin.name)
+    // 按工具名找行（跨工作区）：现场行可能属于任何 workspaceKey，升级时不改写它。
+    let rowId: string | undefined
+    let row: ToolMemory | undefined
+    for (const [id, record] of store.toolMemory.entries()) {
+      if (record.kind !== 'composite' || !record.entry) continue
+      try {
+        if ((JSON.parse(record.entry) as CompositeSpec).name === toolName) { rowId = id; row = record; break }
+      } catch { /* a broken row never blocks */ }
+    }
+    if (!rowId || !row) {
+      const built = buildCapabilitySpec(builtin)
+      if (built.status === 'error') continue
+      const spec: CapabilitySpec = {
+        ...built.spec,
+        version: builtin.version,
+        ...(builtin.changelog?.length ? { changelog: [...builtin.changelog] } : {}),
+      }
+      const seedWorkspace = builtin.scope ? workspaceKeyOf(builtin.scope) : undefined
+      await persistComposite(store, spec, 'capability/' + toolName, seedWorkspace)
+      report.seeded.push(toolName)
+      report.changed.push({ spec, workspaceKey: seedWorkspace })
+      continue
+    }
+    let spec: CompositeSpec | undefined
+    try {
+      spec = JSON.parse(row.entry) as CompositeSpec
+    } catch { /* 定义损坏：按旧版处理，用内置修复 */ }
+    // 同名的序列组合工具不是这个能力的行：不劫持、不播种。
+    if (spec && spec.kind !== 'capability') continue
+    const storeVersion = Number(spec?.version) || 0
+    if (spec && storeVersion >= builtin.version) {
+      if (storeVersion > builtin.version) report.localNewer.push(toolName)
+      else report.current.push(toolName)
+      continue
+    }
+    const built = buildCapabilitySpec(builtin)
+    if (built.status === 'error') continue
+    const next: CapabilitySpec = {
+      ...built.spec,
+      version: builtin.version,
+      updatedAt: Date.now(),
+      changelog: [...(builtin.changelog ?? []), ...(spec?.changelog ?? [])].slice(0, CAP_CHANGELOG_MAX),
+      // 使用统计保留：升级定义不重置计数；无明细的历史行把行级 useCount 结转。
+      usage: spec?.usage ?? {
+        useCount: Number(row.useCount) || 0,
+        successCount: 0,
+        failCount: 0,
+        consecutiveFailures: 0,
+      },
+    }
+    await store.toolMemory.update(rowId, (r) => ({
+      ...r,
+      title: next.title ?? r.title,
+      tags: next.tags ?? r.tags,
+      description: next.description,
+      entry: JSON.stringify(next),
+      // status / workspaceKey 不碰：停用是现场决定，工作区归属是现场事实。
+    }))
+    report.upgraded.push(toolName)
+    report.changed.push({ spec: next, workspaceKey: row.workspaceKey })
+  }
+  // 运行时刷新：立即重新注册变化的 spec，模型当场看到新描述/新语义。
+  if (opts?.ctx && opts?.register) {
+    for (const entry of report.changed) {
+      try {
+        await opts.register(opts.ctx, store, entry.spec, entry.workspaceKey)
+      } catch { /* 注册失败不阻塞刷新：重启时 rebuildComposites 会补 */ }
+    }
+  }
+  return report
+}
+
+/** One capability's maintenance snapshot (the "does it still fit?" signals). */
+export interface CapabilityHealth {
+  id: string
+  /** 工具名（sm_composite_*）。 */
+  name: string
+  title?: string
+  entry: string
+  doc?: string
+  scope?: string
+  status: string
+  live: boolean
+  /** 是否内置能力（定义随插件分发）。 */
+  builtin: boolean
+  builtinVersion?: number
+  version: number
+  useCount: number
+  successCount: number
+  failCount: number
+  consecutiveFailures: number
+  lastUsedAt?: number
+  lastStatus?: 'completed' | 'failed'
+  lastDryRun?: boolean
+  lastSummary?: string
+  /** doc 文件在 scope 内不存在（文档与现状不符）。 */
+  docMissing: boolean
+  /** scope 目录不存在（换机器/换克隆目录）。 */
+  scopeMissing: boolean
+  /** 人读维护信号（连续失败/文档缺失/零使用/未注册/版本关系）。 */
+  notes: string[]
+}
+
+/**
+ * Every durable capability's health snapshot — the data behind
+ * memory_toolize refresh-builtin. Pure read (existsSync 只读文件系统)。
+ */
+export function capabilityHealthOf(store: Store, workspaceKey?: string): CapabilityHealth[] {
+  const out: CapabilityHealth[] = []
+  for (const [id, record] of store.toolMemory.entries()) {
+    if (record.kind !== 'composite' || !record.entry) continue
+    let spec: CompositeSpec
+    try {
+      spec = JSON.parse(record.entry) as CompositeSpec
+    } catch { continue }
+    if (spec?.kind !== 'capability' || !spec.entry) continue
+    // A3: 与 capabilityRecordsOf 同一判定——健康报告只覆盖当前工作区适用的能力。
+    if (!capabilityAppliesToWorkspace(spec, workspaceKey, record.workspaceKey)) continue
+    const usage = spec.usage
+    const builtin = BUILTIN_CAPABILITIES.find((b) => capabilityToolName(b.name) === spec.name)
+    const version = Number(spec.version) || 0
+    const useCount = Number(record.useCount) || 0
+    const successCount = usage?.successCount ?? 0
+    const failCount = usage?.failCount ?? 0
+    const consecutiveFailures = usage?.consecutiveFailures ?? 0
+    const scopeMissing = Boolean(spec.scope && !existsSync(spec.scope))
+    const docMissing = Boolean(spec.doc && spec.scope && !scopeMissing && !existsSync(join(spec.scope, spec.doc)))
+    const notes: string[] = []
+    if (consecutiveFailures >= 2) {
+      notes.push(`连续失败 ${consecutiveFailures} 次：必须用 memory_toolize register 同名更新能力（或修订 ${spec.doc ?? '文档'}），不要绕过`)
+    }
+    if (useCount > 0 && successCount === 0 && failCount > 0) notes.push('从未成功执行过：入口命令或适用范围需要修订')
+    if (scopeMissing) notes.push(`适用范围目录不存在：${spec.scope}（换机器/换克隆目录时会出现，register 同名更新可修正）`)
+    if (docMissing) notes.push(`文档缺失：${spec.doc}（scope 内找不到）——文档与现状不符，必须更新能力`)
+    if (useCount === 0) notes.push('零使用：确认路由描述是否说清何时用它，否则更新或停用')
+    if (!liveCompositeSpecs.has(spec.name)) notes.push('未注册（重启或 refresh-builtin 后生效）')
+    if (builtin && version < builtin.version) notes.push(`现场版本旧于内置 v${builtin.version}：memory_toolize refresh-builtin 可升级`)
+    if (builtin && version > builtin.version) notes.push(`现场版本新于内置 v${builtin.version}（本地维护中，内置升级不会覆盖）`)
+    out.push({
+      id,
+      name: spec.name,
+      ...(spec.title ? { title: spec.title } : {}),
+      entry: spec.entry,
+      ...(spec.doc ? { doc: spec.doc } : {}),
+      ...(spec.scope ? { scope: spec.scope } : {}),
+      status: record.status,
+      live: liveCompositeSpecs.has(spec.name),
+      builtin: Boolean(builtin),
+      ...(builtin ? { builtinVersion: builtin.version } : {}),
+      version,
+      useCount,
+      successCount,
+      failCount,
+      consecutiveFailures,
+      ...(usage?.lastUsedAt !== undefined ? { lastUsedAt: usage.lastUsedAt } : {}),
+      ...(usage?.lastStatus ? { lastStatus: usage.lastStatus } : {}),
+      ...(usage?.lastDryRun !== undefined ? { lastDryRun: usage.lastDryRun } : {}),
+      ...(usage?.lastSummary ? { lastSummary: usage.lastSummary } : {}),
+      docMissing,
+      scopeMissing,
+      notes,
+    })
   }
   return out
 }

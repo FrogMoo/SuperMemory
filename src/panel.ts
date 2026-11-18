@@ -15,20 +15,20 @@ import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
 import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
-  touchTopicSet, updateTopicSetSummary,
+  topicSetIdsOf, touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
-  bumpCompositeUse, deleteCompositeTool, editCompositeTool, liveCompositeSpecs,
-  runCapability, type CapabilityRunResult, type CompositeSpec,
+  bumpCompositeUse, capabilityAppliesToWorkspace, deleteCompositeTool, editCompositeTool,
+  liveCompositeSpecs, runCapability, type CapabilityRunResult, type CompositeSpec,
 } from './composite.ts'
 import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
 import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
-import { hubsByBranch, listHubBranches, type HubBranchView } from './hub-branches.ts'
+import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 
 export interface TopicSetView {
@@ -53,6 +53,12 @@ export interface TopicSetView {
     topicSetTitle?: string
     /** Distinct hubs that dispatched into this branch (>=2 means 共享). */
     hubs?: number
+    /**
+     * Latest task excerpt dispatched into this branch (durable ledger read).
+     * Carried so a preserved branch stays identifiable after a restart —
+     * title + owning set + task summary, without needing a live handle.
+     */
+    task?: string
   }>
   model?: string
 }
@@ -89,6 +95,19 @@ export interface ToolView {
   runnable?: boolean
   dryRunArg?: string
   writeConfirm?: boolean
+  // R26: 能力定义版本与使用明细（register 同名更新 +1；成败分列/连续失败/最近一次结果）。
+  version?: number
+  usage?: {
+    useCount: number
+    successCount: number
+    failCount: number
+    consecutiveFailures: number
+    lastUsedAt?: number
+    lastStatus?: 'completed' | 'failed'
+    lastDryRun?: boolean
+    lastExitCode?: number
+    lastSummary?: string
+  }
 }
 
 /** One agent-preset row for the hub quick launcher (R7). */
@@ -343,12 +362,28 @@ export class SupermemoryPanelService {
     return workspaceKeyOf(cwd)
   }
 
+  /**
+   * A3: 一条 tool_memory 行是否适用于给定工作区。能力按行级归属或 scope 推导
+   * （与 composite.capabilityAppliesToWorkspace 同一语义）；序列组合工具无归属
+   * 无 scope = 全局，任何工作区照常可见。
+   */
+  private toolApplies(record: Pick<ToolMemory, 'workspaceKey' | 'entry'>, workspaceKey: string | undefined): boolean {
+    if (!workspaceKey) return true
+    if (record.workspaceKey) return record.workspaceKey === workspaceKey
+    try {
+      const spec = JSON.parse(record.entry) as { scope?: string }
+      if (spec.scope) return workspaceKeyOf(spec.scope) === workspaceKey
+    } catch { /* a broken definition counts as global */ }
+    return true
+  }
+
   private view(id: string, topicSet: ReturnType<typeof getTopicSet>): TopicSetView {
     if (!topicSet) return { id, title: id, tags: [], summary: '', sessions: 0, live: 0, branches: [] }
     // R19 协同③: a branch row names how many hubs dispatched into it. The branch
     // belongs to the set (not to one hub), so a card showing "2 中枢共享" is the
     // truthful projection; `undefined` means the branch has no dispatch yet.
     const hubCounts = hubsByBranch(this.store)
+    const latestTasks = latestTaskByBranch(this.store)
     return {
       id,
       title: topicSet.title,
@@ -371,6 +406,10 @@ export class SupermemoryPanelService {
           // branch card can say so (and show 共享 for kind-root branches too).
           ...(isBranch ? { topicSetId: id, topicSetTitle: topicSet.title } : {}),
           ...(hubCount ? { hubs: hubCount } : {}),
+          // 任务摘要（最新一次派发）：重启后仅凭持久台账也能认出这个分支。
+          ...(isBranch && latestTasks.get(m.sessionId)
+            ? { task: taskExcerpt(latestTasks.get(m.sessionId)!, BRANCH_CARD_EXCERPT_CHARS) }
+            : {}),
         }
       }),
       ...(topicSet.defaultModel ? { model: `${topicSet.defaultModel.provider}/${topicSet.defaultModel.model}` } : {}),
@@ -427,13 +466,27 @@ export class SupermemoryPanelService {
     for (const [, record] of this.store.requirements.entries()) {
       if (record.workspaceKey === workspaceKey && record.status === 'open') requirements++
     }
+    // A3: 概览计数同样按工作区隔离——跨工作区的派发/能力不计入本工作区。
+    const ownSetIds = topicSetIdsOf(this.store, workspaceKey)
+    let episodes = 0
+    for (const [, episode] of this.store.episodes.entries()) {
+      if (episode.topicSetId && ownSetIds.has(episode.topicSetId)) episodes++
+    }
     let dispatches = 0
     for (const [, record] of this.store.dispatches.entries()) {
       // R19 fix: `interrupted` is terminal too; counting it as "进行中" made the
       // hub badge claim work was still running after the interrupt relay.
-      if (record.status !== 'delivered' && record.status !== 'failed' && record.status !== 'interrupted') dispatches++
+      if (record.status === 'delivered' || record.status === 'failed' || record.status === 'interrupted') continue
+      if (record.topicSetId && !ownSetIds.has(record.topicSetId)) continue
+      dispatches++
     }
-    const tools = [...this.store.toolMemory.entries()].filter(([, r]) => r.kind === 'composite').length
+    let tools = 0
+    for (const [, record] of this.store.toolMemory.entries()) {
+      if (record.kind !== 'composite') continue
+      // 能力按行级归属/scope 判定；序列组合工具无归属=全局，照常计数。
+      if (!this.toolApplies(record, workspaceKey)) continue
+      tools++
+    }
     return {
       sessionId,
       workspaceKey,
@@ -442,7 +495,7 @@ export class SupermemoryPanelService {
         : {}),
       topicSets,
       memories,
-      counts: { memories: memories.length, requirements, episodes: this.store.episodes.size, dispatches, tools },
+      counts: { memories: memories.length, requirements, episodes, dispatches, tools },
     }
   }
 
@@ -1045,8 +1098,15 @@ export class SupermemoryPanelService {
     }
   }
 
-  /** R6: list composite tools (self-generated) with descriptions. */
-  listTools(): ToolView[] {
+  /**
+   * R6: list composite tools (self-generated) with descriptions.
+   *
+   * A3 工作区隔离：传入 cwd 时只返回适用于该工作区的工具——能力的行级归属
+   * （tool_memory.workspaceKey）或 scope 推导命中当前工作区；别的工作区的
+   * 能力不列出。无 cwd（旧宿主/兼容路径）不过滤。
+   */
+  listTools(cwd?: string): ToolView[] {
+    const workspaceKey = cwd ? this.wk(cwd) : undefined
     const rows: ToolView[] = []
     for (const [id, record] of this.store.toolMemory.entries()) {
       if (record.kind !== 'composite') continue
@@ -1060,6 +1120,8 @@ export class SupermemoryPanelService {
       let runnable: boolean | undefined
       let dryRunArg: string | undefined
       let writeConfirm: boolean | undefined
+      let version: number | undefined
+      let usage: ToolView["usage"]
       try {
         const spec = JSON.parse(record.entry) as {
           name?: string
@@ -1072,6 +1134,8 @@ export class SupermemoryPanelService {
           runnable?: boolean
           dryRunArg?: string
           writeConfirm?: boolean
+          version?: number
+          usage?: ToolView["usage"]
         }
         name = spec.name ?? id
         kind = spec.kind === 'capability' ? 'capability' : 'sequence'
@@ -1083,7 +1147,11 @@ export class SupermemoryPanelService {
         runnable = spec.runnable
         dryRunArg = spec.dryRunArg
         writeConfirm = spec.writeConfirm
+        version = typeof spec.version === 'number' ? spec.version : undefined
+        usage = spec.usage
       } catch { /* a broken definition still lists with its description */ }
+      // A3: 跨工作区的工具不列出（能力按行级归属/scope 判定；序列无归属=全局）。
+      if (!capabilityAppliesToWorkspace({ scope }, workspaceKey, record.workspaceKey)) continue
       rows.push({
         id, name,
         title: record.title || record.description.slice(0, TITLE_MAX),
@@ -1094,6 +1162,8 @@ export class SupermemoryPanelService {
         status: record.status,
         live: liveCompositeSpecs.has(name),
         kind, entry, doc, scope, runnable, dryRunArg, writeConfirm,
+        ...(version !== undefined ? { version } : {}),
+        ...(usage ? { usage } : {}),
       })
     }
     rows.sort((a, b) => a.name.localeCompare(b.name))
@@ -1148,7 +1218,8 @@ export class SupermemoryPanelService {
     }
     const result = runCapability(spec, { dryRun: options.dryRun, confirm: options.confirm })
     // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
-    if (result.status !== 'needs-confirm') bumpCompositeUse(this.store, spec.name)
+    // R26 收尾：传入 result，面板执行也记成败明细/最近一次结果。
+    if (result.status !== 'needs-confirm') void bumpCompositeUse(this.store, spec.name, result)
     return result
   }
 
@@ -1379,7 +1450,10 @@ const PANEL_DESCRIPTORS = Object.freeze([
     service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listTools',
     invocation: { kind: 'direct' },
     result: { mode: 'strict', typeSymbol: 'dsh-supermemory#ToolViews', create: () => ({ parse: (v: unknown) => v }) },
-    parameters: [],
+    // A3: 面板按当前工作区拉取工具列表（cwd 由面板传入）。
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
   },
   {
     id: 'dsh-supermemory#supermemoryPanel/editTool',
