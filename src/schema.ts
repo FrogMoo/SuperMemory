@@ -233,6 +233,10 @@ export async function buildSchemas() {
   const meta = z.object({
     titlesMigratedAt: z.number().int().optional(),
     titlesMigrationVersion: z.number().int().optional(),
+    // R23 merge marker (meta row 'merges'): executed cluster signatures.
+    mergesVersion: z.number().int().optional(),
+    mergeSignatures: z.array(z.string()).optional(),
+    lastMergeAt: z.number().int().optional(),
   })
 
   return {

@@ -185,3 +185,26 @@ export function renderTopicSetConfirm(result: TopicSetMatchResult): string {
   lines.push('请用户裁决后重试：复用某个候选（带 topicSetId 派发）、强制新建（forceNewTopicSet=true），或改述任务。')
   return lines.join('\n')
 }
+
+/**
+ * Symmetric pairwise similarity of two topic sets, for MERGE clustering
+ * (topicset-merge.ts).
+ *
+ * The comparison is TITLE vs TITLE through the same scorer (matchTopicSets):
+ * one set's title is the query, the other set's title is the only candidate
+ * field. Summaries are deliberately NOT read here — an LLM-generated summary
+ * is project boilerplate ("该话题集的目标是…") that makes every set of a
+ * single-project workspace look alike (measured on the real store: title +
+ * summary scoring merges all 20 active sets into one component at any
+ * threshold ≤ 25). The title is the identity label a human judges "same
+ * topic" by, and merging is a heavy, hard-to-reverse decision, so it requires
+ * title evidence. No dispatch guardrails (active/recency bonuses) apply:
+ * this is a catalog decision, not a routing one.
+ */
+export function topicSetPairScore(a: TopicSet, b: TopicSet): number {
+  const titleOf = (set: TopicSet) => String(set.title ?? '')
+  const candidate = (set: TopicSet) => [[titleOf(set), { title: titleOf(set), summary: '', keywords: [], status: 'active' }]]
+  const forward = matchTopicSets(candidate(b) as never, titleOf(a), 1)[0]?.score ?? 0
+  const backward = matchTopicSets(candidate(a) as never, titleOf(b), 1)[0]?.score ?? 0
+  return Math.max(forward, backward)
+}

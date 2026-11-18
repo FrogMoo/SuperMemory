@@ -73,6 +73,8 @@ const fakeStore = (seed = {}) => ({
   routing: table(seed.routing ?? []),
   hotcache: table(seed.hotcache ?? []),
   outbox: table(seed.outbox ?? []),
+  questions: table(seed.questions ?? []),
+  meta: table(seed.meta ?? []),
 })
 const obs = (name, text, isError = false) => ({ name, args: {}, text, isError })
 const quiet = { ...repeat, hotSignal: false }
@@ -2121,6 +2123,190 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
     assert.equal(store.topicsets.size, 0, 'an empty task must not leave an empty-titled set behind')
     assert.equal(store.dispatches.size, 0)
     ok('M7 空任务护栏：先报错，不再先建空标题话题集')
+  }
+}
+
+
+// ---- R23: topic-set merge (plan / apply / marker idempotency) ----
+{
+  const { planTopicSetMerges, applyPlanToStore, mergeTopicSets, renderMergeReport, TOPIC_MERGE_THRESHOLD } = await import('../src/topicset-merge.ts')
+  const { topicSetIdsOf } = await import('../src/topicsets.ts')
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const { verifyTopicSetTitle } = await import('../src/topicset-match.ts')
+  const cwd = process.cwd()
+  const ws = workspaceKeyOf(cwd)
+  const row = (over = {}) => ({
+    workspaceKey: ws, title: '集合', summary: '', keywords: [], status: 'active', members: [],
+    createdAt: now, updatedAt: now, lastActiveAt: now, ...over,
+  })
+  const member = (sessionId, title, kind = 'fork') => ({ sessionId, kind, title, summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now })
+  const dsp = (topicSetId, branchSessionId, task, createdAt = now) => ({
+    topicSetId, branchSessionId, task, hubSessionId: 'hub-1', startSeq: 0, status: 'delivered', createdAt, updatedAt: now,
+  })
+  const fixture = () => fakeStore({
+    topicsets: [
+      // A 簇：git 同步三集（主集=成员最多）
+      ['ts-git-a', row({ title: '同步并提交 SuperMemory 仓库的 Git', members: [member('b-git', '旧标题甲')], keywords: ['git'], createdAt: now - 3000 })],
+      ['ts-git-b', row({ title: '同步并提交 SuperMemory 仓库的 Git 改动', members: [member('b-git', '旧标题甲', 'root')], createdAt: now - 2000 })],
+      ['ts-git-c', row({ title: '同步并提交 SuperMemory 仓库', createdAt: now - 1000 })],
+      // B 簇：插件修复两集（主集=成员最多）
+      ['ts-dev-x', row({ title: '修复 SuperMemory 插件三个 GUI 问题', members: [member('b-dev-1', '修复甲'), member('b-dev-2', '修复乙')], createdAt: now - 500 })],
+      ['ts-dev-y', row({ title: '修复 SuperMemory 插件 GUI 问题', createdAt: now - 400 })],
+      // C 簇：一次性验证两集 → 目标即「<项目> · 验证」（不存在则新建）
+      ['ts-c1', row({ title: '派发复测任务：请直接回复', summary: '这是 P1 派发链路的复测', members: [member('b-c1', '验证旧标题')], createdAt: now - 350 })],
+      ['ts-c2', row({ title: '最终链路验证：请直接回复', summary: 'P1 最终链路验证', createdAt: now - 340 })],
+      // 只共享「验证」二字的集合：不得误并（设计里的反例）
+      ['ts-lonely', row({ title: '命名验证', createdAt: now - 300 })],
+      // 边界对：共享两个标题词（6 分 < 阈值），只报告不合并
+      ['ts-border-a', row({ title: '导出功能确认一下', createdAt: now - 290 })],
+      ['ts-border-b', row({ title: '导出报表确认二次', createdAt: now - 280 })],
+      // 0 成员 0 记录：空集归档
+      ['ts-empty', row({ title: '空集一', createdAt: now - 270 })],
+      // 0 成员但有记录：待人工处理
+      ['ts-orphan', row({ title: '孤儿集', createdAt: now - 260 })],
+    ],
+    dispatches: [
+      ['d-git-a', dsp('ts-git-a', 'b-git', '同步并提交 SuperMemory 仓库的 Git 改动并推送')],
+      ['d-git-b', dsp('ts-git-b', 'b-git', '同步并提交 SuperMemory 仓库的 Git 改动并推送')],
+      ['d-git-c', dsp('ts-git-c', 'b-other', '同步并提交 SuperMemory 仓库')],
+      ['d-dev-x', dsp('ts-dev-x', 'b-dev-1', '修复 SuperMemory 插件三个 GUI 问题')],
+      ['d-dev-y', dsp('ts-dev-y', 'b-dev-2', '修复 SuperMemory 插件 GUI 问题')],
+      ['d-c1', dsp('ts-c1', 'b-c1', '派发复测任务：请直接回复一行')],
+      ['d-orphan', dsp('ts-orphan', 'b-orphan', '无人认领的任务')],
+    ],
+    episodes: [
+      ['e-git-c', { topicSetId: 'ts-git-c', branchSessionId: 'b-other', timeStart: now, timeEnd: now, summary: 'C 的归档', result: '', decisions: [], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'b-other', sourceSeqStart: 0, sourceSeqEnd: 1 }],
+      ['e-dev-y', { topicSetId: 'ts-dev-y', branchSessionId: 'b-dev-2', timeStart: now, timeEnd: now, summary: 'Y 的归档', result: '', decisions: [], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'b-dev-2', sourceSeqStart: 0, sourceSeqEnd: 1 }],
+    ],
+    requirements: [
+      ['r-dev-y', { topicSetId: 'ts-dev-y', workspaceKey: ws, text: '需求一', constraints: [], status: 'open', sourceSessionId: 'b-dev-2', sourceSeq: 0, createdAt: now }],
+    ],
+    questions: [
+      ['q-dev-y', { topicSetId: 'ts-dev-y', dispatchId: 'd-dev-y', branchSessionId: 'b-dev-2', title: '问题一', question: '怎么做？', options: [], severity: 'medium', blocking: false, progress: '', defaultPlan: '', status: 'open', branchTask: '', createdAt: now, updatedAt: now }],
+    ],
+    routing: [
+      ['hub-1', { activeTopicSetId: 'ts-dev-y', driftCount: 0, updatedAt: now }],
+      ['hub-2', { activeTopicSetId: 'ts-git-c', driftCount: 0, updatedAt: now }],
+    ],
+    meta: [],
+  })
+
+  // M8: plan — 聚类、主集、验证集目标、边界/空集/孤儿
+  {
+    const store = fixture()
+    const plan = planTopicSetMerges(store)
+    assert.equal(plan.clusters.length, 3, 'three clusters: git / dev / verify')
+    const git = plan.clusters.find((c) => c.target.topicSetId === 'ts-git-a')
+    assert.ok(git, 'the git cluster targets the set with the most members')
+    assert.ok(git.target.reason.includes('成员最多'), 'the primary reason is stated')
+    assert.equal(git.sources.length, 2)
+    assert.equal(git.membersAfter, 1, 'a session in two sets is kept ONCE')
+    assert.equal(git.memberChanges.length, 1, 'the merged member title is recomputed')
+    assert.ok(git.memberChanges[0].to.startsWith('同步并提交 SuperMemory 仓库的 Git'), 'the new title carries the target topic title')
+    const dev = plan.clusters.find((c) => c.target.topicSetId === 'ts-dev-x')
+    assert.ok(dev, 'the dev cluster targets the 2-member set')
+    assert.equal(dev.records.dispatches, 1)
+    assert.equal(dev.records.episodes, 1)
+    assert.equal(dev.records.requirements, 1)
+    assert.equal(dev.records.questions, 1)
+    assert.equal(dev.records.routing, 1)
+    const verify = plan.clusters.find((c) => c.verifyNature)
+    assert.ok(verify, 'the one-shot verification family is detected')
+    assert.equal(verify.target.toCreate, true, 'its target is the workspace verify set, minted on apply')
+    assert.equal(verify.target.title, verifyTopicSetTitle(ws))
+    assert.equal(verify.sources.length, 2, 'every set of the cluster is archived into it')
+    assert.equal(plan.emptySets.map((s) => s.topicSetId).includes('ts-empty'), true, 'a 0-member 0-record set is an empty-archive candidate')
+    assert.equal(plan.orphans.map((s) => s.topicSetId).includes('ts-orphan'), true, 'a 0-member set with records is flagged, untouched')
+    const border = plan.borderline.find((b) => b.topicSetId === 'ts-border-a')
+    assert.ok(border && border.partnerId === 'ts-border-b' && border.score < TOPIC_MERGE_THRESHOLD, 'a sub-threshold pair is reported as borderline only')
+    assert.equal(plan.clusters.some((c) => c.sources.some((s) => s.topicSetId === 'ts-lonely')), false,
+      'a set sharing only the word 验证 is never merged')
+    ok('M8 合并计划：连通簇 + 主集规则 + 验证集目标 + 边界/空集/孤儿分类')
+  }
+
+  // M9: apply — 6 处 FK 全搬迁、成员去重、源集 archived 可查、标题重算
+  {
+    const store = fixture()
+    const plan = planTopicSetMerges(store)
+    await applyPlanToStore(store, plan)
+    // dispatches / episodes / requirements / questions / routing moved
+    assert.equal(store.dispatches.get('d-git-c').topicSetId, 'ts-git-a', 'dispatches.topicSetId moved')
+    assert.equal(store.episodes.get('e-git-c').topicSetId, 'ts-git-a', 'episodes.topicSetId moved')
+    assert.equal(store.episodes.get('e-dev-y').topicSetId, 'ts-dev-x', 'episodes of the dev source moved')
+    assert.equal(store.requirements.get('r-dev-y').topicSetId, 'ts-dev-x', 'requirements.topicSetId moved')
+    assert.equal(store.questions.get('q-dev-y').topicSetId, 'ts-dev-x', 'questions.topicSetId moved')
+    assert.equal(store.routing.get('hub-1').activeTopicSetId, 'ts-dev-x', 'routing.activeTopicSetId moved (hub-1)')
+    assert.equal(store.routing.get('hub-2').activeTopicSetId, 'ts-git-a', 'routing.activeTopicSetId moved (hub-2)')
+    // sources archived but still readable (never deleted)
+    assert.equal(store.topicsets.get('ts-git-c').status, 'archived', 'the source is archived, not deleted')
+    assert.ok(store.topicsets.get('ts-git-c').title.length > 0, 'the archived row is still queryable')
+    assert.equal(store.topicsets.get('ts-dev-y').status, 'archived')
+    // members: one row per sessionId, kind conflict resolves to root
+    const target = store.topicsets.get('ts-git-a')
+    assert.equal(target.members.length, 1, 'the duplicated session collapses to one row')
+    assert.equal(target.members[0].kind, 'root', 'a kind conflict resolves to root')
+    assert.ok(target.members[0].title.includes('同步并提交 SuperMemory 仓库的 Git'), 'the member title was recomputed')
+    // the verify set was minted and owns the C members
+    const minted = [...store.topicsets.entries()].filter(([id]) => id.startsWith('ts-')).map(([id, r]) => r).find((r) => r.title === verifyTopicSetTitle(ws))
+    assert.ok(minted, 'the verify set was created')
+    assert.equal(store.topicsets.get('ts-c1').status, 'archived')
+    assert.equal(store.topicsets.get('ts-c2').status, 'archived')
+    assert.equal(minted.members.length, 1, 'the C member moved into the verify set')
+    // empty set archived; orphan untouched
+    assert.equal(store.topicsets.get('ts-empty').status, 'archived', 'the empty set is archived')
+    assert.equal(store.topicsets.get('ts-orphan').status, 'active', 'the orphan set is left alone')
+    assert.equal(store.dispatches.get('d-orphan').topicSetId, 'ts-orphan', 'the orphan keeps its records')
+    // questions never dangle: the workspace filter still sees them
+    const own = topicSetIdsOf(store, ws)
+    assert.equal(own.has(store.questions.get('q-dev-y').topicSetId), true, 'a moved question stays inside the workspace scope')
+    // marker written
+    const marker = store.meta.get('merges')
+    assert.equal(marker.mergesVersion, 1)
+    assert.ok(marker.mergeSignatures.length >= 3, 'executed cluster signatures are recorded')
+    ok('M9 合并执行：6 处 FK 搬迁 + 成员去重(root 优先) + 源集 archived 可查 + 验证集新建 + 空集归档 + 孤儿不动')
+  }
+
+  // M10: marker idempotency — 已执行簇签名不再出现；手工重新激活的源集被重新收敛
+  {
+    const store = fixture()
+    const plan = planTopicSetMerges(store)
+    await store.meta.put('merges', { mergesVersion: 1, mergeSignatures: plan.clusters.map((c) => c.signature), lastMergeAt: now })
+    const skipped = planTopicSetMerges(store)
+    assert.equal(skipped.clusters.length, 0, 'an executed cluster signature is never re-proposed')
+    assert.equal(skipped.executedSignatures.length, 3, 'the executed signatures are reported')
+    assert.equal(skipped.emptySets.map((s) => s.topicSetId).includes('ts-empty'), true, 'non-cluster proposals are unaffected by the marker')
+    // a hand-reactivated source is re-proposed into the SAME target (recovery)
+    const store2 = fixture()
+    await applyPlanToStore(store2, planTopicSetMerges(store2))
+    assert.equal(planTopicSetMerges(store2).clusters.length, 0, 'after apply a re-plan finds no cluster (sources archived)')
+    await store2.topicsets.update('ts-git-c', (r) => ({ ...r, status: 'active' }))
+    const revived = planTopicSetMerges(store2)
+    const git = revived.clusters.find((c) => c.target.topicSetId === 'ts-git-a')
+    assert.ok(git && git.sources.length === 1 && git.sources[0].topicSetId === 'ts-git-c',
+      'a reactivated source is re-proposed into its former target (recovery, not duplication)')
+    await applyPlanToStore(store2, revived)
+    assert.equal(store2.topicsets.get('ts-git-c').status, 'archived', 're-apply re-archives it — the end state is idempotent')
+    assert.equal(planTopicSetMerges(store2).clusters.length, 0)
+    ok('M10 幂等：marker 记录已执行簇签名；源集被手工激活时按恢复语义重新收敛，终态仍幂等')
+  }
+
+  // M11: mergeTopicSets — dry-run 不写库；apply 才写库并回报
+  {
+    const store = fixture()
+    const ctx = { agents: { get: () => undefined }, sessions: { get: () => ({ seq: 0, append: () => {} }) }, get: () => undefined }
+    const deps = { ctx, store, logger }
+    const dry = await mergeTopicSets(deps, { dryRun: true })
+    assert.equal(dry.status, 'planned')
+    assert.equal(store.topicsets.get('ts-git-c').status, 'active', 'dry-run must not write the store')
+    assert.equal(store.meta.size, 0, 'dry-run writes no marker')
+    assert.ok(renderMergeReport(dry).includes('预演') && renderMergeReport(dry).includes('主集'))
+    const applied = await mergeTopicSets(deps, { dryRun: false })
+    assert.equal(applied.status, 'applied')
+    assert.equal(applied.applied.archived > 0, true)
+    assert.equal(store.topicsets.get('ts-git-c').status, 'archived', 'apply writes the store')
+    const again = await mergeTopicSets(deps, { dryRun: false })
+    assert.equal(again.status, 'nothing-to-do', 'a second apply has nothing left to do')
+    ok('M11 /memory merge 契约：默认 dry-run 不写库；apply 显式写库；二次 apply 无事可做')
   }
 }
 
