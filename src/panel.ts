@@ -674,7 +674,8 @@ export class SupermemoryPanelService {
     let message: UserMessage
     try {
       const factory = await messageFactory()
-      message = factory({ content: [{ type: 'text', text: body }], source: { kind: 'supermemory' } })
+      // R25: 面板里发消息就是用户行为 —— 以 kind 'user' 落账，会话因此置顶。
+      message = factory({ content: [{ type: 'text', text: body }], source: { kind: 'user' } })
     } catch (error) {
       return { status: 'error', message: `宿主消息工厂不可用：${String(error).slice(0, 160)}` }
     }
@@ -840,9 +841,10 @@ export class SupermemoryPanelService {
     if (!body) return false
     try {
       const factory = await messageFactory()
+      // R25: 新会话本就靠 createdAt 置顶，这里用 'user' 只为规则一致（人发起的投递）。
       const message = factory({
         content: [{ type: 'text', text: body }],
-        source: { kind: 'supermemory' },
+        source: { kind: 'user' },
       })
       handle.agent.followup(message as UserMessage)
       return true
@@ -1030,7 +1032,8 @@ export class SupermemoryPanelService {
             + '你是该话题集的工作分支：按用户回复继续执行并汇报结果。遇到分歧按最合理解释执行，不要停下来等确认；'
             + '需要用户裁决时用 memory_raise_question 上交中枢汇总（不要在本分支里直接向用户提问）。',
         }],
-        source: { kind: 'supermemory' },
+        // R25: 面板里的用户回复同样是人类投递 → kind 'user'（置顶）。
+        source: { kind: 'user' },
       })
       const agent = branchHandles.get(sessionId)?.agent ?? ctx.agents.get(sessionId as never)
       if (!agent) return { status: 'error', message: '分支会话不在线，回复未送达。', id: sessionId }

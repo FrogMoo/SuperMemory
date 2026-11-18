@@ -360,9 +360,11 @@ export async function resumeDispatch(
       const factory = options.createMessage ?? (await messageFactory())
       agent.followup(factory({
         content: [{ type: 'text', text: resumeMessage(dispatchId, record, partial) }],
-        // form 'instructions'：observe.isDispatchInput 只排除 recall/notice，
-        // 续跑消息因此能被归属为一次派发输入（与 reconcile 重派发同一形态）。
-        source: { kind: 'supermemory', form: 'instructions' },
+        // R25: 续跑消息也以人类提示形态落账（kind 'user'，不再用 form
+        // 'instructions'）：宿主会话列表的 recency 只认 kind 'user'，续跑一条
+        // 已存在的分支才能回到列表顶部。归属由 kind 'user' + observe 的首个
+        // 匹配扫描保证（与派发输入同一形态）。
+        source: { kind: 'user' },
       }) as UserMessage)
       const seqAfter = (ctx.sessions.get(record.branchSessionId as never) as { seq?: number } | undefined)?.seq ?? seqBefore
       if (seqAfter > seqBefore) {

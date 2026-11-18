@@ -591,7 +591,10 @@ async function dispatchOne(
           ? `${script}\n\n本任务是并行组 ${groupId} 的一员：只负责这一个任务；全部成员到达终态后由中枢统一汇总，不要等待其他分支。`
           : script,
       }],
-      source: { kind: 'supermemory' },
+      // R25: 派发输入以 kind 'user' 落账——宿主会话列表的 recency（lastPromptAt）
+      // 只对 user/message 且 source.kind === 'user' 刷新，复用/续跑的分支因此能
+      // 立即置顶。归属仍由 observe 的首个匹配扫描保证（见 observe.ts）。
+      source: { kind: 'user' },
     })
     if (!handle) throw new Error('分支句柄缺失（acquireBranch 未返回 handle）')
     const seqBefore = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq

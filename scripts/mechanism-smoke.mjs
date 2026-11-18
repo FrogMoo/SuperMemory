@@ -1829,7 +1829,10 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   const message = follows[0].content[0].text
   assert.ok(message.includes('[supermemory-resume dsp-r3]'))
   assert.ok(message.includes('原始任务：任务甲') && message.includes('已完成部分'), 'the wake message carries task + partial')
-  assert.equal(follows[0].source.form, 'instructions', 'the resume input is dispatch-owned (not recall/notice)')
+  // R25: the continuation input lands as a human-form user message (kind
+  // 'user', no form) so the branch's session-list recency advances.
+  assert.equal(follows[0].source.kind, 'user', 'the resume input lands as kind user')
+  assert.equal(follows[0].source.form, undefined, 'no form: a plain user prompt, not a context card')
   ok('R3 续跑：优先续接被保留的分支会话（live 直投），台账双向关联')
 }
 
@@ -2308,6 +2311,161 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
     assert.equal(again.status, 'nothing-to-do', 'a second apply has nothing left to do')
     ok('M11 /memory merge 契约：默认 dry-run 不写库；apply 显式写库；二次 apply 无事可做')
   }
+
+  // 单「已有主集」簇 + 验证类簇的夹具（对应当前存量：簇 2 已批准改名、簇 1 新建验证集）
+  const renameFixture = () => fakeStore({
+    topicsets: [
+      ['ts-git-a', row({ title: '同步并提交 SuperMemory 仓库的 Git', members: [member('b-git', '旧标题甲')], keywords: ['git'], createdAt: now - 3000 })],
+      ['ts-git-b', row({ title: '同步并提交 SuperMemory 仓库的 Git 改动', members: [member('b-git', '旧标题甲', 'root')], createdAt: now - 2000 })],
+      ['ts-git-c', row({ title: '同步并提交 SuperMemory 仓库', createdAt: now - 1000 })],
+      ['ts-c1', row({ title: '派发复测任务：请直接回复', summary: '这是 P1 派发链路的复测', members: [member('b-c1', '验证旧标题')], createdAt: now - 350 })],
+      ['ts-c2', row({ title: '最终链路验证：请直接回复', summary: 'P1 最终链路验证', createdAt: now - 340 })],
+    ],
+    dispatches: [
+      ['d-git-a', dsp('ts-git-a', 'b-git', '同步并提交 SuperMemory 仓库的 Git 改动并推送')],
+      ['d-git-b', dsp('ts-git-b', 'b-git', '同步并提交 SuperMemory 仓库的 Git 改动并推送')],
+      ['d-git-c', dsp('ts-git-c', 'b-other', '同步并提交 SuperMemory 仓库')],
+      ['d-c1', dsp('ts-c1', 'b-c1', '派发复测任务：请直接回复一行')],
+    ],
+    episodes: [
+      ['e-git-c', { topicSetId: 'ts-git-c', branchSessionId: 'b-other', timeStart: now, timeEnd: now, summary: 'C 的归档', result: '', decisions: [], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'b-other', sourceSeqStart: 0, sourceSeqEnd: 1 }],
+    ],
+    routing: [['hub-2', { activeTopicSetId: 'ts-git-c', driftCount: 0, updatedAt: now }]],
+    meta: [],
+  })
+
+  // M12: --rename 干跑——目标标题与成员标题全部按新标题计算，聚类不受影响
+  {
+    const NEW = 'SuperMemory 仓库与插件维护'
+    const plan = planTopicSetMerges(renameFixture(), { rename: NEW })
+    const git = plan.clusters.find((c) => c.target.topicSetId === 'ts-git-a')
+    assert.ok(git, 'fixture still clusters')
+    assert.equal(git.target.title, NEW, 'the existing target is relabeled')
+    assert.equal(git.target.renameFrom, '同步并提交 SuperMemory 仓库的 Git')
+    assert.ok(git.memberChanges.length > 0 && git.memberChanges.every((c) => c.to.startsWith(NEW)), 'every member title carries the NEW prefix')
+    const report = renderMergeReport({ ...plan, status: 'planned', applied: { clusters: 0, archived: 0, created: 0, moved: { dispatches: 0, episodes: 0, requirements: 0, questions: 0, routing: 0 }, hostRenamed: 0, hostSkipped: 0 } })
+    assert.ok(report.includes('目标集改名') && report.includes(NEW), 'the report shows the rename')
+    const plain = planTopicSetMerges(renameFixture())
+    assert.equal(plain.clusters.find((c) => c.target.topicSetId === 'ts-git-a').target.title, '同步并提交 SuperMemory 仓库的 Git', 'clustering still uses the current titles')
+    ok('M12 --rename 干跑：目标标题 + 成员标题按新标题计算；聚类按原标题进行')
+  }
+
+  // M13: --rename apply——合并→改名→成员重算同一 plan，无旧前缀残留，marker 仍幂等
+  {
+    const NEW = 'SuperMemory 仓库与插件维护'
+    const store = renameFixture()
+    const planned = planTopicSetMerges(store, { rename: NEW })
+    const gitPlanned = planned.clusters.find((c) => c.target.topicSetId === 'ts-git-a')
+    await applyPlanToStore(store, planned)
+    const target = store.topicsets.get('ts-git-a')
+    assert.equal(target.title, NEW, 'the target is renamed')
+    assert.equal(target.members.length, gitPlanned.membersAfter)
+    for (const change of gitPlanned.memberChanges) {
+      const row = target.members.find((m) => m.sessionId === change.sessionId)
+      assert.ok(row, 'member ' + change.sessionId + ' exists')
+      assert.equal(row.title, change.to, 'the stored title equals the planned one')
+    }
+    assert.ok(target.members.every((m) => m.title.startsWith(NEW)), 'no member keeps the old target prefix')
+    assert.ok(target.members.some((m) => m.sessionId === 'b-git'), 'the target own member is kept')
+    assert.equal(store.topicsets.get('ts-git-c').status, 'archived')
+    assert.equal(store.dispatches.get('d-git-c').topicSetId, 'ts-git-a', 'FK 搬迁不受改名影响')
+    assert.equal(store.meta.get('merges').mergeSignatures.includes(gitPlanned.signature), true, 'marker 幂等（签名用 id 不用标题）')
+    assert.equal(planTopicSetMerges(store).clusters.length, 0, 'a re-plan finds nothing (sources archived)')
+    ok('M13 --rename apply：同一 plan 完成合并+改名+成员重算；无旧前缀；marker 幂等')
+  }
+
+  // M14: 多个「已有主集」簇 + --rename → 明确报错；不带 rename 不受影响
+  {
+    const store = fakeStore({
+      topicsets: [
+        ['ts-x1', row({ title: '同步并提交 SuperMemory 仓库的 Git', members: [member('bx1', '甲')], createdAt: now - 3000 })],
+        ['ts-x2', row({ title: '同步并提交 SuperMemory 仓库的 Git 改动', createdAt: now - 2000 })],
+        ['ts-y1', row({ title: '修复 SuperMemory 插件三个 GUI 问题', members: [member('by1', '乙')], createdAt: now - 1000 })],
+        ['ts-y2', row({ title: '修复 SuperMemory 插件 GUI 问题', createdAt: now - 900 })],
+      ],
+    })
+    assert.throws(() => planTopicSetMerges(store, { rename: '合并集' }), /不明确/, 'two existing-target clusters make --rename ambiguous')
+    assert.equal(planTopicSetMerges(store).clusters.length, 2, 'without --rename both clusters are planned')
+    ok('M14 多已有主集簇 + --rename：明确报错并提示分批/管理台；不带 rename 不受影响')
+  }
+
+  // M15: 命令层契约——mergeTopicSets 带 rename 的 dry-run/apply
+  {
+    const NEW = 'SuperMemory 仓库与插件维护'
+    const store = renameFixture()
+    const ctx = { agents: { get: () => undefined }, sessions: { get: () => ({ seq: 0, append: () => {} }) }, get: () => undefined }
+    const deps2 = { ctx, store, logger }
+    const dry = await mergeTopicSets(deps2, { dryRun: true, rename: NEW })
+    assert.equal(dry.status, 'planned')
+    assert.equal(store.topicsets.get('ts-git-a').title, '同步并提交 SuperMemory 仓库的 Git', 'dry-run 不写库')
+    const applied = await mergeTopicSets(deps2, { dryRun: false, rename: NEW })
+    assert.equal(applied.status, 'applied')
+    assert.equal(store.topicsets.get('ts-git-a').title, NEW, 'apply 落新标题')
+    assert.equal(applied.applied.hostRenamed > 0, true, '宿主侧改名同样走新标题')
+    ok('M15 命令层契约：--rename 干跑不写库、apply 写库且宿主改名用新标题')
+  }
+}
+
+
+// ---- R25: dispatch/resume inputs are human-form (kind 'user') so a reused branch sorts up ----
+{
+  const { isDispatchInput } = await import('../src/observe.ts')
+  const msg = (source) => ({ id: 'u', role: 'user', content: [{ type: 'text', text: 'x' }], source })
+  assert.equal(isDispatchInput(msg({ kind: 'user' })), true,
+    'a plain user prompt inside a dispatch window is the dispatch input')
+  assert.equal(isDispatchInput(msg({ kind: 'supermemory', form: 'recall' })), false, 'recall cards are context')
+  assert.equal(isDispatchInput(msg({ kind: 'supermemory', form: 'notice' })), false, 'notice cards are context')
+  assert.equal(isDispatchInput(msg({ kind: 'supermemory', form: 'relay' })), false, 'relay cards are context')
+  assert.equal(isDispatchInput(msg({ kind: 'agent' })), false, 'a non-user kind is never our input')
+  const { readFileSync } = await import('node:fs')
+  const observeSrc = readFileSync('src/observe.ts', 'utf8')
+  assert.ok(observeSrc.includes("{ kind: 'supermemory', form: 'relay'"),
+    'relay cards stay supermemory-kind (context, not input)')
+  const dispatchSrc = readFileSync('src/dispatch.ts', 'utf8')
+  assert.ok(dispatchSrc.includes("source: { kind: 'user' }"),
+    'the dispatch wake message lands as a human-form user message')
+  const panelSrc = readFileSync('src/panel.ts', 'utf8')
+  assert.equal((panelSrc.match(/source: \{ kind: 'supermemory' \}/g) || []).length, 0,
+    'no human-initiated panel delivery is left on the private kind')
+  ok('R25-1 归属形态：派发/续跑/面板输入 kind=user；recall/notice/relay 卡仍是 supermemory 上下文')
+}
+
+{
+  // Drive the REAL dispatch wake and read the message source it hands the branch.
+  const { runDispatch } = await import('../src/dispatch.ts')
+  const cwd = process.cwd()
+  const store = {
+    topicsets: table([['ts-r25', {
+      workspaceKey: cwd, title: '置顶形态验证', summary: '', keywords: [], status: 'active', members: [],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    }]]),
+    dispatches: table(), episodes: table(), outbox: table(), routing: table(),
+  }
+  const ctx = {
+    agents: {
+      get: () => undefined,
+      create: async (options) => ({
+        agent: { id: options.sessionId, followup: () => {}, session: { header: { cwd } } },
+        dispose: async () => {},
+      }),
+      resume: async () => { throw new Error('resume not available in the host-free gate') },
+      turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+    },
+    sessions: { get: () => ({ seq: 0 }) },
+    get: () => undefined,
+  }
+  const seen = []
+  const result = await runDispatch(
+    { ctx, store, logger, createMessage: (input) => { seen.push(input); return input } },
+    { topicSetId: 'ts-r25', task: 'R25 置顶形态验证任务' },
+    { agent: { id: 'hub-r25', session: { header: { cwd } } } },
+  )
+  assert.equal(result.status, 'dispatched')
+  assert.equal(seen.length, 1, 'the branch is woken once')
+  assert.equal(seen[0].source.kind, 'user',
+    'the dispatch input records as user → lastPromptAt advances → the branch sorts to the top')
+  assert.equal(seen[0].source.form, undefined, 'no form on a dispatch input')
+  ok('R25-2 派发输入实测：runDispatch 交给分支的消息 source.kind=user（无 form）')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

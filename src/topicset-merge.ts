@@ -22,7 +22,7 @@ import type { Store } from './store.ts'
 import { newId } from './store.ts'
 import { normalizeTags } from './retrieval.ts'
 import { findVerifyTopicSet, topicSetPairScore, verifyTopicSetTitle } from './topicset-match.ts'
-import { applySessionTitle, clipEllipsis, currentSessionTitle, sessionTitleFor } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, sessionTitleFor } from './title.ts'
 
 /** Bump when the merge rules change; an older marker re-runs. */
 export const MERGES_VERSION = 1
@@ -95,6 +95,8 @@ export interface MergeTargetView {
   reason: string
   /** True when apply mints this set (the workspace's verify set, absent). */
   toCreate?: boolean
+  /** The title before a --rename override (absent when unchanged). */
+  renameFrom?: string
 }
 
 export interface MergeClusterPlan {
@@ -321,7 +323,7 @@ export function mergeMarker(store: Store): { mergesVersion?: number; mergeSignat
  * topicsets + record tables, so it is unit-testable with a fake store and
  * safe to run against the REAL store as a dry-run.
  */
-export function planTopicSetMerges(store: Store): TopicSetMergePlan {
+export function planTopicSetMerges(store: Store, options: { rename?: string } = {}): TopicSetMergePlan {
   const marker = mergeMarker(store)
   const executed = new Set<string>(
     marker && (marker.mergesVersion ?? 0) >= MERGES_VERSION ? marker.mergeSignatures ?? [] : [],
@@ -348,6 +350,9 @@ export function planTopicSetMerges(store: Store): TopicSetMergePlan {
     executedSignatures: [...executed],
   }
   const clustered = new Set<string>()
+  // Clusters kept with their title-recompute inputs, so a --rename override can
+  // re-plan member titles against the NEW target title from the same data.
+  const built: Array<{ cluster: MergeClusterPlan; members: Member[]; sourceTitles: Map<string, string> }> = []
   for (const [workspaceKey, entries] of byWorkspace) {
     plan.totals.activeSets += entries.length
     const byId = new Map(entries)
@@ -467,6 +472,7 @@ export function planTopicSetMerges(store: Store): TopicSetMergePlan {
         summaryAfter: clipEllipsis(summaryParts.join('\n'), MERGED_SUMMARY_MAX),
         verifyNature,
       })
+      built.push({ cluster: plan.clusters[plan.clusters.length - 1], members: merged, sourceTitles })
     }
     // ---- singletons: borderline / empty / orphan ----
     for (const [id, record] of entries) {
@@ -495,6 +501,34 @@ export function planTopicSetMerges(store: Store): TopicSetMergePlan {
       }
     }
   }
+  // ---- --rename: post-clustering override of an EXISTING target's title ----
+  // Clustering itself is untouched (it ran on the current titles). The rename
+  // only re-labels the primary set and recomputes member titles against the
+  // NEW title, so a dry-run preview and the apply result come from ONE plan
+  // (identical memberChanges). A to-create verify target is never renamed.
+  if (options.rename !== undefined) {
+    const wanted = String(options.rename ?? '').trim()
+    if (!wanted) throw new Error('--rename 的标题不能为空。')
+    const existing = plan.clusters.filter((cluster) => !cluster.target.toCreate)
+    if (existing.length > 1) {
+      throw new Error(
+        '--rename 不明确：本批有 ' + existing.length + ' 个「已有主集」簇（'
+        + existing.map((cluster) => '『' + cluster.target.title + '』').join('、')
+        + '）；请分批执行，或在 SuperMemory 管理台逐个改名。',
+      )
+    }
+    if (existing.length === 0) {
+      throw new Error('--rename 无可生效的目标：本批没有「已有主集」簇（一次性验证类簇会新建目标集，标题固定）。')
+    }
+    const item = built.find((entry) => entry.cluster === existing[0])
+    const to = clipEllipsis(wanted, TOPIC_SET_TITLE_MAX_CHARS)
+    if (item && to && to !== existing[0].target.title) {
+      existing[0].target.renameFrom = existing[0].target.title
+      existing[0].target.title = to
+      existing[0].memberChanges = planMemberTitles(item.members, to, tasks, item.sourceTitles)
+    }
+  }
+
   // ---- totals ----
   for (const cluster of plan.clusters) {
     plan.totals.clusteredSets += cluster.sources.length + 1
@@ -588,6 +622,9 @@ export async function applyPlanToStore(
       if (!record) return record
       return {
         ...record,
+        // The (possibly --rename'd) target title lands in the SAME record write
+        // as the merged members, so no stale-prefix state is ever at rest.
+        title: cluster.target.title,
         members: merged.map((member) => {
           const title = titleChanges.get(member.sessionId)
           return title ? { ...member, title } : member
@@ -654,10 +691,10 @@ export async function applyPlanToHost(
  */
 export async function mergeTopicSets(
   deps: TopicSetMergeDeps,
-  options: { dryRun?: boolean } = {},
+  options: { dryRun?: boolean; rename?: string } = {},
 ): Promise<TopicSetMergeResult> {
   const zeros = { clusters: 0, archived: 0, created: 0, moved: zeroCounts(), hostRenamed: 0, hostSkipped: 0 }
-  const plan = planTopicSetMerges(deps.store)
+  const plan = planTopicSetMerges(deps.store, options.rename === undefined ? {} : { rename: options.rename })
   if (plan.clusters.length === 0 && plan.emptySets.length === 0) {
     return { ...plan, status: 'nothing-to-do', applied: zeros }
   }
@@ -707,6 +744,10 @@ export function renderMergeReport(result: TopicSetMergeResult): string {
       ? '『' + cluster.target.title + '』（' + cluster.target.topicSetId + '，成员 ' + cluster.target.members + '）'
       : '（新建）『' + cluster.target.title + '』'
     lines.push('  · 主集：' + target + '——' + cluster.target.reason)
+    if (cluster.target.renameFrom) {
+      lines.push('  · 目标集改名：「' + cluster.target.renameFrom + '」→「' + cluster.target.title + '」'
+        + '（成员标题与索引预览均按新标题计算；聚类按原标题进行，不受影响）')
+    }
     for (const source of cluster.sources) {
       lines.push('  · 源集：『' + source.title + '』（' + source.topicSetId + '，成员 ' + source.members
         + '，相似分 ' + source.score
@@ -716,7 +757,9 @@ export function renderMergeReport(result: TopicSetMergeResult): string {
         + ' / 问题 ' + source.records.questions
         + ' / 路由 ' + source.records.routing + '）')
     }
-    lines.push('  · 合并后：标题不变；keywords=[' + cluster.keywordsAfter.join('、') + ']；成员 ' + cluster.membersAfter + ' 个')
+    lines.push('  · 合并后：'
+      + (cluster.target.renameFrom ? '目标集改名为『' + cluster.target.title + '』；' : '标题不变；')
+      + 'keywords=[' + cluster.keywordsAfter.join('、') + ']；成员 ' + cluster.membersAfter + ' 个')
     if (cluster.summaryAfter) lines.push('  · 摘要预览：' + cluster.summaryAfter.slice(0, 120) + (cluster.summaryAfter.length > 120 ? '…' : ''))
     lines.push('  · 成员标题变化 ' + cluster.memberChanges.length + ' 条：')
     for (const change of cluster.memberChanges) {

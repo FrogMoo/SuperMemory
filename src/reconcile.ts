@@ -112,8 +112,11 @@ export function runReconciliation(deps: ReconcileDeps): void {
           // Only THIS dispatch's window: an older dispatch's splice must not make
           // a new dispatch look "already traced" (which stranded it forever).
           .filter((e) => e.seq > record.startSeq)
+        // R25: dispatch/resume inputs land as kind 'user' now, so a splice counts
+        // for either kind (an in-flight record may still be 'supermemory').
         const spliced = (e: SessionEventLike) => e.type === 'agent/inbox/spliced'
-          && ((e.data as { inserted?: Array<{ source?: { kind?: string } }> })?.inserted?.some((m) => m.source?.kind === 'supermemory') ?? false)
+          && ((e.data as { inserted?: Array<{ source?: { kind?: string } }> })?.inserted
+            ?.some((m) => m.source?.kind === 'supermemory' || m.source?.kind === 'user') ?? false)
         // followup() splices the input immediately, but only the CLAIMED
         // user/message proves the branch actually consumed it.
         const claimedAt = events.findIndex((e) => e.type === 'user/message' && isDispatchInput(e.data as UserMessageLike))
@@ -152,7 +155,9 @@ export function runReconciliation(deps: ReconcileDeps): void {
               type: 'text',
               text: `[supermemory-dispatch ${dispatchId}]\n任务：${record.task}\n\n（重启恢复：重新派发）\n遇到分歧按最合理解释执行；需要用户裁决时用 memory_raise_question 上交中枢，不要直接向用户提问。`,
             }],
-            source: { kind: 'supermemory', form: 'instructions' },
+            // R25: 重启重投同样是派发输入（kind 'user'），否则 observe 的
+            // isDispatchInput 认领不到它，这条 dispatch 会永久悬空。
+            source: { kind: 'user' },
           }) as never)
           logger.info(`supermemory: reconcile ${dispatchId}: re-followed branch`)
           continue

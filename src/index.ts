@@ -19,6 +19,7 @@ import { createTracker } from './inrequest.ts'
 import { attachPreStep } from './prestep.ts'
 import { sweepAutoToolize, type ToolizeConfig } from './toolize.ts'
 import { loadHostModule } from './host.ts'
+import { isPluginBranchId } from './hub-sessions.ts'
 import { runReconciliation } from './reconcile.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
@@ -192,6 +193,10 @@ function attachProposals(ctx: Context, store: Store | undefined, logger: { warn:
     if (decision.kind !== 'enter') return decision
     const messages = decision.messages ?? []
     if (!messages.some((m) => m.source?.kind === 'user')) return decision
+    // R25: dispatch inputs are kind 'user' now, so a BRANCH passes this gate
+    // too. A tool-ization proposal is a hub↔user interaction and a branch must
+    // never ask the user itself (R20) — skip plugin-minted branches here.
+    if (isPluginBranchId(String(payload.agent?.id ?? ''))) return decision
     try {
       const pending: Array<[string, Signal]> = []
       for (const [key, signal] of store.signals.entries()) {

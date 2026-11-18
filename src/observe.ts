@@ -84,11 +84,18 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number, until
 
 /** True when a committed user message is this plugin's dispatch input. */
 export function isDispatchInput(message: UserMessageLike): boolean {
-  if (message.source?.kind !== 'supermemory') return false
-  // Recall/notice cards are also appended as user/message; they are context, not
-  // an input, and must never own a turn.
+  // R25: dispatch/resume inputs land as kind 'user': the host's session-list
+  // recency only advances for a user/message whose source.kind is 'user', which
+  // is what puts a reused/resumed branch back on top. Recall/notice/relay cards
+  // stay 'supermemory' and are context, never an input.
+  //
+  // Known boundary: a human message typed INSIDE a branch is also kind 'user',
+  // so a first-match scan could attribute that turn to an open dispatch. It is
+  // acceptable: the plugin appends its input immediately after recording the
+  // dispatch, so the claimed user/message inside the window is ours in practice.
+  if (message.source?.kind !== 'user') return false
   const form = message.source?.form
-  return form !== 'recall' && form !== 'notice'
+  return form !== 'recall' && form !== 'notice' && form !== 'relay'
 }
 
 /**

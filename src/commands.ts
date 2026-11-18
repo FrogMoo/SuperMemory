@@ -49,7 +49,7 @@ const SUBCOMMANDS: ReadonlyArray<readonly [string, string]> = [
   ['scan', '扫描工作区，刷新项目文件地图'],
   ['export', '导出 .supermemory-export.md 到工作区根目录'],
   ['titles', '补正刷新被旧截断逻辑损坏的话题集/分支标题（dry-run 只预览不写库）'],
-  ['merge', '话题集合并治理：/memory-merge 预览合并清单（dry-run 不写库）；/memory-merge apply 执行'],
+  ['merge', '话题集合并治理：/memory-merge [dry-run|apply] [--rename <标题>]（默认 dry-run 不写库；--rename 只改「已有主集」簇的目标标题）'],
   ['help', '查看 /memory 命令族全部用法'],
 ]
 
@@ -105,13 +105,30 @@ async function runMemory(
     }
     case 'merge': {
       // R23: 存量话题集合并。默认 dry-run 只渲染清单；apply 必须显式才写库。
-      const verb = arg.trim()
-      const apply = /^(apply|执行|应用)$/i.test(verb)
-      const dryRun = !verb || /^(dry[-_ ]?run|预览|预演)$/i.test(verb)
-      if (!apply && !dryRun) {
-        return { kind: 'error', text: '用法：/memory merge [dry-run|apply]（默认 dry-run 只预览不写库；apply 才写库）' }
+      // --rename <标题>（子命令前后均可）只改「已有主集」簇的目标标题：聚类仍按当前
+      // 标题进行，改名在 plan 之后生效，dry-run 预览即最终形态。
+      const raw = arg.trim()
+      let rename: string | undefined
+      let rest = raw
+      const flag = rest.match(/--rename(?:=|\s+)([\s\S]+)$/)
+      if (flag) {
+        rename = flag[1].trim()
+        rest = rest.slice(0, flag.index).trim()
       }
-      const result = await mergeTopicSets({ ctx: deps.ctx, store, logger: deps.logger }, { dryRun })
+      const apply = /^(apply|执行|应用)$/i.test(rest)
+      const dryRun = !rest || /^(dry[-_ ]?run|预览|预演)$/i.test(rest)
+      if (!apply && !dryRun) {
+        return { kind: 'error', text: '用法：/memory merge [dry-run|apply] [--rename <标题>]（默认 dry-run 只预览不写库；apply 才写库；--rename 仅改「已有主集」簇的目标标题，存在多个已有主集簇时请分批或用管理台逐个改名）' }
+      }
+      let result
+      try {
+        result = await mergeTopicSets(
+          { ctx: deps.ctx, store, logger: deps.logger },
+          { dryRun, ...(rename === undefined ? {} : { rename }) },
+        )
+      } catch (error) {
+        return { kind: 'error', text: String((error as { message?: string })?.message ?? error).slice(0, 300) }
+      }
       return { kind: 'success', text: renderMergeReport(result) }
     }
     case 'help':
@@ -257,7 +274,8 @@ async function runMemory(
 
 const HELP = 'status 状态总览 · topicsets 话题集列表 · switch <名> 激活 · new <标题> 新建 · '
   + 'model 模型管理 · tools 组合工具 · reqs 需求 · resume 续跑中断任务 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
-  + 'merge：存量话题集合并治理（相似簇→主集，源集 archived 不删）。/memory-merge 预览清单（dry-run 不写库）；/memory-merge apply 执行。\n'
+  + 'merge：存量话题集合并治理（相似簇→主集，源集 archived 不删）。/memory-merge 预览清单（dry-run 不写库）；/memory-merge apply 执行；\n'
+  + '  --rename <标题>：同时把「已有主集」簇的目标集改名（dry-run 预览即最终形态；存在多个已有主集簇时请分批或用管理台）。\n'
   + 'resume：被中断的任务（插件重载/关闭或 DSH 退出导致，分支会话已保留）。'
   + '/memory-resume 查看清单；/memory-resume <dispatchId...> 续跑指定任务（优先续接原分支会话）。\n'
   + '快捷方式：每个子命令都是独立命令，输入 /memory 后可在列表里直接选择'

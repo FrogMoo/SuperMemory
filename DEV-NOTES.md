@@ -1672,3 +1672,55 @@ wrap 后字符数 **87298 → 105183（+17885）**；磁盘 UTF-8 **89065 → 10
 - 收口是**软契约**（提示词 + 回执字段），宿主不强制：模型仍可能选择等待。若将来宿主提供
   "turn 收口/回合结束"钩子，可升级为硬拦截；当前 DSH 无此 API，故明确降级为提示词 + 回执字段。
 
+## 25. 重新激活的分支在会话列表置顶（R25，2026-11-18）
+
+### 25.1 根因（已由中枢实证，本分支复核）
+- GUI 会话列表按 `updatedAt = max(header.createdAt, lastPromptAt)` 降序（宿主
+  `dsh-api-session-controller/lib/types/list.js`）；`lastPromptAt` **只在提交 user/message 且
+  `event.data.source.kind === 'user'` 时刷新**，其他 kind 一律不刷新。
+- 本插件所有「人发起」的投递都用私有 kind `supermemory`（派发 / 续跑 / 面板发消息 / 面板回复 /
+  新会话首消息），因此复用或续跑一条**已存在**的分支时，recency 键不前进 → 侧栏位置不动。
+- workspace.json 的 sessionIds 只是归属顺序、不影响侧栏；宿主零处消费 `supermemory` kind；
+  kind `user` 的其余消费点（continuation admitted、inbox steering 标注）对分支中性/正向。
+
+### 25.2 改动（文件 + 行号，行号以本次结束时为准）
+- `src/dispatch.ts:594-597`：派发唤醒消息 `source: { kind: 'supermemory' }` → `{ kind: 'user' }`
+  （含并行组：同一处）。**R25 起派发/续跑以人类提示形态落账**，归属仍由 observe 的首个匹配扫描保证。
+- `src/resume.ts:363-367`：续跑投递同样改为 `{ kind: 'user' }`，删除 `form: 'instructions'`
+  并改写注释（原 form 的归属 rationale 失效）。
+- `src/panel.ts:677-678`（sendSessionMessage）、`:844-847`（deliverFirstMessage）、`:1035-1036`
+  （面板回复分支）：统一 `kind: 'user'`——面板操作即用户行为。
+- `src/reconcile.ts:115-120`：splice 追溯同时接受 `supermemory` 与 `user` 两种 kind（旧在途记录
+  未结算时仍旧 kind）；`:158-161`：重启重投也改为 `{ kind: 'user' }`（`:158-160`）——否则 `isDispatchInput`
+  认领不到，重启恢复的 dispatch 会永久悬空（漏改点，按同一规则处理）。
+- `src/observe.ts:85-100`：`isDispatchInput` 改为 `message.source?.kind !== 'user'` 才 false，
+  继续排除 form `recall` / `notice` / `relay`；注释写明 R25 动机与已知边界（人类在分支里手打的
+  消息也是 kind 'user'，首匹配扫描可能归属——可接受：插件在落账 dispatch 后同步追加输入，窗口内首条是它）。
+- `src/index.ts:22`（导入）+ `:196-199`：`attachProposals` 增加 `isPluginBranchId` 守卫——派发输入现在是 kind
+  'user'，分支也会通过「有用户消息」门槛；工具化提议是中枢↔用户交互，分支不得直接问用户（R20）。
+- `scripts/mechanism-smoke.mjs`：R3 断言改为 `source.kind === 'user'` 且无 form；新增
+  R25-1（`isDispatchInput` 语义 + 源级断言：relay 仍为 supermemory、派发为 user、面板无残留）、
+  R25-2（用测试缝驱动**真实** `runDispatch`，断言交给分支的消息 `source.kind === 'user'`）。
+
+### 25.3 闸门（本分支实测）
+- `pnpm typecheck` 双配置 0 错。
+- `pnpm smoke` 全绿：core 9 + mechanism **81**（含 R25-1/2、R24-1..3、R23 的 M0–M7）+ webui 32 + client-sim。
+- `pnpm build` 全管线通过；`lib/supermemory.js` 实测含 `isDispatchInput` 新判定
+  （`kind !== "user"` + 排除 recall/notice/relay）与 6 处 `source: { kind: "user" }`
+  （dispatch / resume / panel×3 / reconcile 重投），且已无 `form: "instructions"`。
+
+### 25.4 生效方式与预期行为
+- 需在 GUI 插件页对 dsh-supermemory **禁用→启用**（或重启 DSH Desktop）重载；分支会话内禁止自己重载。
+- 重载后：**复用/续跑**的分支在投递后立即出现在会话列表顶部（lastPromptAt 前进）；**新建**分支
+  不变（本来靠 createdAt 置顶）；recall/notice/relay 卡仍是 kind `supermemory`，不刷新 recency、
+  行为不变。
+
+### 25.5 已知边界与副作用
+- 人类在分支里手打的 user/message 也可能被首匹配扫描归属为一个派发输入（窗口内首条是插件输入，
+  实践中不冲突；若将来出现 human-in-branch 场景，可给派发输入加可识别标记并在此处收紧）。
+- `maintenance.ts` 的事实/需求抽取只认 kind 'user'：派发任务的文本现在也会进入分支会话的
+  抽取管线（任务里的「必须/需要」可能落成 requirement 行）。判定为可接受：任务文本本就走中枢的
+  user 语义；本次不扩大改动，如需去重留给后续轮次。
+- 编号：并行分支的话题集匹配是 R23（无独立 DEV-NOTES 小节），本需求按当前最大编号顺延为 **R25**。
+
+
