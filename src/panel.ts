@@ -17,10 +17,13 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
-import { applySessionTitle, ensureMemberTitle } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
-import { deleteCompositeTool, editCompositeTool, liveCompositeSpecs } from './composite.ts'
+import {
+  bumpCompositeUse, deleteCompositeTool, editCompositeTool, liveCompositeSpecs,
+  runCapability, type CapabilityRunResult, type CompositeSpec,
+} from './composite.ts'
 import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
@@ -78,6 +81,14 @@ export interface ToolView {
   useCount: number
   status: string
   live: boolean
+  // R22 能力（capability）字段；序列组合工具这些字段为空。
+  kind?: 'sequence' | 'capability'
+  entry?: string
+  doc?: string
+  scope?: string
+  runnable?: boolean
+  dryRunArg?: string
+  writeConfirm?: boolean
 }
 
 /** One agent-preset row for the hub quick launcher (R7). */
@@ -725,7 +736,8 @@ export class SupermemoryPanelService {
     const keywords = mergeTags(explicitTags, tagsOfBody(`${name} ${body}`))
     const id = await createTopicSet(this.store, {
       workspaceKey,
-      title: name.slice(0, 40),
+      // Whole up to TOPIC_SET_TITLE_MAX_CHARS, "…" beyond (was slice(0, 40)).
+      title: clipEllipsis(name, TOPIC_SET_TITLE_MAX_CHARS),
       summary: body,
       keywords,
     })
@@ -747,7 +759,7 @@ export class SupermemoryPanelService {
     const stored = this.store.topicsets.get(id)
     const finalTags = stored?.keywords ?? keywords
     const tagText = finalTags.length > 0 ? `（标签：${finalTags.join('、')}）` : ''
-    return { status: 'ok', message: `已创建话题集『${stored?.title ?? name.slice(0, 40)}』${tagText}${shapeNote}。`, id }
+    return { status: 'ok', message: `已创建话题集『${stored?.title ?? clipEllipsis(name, TOPIC_SET_TITLE_MAX_CHARS)}』${tagText}${shapeNote}。`, id }
   }
 
   /** Update a topic set's summary (panel). */
@@ -1038,11 +1050,36 @@ export class SupermemoryPanelService {
       let steps: string[] = []
       let parameters: string[] = []
       let name = id
+      let kind: 'sequence' | 'capability' = 'sequence'
+      let entry: string | undefined
+      let doc: string | undefined
+      let scope: string | undefined
+      let runnable: boolean | undefined
+      let dryRunArg: string | undefined
+      let writeConfirm: boolean | undefined
       try {
-        const spec = JSON.parse(record.entry) as { name?: string; steps?: Array<{ tool: string }>; parameters?: Array<{ name: string }> }
+        const spec = JSON.parse(record.entry) as {
+          name?: string
+          kind?: 'sequence' | 'capability'
+          steps?: Array<{ tool: string }>
+          parameters?: Array<{ name: string }>
+          entry?: string
+          doc?: string
+          scope?: string
+          runnable?: boolean
+          dryRunArg?: string
+          writeConfirm?: boolean
+        }
         name = spec.name ?? id
+        kind = spec.kind === 'capability' ? 'capability' : 'sequence'
         steps = (spec.steps ?? []).map((s) => s.tool)
         parameters = (spec.parameters ?? []).map((p) => p.name)
+        entry = spec.entry
+        doc = spec.doc
+        scope = spec.scope
+        runnable = spec.runnable
+        dryRunArg = spec.dryRunArg
+        writeConfirm = spec.writeConfirm
       } catch { /* a broken definition still lists with its description */ }
       rows.push({
         id, name,
@@ -1053,6 +1090,7 @@ export class SupermemoryPanelService {
         useCount: record.useCount,
         status: record.status,
         live: liveCompositeSpecs.has(name),
+        kind, entry, doc, scope, runnable, dryRunArg, writeConfirm,
       })
     }
     rows.sort((a, b) => a.name.localeCompare(b.name))
@@ -1080,6 +1118,35 @@ export class SupermemoryPanelService {
   async deleteTool(id: string): Promise<MutationResult> {
     if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法删除工具。' }
     return deleteCompositeTool(this.ctx, this.store, id)
+  }
+
+  /**
+   * R22: run one capability tool (its entry command inside its scope directory).
+   * Dry-run is the default (dryRunArg appended); a writeConfirm capability
+   * refuses a real run without an explicit confirm and answers
+   * status 'needs-confirm' WITHOUT executing anything.
+   */
+  async runTool(id: string, options: { dryRun?: boolean; confirm?: boolean } = {}): Promise<CapabilityRunResult> {
+    const record = this.store.toolMemory.get(id)
+    if (!record || record.kind !== 'composite' || !record.entry) {
+      return { status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '', summary: '组合工具不存在。' }
+    }
+    let spec: CompositeSpec
+    try {
+      spec = JSON.parse(record.entry) as CompositeSpec
+    } catch {
+      return { status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '', summary: '工具定义损坏，无法执行。' }
+    }
+    if (spec.kind !== 'capability' || !spec.entry) {
+      return {
+        status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '',
+        summary: '只有能力（capability）可以一键执行；序列组合工具请直接调用它。',
+      }
+    }
+    const result = runCapability(spec, { dryRun: options.dryRun, confirm: options.confirm })
+    // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
+    if (result.status !== 'needs-confirm') bumpCompositeUse(this.store, spec.name)
+    return result
   }
 
   /**
@@ -1328,6 +1395,17 @@ const PANEL_DESCRIPTORS = Object.freeze([
     result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
     parameters: [
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R22: 一键执行能力（默认预演；writeConfirm 能力需 options.confirm=true）。
+    id: 'dsh-supermemory#supermemoryPanel/runTool',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'runTool',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#CapabilityRunResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'options', wire: 'options', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#RunOptions', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

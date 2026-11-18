@@ -18,7 +18,10 @@ import { renderCard } from './route.ts'
 import type { ModelDeps } from './model.ts'
 import { askDefaultModel, applyModelSelection } from './model.ts'
 import { openRequirements } from './requirements.ts'
+import { listInterruptedDispatches, renderInterruptedList, resumeDispatch } from './resume.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, firstLine } from './title.ts'
+import { migrateTruncatedTitles, renderTitlesMigrationReport } from './title-migration.ts'
 
 export interface CommandsDeps {
   ctx: Context
@@ -40,9 +43,11 @@ const SUBCOMMANDS: ReadonlyArray<readonly [string, string]> = [
   ['model', '话题集/分支模型管理：/memory-model <provider> <model> [effort]'],
   ['tools', '组合工具管理：/memory-tools 列表；edit <id> <JSON> 修改；desc <id> <文本> 改简介；retire <id> 停用'],
   ['reqs', '列出未完成需求'],
+  ['resume', '继续被中断的任务：/memory-resume 查看清单；/memory-resume <dispatchId...> 续跑（可多个）'],
   ['wrap', '更新当前话题集梗概'],
   ['scan', '扫描工作区，刷新项目文件地图'],
   ['export', '导出 .supermemory-export.md 到工作区根目录'],
+  ['titles', '补正刷新被旧截断逻辑损坏的话题集/分支标题（dry-run 只预览不写库）'],
   ['help', '查看 /memory 命令族全部用法'],
 ]
 
@@ -52,7 +57,7 @@ export function attachCommands(ctx: Context, deps: CommandsDeps): () => void {
   disposers.push(ctx.commands.register({
     name: 'memory',
     description: 'SuperMemory 命令族：ui 可视化管理台 · status 状态 · topicsets 话题集 · switch 激活 · new 新建 · '
-      + 'model 模型 · tools 组合工具 · reqs 需求 · wrap 梗概 · scan 扫描 · export 导出（每个子命令也可直接输 /memory-<名> 快速选择）',
+      + 'model 模型 · tools 组合工具 · reqs 需求 · resume 续跑中断任务 · wrap 梗概 · scan 扫描 · export 导出（每个子命令也可直接输 /memory-<名> 快速选择）',
     handler: async (invocation): Promise<Result> => {
       const raw = (invocation.rawInput ?? '').trim()
       const [sub, ...rest] = raw.split(/\s+/)
@@ -86,6 +91,16 @@ async function runMemory(
     case '':
     case 'status':
       return statusText(deps, sessionId, workspaceKey)
+    case 'titles': {
+      // One-time repair of titles damaged by the pre-2026-11-18 truncation.
+      // dry-run previews; a plain run writes the store AND renames live host
+      // sessions. The startup pass is marker-guarded; this manual path always
+      // re-plans (after a successful run the plan is empty anyway).
+      const dryRun = /dry[-_ ]?run|预览|预演/i.test(arg)
+      if (arg && !dryRun) return { kind: 'error', text: '用法：/memory titles [dry-run]（dry-run 只预览不写库）' }
+      const result = await migrateTruncatedTitles({ ctx: deps.ctx, store, logger: deps.logger }, { dryRun, ignoreMarker: true })
+      return { kind: 'success', text: renderTitlesMigrationReport(result) }
+    }
     case 'help':
       return { kind: 'success', text: HELP }
     case 'topicsets':
@@ -103,7 +118,10 @@ async function runMemory(
     case 'new': {
       if (!arg) return { kind: 'error', text: '用法：/memory new <标题>' }
       const model = await askDefaultModel(deps.model, agent)
-      const id = await createTopicSet(store, { workspaceKey, title: arg.slice(0, 40), ...(model ? { defaultModel: model } : {}) })
+      // An explicit title is shown whole up to TOPIC_SET_TITLE_MAX_CHARS
+      // and clipped with "…" beyond that (the old slice(0, 40) cut with no marker).
+      const title = clipEllipsis(firstLine(arg), TOPIC_SET_TITLE_MAX_CHARS)
+      const id = await createTopicSet(store, { workspaceKey, title, ...(model ? { defaultModel: model } : {}) })
       // R19 需求⑥: a bare title is enough for /memory new — the model fills the
       // tags/body index (falling back to what was written on any failure).
       try {
@@ -116,7 +134,7 @@ async function runMemory(
       const stored = getTopicSet(store, id)
       return {
         kind: 'success',
-        text: `已创建并激活话题集『${stored?.title ?? arg.slice(0, 40)}』${stored && stored.keywords.length ? `（标签：${stored.keywords.join('、')}）` : ''}${model ? `（默认模型 ${model.provider}/${model.model}）` : ''}`,
+        text: `已创建并激活话题集『${stored?.title ?? title}』${stored && stored.keywords.length ? `（标签：${stored.keywords.join('、')}）` : ''}${model ? `（默认模型 ${model.provider}/${model.model}）` : ''}`,
       }
     }
     case 'model': {
@@ -192,6 +210,19 @@ async function runMemory(
         text: `记忆管理台：\n${url}\n\n直接点击链接，或粘贴进侧边栏 browser tab（管理台与 GUI 不同源，侧边栏可正常嵌入；系统浏览器也可）。令牌仅本次运行有效；宿主重启后请重新执行 /memory ui。`,
       }
     }
+    case 'resume': {
+      // E: 被中断的任务由用户决定继续哪些。无参=清单；带 dispatchId（可多个）=续跑。
+      const ids = arg ? arg.split(/\s+/).map((row) => row.trim()).filter(Boolean) : []
+      if (ids.length === 0) {
+        return { kind: 'success', text: renderInterruptedList(listInterruptedDispatches(store, { workspaceKey })) }
+      }
+      const lines: string[] = []
+      for (const id of ids) {
+        const row = await resumeDispatch({ ctx: deps.ctx, store, logger: deps.logger }, id, { exec: { agent } })
+        lines.push((row.status === 'resumed' ? '✅ ' : '❌ ') + row.dispatchId + '：' + row.message)
+      }
+      return { kind: 'success', text: lines.join('\n') }
+    }
     case 'wrap': {
       const active = getRouting(store, sessionId)?.activeTopicSetId
       if (!active) return { kind: 'error', text: '当前没有激活的话题集。' }
@@ -212,7 +243,9 @@ async function runMemory(
 }
 
 const HELP = 'status 状态总览 · topicsets 话题集列表 · switch <名> 激活 · new <标题> 新建 · '
-  + 'model 模型管理 · tools 组合工具 · reqs 需求 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
+  + 'model 模型管理 · tools 组合工具 · reqs 需求 · resume 续跑中断任务 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
+  + 'resume：被中断的任务（插件重载/关闭或 DSH 退出导致，分支会话已保留）。'
+  + '/memory-resume 查看清单；/memory-resume <dispatchId...> 续跑指定任务（优先续接原分支会话）。\n'
   + '快捷方式：每个子命令都是独立命令，输入 /memory 后可在列表里直接选择'
   + '（如 /memory-ui、/memory-status、/memory-topicsets）；也可用 /memory <子命令> <参数>。'
 

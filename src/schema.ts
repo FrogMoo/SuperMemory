@@ -82,7 +82,16 @@ export async function buildSchemas() {
     branchSessionId: z.string().optional(),
     timeStart: z.number().int(),
     timeEnd: z.number().int(),
+    /** Short form for recall cards / topic-shape fingerprints / exports. */
     summary: z.string().default(''),
+    /**
+     * The branch's FULL final answer. `summary` is deliberately short (recall
+     * cards, topic-shape fingerprints and exports read it), but the hub-facing
+     * relay must carry the whole result: clipping it there silently destroyed
+     * most of a branch's work. Episodes written before this field read as ''
+     * and fall back to `summary` (the domain stays v1).
+     */
+    result: z.string().default(''),
     decisions: z.array(z.string()).default([]),
     files: z.array(z.string()).default([]),
     nextSteps: z.array(z.string()).default([]),
@@ -154,6 +163,11 @@ export async function buildSchemas() {
     status: z.enum(['queued', 'dispatched', 'observed', 'summarized', 'delivered', 'failed', 'interrupted']).default('queued'),
     // D: last heartbeat while the branch was still working (timeout judgement)
     lastActivityAt: z.number().int().optional(),
+    // E: 续跑关联（中断任务由用户决定继续）。续跑产生的新派发记录原 dispatchId
+    // （resumeOf），原派发回写续跑派发 id（resumedBy）。两个字段都是可选的：
+    // 旧记录读作 undefined，存储域保持 v1 兼容（同 D 的 interrupted/lastActivityAt）。
+    resumeOf: z.string().optional(),
+    resumedBy: z.string().optional(),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })
@@ -214,9 +228,16 @@ export async function buildSchemas() {
     updatedAt: z.number().int(),
   })
 
+  // One-time migration markers (title repair). A single row keyed 'titles';
+  // an old medium simply has no rows here, so the domain stays v1-compatible.
+  const meta = z.object({
+    titlesMigratedAt: z.number().int().optional(),
+    titlesMigrationVersion: z.number().int().optional(),
+  })
+
   return {
     topicsets, memories, episodes, requirements, filemap, tool_memory: toolMemory,
-    signals, dispatches, questions, outbox, routing, hotcache,
+    signals, dispatches, questions, outbox, routing, hotcache, meta,
   }
 }
 
@@ -234,3 +255,4 @@ export type Question = z.infer<Schemas['questions']>
 export type OutboxItem = z.infer<Schemas['outbox']>
 export type Routing = z.infer<Schemas['routing']>
 export type Hotcache = z.infer<Schemas['hotcache']>
+export type Meta = z.infer<Schemas['meta']>

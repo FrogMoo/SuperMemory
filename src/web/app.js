@@ -12,7 +12,7 @@ const SECTIONS = [
   ['hubs', '中枢会话', 'primary'],
   ['topicsets', '话题集', 'primary'],
   ['memories', '记忆', 'primary'],
-  ['tools', '组合工具', 'primary'],
+  ['tools', '固化能力', 'primary'],
   ['overview', '统计', 'primary'],
   ['requirements', '需求', 'more'],
   ['dispatch', '派发与交付', 'more'],
@@ -36,6 +36,9 @@ const state = {
   editing: new Set(),
   // R19 需求⑦: memory editing is a modal, exactly like the in-app panel.
   editMem: null,
+  // R22 能力：执行结果弹窗 + 写操作二次确认弹窗。
+  capRun: null,
+  capConfirm: null,
 }
 
 const $ = (sel) => document.querySelector(sel)
@@ -101,7 +104,7 @@ function render() {
     tools: renderTools, requirements: renderRequirements, dispatch: renderDispatch, episodes: renderEpisodes,
     filemap: renderFilemap, signals: renderSignals,
   }[state.section]
-  $('#content').innerHTML = (renderer && state.data ? renderer(state.data) : '<div class="empty">加载中…</div>') + memoryModal()
+  $('#content').innerHTML = (renderer && state.data ? renderer(state.data) : '<div class="empty">加载中…</div>') + memoryModal() + capRunModal() + capConfirmModal()
 }
 
 /* ---------- 分区渲染 ---------- */
@@ -117,7 +120,7 @@ function renderOverview(d) {
     ['派发', Object.keys(dq).length ? Object.entries(dq).map(([k, v]) => k + ' ' + v).join(' · ') : '无'],
     ['待交付 outbox', d.outbox.filter((o) => o.status === 'pending').length],
     ['重复信号', d.signals.length],
-    ['组合工具', d.toolMemory.length],
+    ['固化能力', d.toolMemory.length],
     ['文件地图', d.filemap.length],
   ]
   const tsTitle = (id) => { const t = d.topicsets.find((x) => x.id === id); return t ? t.title : '（已删除）' }
@@ -455,14 +458,17 @@ function renderHubs(d) {
     + `<div class="body"><div class="card-list">${cards}</div></div></div>`
 }
 
-/** R18: 组合工具 — its own section, rendered as cards (not a table). */
-function renderTools(d) {
-  if (!d.toolMemory.length) {
-    return '<div class="panel"><header>组合工具</header><div class="body"><div class="empty">'
-      + '暂无组合工具；重复流程出现 3 次后会提议固化'
-      + '</div></div></div>'
-  }
-  const cards = d.toolMemory.map((t) => `
+/** R22: 解析一条 toolMemory 记录的能力定义；非能力返回 null。 */
+function capabilitySpecOf(t) {
+  try {
+    const spec = JSON.parse(t.entry || '')
+    return (spec && spec.kind === 'capability' && spec.entry) ? spec : null
+  } catch { return null }
+}
+
+/** R18: 序列组合工具卡片（自动固化的工具序列，保持原样）。 */
+function sequenceCard(t) {
+  return `
     <div class="list-card">
       <div class="list-card-head">
         <b>${esc(t.title || t.trigger || t.kind)}</b>
@@ -472,9 +478,123 @@ function renderTools(d) {
       </div>
       <div class="row-meta">${kwHtml(t.tags) || '<span class="muted">（无标签）</span>'}</div>
       <div class="list-card-body">${esc(t.description || '—')}</div>
-    </div>`).join('')
-  return `<div class="panel"><header>组合工具 <span class="badge info">${d.toolMemory.length}</span></header>`
-    + `<div class="body"><div class="card-list">${cards}</div></div></div>`
+    </div>`
+}
+
+/** R22: 能力卡片 — 入口命令（可复制）/适用范围/文档/预演参数 + 运行/确认执行/启停/删除。 */
+function capabilityCard(t, spec) {
+  // 写操作能力若没定义预演参数，预演无从谈起（避免把真实命令当预演跑掉）。
+  const canDryRun = !(spec.writeConfirm && !spec.dryRunArg)
+  return `
+    <div class="list-card">
+      <div class="list-card-head">
+        <b>${esc(t.title || spec.name)}</b>
+        <span class="badge info">能力</span> ${badge(t.status)}
+        ${spec.writeConfirm ? '<span class="badge warn">写操作需确认</span>' : ''}
+        ${spec.runnable === false ? '<span class="badge danger">未开放执行</span>' : ''}
+        <span class="grow"></span>
+        <span class="muted">使用 ${t.useCount} 次</span>
+      </div>
+      <div class="row-meta">${kwHtml(t.tags) || '<span class="muted">（无标签）</span>'}</div>
+      <div class="list-card-body">${esc(t.description || '—')}</div>
+      <div class="row-meta">
+        <span class="muted">入口</span> <code>${esc(spec.entry)}</code>
+        <button class="btn small" type="button" data-action="cap-copy" data-text="${esc(spec.entry)}">复制</button>
+        ${spec.dryRunArg ? `<span class="muted">预演参数</span> <code>${esc(spec.dryRunArg)}</code>` : ''}
+      </div>
+      <div class="row-meta">
+        <span class="muted">适用范围</span> <code>${esc(spec.scope || '当前目录')}</code>
+        ${spec.doc ? `<span class="muted">文档</span> <code>${esc(spec.doc)}</code>` : ''}
+      </div>
+      <div class="row-actions">
+        <button class="btn small primary" type="button" data-action="cap-run" data-id="${t.id}"${canDryRun ? '' : ' disabled title="该能力未定义预演参数，无法预演；请用确认执行"'}>运行（预演）</button>
+        ${spec.writeConfirm ? `<button class="btn small danger" type="button" data-action="cap-run-confirm" data-id="${t.id}">确认执行</button>` : ''}
+        ${t.status === 'active'
+          ? `<button class="btn small" type="button" data-action="tool-status" data-id="${t.id}" data-status="retired">停用</button>`
+          : `<button class="btn small" type="button" data-action="tool-status" data-id="${t.id}" data-status="active">启用</button>`}
+        <button class="btn small danger" type="button" data-action="tool-del" data-id="${t.id}">删除</button>
+      </div>
+    </div>`
+}
+
+/** R22: 能力执行结果弹窗（stdout/stderr + 退出码 + 耗时）。 */
+function capRunModal() {
+  const r = state.capRun
+  if (!r) return ''
+  const pre = 'white-space:pre-wrap;word-break:break-all;max-height:280px;overflow:auto;background:rgba(0,0,0,.06);padding:8px;border-radius:6px'
+  return `
+  <div class="modal-backdrop" data-action="modal-close">
+    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+      <h3>执行结果</h3>
+      <p class="modal-hint">${esc(r.command || '')} · ${r.dryRun ? '预演' : '实跑'} · ${r.durationMs}ms · exit ${r.exitCode === undefined ? '—' : r.exitCode}</p>
+      ${r.summary ? `<p class="modal-hint">${esc(r.summary)}</p>` : ''}
+      <pre style="${pre}">${esc(r.stdout || '（无 stdout）')}</pre>
+      ${r.stderr ? `<pre style="${pre}">${esc(r.stderr)}</pre>` : ''}
+      <div class="toolbar" style="margin-top:10px">
+        <button class="btn primary" type="button" data-action="modal-close">关闭</button>
+      </div>
+    </div>
+  </div>`
+}
+
+/** R22: 写操作能力的二次确认弹窗（确认后才带 confirm=true 真跑）。 */
+function capConfirmModal() {
+  const c = state.capConfirm
+  if (!c) return ''
+  return `
+  <div class="modal-backdrop" data-action="modal-close">
+    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+      <h3>确认执行（写操作）</h3>
+      <p class="modal-hint">将在 <code>${esc(c.scope || '当前目录')}</code> 内真实执行：</p>
+      <pre style="white-space:pre-wrap;word-break:break-all;background:rgba(0,0,0,.06);padding:8px;border-radius:6px">${esc(c.command)}</pre>
+      <p class="modal-hint">该操作可能写远端/改状态。确定继续？</p>
+      <div class="toolbar" style="margin-top:10px">
+        <button class="btn danger" type="button" data-action="cap-run-do" data-id="${c.id}">确认执行</button>
+        <button class="btn" type="button" data-action="modal-close">取消</button>
+      </div>
+    </div>
+  </div>`
+}
+
+/** R18+R22: 组合工具页签 — 能力（可一键执行）与序列组合工具（自动固化）两类卡片。 */
+function renderTools(d) {
+  const seqs = []
+  const caps = []
+  for (const t of d.toolMemory || []) {
+    const spec = capabilitySpecOf(t)
+    if (spec) caps.push([t, spec])
+    else seqs.push(t)
+  }
+  if (!seqs.length && !caps.length) {
+    return '<div class="panel"><header>固化能力</header><div class="body"><div class="empty">'
+      + '暂无固化能力：可手动注册（入口命令 + 文档 + 适用范围，一键执行，默认预演，写操作需确认）；'
+      + '重复流程出现 3 次后也会自动提议固化为序列（一次调用完成确定性子序列）。'
+      + '</div></div></div>'
+  }
+  const capPanel = `<div class="panel"><header>能力（可一键执行） <span class="badge info">${caps.length}</span></header><div class="body">`
+    + (caps.length
+      ? `<div class="card-list">${caps.map(([t, spec]) => capabilityCard(t, spec)).join('')}</div>`
+      : '<div class="empty">还没有能力。用 memory_toolize register 注册，或在下面表单录入（首个样板：git 同步/提交/推送）。</div>')
+    + `<details style="margin-top:10px"><summary>注册新能力</summary>
+      <form data-form="cap-create" class="form-inline">
+        <input type="text" name="name" placeholder="能力名（git-sync-supermemory）" required style="flex:0 0 220px">
+        <input type="text" name="title" placeholder="标题" style="flex:1;min-width:160px">
+        <input type="text" name="entry" placeholder="入口命令（pnpm git:sync）" required style="flex:1;min-width:220px">
+        <input type="text" name="scope" placeholder="适用范围目录（G:\\09 - dsh\\SuperMemory）" style="flex:1;min-width:200px">
+        <input type="text" name="doc" placeholder="文档路径（docs/git-sync.md）" style="flex:1;min-width:200px">
+        <input type="text" name="dryRunArg" placeholder="预演参数（--dry-run）" style="flex:0 0 160px">
+        <input type="text" name="tags" placeholder="标签，逗号分隔" style="flex:0 0 180px">
+        <label class="muted"><input type="checkbox" name="writeConfirm" checked> 写操作需确认</label>
+        <label class="muted"><input type="checkbox" name="runnable" checked> 可执行</label>
+        <textarea name="description" placeholder="描述 + 路由：何时优先用本能力、关键坑是什么（模型据此路由）" style="min-height:56px;width:100%"></textarea>
+        <button class="btn primary" type="submit">注册能力</button>
+      </form>
+    </details></div></div>`
+  const seqPanel = seqs.length
+    ? `<div class="panel"><header>自动固化序列（重复流程的附带产物） <span class="badge info">${seqs.length}</span></header>`
+      + `<div class="body"><div class="card-list">${seqs.map(sequenceCard).join('')}</div></div></div>`
+    : ''
+  return capPanel + seqPanel
 }
 
 /** R18: 信号 — repeated-flow candidates, as cards. */
@@ -524,7 +644,7 @@ document.addEventListener('click', async (ev) => {
       render()
       return
     }
-    case 'modal-close': state.editMem = null; render(); return
+    case 'modal-close': state.editMem = null; state.capRun = null; state.capConfirm = null; render(); return
     case 'mem-save-modal': await run(async () => {
       const modal = document.querySelector('.modal')
       if (!modal) throw new Error('编辑框已关闭')
@@ -597,6 +717,44 @@ document.addEventListener('click', async (ev) => {
         const r = await post('/export', { ws: state.ws, cwd: state.ws })
         toast('已导出 ' + r.path)
       }); return
+    // ---- R22 能力（capability）----
+    case 'cap-run': await run(async () => {
+      const r = await post('/tool/run', { ws: state.ws, id })
+      state.capRun = r
+      render()
+    }); return
+    case 'cap-run-confirm': {
+      const t = (state.data && state.data.toolMemory || []).find((x) => x.id === id)
+      const spec = t && capabilitySpecOf(t)
+      if (!spec) return
+      state.capConfirm = { id, scope: spec.scope, command: spec.entry }
+      render()
+      return
+    }
+    case 'cap-run-do': await run(async () => {
+      const c = state.capConfirm
+      if (!c) return
+      const r = await post('/tool/run', { ws: state.ws, id: c.id, confirm: true })
+      state.capConfirm = null
+      state.capRun = r
+      render()
+    }); return
+    case 'tool-status': await run(async () => {
+      const status = btn.dataset.status === 'retired' ? 'retired' : 'active'
+      await post('/tool/status', { ws: state.ws, id, status })
+      toast(status === 'retired' ? '已停用（重启后不会重新注册）' : '已启用')
+    }); return
+    case 'tool-del':
+      if (!confirm('删除该固化能力/自动固化序列不可恢复，确定？')) return
+      await run(async () => { await post('/tool/delete', { ws: state.ws, id }); toast('已删除') }); return
+    case 'cap-copy': {
+      const copyText = btn.dataset.text || ''
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        try { await navigator.clipboard.writeText(copyText); toast('已复制：' + copyText) }
+        catch { toast('复制失败，请手动复制：' + copyText) }
+      } else { toast('请手动复制：' + copyText) }
+      return
+    }
     default: return
   }
 })
@@ -650,6 +808,18 @@ document.addEventListener('submit', async (ev) => {
       if (!text) return
       await api('/requirement/create', { method: 'POST', body: { ws: state.ws, text, topicSetId: val('topicSetId') } })
       toast('需求已添加')
+    } else if (kind === 'cap-create') {
+      // R22: 注册一个能力（入口命令 + 文档 + 适用范围，可一键执行，默认预演）。
+      const name = val('name')
+      const entry = val('entry')
+      const description = val('description')
+      if (!name || !entry || !description) { toast('能力名、入口命令、描述为必填'); return }
+      await api('/tool/register', { method: 'POST', body: {
+        ws: state.ws, name, title: val('title'), entry, scope: val('scope'), doc: val('doc'),
+        dryRunArg: val('dryRunArg'), tags: val('tags'), description,
+        writeConfirm: fd.get('writeConfirm') === 'on', runnable: fd.get('runnable') === 'on',
+      } })
+      toast('能力已注册')
     }
     form.reset()
     await loadState()

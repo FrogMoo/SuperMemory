@@ -15,7 +15,9 @@ import { newId, workspaceKeyOf } from './store.ts'
 import {
   createTopicSet, getRouting, getTopicSet, rankMembers, setRouting, touchTopicSet, updateMember,
 } from './topicsets.ts'
-import { applySessionTitle, ensureMemberTitle } from './title.ts'
+import {
+  TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine,
+} from './title.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
 import { groupComplete, groupEpisodeSummaries, groupRelayExists, groupRelayText, newGroupId } from './group.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
@@ -277,7 +279,14 @@ export async function runDispatch(
   }
   const firstTask = (args.task ?? args.tasks?.[0] ?? '').trim()
   if (!topicSetId) {
-    topicSetId = await createTopicSet(store, { workspaceKey, title: firstTask.slice(0, 12) })
+    topicSetId = await createTopicSet(store, {
+      workspaceKey,
+      // An auto-created set is named after the task that created it: first
+      // line, markup stripped, shown whole up to TOPIC_SET_TITLE_MAX_CHARS
+      // and clipped with "…" beyond that (the old slice(0, 12) cut every
+      // auto-created title at 12 characters with no marker).
+      title: clipEllipsis(firstLine(cleanTitleText(firstTask)), TOPIC_SET_TITLE_MAX_CHARS),
+    })
     await setRouting(store, hubSessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
     // R19 需求⑥: a dispatch that auto-created/bound a set activates it; the
     // shape refresh is content-gated and throttled, so this is cheap.
@@ -732,6 +741,29 @@ export function releasableBranches(store: Store, now: number, idleReleaseMs: num
     out.push(sessionId)
   }
   return out
+}
+
+/**
+ * E: 保留分支会话——空闲分支只释放插件侧 handle（从 branchHandles 摘除），
+ * 绝不调用 handle.dispose()：宿主语义是停 loop、关闭写句柄、注销 agent，而分支
+ * 会话的持久日志与可恢复性必须留下（acquireBranch 的 live→resume 路径随时续接，
+ * memory_resume 也依赖它继续被中断的任务）。判定沿用 releasableBranches
+ * （D5：有未交付 outbox 的分支不释放）。
+ */
+export function detachIdleBranches(
+  store: Store,
+  now: number,
+  idleReleaseMs: number,
+  logger: { info: (msg: string) => void },
+): string[] {
+  const detached: string[] = []
+  for (const sessionId of releasableBranches(store, now, idleReleaseMs)) {
+    if (branchHandles.delete(sessionId)) {
+      detached.push(sessionId)
+      logger.info(`supermemory: detached idle branch ${sessionId.slice(0, 13)}（会话保留，可续接）`)
+    }
+  }
+  return detached
 }
 
 function findMember(store: Store, sessionId: string): { lastActiveAt: number } | undefined {

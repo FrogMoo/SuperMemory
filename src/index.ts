@@ -10,7 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { attachCommands, type CommandsDeps } from './commands.ts'
-import { branchHandles, releasableBranches } from './dispatch.ts'
+import { detachIdleBranches } from './dispatch.ts'
 import { attachMaintenance } from './maintenance.ts'
 import type { ModelDeps } from './model.ts'
 import { attachObserve, flushObserve, settleInterruptedDispatches } from './observe.ts'
@@ -20,6 +20,8 @@ import { attachPreStep } from './prestep.ts'
 import { sweepAutoToolize, type ToolizeConfig } from './toolize.ts'
 import { loadHostModule } from './host.ts'
 import { runReconciliation } from './reconcile.ts'
+import { migrateTruncatedTitles } from './title-migration.ts'
+import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
 import type { Signal } from './schema.ts'
 import { attachPanel } from './panel.ts'
@@ -472,6 +474,13 @@ export async function apply(ctx: Context, config: Config) {
       ctx, store, logger,
       observe: { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy, interruptAfterMs: config.observe.interruptAfterMs },
     })
+    // One-time title repair: refresh rows damaged by the pre-2026-11-18
+    // truncation (12/40-char topic titles, 16-char task snippets).
+    // Marker-guarded via store.meta.titles and content-idempotent, so a
+    // restart never repeats the work; a manual re-scan is /memory titles.
+    void migrateTruncatedTitles({ ctx, store, logger }).catch((error) => {
+      logger.warn('supermemory: title migration failed: ' + String(error).slice(0, 160))
+    })
     // D: a dispatch that died before it could relay (crash/reload between settle and
     // deliver) is backfilled here; open dispatches wait for the periodic sweep.
     void settleInterruptedDispatches(
@@ -480,10 +489,14 @@ export async function apply(ctx: Context, config: Config) {
     ).catch(() => { /* startup backfill is best-effort */ })
   }
 
-  // D5: idle branch release sweep (never releases the hub; never with pending outbox).
+  // D5 + E: idle branch sweep. 只摘除插件侧 handle——分支会话保留、可续接
+  // （acquireBranch 的 live→resume 与 memory_resume 都依赖它），绝不调用
+  // handle.dispose()；同一轮里做投递自愈、中断巡检与中断清单主动触达。
   if (store) {
     const releaseStore = store
     const observeConfig = { enabled: config.observe.enabled, maxTokensPolicy: config.observe.maxTokensPolicy, interruptAfterMs: config.observe.interruptAfterMs }
+    // E: 每个 hub 的中断清单通知签名去重（清单变化才再通知，不刷屏）。
+    const noticeState: NotifyState = { signatures: new Map() }
     const timer = setInterval(() => {
       try {
         // Self-healing delivery: re-send relays that were stranded while the hub
@@ -494,18 +507,23 @@ export async function apply(ctx: Context, config: Config) {
         // timeout sweep is the only thing that turns silence into a relay.
         void settleInterruptedDispatches({ ctx, store: releaseStore, config: observeConfig, logger }, { timeoutMs: config.observe.interruptAfterMs })
           .catch(() => { /* interrupt sweep is best-effort */ })
-        const now = Date.now()
-        for (const sessionId of releasableBranches(releaseStore, now, config.dispatch.idleReleaseMs)) {
-          const handle = branchHandles.get(sessionId)
-          if (!handle) continue
-          void handle.dispose().then(() => {
-            branchHandles.delete(sessionId)
-            logger.info(`supermemory: released idle branch ${sessionId.slice(0, 13)}`)
-          }).catch(() => { /* release is best-effort */ })
-        }
+        // E: preserve branch sessions — release the plugin-side handle only.
+        detachIdleBranches(releaseStore, Date.now(), config.dispatch.idleReleaseMs, logger)
+        // E: 巡检后把（新的）中断清单推给 hub；签名去重，hub 不在线则 outbox 自愈重投。
+        void notifyInterruptedDispatches({ ctx, store: releaseStore, config: observeConfig, logger }, { state: noticeState })
+          .catch(() => { /* interrupted notice is best-effort */ })
       } catch { /* sweep is best-effort */ }
     }, 300000)
     ctx.effect(() => () => clearInterval(timer), 'supermemory: release-sweep')
+
+    // E: 恢复后主动检查被中断任务（需求：用户决定续跑）。等启动对账三路径跑完
+    // （约 10s）再出清单，否则刚被对账判死的派发还没进台账；hub 不在线时由上面
+    // 的巡检补投（outbox pending + flushObserve 自愈）。
+    const noticeTimer = setTimeout(() => {
+      void notifyInterruptedDispatches({ ctx, store: releaseStore, config: observeConfig, logger }, { state: noticeState })
+        .catch(() => { /* startup notice is best-effort */ })
+    }, 10000)
+    ctx.effect(() => () => clearTimeout(noticeTimer), 'supermemory: resume-notice')
 
     // D: disposing the plugin (reload/disable) kills live branch handles, so the
     // hub must learn about it instead of waiting forever for a turn/end.

@@ -27,16 +27,19 @@ import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tag
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import type { Dispatch, Episode, FileMapEntry, Memory, OutboxItem, Requirement, Routing, Signal, ToolMemory, TopicSet } from './schema.ts'
 import { createTopicSet, setRouting, touchTopicSet } from './topicsets.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { listHubSessions } from './hub-sessions.ts'
 import { listWorkspaceBranches } from './hub-branches.ts'
+import {
+  bumpCompositeUse, deleteCompositeTool, editCompositeTool, registerCapability,
+  runCapability, type CompositeSpec,
+} from './composite.ts'
 
 /** Route prefix owned by this module (a host web-server named prefix route). */
 const PREFIX = '/supermemory'
 /** Hard cap for JSON request bodies. */
 const MAX_BODY_BYTES = 1024 * 1024
-/** Title cap, mirroring `/memory new`. */
-const MAX_TITLE = 40
 
 export interface WebuiConfig {
   enabled: boolean
@@ -412,7 +415,7 @@ async function handleApi(
       const title = text(body.title)
       if (!title) return fail('title 不能为空')
       const id = await createTopicSet(store, {
-        workspaceKey: ws, title: title.slice(0, MAX_TITLE),
+        workspaceKey: ws, title: clipEllipsis(title.trim(), TOPIC_SET_TITLE_MAX_CHARS),
         summary: text(body.summary) || undefined,
         keywords: list(body.keywords),
       })
@@ -440,7 +443,7 @@ async function handleApi(
       const status = body.status === 'active' || body.status === 'archived' ? body.status : undefined
       await store.topicsets.update(id, (r) => ({
         ...r,
-        ...(title ? { title: title.slice(0, MAX_TITLE) } : {}),
+        ...(title ? { title: clipEllipsis(title.trim(), TOPIC_SET_TITLE_MAX_CHARS) } : {}),
         ...(body.summary !== undefined ? { summary: text(body.summary) } : {}),
         ...(body.keywords !== undefined ? { keywords: list(body.keywords) } : {}),
         ...(status ? { status } : {}),
@@ -549,6 +552,72 @@ async function handleApi(
       await store.topicsets.delete(id)
       logger.info(`supermemory: webui deleted topic set ${id} (episodes ${episodes}, dispatches ${dispatchIds.size}, outbox ${outbox}, routing ${routing})`)
       return sendJson(res, 200, { ok: true, episodes, dispatches: dispatchIds.size, outbox, routing })
+    }
+    // ---- R22 能力（capability）：注册 / 一键执行 / 启用停用 / 删除 ----
+    case 'tool/register': {
+      if (!ctx) return fail('宿主上下文不可用，无法注册能力。')
+      const result = await registerCapability(ctx, store, {
+        name: text(body.name),
+        title: text(body.title) || undefined,
+        description: text(body.description),
+        entry: text(body.entry),
+        doc: text(body.doc) || undefined,
+        scope: text(body.scope) || undefined,
+        runnable: body.runnable === undefined ? undefined : Boolean(body.runnable),
+        dryRunArg: text(body.dryRunArg) || undefined,
+        writeConfirm: body.writeConfirm === undefined ? undefined : Boolean(body.writeConfirm),
+        tags: list(body.tags),
+      }, ws)
+      if (result.status === 'error') return fail(result.message)
+      logger.info(`supermemory: webui registered capability ${result.name}`)
+      return sendJson(res, 200, { ok: true, id: result.id, name: result.name, message: result.message })
+    }
+    case 'tool/run': {
+      const id = text(body.id)
+      const record = store.toolMemory.get(id)
+      if (!record || record.kind !== 'composite' || !record.entry) return fail('组合工具不存在')
+      // 工作区隔离：能力记录按适用范围落到工作区。
+      if (record.workspaceKey && record.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      let spec: CompositeSpec
+      try {
+        spec = JSON.parse(record.entry) as CompositeSpec
+      } catch {
+        return fail('工具定义损坏，无法执行')
+      }
+      if (spec.kind !== 'capability' || !spec.entry) return fail('只有能力（capability）可以一键执行；序列组合工具请直接调用')
+      const result = runCapability(spec, {
+        ...(body.dryRun === undefined ? {} : { dryRun: Boolean(body.dryRun) }),
+        ...(body.confirm === undefined ? {} : { confirm: Boolean(body.confirm) }),
+      })
+      // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
+      if (result.status !== 'needs-confirm') bumpCompositeUse(store, spec.name)
+      logger.info(`supermemory: webui ran capability ${spec.name} (${result.status}, exit ${result.exitCode ?? '-'})`)
+      // needs-confirm 也返回 200：前端据此弹二次确认框，再带 confirm=true 重试。
+      return sendJson(res, 200, { ok: true, ...result })
+    }
+    case 'tool/status': {
+      if (!ctx) return fail('宿主上下文不可用，无法修改工具状态。')
+      const id = text(body.id)
+      const status = body.status === 'active' || body.status === 'retired' ? body.status : undefined
+      if (!status) return fail('status 必须是 active 或 retired')
+      const existing = store.toolMemory.get(id)
+      if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
+      if (existing.workspaceKey && existing.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      const result = await editCompositeTool(ctx, store, id, { status })
+      if (result.status === 'error') return fail(result.message)
+      logger.info(`supermemory: webui tool ${id} -> ${status}`)
+      return sendJson(res, 200, { ok: true })
+    }
+    case 'tool/delete': {
+      if (!ctx) return fail('宿主上下文不可用，无法删除工具。')
+      const id = text(body.id)
+      const existing = store.toolMemory.get(id)
+      if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
+      if (existing.workspaceKey && existing.workspaceKey !== ws) return fail('工具不属于当前工作区')
+      const result = await deleteCompositeTool(ctx, store, id)
+      if (result.status === 'error') return fail(result.message)
+      logger.info(`supermemory: webui deleted tool ${id}`)
+      return sendJson(res, 200, { ok: true })
     }
     default:
       return sendJson(res, 404, { ok: false, error: `unknown api route: ${route}` })

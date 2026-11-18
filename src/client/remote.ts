@@ -64,6 +64,8 @@ export const PANEL_REMOTE = Object.freeze({
     method('listTools', []),
     method('editTool', [param('id'), param('patch')]),
     method('deleteTool', [param('id')]),
+    // R22: 一键执行能力（默认预演；writeConfirm 能力需 options.confirm=true）。
+    method('runTool', [param('id'), param('options', true)]),
     method('sessionBadge', [param('sessionId')]),
   ]),
 })

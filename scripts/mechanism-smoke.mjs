@@ -32,6 +32,11 @@ const {
   planAutoToolize, longestPrefixMatch, pickCompositeMatch, catalogFor, renderCatalog,
   repeatedWindow, autoToolizeFromSequence, sweepAutoToolize,
 } = await import('../src/toolize.ts')
+// R22 能力（capability）：数据模型 / 执行安全闸 / 注册-持久化-重建 / 面板一键执行。
+const {
+  buildCapabilitySpec, capabilityToolName, isValidCapabilityName, runCapability,
+  registerCapability, capabilityRecordsOf, rebuildComposites, persistComposite,
+} = await import('../src/composite.ts')
 
 const repeat = { enabled: true, everySteps: 3, maxCardsPerRequest: 4, maxCharsPerRequest: 6000, dedupe: true, hotSignal: true }
 const toolize = { enabled: true, threshold: 3, cooldownMs: 60000, maxActive: 8, minSteps: 2, minDistinctTools: 2, nearMissHint: true, recycleIdleDays: 0 }
@@ -234,11 +239,14 @@ const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, apply
   assert.equal(title.startsWith('导出功能 · '), true, 'title must join topic and task')
   assert.equal(title.includes('##'), false, 'heading markup must be stripped')
   assert.equal(title.includes('**'), false, 'emphasis markup must be stripped')
-  assert.equal(Array.from(title).length <= 40, true, 'title must stay within 40 chars')
-  assert.equal(Array.from(sessionTitleFor('', '一'.repeat(60))).length, 16, 'task snippet is capped at 16 chars')
+  assert.equal(Array.from(title).length <= 80, true, 'title must stay within 80 chars')
+  const longSnippet = sessionTitleFor('', '一'.repeat(60))
+  assert.equal(Array.from(longSnippet).length, 48, 'a 60-char task is clipped to the 48-char snippet budget')
+  assert.equal(longSnippet.endsWith('…'), true, 'the clipped snippet is marked with an ellipsis')
+  assert.equal(sessionTitleFor('', '修'.repeat(40)), '修'.repeat(40), 'a 40-char task is shown whole')
   assert.equal(sessionTitleFor('', ''), '新会话', 'empty input falls back to a readable default')
   assert.equal(cleanTitleText('- [ ] 待办事项'), '待办事项', 'task box and bullet stripped')
-  ok('C1 命名规则：去标记 / 首行截断 16 / 总长 40 / 空任务兜底')
+  ok('C1 命名规则：去标记 / 任务≤48 字完整展示、超长省略号 / 总长 80 / 空任务兜底')
 }
 
 {
@@ -247,7 +255,7 @@ const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, apply
   const third = sessionTitleFor('导出功能', '修复导出', [first, second])
   assert.equal(second.endsWith('（2）'), true, 'a duplicate appends an ordinal')
   assert.equal(third.endsWith('（3）'), true, 'the ordinal keeps counting')
-  assert.equal(Array.from(second).length <= 40, true, 'the ordinal never overflows the cap')
+  assert.equal(Array.from(second).length <= 80, true, 'the ordinal never overflows the cap')
   ok('C2 去重：同话题集重名追加序号且不超长')
 }
 
@@ -277,6 +285,143 @@ const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, apply
   assert.equal(calls[calls.length - 1][1].source.kind, 'user')
   assert.equal(applySessionTitle({ sessions: { get: () => undefined } }, 's', 'x', logger), 'none')
   ok('C4 宿主命名优先；无服务时回退 session/title 日志事件；已有标题不覆盖')
+}
+
+// ---- title migration: repair rows damaged by the legacy truncation ----
+const { planTitlesMigration, applyPlanToStore, migrateTruncatedTitles, renderTitlesMigrationReport, TITLES_MIGRATION_VERSION } = await import('../src/title-migration.ts')
+const { clipEllipsis, firstLine } = await import('../src/title.ts')
+
+const tsRow = (over = {}) => ({ workspaceKey: 'ws', title: '', summary: '', keywords: [], status: 'active', members: [], shapeFingerprint: '', shapeGeneratedAt: 0, createdAt: now, updatedAt: now, lastActiveAt: now, ...over })
+const dspRow = (over = {}) => ({ topicSetId: 'ts-1', branchSessionId: 'b-1', task: '任务', hubSessionId: 'hub', startSeq: 0, status: 'delivered', createdAt: now, updatedAt: now, ...over })
+const memberRow = (sessionId, title, over = {}) => ({ sessionId, kind: 'root', title, summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now, ...over })
+
+{
+  // T1: a topic-set title still cut at 12 chars by the dispatch auto-create,
+  // and a member title still carrying the 16-char task snippet: both are
+  // rebuilt from the dispatch's full task text.
+  const task = '修复 SuperMemory 插件（工作区 G:/09 - dsh/SuperMemory）中「话题集标题」和「分支会话标题」被过度截断的问题。用户反馈：这两类标题都有被截断的情况，需要修复。'
+  const store = {
+    topicsets: table([['ts-1', tsRow({ title: task.slice(0, 12), members: [memberRow('b-1', task.slice(0, 12) + ' · ' + task.slice(0, 16))] })]]),
+    dispatches: table([['dsp-1', dspRow({ task })]]),
+    meta: table(),
+  }
+  const plan = planTitlesMigration(store)
+  assert.equal(plan.topicSetsTotal, 1)
+  assert.equal(plan.membersTotal, 1)
+  assert.equal(plan.topicSets.length, 1, 'the 12-cut topic title is recoverable from its dispatch')
+  assert.equal(plan.topicSets[0].from, task.slice(0, 12))
+  assert.equal(plan.topicSets[0].to, clipEllipsis(firstLine(cleanTitleText(task)), 60))
+  assert.equal(plan.members.length, 1, 'the 16-char snippet member title is refreshed')
+  assert.equal(plan.members[0].to, sessionTitleFor(plan.topicSets[0].to, task, []))
+  assert.ok(plan.members[0].to.includes(' · '), 'the member title keeps the topic · task shape')
+  assert.ok(Array.from(plan.members[0].to).length <= 80, 'the refreshed title respects the 80-char cap')
+  await applyPlanToStore(store, plan)
+  assert.equal(store.topicsets.get('ts-1').title, plan.topicSets[0].to)
+  assert.equal(store.topicsets.get('ts-1').members[0].title, plan.members[0].to)
+  assert.equal(planTitlesMigration(store).members.length, 0, 'a second plan over the same store is empty')
+  ok('T1 旧 12 字话题集标题 + 16 字成员标题 → 按派发任务全文重算（60/48/80），二次规划为空')
+}
+
+{
+  // T2: without a dispatch row there is no source text: the damaged title is
+  // reported and left untouched; model-regenerated and natural titles stay.
+  const store = {
+    topicsets: table([
+      ['ts-cut', tsRow({ title: '我在dsh的插件中看不到' })],
+      ['ts-model', tsRow({ title: '【任务】把 SuperM 相关事项推进（目标与范围待补全）', shapeGeneratedAt: now })],
+      ['ts-natural', tsRow({ title: '命名验证' })],
+    ]),
+    dispatches: table(),
+    meta: table(),
+  }
+  const plan = planTitlesMigration(store)
+  assert.equal(plan.topicSets.length, 0, 'nothing is recoverable without a dispatch source')
+  assert.equal(plan.topicSetsTotal, 3)
+  assert.equal(plan.unrecoverable.length, 1, 'the 12-cut title without a source is reported, not touched')
+  assert.equal(plan.unrecoverable[0].topicSetId, 'ts-cut')
+  assert.equal(plan.unrecoverable[0].title, '我在dsh的插件中看不到')
+  ok('T2 无派发源的 12 字标题：保持不动并计入不可恢复；模型/自然标题不动')
+}
+
+{
+  // T3: a member with no dispatch row is refreshed only when its title IS the
+  // old topic-set title (a panel-created root session); a hand-edited title
+  // and a bare legacy snippet without a source are never guessed.
+  const store = {
+    topicsets: table([['ts-1', tsRow({ title: '同步并提交 SuperM', members: [
+      memberRow('session-1', '同步并提交 SuperM', { status: 'live' }),
+      memberRow('session-2', '手改的标题', { status: 'live' }),
+    ] })]]),
+    dispatches: table([['dsp-1', dspRow({ task: '同步并提交 SuperMemory 仓库的 Git。' })]]),
+    meta: table(),
+  }
+  const plan = planTitlesMigration(store)
+  assert.equal(plan.topicSets.length, 1, 'the topic title is recovered from the dispatch')
+  assert.equal(plan.members.length, 1, 'only the member echoing the old topic title is refreshed')
+  assert.equal(plan.members[0].sessionId, 'session-1')
+  assert.equal(plan.members[0].to, '同步并提交 SuperMemory 仓库的 Git。')
+  assert.equal(plan.unrecoverable.length, 0, 'a short hand-edited title is not misreported')
+  ok('T3 无派发记录的成员：仅「等于旧话题集标题」的根会话被刷新，手改标题不动')
+}
+
+{
+  // T4: two members of one set sharing a task keep the ordinal suffix, and a
+  // legacy bare snippet without a dispatch row is reported unrecoverable.
+  const task = '终验任务：请直接回复一行文字：终验分支确认。不要调用任何工具。'
+  const oldTitle = task.slice(0, 12) + ' · ' + task.slice(0, 16)
+  const store = {
+    topicsets: table([['ts-1', tsRow({ title: task.slice(0, 12), members: [
+      memberRow('b-1', oldTitle),
+      memberRow('b-2', oldTitle),
+      memberRow('b-3', '这是一个派发链路验证任务。请直接'),
+    ] })]]),
+    dispatches: table([
+      ['dsp-1', dspRow({ branchSessionId: 'b-1', task })],
+      ['dsp-2', dspRow({ branchSessionId: 'b-2', task, createdAt: now + 1 })],
+    ]),
+    meta: table(),
+  }
+  const plan = planTitlesMigration(store)
+  assert.equal(plan.members.length, 2, 'both dispatched members are refreshed')
+  assert.equal(plan.members[0].to.endsWith('（2）'), false)
+  assert.equal(plan.members[1].to.endsWith('（2）'), true, 'the duplicate title gets the ordinal suffix')
+  assert.equal(plan.unrecoverable.length, 1, 'the bare 16-char snippet without a dispatch is reported')
+  assert.equal(plan.unrecoverable[0].sessionId, 'b-3')
+  await applyPlanToStore(store, plan)
+  assert.equal(planTitlesMigration(store).members.length, 0, 'a second plan is empty (idempotent)')
+  ok('T4 同任务重名追加（2）；无源 16 字片段计入不可恢复；二次规划为空')
+}
+
+{
+  // T5: the startup pass is marker-guarded; the manual pass re-plans but finds
+  // nothing left; dry-run writes nothing; the report renders every bucket.
+  const task = '命名验证：直接回复一行文字「命名分支确认」，不要调用任何工具。'
+  const store = {
+    topicsets: table([['ts-1', tsRow({ title: task.slice(0, 12), members: [memberRow('b-1', task.slice(0, 12) + ' · ' + task.slice(0, 16))] })]]),
+    dispatches: table([['dsp-1', dspRow({ task })]]),
+    meta: table(),
+  }
+  const deps = { ctx: { sessions: { get: () => undefined } }, store, logger }
+  const preview = await migrateTruncatedTitles(deps, { dryRun: true, ignoreMarker: true })
+  assert.equal(preview.status, 'planned')
+  assert.equal(preview.members.length, 1)
+  assert.equal(store.topicsets.get('ts-1').title, task.slice(0, 12), 'dry-run must not write the store')
+  assert.equal(store.meta.size, 0, 'dry-run must not write the marker')
+  const applied = await migrateTruncatedTitles(deps)
+  assert.equal(applied.status, 'applied')
+  assert.equal(applied.applied.topicSets, 1)
+  assert.equal(applied.applied.members, 1)
+  assert.equal(applied.applied.hostRenamed, 0, 'a dead session is store-only (no host rename faked)')
+  assert.equal(store.meta.get('titles').titlesMigrationVersion, TITLES_MIGRATION_VERSION)
+  const again = await migrateTruncatedTitles(deps)
+  assert.equal(again.status, 'already-done', 'the marker stops a restart from rescanning')
+  assert.equal(again.members.length, 0)
+  const manual = await migrateTruncatedTitles(deps, { ignoreMarker: true })
+  assert.equal(manual.status, 'applied', 'a manual re-scan applies (an empty plan is still a valid apply)')
+  assert.equal(manual.members.length + manual.topicSets.length, 0, 'a manual re-scan after the repair finds nothing')
+  const report = renderTitlesMigrationReport(applied)
+  assert.ok(report.includes('标题补正刷新') && report.includes('分支成员标题') && report.includes('宿主会话改名'), 'the report renders the applied buckets')
+  ok('T5 启动迁移有标记幂等；dry-run 不写库；手动重扫空跑；报告渲染各Bucket')
 }
 
 // ---- requirement D: interrupted settlement (abort / timeout / reload) ----
@@ -1337,6 +1482,439 @@ const { groupRelayText } = await import('../src/group.ts')
   assert.match(groupRow[1].payload, /\[supermemory-group-relay grp-i\]/)
   assert.match(groupRow[1].payload, /中断终态/, 'the queued group relay carries the interruption annotation')
   ok('R19-协同1b 中断成员：interrupted 纳入组终态，整组汇总立即收敛且中断单独标注')
+}
+
+
+// ---- R21: the relay must deliver the branch's WHOLE answer ----
+// Regression (2026-11-18): the relay body used to be built from the episode's
+// 400-char `summary`, so the hub silently lost most of every branch result.
+{
+  const { episodeResult, clipRelayResult, RELAY_RESULT_MAX_CHARS } = await import('../src/relay-text.ts')
+  const { groupEpisodeSummaries, groupRelayText } = await import('../src/group.ts')
+
+  // the full answer wins; the short summary is a fallback, never the source
+  assert.equal(episodeResult({ result: '完整答案', summary: '短梗概' }), '完整答案')
+  assert.equal(episodeResult({ result: '', summary: '旧记录的短梗概' }), '旧记录的短梗概', 'episodes written before result fall back to summary')
+  assert.equal(episodeResult(undefined), '')
+  ok('R21-1 episodeResult：relay 取完整 result，旧记录回退 summary')
+
+  // a normal-length answer passes through untouched: the 400-char clip is gone
+  const long = '重'.repeat(5000)
+  assert.equal(clipRelayResult(long, 'br-1'), long, 'a 5000-char answer is delivered whole')
+  assert.equal(clipRelayResult('短', 'br-1'), '短')
+  // only a runaway turn is clipped, and the marker says so instead of cutting silently
+  const clipped = clipRelayResult('x'.repeat(RELAY_RESULT_MAX_CHARS + 10), 'br-9')
+  assert.ok(clipped.includes('已截断') && clipped.includes('br-9'), 'an oversized answer is clipped with an explicit marker')
+  ok('R21-2 clipRelayResult：正常长度原样送达，超长才截断且明确标注')
+
+  // the group relay carries the full result of every delivered member
+  const stamp = Date.now()
+  const store = fakeStore({
+    dispatches: [
+      ['d-r', { topicSetId: 'ts-r', branchSessionId: 'br-r', task: '修复 relay 截断', hubSessionId: 'hub-1', startSeq: 0, status: 'delivered', groupId: 'grp-r', createdAt: stamp, updatedAt: stamp }],
+    ],
+    episodes: [
+      ['epi-r', { topicSetId: 'ts-r', branchSessionId: 'br-r', timeStart: stamp, timeEnd: stamp, summary: '只有前 400 字的梗概', result: '分支的完整最终答案：' + '细节'.repeat(300), decisions: [], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'br-r', sourceSeqStart: 0, sourceSeqEnd: 1 }],
+    ],
+  })
+  const results = groupEpisodeSummaries(store, 'grp-r')
+  assert.equal(results.get('br-r'), store.episodes.get('epi-r').result, 'the group relay reads the full result, not the 400-char summary')
+  assert.ok(results.get('br-r').length > 400, 'a long answer survives the group path')
+  const relay = groupRelayText(store, 'grp-r', results)
+  assert.ok(relay.includes('分支的完整最终答案'), 'the group relay text carries the full answer')
+  assert.ok(!relay.includes('只有前 400 字的梗概'), 'the short summary is not what the hub receives')
+  ok('R21-3 组 relay：送达完整 result 而非 400 字梗概')
+}
+
+// ---- R22 能力（capability）：流程固化为受管能力，可一键执行 ----
+// 序列组合工具回答"按什么顺序调哪些工具"；能力回答"这件事现在怎么做"——
+// 入口命令 + 文档 + 适用范围 + 路由描述，落库后可被模型与管理台一键执行
+// （默认预演，写操作二次确认）。
+{
+  assert.equal(isValidCapabilityName('git-sync-supermemory'), true)
+  assert.equal(isValidCapabilityName('bad name'), false)
+  assert.equal(isValidCapabilityName(''), false)
+  assert.equal(isValidCapabilityName('-lead'), false)
+  assert.equal(capabilityToolName('git-sync-supermemory'), 'sm_composite_git_sync_supermemory')
+  const built = buildCapabilitySpec({
+    name: 'git-sync-supermemory',
+    title: 'git 同步/提交/推送（SuperMemory 仓库）',
+    description: '本仓库 git 同步/提交/推送的固化流程：先判断工作区，再走入口命令。',
+    entry: 'pnpm git:sync',
+    doc: 'docs/git-sync.md',
+    scope: 'G:\\09 - dsh\\SuperMemory',
+    runnable: true,
+    dryRunArg: '--dry-run',
+    writeConfirm: true,
+    tags: ['git', '同步', '推送', '流程固化'],
+  })
+  assert.equal(built.status, 'ok')
+  assert.equal(built.spec.kind, 'capability')
+  assert.equal(built.spec.name, 'sm_composite_git_sync_supermemory')
+  assert.equal(built.spec.entry, 'pnpm git:sync')
+  assert.equal(built.spec.doc, 'docs/git-sync.md')
+  assert.equal(built.spec.scope, 'G:\\09 - dsh\\SuperMemory')
+  assert.equal(built.spec.runnable, true)
+  assert.equal(built.spec.dryRunArg, '--dry-run')
+  assert.equal(built.spec.writeConfirm, true)
+  assert.deepEqual(built.spec.tags, ['git', '同步', '推送', '流程固化'])
+  assert.deepEqual(built.spec.steps, [], 'a capability carries no steps')
+  assert.equal(buildCapabilitySpec({ name: 'x', description: 'd', entry: '' }).status, 'error', 'entry is required')
+  assert.equal(buildCapabilitySpec({ name: 'x', description: '', entry: 'pnpm git:sync' }).status, 'error', 'description is required')
+  assert.equal(buildCapabilitySpec({ name: 'bad name', description: 'd', entry: 'e' }).status, 'error', 'the name must be a legal slug')
+  assert.equal(buildCapabilitySpec({ name: 'x', description: 'd', entry: 'e' }).spec.runnable, true, 'runnable defaults to true')
+  ok('K1 能力数据模型：命名规则/字段默认值/缺 entry 缺描述非法名均拒绝')
+}
+
+{
+  const spec = {
+    name: 'sm_composite_cap_echo', kind: 'capability', description: 'd',
+    entry: 'echo capability-dry-run-marker', steps: [], parameters: [],
+    runnable: true, dryRunArg: '--dry-run',
+  }
+  const r = runCapability(spec, {})
+  assert.equal(r.status, 'completed', 'echo must succeed: ' + r.summary)
+  assert.equal(r.exitCode, 0)
+  assert.equal(r.dryRun, true, 'a defined dryRunArg makes dry-run the default')
+  assert.ok(r.stdout.includes('capability-dry-run-marker'), 'stdout is captured')
+  assert.equal(r.command, 'echo capability-dry-run-marker --dry-run')
+  assert.ok(r.durationMs >= 0)
+  ok('K2 能力执行（dry-run 默认）：捕获 stdout/退出码/耗时，命令自动附加预演参数')
+}
+
+{
+  // 写操作闸门：无 confirm 拒绝执行且不跑命令；confirm=true 才真跑。
+  const writeSpec = {
+    name: 'sm_composite_gate_test', kind: 'capability', description: 'd',
+    entry: 'echo gate-should-not-run', steps: [], parameters: [],
+    runnable: true, writeConfirm: true,
+  }
+  const blocked = runCapability(writeSpec, {})
+  assert.equal(blocked.status, 'needs-confirm', 'a write capability without confirm must be refused')
+  assert.equal(blocked.stdout, '', 'nothing may be executed')
+  assert.equal(blocked.dryRun, false)
+  const allowed = runCapability(writeSpec, { confirm: true })
+  assert.equal(allowed.status, 'completed')
+  assert.ok(allowed.stdout.includes('gate-should-not-run'), 'confirm=true really runs it')
+  assert.equal(allowed.dryRun, false)
+  // 预演缺省：定义了 dryRunArg 时默认预演，无需 confirm。
+  const dry = runCapability({ ...writeSpec, dryRunArg: '--dry-run' }, {})
+  assert.equal(dry.status, 'completed')
+  assert.equal(dry.dryRun, true)
+  assert.ok(dry.command.includes('--dry-run'), 'the dry-run arg is appended')
+  // 写操作能力没有预演参数时，预演必须拒绝——不能把真实命令当预演跑掉。
+  const noDry = runCapability(writeSpec, { dryRun: true })
+  assert.equal(noDry.status, 'failed')
+  assert.ok(noDry.summary.includes('无法预演'))
+  assert.equal(noDry.stdout, '', 'still nothing executed')
+  // runnable=false 直接拒绝；非能力定义拒绝。
+  const off = runCapability({ ...writeSpec, runnable: false }, { confirm: true })
+  assert.equal(off.status, 'failed')
+  assert.ok(off.summary.includes('未开放执行'))
+  assert.equal(runCapability({ name: 'x', description: 'd', steps: [], parameters: [] }).status, 'failed')
+  ok('K3 执行安全闸：写操作需 confirm、默认预演、无预演参数拒绝预演、未开放执行拒绝')
+}
+
+{
+  // 注册 → 持久化 → 重启重建拾取 → 同名更新（不重复建行）→ 宿主冲突拒绝。
+  const registered = []
+  const store = fakeStore()
+  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
+  const deps = {
+    register: async (c, s, spec) => { registered.push(spec.name); return () => {} },
+    persist: persistComposite,
+    toolExists: () => false,
+  }
+  const seed = {
+    name: 'git-sync-supermemory',
+    title: 'git 同步/提交/推送（SuperMemory 仓库）',
+    description: '本仓库 git 同步/提交/推送的固化流程。',
+    entry: 'pnpm git:sync',
+    doc: 'docs/git-sync.md',
+    scope: 'G:\\09 - dsh\\SuperMemory',
+    runnable: true,
+    dryRunArg: '--dry-run',
+    writeConfirm: true,
+    tags: ['git', '同步'],
+  }
+  const first = await registerCapability(ctx, store, seed, 'ws-cap', deps)
+  assert.equal(first.status, 'ok', 'register must succeed: ' + first.message)
+  assert.equal(first.name, 'sm_composite_git_sync_supermemory')
+  assert.equal(store.toolMemory.size, 1, 'the capability must be persisted')
+  const [, row] = [...store.toolMemory.entries()][0]
+  assert.equal(row.kind, 'composite', 'the row stays kind=composite (domain schema unchanged)')
+  assert.equal(row.workspaceKey, 'ws-cap', 'the capability is scoped to its workspace')
+  const spec = JSON.parse(row.entry)
+  assert.equal(spec.kind, 'capability')
+  assert.equal(spec.entry, 'pnpm git:sync')
+  assert.equal(spec.writeConfirm, true)
+  assert.deepEqual(registered, ['sm_composite_git_sync_supermemory'], 'the live tool is registered once')
+  // 重启：rebuildComposites 必须拾取能力记录。
+  const rebuilt = []
+  const count = await rebuildComposites(ctx, store, { register: async (c, s, sp) => { rebuilt.push(sp); return () => {} } })
+  assert.equal(count, 1)
+  assert.equal(rebuilt[0].kind, 'capability', 'rebuild picks up the capability')
+  assert.equal(rebuilt[0].name, 'sm_composite_git_sync_supermemory')
+  // 重注册同名能力 = 原地更新。
+  const again = await registerCapability(ctx, store, { ...seed, description: '更新后的路由描述' }, 'ws-cap', deps)
+  assert.equal(again.status, 'ok')
+  assert.equal(store.toolMemory.size, 1, 're-registering the same name updates in place')
+  assert.equal(JSON.parse([...store.toolMemory.entries()][0][1].entry).description, '更新后的路由描述')
+  // 与宿主既有工具冲突 → 拒绝（且不落库）。用默认 deps，让冲突检查走
+  // ctx.tools.get 这条真实路径（注入缝的 toolExists 恒 false，测不到冲突）。
+  const clashCtx = { tools: { register: () => () => {}, get: (n) => (n === 'sm_composite_other_cap' ? {} : undefined) } }
+  const clash = await registerCapability(clashCtx, store, { ...seed, name: 'other-cap' }, 'ws-cap')
+  assert.equal(clash.status, 'error')
+  assert.ok(clash.message.includes('已被占用'))
+  assert.equal(store.toolMemory.size, 1, 'a refused register persists nothing')
+  // capabilityRecordsOf 列出能力（供 memory_toolize list / 控制台）。
+  const caps = capabilityRecordsOf(store)
+  assert.equal(caps.length, 1)
+  assert.equal(caps[0].spec.entry, 'pnpm git:sync')
+  assert.equal(caps[0].useCount, 0)
+  ok('K4 能力注册→持久化→重启重建拾取→同名原地更新→宿主冲突拒绝→列表')
+}
+
+{
+  // 面板 runTool：能力可跑且计数、needs-confirm 不计数、序列工具拒绝一键执行。
+  const capSpec = {
+    name: 'sm_composite_panel_cap', kind: 'capability', description: '面板执行冒烟', title: '面板能力',
+    entry: 'echo panel-capability-ok', steps: [], parameters: [], runnable: true, dryRunArg: '--dry-run',
+  }
+  const store = fakeStore({ toolMemory: [['tm-cap', {
+    kind: 'composite', workspaceKey: 'ws', title: '面板能力', tags: ['git'], trigger: 'capability/x',
+    description: '面板执行冒烟', entry: JSON.stringify(capSpec), useCount: 0, status: 'active',
+  }]] })
+  const service = new SupermemoryPanelService(store, serviceCtx())
+  const views = service.listTools()
+  assert.equal(views[0].kind, 'capability', 'listTools exposes the capability kind')
+  assert.equal(views[0].entry, 'echo panel-capability-ok')
+  assert.equal(views[0].dryRunArg, '--dry-run')
+  const r = await service.runTool('tm-cap')
+  assert.equal(r.status, 'completed')
+  assert.ok(r.stdout.includes('panel-capability-ok'))
+  assert.equal(r.dryRun, true)
+  assert.equal(store.toolMemory.get('tm-cap').useCount, 1, 'a real run bumps the durable counter')
+  const wstore = fakeStore({ toolMemory: [['tm-w', {
+    kind: 'composite', title: '写能力', tags: [], trigger: '', description: 'd',
+    entry: JSON.stringify({ ...capSpec, name: 'sm_composite_panel_w', writeConfirm: true }), useCount: 0, status: 'active',
+  }]] })
+  const wservice = new SupermemoryPanelService(wstore, serviceCtx())
+  // 预演缺省仍在（dryRunArg 已定义）：直接调用是预演，不计确认流程。
+  const dryFirst = await wservice.runTool('tm-w')
+  assert.equal(dryFirst.status, 'completed')
+  assert.equal(dryFirst.dryRun, true)
+  assert.equal(wstore.toolMemory.get('tm-w').useCount, 1)
+  // 显式要求实跑（dryRun:false）但没有 confirm → needs-confirm，不执行。
+  const blocked = await wservice.runTool('tm-w', { dryRun: false })
+  assert.equal(blocked.status, 'needs-confirm')
+  assert.equal(wstore.toolMemory.get('tm-w').useCount, 1, 'needs-confirm does not count as use')
+  // confirm=true = 确认真实执行（自动脱离预演缺省）。
+  const ran = await wservice.runTool('tm-w', { confirm: true })
+  assert.equal(ran.status, 'completed')
+  assert.equal(ran.dryRun, false, 'confirm=true really runs')
+  assert.equal(wstore.toolMemory.get('tm-w').useCount, 2)
+  const sstore = fakeStore({ toolMemory: [['tm-s', {
+    kind: 'composite', title: '序列', tags: [], trigger: '', description: 'd',
+    entry: JSON.stringify({ name: 'sm_composite_s', steps: [{ tool: 'read', arguments: {} }], parameters: [] }), useCount: 0, status: 'active',
+  }]] })
+  const seqResult = await new SupermemoryPanelService(sstore, serviceCtx()).runTool('tm-s')
+  assert.equal(seqResult.status, 'failed', 'a sequence composite is not one-click runnable')
+  ok('K5 面板执行：能力可跑且计数、needs-confirm 不计数、序列工具拒绝一键执行')
+}
+
+// ---- requirement E: interrupted dispatch preservation + resume ----
+// 插件被中断/关闭时分支会话保留（不 kill/abort/delete），恢复后扫描台账列出
+// 被中断任务，由用户决定续跑：优先续接被保留的分支会话，失败才带上下文重派发。
+const { listInterruptedDispatches, renderInterruptedList, resumeDispatch, isCutOffDispatch } = await import('../src/resume.ts')
+const { detachIdleBranches, releasableBranches, branchHandles } = await import('../src/dispatch.ts')
+
+{
+  // R1: dispose/清理路径不删除分支会话——空闲释放只摘除插件侧 handle，
+  // 不调用宿主 dispose（停 loop/关闭写句柄/注销 agent），会话与台账原样保留。
+  const store = fakeStore({
+    topicsets: [['ts-r1', {
+      workspaceKey: 'ws', title: 'TS-R1', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-r1', kind: 'root', title: '分支一', summary: '', status: 'idle', lastActiveAt: now - 7200000 }],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    }]],
+    dispatches: [['dsp-r1', { topicSetId: 'ts-r1', branchSessionId: 'branch-r1', task: '任务一', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now }]],
+  })
+  let disposeCalls = 0
+  branchHandles.set('branch-r1', { agent: { id: 'branch-r1' }, dispose: async () => { disposeCalls += 1 } })
+  const detached = detachIdleBranches(store, now, 1800000, logger)
+  assert.deepEqual(detached, ['branch-r1'], 'an idle branch handle is released')
+  assert.equal(disposeCalls, 0, 'idle release must NOT call the host dispose (branch session preserved)')
+  assert.equal(branchHandles.has('branch-r1'), false, 'the plugin-side handle is gone')
+  assert.equal(store.dispatches.get('dsp-r1').status, 'interrupted', 'the ledger row is untouched')
+  assert.deepEqual(releasableBranches(store, now, 1800000), [], 'a detached handle is not releasable twice')
+  ok('R1 保留分支会话：空闲释放只摘除 handle，绝不调用宿主 dispose')
+}
+
+{
+  // R2: 重启扫描列出被中断且未终态完成的派发（含已完成部分），
+  // 排除已交付 / 自主失败 / 在途 / 已被续跑接续的行；工作区过滤生效。
+  const stale = now - 3600000
+  const store = fakeStore({
+    topicsets: [['ts-r2', {
+      workspaceKey: 'ws', title: '话题甲', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'b-a', kind: 'root', title: '分支甲', summary: '', status: 'idle', lastActiveAt: stale }],
+      createdAt: stale, updatedAt: stale, lastActiveAt: stale,
+    }]],
+    dispatches: [
+      ['dsp-r2a', { topicSetId: 'ts-r2', branchSessionId: 'b-a', task: '任务甲', hubSessionId: 'hub-1', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: stale }],
+      ['dsp-r2b', { topicSetId: 'ts-r2', branchSessionId: 'b-b', task: '任务乙', hubSessionId: 'hub-1', startSeq: 0, status: 'failed', turnEndReason: 'aborted', createdAt: stale, updatedAt: stale }],
+      ['dsp-r2c', { topicSetId: 'ts-r2', branchSessionId: 'b-c', task: '任务丙', hubSessionId: 'hub-1', startSeq: 0, status: 'delivered', createdAt: stale, updatedAt: stale }],
+      ['dsp-r2d', { topicSetId: 'ts-r2', branchSessionId: 'b-d', task: '任务丁', hubSessionId: 'hub-1', startSeq: 0, status: 'dispatched', lastActivityAt: now - 1000, createdAt: stale, updatedAt: stale }],
+      ['dsp-r2e', { topicSetId: 'ts-r2', branchSessionId: 'b-e', task: '任务戊', hubSessionId: 'hub-1', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: stale, resumedBy: 'dsp-r2f' }],
+      ['dsp-r2f', { topicSetId: 'ts-r2', branchSessionId: 'b-e', task: '任务戊', hubSessionId: 'hub-1', startSeq: 0, status: 'dispatched', resumeOf: 'dsp-r2e', createdAt: stale, updatedAt: now - 1000 }],
+      ['dsp-r2g', { topicSetId: 'ts-r2', branchSessionId: 'b-g', task: '任务己', hubSessionId: 'hub-1', startSeq: 0, status: 'failed', turnEndReason: 'max-tokens', createdAt: stale, updatedAt: stale }],
+    ],
+    outbox: [['dlv-dsp-r2a', {
+      kind: 'single', dispatchId: 'dsp-r2a', status: 'relayed', enqueuedAt: stale,
+      payload: '[supermemory-relay b-a]\n任务：任务甲\n结果：分支中断（插件重载/卸载导致分支中断）。\n已完成部分：做完了前半段\n以上为失败事实，未伪装成答案。',
+    }]],
+  })
+  const views = listInterruptedDispatches(store, { now })
+  assert.deepEqual(views.map((v) => v.dispatchId), ['dsp-r2a', 'dsp-r2b'],
+    'interrupted + cut-off failed are listed; delivered / live / resumed-chain / honest-failure are not')
+  assert.equal(views[0].partial, '做完了前半段', 'the partial summary is surfaced from the interrupt relay')
+  assert.equal(views[0].topicSetTitle, '话题甲')
+  assert.equal(views[0].branchTitle, '分支甲')
+  assert.equal(isCutOffDispatch({ status: 'failed', turnEndReason: 'branch-died' }), true)
+  assert.equal(isCutOffDispatch({ status: 'failed', turnEndReason: 'max-tokens' }), false)
+  assert.deepEqual(listInterruptedDispatches(store, { now, workspaceKey: 'other-ws' }), [], 'workspace scope filters foreign sets')
+  const text = renderInterruptedList(views, now)
+  assert.ok(text.includes('dsp-r2a') && text.includes('memory_resume') && text.includes('1 小时前'), 'the rendered list names the id, the resume entry and the age')
+  ok('R2 重启扫描：列出被中断且未终态完成的派发（含已完成部分，排除已续跑/已交付/在途/自主失败）')
+}
+
+{
+  // R3: 续跑优先续接被保留的分支会话（live agent 直投，不 resume），
+  // 台账双向关联 resumeOf/resumedBy，relay 目标为调用方 hub。
+  const store = fakeStore({
+    topicsets: [['ts-r3', {
+      workspaceKey: 'ws', title: '话题甲', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-r3', kind: 'root', title: '分支甲', summary: '', status: 'idle', lastActiveAt: now }],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    }]],
+    dispatches: [['dsp-r3', { topicSetId: 'ts-r3', branchSessionId: 'branch-r3', task: '任务甲', hubSessionId: 'hub-1', startSeq: 5, status: 'interrupted', createdAt: now, updatedAt: now }]],
+  })
+  const follows = []
+  const agent = { id: 'branch-r3', followup: (message) => { follows.push(message) } }
+  const ctx = {
+    agents: {
+      get: (id) => (id === 'branch-r3' ? agent : undefined),
+      resume: async () => { throw new Error('a live agent must not be resumed again') },
+    },
+    sessions: { get: () => ({ seq: 42 }) },
+  }
+  const r = await resumeDispatch({ ctx, store, logger }, 'dsp-r3', {
+    exec: { agent: { id: 'hub-1', session: { header: { cwd: 'G:/ws' } } } },
+    createMessage: (input) => input,
+  })
+  assert.equal(r.status, 'resumed')
+  assert.equal(r.mode, 'continued', 'a live preserved branch is continued, not resumed')
+  assert.equal(r.branchSessionId, 'branch-r3')
+  assert.ok(r.newDispatchId)
+  assert.equal(follows.length, 1)
+  const row = store.dispatches.get(r.newDispatchId)
+  assert.equal(row.resumeOf, 'dsp-r3', 'the continuation links back to the interrupted dispatch')
+  assert.equal(row.status, 'dispatched')
+  assert.equal(row.hubSessionId, 'hub-1', 'the relay goes to the calling hub')
+  assert.equal(row.startSeq, 42)
+  assert.equal(store.dispatches.get('dsp-r3').resumedBy, r.newDispatchId, 'the original links forward')
+  const message = follows[0].content[0].text
+  assert.ok(message.includes('[supermemory-resume dsp-r3]'))
+  assert.ok(message.includes('原始任务：任务甲') && message.includes('已完成部分'), 'the wake message carries task + partial')
+  assert.equal(follows[0].source.form, 'instructions', 'the resume input is dispatch-owned (not recall/notice)')
+  ok('R3 续跑：优先续接被保留的分支会话（live 直投），台账双向关联')
+}
+
+{
+  // R4: 分支 agent 已不在注册表（重启/重载杀死）时，经 agents.resume 重连持久
+  // 会话后续投；句柄重新登记到 branchHandles。
+  const store = fakeStore({
+    topicsets: [['ts-r4', {
+      workspaceKey: 'ws', title: '话题甲', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-r4', kind: 'root', title: '分支甲', summary: '', status: 'idle', lastActiveAt: now }],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    }]],
+    dispatches: [['dsp-r4', { topicSetId: 'ts-r4', branchSessionId: 'branch-r4', task: '任务甲', hubSessionId: 'hub-1', startSeq: 5, status: 'interrupted', createdAt: now, updatedAt: now }]],
+  })
+  const follows = []
+  const agent = { id: 'branch-r4', followup: (message) => { follows.push(message) } }
+  let resumeCalls = 0
+  const ctx = {
+    agents: {
+      get: () => undefined,
+      resume: async (options) => {
+        resumeCalls += 1
+        assert.equal(options.resumeSessionId, 'branch-r4', 'the preserved session id is resumed')
+        return { agent, dispose: async () => {} }
+      },
+    },
+    sessions: { get: () => ({ seq: 7 }) },
+  }
+  const r = await resumeDispatch({ ctx, store, logger }, 'dsp-r4', {
+    exec: { agent: { id: 'hub-1', session: { header: { cwd: 'G:/ws' } } } },
+    createMessage: (input) => input,
+  })
+  assert.equal(r.status, 'resumed')
+  assert.equal(r.mode, 'continued')
+  assert.equal(resumeCalls, 1, 'a dead-but-persisted branch is reconnected through agents.resume')
+  assert.equal(follows.length, 1)
+  assert.equal(branchHandles.has('branch-r4'), true, 'the reconnected handle is registered again')
+  branchHandles.delete('branch-r4')
+  ok('R4 续跑：分支已死但会话保留 → agents.resume 重连后续投')
+}
+
+{
+  // R5: 会话彻底无法恢复时，带「原始任务 + 已完成部分」上下文重派发到新分支，
+  // 台账关联原 dispatchId；重派发失败如实报错。
+  const store = fakeStore({
+    dispatches: [['dsp-r5', { topicSetId: 'ts-r5', branchSessionId: 'b-r5', task: '任务戊', hubSessionId: 'hub-1', startSeq: 5, status: 'interrupted', createdAt: now, updatedAt: now }]],
+  })
+  const ctx = {
+    agents: { get: () => undefined, resume: async () => { throw new Error('session log gone') } },
+    sessions: { get: () => ({ seq: 0 }) },
+  }
+  let seen = null
+  const r = await resumeDispatch({ ctx, store, logger }, 'dsp-r5', {
+    exec: { agent: { id: 'hub-1', session: { header: { cwd: 'G:/ws' } } } },
+    redispatch: async (task) => { seen = task; return { status: 'dispatched', dispatchId: 'dsp-r5-new', branchSessionId: 'branch-r5-new' } },
+  })
+  assert.equal(r.status, 'resumed')
+  assert.equal(r.mode, 'redispatched')
+  assert.equal(r.newDispatchId, 'dsp-r5-new')
+  assert.equal(r.branchSessionId, 'branch-r5-new')
+  assert.ok(seen.includes('任务戊') && seen.includes('【续跑上下文】') && seen.includes('dsp-r5'),
+    'the re-dispatch carries the original task + continuation context')
+  assert.equal(store.dispatches.get('dsp-r5').resumedBy, 'dsp-r5-new', 'the original links to the re-dispatch')
+  const failed = await resumeDispatch({ ctx, store, logger }, 'dsp-r5', {
+    redispatch: async () => ({ status: 'error', message: '分支获取失败' }),
+  })
+  assert.equal(failed.status, 'error', 'a failed re-dispatch is reported, never disguised')
+  ok('R5 续跑：会话无法恢复 → 带上下文重派发新分支并关联原 dispatchId；失败如实报错')
+}
+
+{
+  // R6: 守卫——已交付 / 仍在进行中 / 不存在 / 已有续跑在进行 都不续跑。
+  const store = fakeStore({
+    dispatches: [
+      ['dsp-r6a', { topicSetId: 'ts', branchSessionId: 'b1', task: '甲', hubSessionId: 'hub', startSeq: 0, status: 'delivered', createdAt: now, updatedAt: now }],
+      ['dsp-r6b', { topicSetId: 'ts', branchSessionId: 'b2', task: '乙', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: now, updatedAt: now }],
+      ['dsp-r6c', { topicSetId: 'ts', branchSessionId: 'b3', task: '丙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now, resumedBy: 'dsp-r6d' }],
+      ['dsp-r6d', { topicSetId: 'ts', branchSessionId: 'b3', task: '丙', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', resumeOf: 'dsp-r6c', createdAt: now, updatedAt: now }],
+    ],
+  })
+  const ctx = { agents: { get: () => undefined, resume: async () => { throw new Error('must not resume') } }, sessions: { get: () => ({ seq: 0 }) } }
+  const deps = { ctx, store, logger }
+  assert.ok((await resumeDispatch(deps, 'dsp-r6a')).message.includes('已交付'))
+  assert.ok((await resumeDispatch(deps, 'dsp-r6b')).message.includes('仍在进行中'))
+  assert.ok((await resumeDispatch(deps, 'nope')).message.includes('不存在'))
+  assert.ok((await resumeDispatch(deps, 'dsp-r6c')).message.includes('已有续跑在进行'))
+  ok('R6 守卫：已交付/在途/不存在/已有续跑 均拒绝续跑')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

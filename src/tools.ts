@@ -9,6 +9,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
 import { runDispatch, type DispatchDeps } from './dispatch.ts'
+import { listInterruptedDispatches, renderInterruptedList, resumeDispatch, type ResumeDeps, type ResumeResult } from './resume.ts'
 import { loadHostModule } from './host.ts'
 import { applyModelSelection, askDefaultModel, enumerateModels, type ModelDeps } from './model.ts'
 import { matchTopicSets, recallMemories, type RecallOptions } from './recall.ts'
@@ -18,6 +19,7 @@ import type { Episode, FileMapEntry, Memory, Requirement, Signal } from './schem
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
 import { createTopicSet, listTopicSets, setRouting, topicSetIdsOf } from './topicsets.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { questionsForHub, raiseQuestion, renderQuestionList, resolveQuestions } from './questions.ts'
 
 export interface ToolsDeps {
@@ -438,7 +440,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       if (args.askModel !== false) {
         model = await askDefaultModel(deps.model, exec.agent)
       }
-      const title = String(args.title ?? '').slice(0, 40)
+      // Whole up to TOPIC_SET_TITLE_MAX_CHARS, "…" beyond (was slice(0, 40)).
+      const title = clipEllipsis(String(args.title ?? '').trim(), TOPIC_SET_TITLE_MAX_CHARS)
       if (!title.trim()) return { status: 'error' as const, message: '标题不能为空。' }
       // R18: the three layers are always written. A model that forgot tags gets
       // the title/body vocabulary as a fallback, never an empty index.
@@ -577,6 +580,134 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       } catch (error) {
         deps.logger.warn(`supermemory: memory_dispatch threw: ${String(error).slice(0, 200)}`)
         return { status: 'error', message: `派发异常：${String(error).slice(0, 200)}` }
+      }
+    },
+  })))
+
+  // E: 中断任务续跑。插件被中断/关闭后分支会话保留（不删除），恢复后由用户
+  // 决定继续哪些：无参=清单；带 dispatchIds=续跑（优先续接被保留的分支会话，
+  // 会话无法恢复才带「原始任务 + 已完成部分」上下文重派发到新分支）。
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_resume',
+    description: '继续被中断的任务（插件重载/关闭或 DSH 退出导致；分支会话已保留，未删除）。'
+      + '无参 = 返回被中断任务清单（dispatchId、话题集、任务摘要、分支会话标识、中断时间、已完成部分）；'
+      + '带 dispatchIds（可多个）= 续跑指定任务：优先续接被保留的分支会话（同一会话同一日志续投「原始任务 + 已完成部分」），'
+      + '会话无法恢复时才带同样上下文重派发到新分支，并用 resumeOf/resumedBy 在台账关联原 dispatchId。'
+      + '已交付、仍在进行中或自主失败（max-tokens 等）的任务不会被续跑。',
+    parameters: {
+      dispatchIds: {
+        type: 'array',
+        description: '要续跑的 dispatchId（多个）；省略 = 只返回被中断任务清单',
+        items: { type: 'string' },
+      },
+      capabilities: {
+        type: 'string',
+        enum: ['read', 'read-write', 'full', 'minimal'],
+        description: '续跑分支能力边界（默认 read-write，与 memory_dispatch 一致）',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['listed', 'resumed', 'partial', 'error'], required: true },
+          items: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              properties: {
+                dispatchId: { type: 'string', required: true },
+                topicSetId: { type: 'string' },
+                topicSetTitle: { type: 'string' },
+                task: { type: 'string', required: true },
+                branchSessionId: { type: 'string', required: true },
+                branchTitle: { type: 'string', required: true },
+                hubSessionId: { type: 'string', required: true },
+                status: { type: 'string', required: true },
+                interruptedAt: { type: 'integer', required: true },
+                partial: { type: 'string' },
+                groupId: { type: 'string' },
+                resumeOf: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          results: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              properties: {
+                dispatchId: { type: 'string', required: true },
+                status: { type: 'string', required: true },
+                mode: { type: 'string' },
+                newDispatchId: { type: 'string' },
+                branchSessionId: { type: 'string' },
+                message: { type: 'string', required: true },
+              },
+              additionalProperties: false,
+            },
+          },
+          total: { type: 'integer', required: true },
+          message: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: String((value as { message?: string }).message ?? '') }],
+    },
+    async execute(
+      args: { dispatchIds?: string[]; capabilities?: 'read' | 'read-write' | 'full' | 'minimal' },
+      exec: ToolExec,
+    ) {
+      // The tool contract is a receipt VALUE, never a thrown exception.
+      try {
+        const cwd = exec.agent?.session?.header?.cwd
+        if (!cwd) {
+          return { status: 'error' as const, items: [], results: [], total: 0, message: '无法确定当前工作区。' }
+        }
+        const ids = (args.dispatchIds ?? []).map((id) => String(id ?? '').trim()).filter(Boolean)
+        const resumeDeps: ResumeDeps = { ctx: deps.ctx, store, logger: deps.logger }
+        if (ids.length === 0) {
+          const views = listInterruptedDispatches(store, { workspaceKey: workspaceKeyOf(cwd) })
+          return {
+            status: 'listed' as const,
+            items: views.map((view) => ({
+              dispatchId: view.dispatchId,
+              ...(view.topicSetId ? { topicSetId: view.topicSetId } : {}),
+              ...(view.topicSetTitle ? { topicSetTitle: view.topicSetTitle } : {}),
+              task: view.task,
+              branchSessionId: view.branchSessionId,
+              branchTitle: view.branchTitle,
+              hubSessionId: view.hubSessionId,
+              status: view.status,
+              interruptedAt: view.interruptedAt,
+              ...(view.partial ? { partial: view.partial } : {}),
+              ...(view.groupId ? { groupId: view.groupId } : {}),
+              ...(view.resumeOf ? { resumeOf: view.resumeOf } : {}),
+            })),
+            results: [],
+            total: views.length,
+            message: renderInterruptedList(views),
+          }
+        }
+        const results: ResumeResult[] = []
+        for (const id of ids) {
+          results.push(await resumeDispatch(resumeDeps, id, {
+            exec,
+            ...(args.capabilities ? { capabilities: args.capabilities } : {}),
+          }))
+        }
+        const resumed = results.filter((row) => row.status === 'resumed').length
+        const status: 'resumed' | 'partial' | 'error' = resumed === results.length
+          ? 'resumed'
+          : resumed > 0 ? 'partial' : 'error'
+        const message = results.map((row, index) =>
+          index + 1 + '. ' + (row.status === 'resumed' ? '✅' : '❌') + ' ' + row.dispatchId + '：' + row.message).join('\n')
+        return { status, items: [], results, total: results.length, message }
+      } catch (error) {
+        deps.logger.warn(`supermemory: memory_resume threw: ${String(error).slice(0, 200)}`)
+        return { status: 'error' as const, items: [], results: [], total: 0, message: `续跑异常：${String(error).slice(0, 200)}` }
       }
     },
   })))
@@ -927,17 +1058,30 @@ ${listText}` : listText
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
-    description: '工具化（P3）：列出待处理的组合工具提议（重复流程达阈值后产生），或接受/拒绝某个提议。'
-      + '接受会把记录到的工具序列编译成组合工具（一次调用完成确定性子序列）并持久化，重启后仍可用。',
+    description: '工具化（P3）：① 列出待处理的组合工具提议（重复流程达阈值后产生）与已注册的能力；'
+      + '② 接受/拒绝某个提议；③ register 注册一个"能力"（capability）——入口命令 + 文档 + 适用范围 + 路由描述 + 可一键执行（默认预演，写操作需 confirm=true）。'
+      + '接受提议会把记录到的工具序列编译成组合工具（一次调用完成确定性子序列）并持久化，重启后仍可用。'
+      + 'register 的能力同样落库（tool_memory），重启后 rebuildComposites 重建注册；仅适用于本仓库范围内注册（scope 指向本仓库目录）。',
     parameters: {
       accept: { type: 'boolean', description: '接受第一个待处理提议并生成组合工具' },
       decline: { type: 'boolean', description: '拒绝（不再提示）第一个待处理提议' },
+      register: { type: 'boolean', description: '注册一个能力（入口命令 + 文档 + 适用范围 + 路由描述，可一键执行）' },
+      name: { type: 'string', description: '能力逻辑名（字母/数字/-/_，如 git-sync-supermemory；工具名派生为 sm_composite_<name>）' },
+      title: { type: 'string', description: '能力标题（人类可读）' },
+      description: { type: 'string', description: '能力描述 + 路由：何时优先用它、关键坑是什么（模型据此路由）' },
+      entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（在 scope 目录内经 shell 执行）' },
+      doc: { type: 'string', description: '文档路径（相对仓库根），如 "docs/git-sync.md"' },
+      scope: { type: 'string', description: '适用范围：入口命令的执行目录，如 "G:\\09 - dsh\\SuperMemory"' },
+      runnable: { type: 'boolean', description: '是否允许执行；缺省 true' },
+      dryRunArg: { type: 'string', description: '预演参数，如 "--dry-run"；定义后默认预演执行' },
+      writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },
+      tags: { type: 'array', description: '标签（3–8 个短词，检索索引）', items: { type: 'string' } },
     },
     output: {
       schema: {
         type: 'object',
         properties: {
-          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'error'], required: true },
+          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'registered', 'error'], required: true },
           pending: {
             type: 'array',
             items: {
@@ -951,30 +1095,114 @@ ${listText}` : listText
           },
           tool: { type: 'string' },
           message: { type: 'string' },
+          capabilities: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                title: { type: 'string' },
+                entry: { type: 'string', required: true },
+                doc: { type: 'string' },
+                scope: { type: 'string' },
+                runnable: { type: 'boolean' },
+                dryRunArg: { type: 'string' },
+                writeConfirm: { type: 'boolean' },
+                status: { type: 'string' },
+                useCount: { type: 'integer' },
+                live: { type: 'boolean' },
+              },
+              additionalProperties: false,
+            },
+          },
         },
         additionalProperties: false,
       },
       render: (_args, value) => {
-        const v = value as { status: string; pending?: Array<{ pattern: string; count: number }>; tool?: string; message?: string }
+        const v = value as {
+          status: string
+          pending?: Array<{ pattern: string; count: number }>
+          tool?: string
+          message?: string
+          capabilities?: Array<{ name: string; title?: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string }>
+        }
         if (v.status === 'listed') {
           const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
-          return [{ type: 'text', text: list ? `待处理提议：\n${list}` : '（没有待处理的工具化提议）' }]
+          const caps = (v.capabilities ?? []).map((c) =>
+            `- ${c.name}：${c.entry}${c.dryRunArg ? `（默认预演 ${c.dryRunArg}）` : ''}${c.writeConfirm ? '（写操作需 confirm=true）' : ''}${c.status === 'retired' ? '（已停用）' : ''}`).join('\n')
+          const parts: string[] = []
+          if (list) parts.push(`待处理提议：\n${list}`)
+          if (caps) parts.push(`已注册能力：\n${caps}`)
+          return [{ type: 'text', text: parts.length > 0 ? parts.join('\n\n') : '（没有待处理的工具化提议，也没有已注册的能力）' }]
         }
         if (v.status === 'accepted') return [{ type: 'text', text: `已固化为组合工具 ${v.tool}。` }]
+        if (v.status === 'registered') return [{ type: 'text', text: v.message ?? `已注册能力 ${v.tool}。` }]
         if (v.status === 'declined') return [{ type: 'text', text: '已拒绝该提议。' }]
         if (v.status === 'none') return [{ type: 'text', text: '（没有待处理的工具化提议）' }]
         return [{ type: 'text', text: v.message ?? '操作失败。' }]
       },
     },
-    async execute(args: { accept?: boolean; decline?: boolean }) {
+    async execute(
+      args: {
+        accept?: boolean
+        decline?: boolean
+        register?: boolean
+        name?: string
+        title?: string
+        description?: string
+        entry?: string
+        doc?: string
+        scope?: string
+        runnable?: boolean
+        dryRunArg?: string
+        writeConfirm?: boolean
+        tags?: string[]
+      },
+      exec: ToolExec,
+    ) {
+      // R22 能力注册：入口命令 + 文档 + 适用范围 + 路由描述，落库后可一键执行。
+      if (args.register) {
+        const { registerCapability } = await import('./composite.ts')
+        const cwd = exec.agent?.session?.header?.cwd
+        const ws = cwd ? workspaceKeyOf(cwd) : (args.scope ? workspaceKeyOf(args.scope) : undefined)
+        const result = await registerCapability(ctx, store, {
+          name: String(args.name ?? ''),
+          title: args.title,
+          description: String(args.description ?? ''),
+          entry: String(args.entry ?? ''),
+          doc: args.doc,
+          scope: args.scope,
+          runnable: args.runnable,
+          dryRunArg: args.dryRunArg,
+          writeConfirm: args.writeConfirm,
+          tags: args.tags,
+        }, ws)
+        if (result.status === 'error') return { status: 'error' as const, message: result.message }
+        deps.logger.info(`supermemory: capability ${result.name} registered via memory_toolize`)
+        return { status: 'registered' as const, tool: result.name, message: result.message }
+      }
       const pending: Array<[string, Signal]> = []
       for (const [key, signal] of store.signals.entries()) {
         if (signal.proposalStatus === 'pending' && signal.proposedAt !== undefined) pending.push([key, signal])
       }
       if (!args.accept && !args.decline) {
+        const { capabilityRecordsOf, liveCompositeSpecs } = await import('./composite.ts')
         return {
           status: 'listed' as const,
           pending: pending.map(([, s]) => ({ pattern: s.pattern, count: s.count })),
+          capabilities: capabilityRecordsOf(store).map((c) => ({
+            name: c.spec.name,
+            title: c.spec.title,
+            entry: c.spec.entry,
+            doc: c.spec.doc,
+            scope: c.spec.scope,
+            runnable: c.spec.runnable !== false,
+            dryRunArg: c.spec.dryRunArg,
+            writeConfirm: Boolean(c.spec.writeConfirm),
+            status: c.status,
+            useCount: c.useCount,
+            live: liveCompositeSpecs.has(c.spec.name),
+          })),
         }
       }
       if (pending.length === 0) return { status: 'none' as const }

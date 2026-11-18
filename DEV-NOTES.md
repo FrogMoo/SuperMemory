@@ -1495,3 +1495,134 @@ wrap 后字符数 **87298 → 105183（+17885）**；磁盘 UTF-8 **89065 → 10
 - 未执行 `git commit`。
 - 并行分支 R19-协同（hub-branches/questions 等）的改动在同一工作树中；本报告只对八项负责，
   合并后的闸门已跑绿。
+## 20. 组合工具 → 能力（capability）管理台（2026-11-18 第十轮）
+
+### 20.1 需求与选型
+
+组合工具从「重复工具序列自动编译」扩展为「固化能力（capability）」管理台：能力 = 入口命令
++ 文档 + 适用范围 + 路由描述 + 可一键执行，全部由插件管理（tool_memory 持久化 + 组合工具
+页签 + memory_toolize 注册），**不落 DSH 共用技能目录**；git-sync 固化为首个能力。
+
+- 持久化选型：**仍走 tool_memory，kind='composite' + spec.kind='capability'**（不新增 kind
+  枚举值 → 域 schema 不变、旧记录零迁移）；rebuildComposites 重启重建时按 spec.kind 分派注册。
+- 删除上个尝试：`~/.dsh/skills/git-sync-supermemory/` 整个目录已删（能力改由插件管理，路由由
+  工具描述承担）；`docs/git-sync.md` 保留，作为能力的 doc 字段被引用。
+
+### 20.2 数据模型与执行（src/composite.ts）
+
+- `CompositeSpec` 增加 `kind?: 'sequence' | 'capability'`（缺省 sequence，旧记录兼容）与能力字段
+  `entry / doc / scope / runnable / dryRunArg / writeConfirm / routeNote`；
+  `CapabilitySpec = CompositeSpec & { kind: 'capability'; entry: string }`。
+- `runCapability(spec, { dryRun?, confirm? })`：`spawnSync(command, { shell: true, cwd: scope,
+  env: process.env, timeout: 120s, maxBuffer: 16MB })`，返回 `{ status: completed|failed|
+  needs-confirm, exitCode, stdout, stderr, durationMs, dryRun, command, summary }`（输出截断 8000 字符）。
+- 安全闸：① `runnable=false` 拒绝；② 定义 dryRunArg 且调用方未显式 dryRun/confirm 时**默认预演**；
+  ③ writeConfirm 能力的真实执行必须 `confirm=true`——confirm=true 的语义就是「确认真实执行」，
+  自动脱离预演缺省（否则管理台「确认执行」会悄悄变成又一次预演）；④ writeConfirm 但未定义
+  dryRunArg 时预演直接拒绝（不能把真实命令当预演跑掉）。
+- `registerCapability(ctx, store, input, workspaceKey?, deps?)`：校验 → 持久记录同名查找
+  （自己注册过的走**原地更新**，不算冲突）→ 宿主工具冲突检查（仅新名字）→ 注册活工具 → 落库
+  （trigger `capability/<toolName>`，workspaceKey 按适用范围落工作区）。无宿主注册器
+  （测试/headless）时只落库，重启后 rebuildComposites 补齐。
+- `rebuildComposites(ctx, store, deps?)` 增加注册缝；`capabilityRecordsOf(store)` 供列表；
+  `bumpCompositeUse` 导出（实际执行过才计数，needs-confirm 不计）。
+
+### 20.3 工具 / 面板 / 管理台三入口
+
+- `memory_toolize`（src/tools.ts）新增 `register` 动作与能力参数（name/title/description/
+  entry/doc/scope/runnable/dryRunArg/writeConfirm/tags）；无 accept/decline/register 时的 list
+  同时返回待处理提议与已注册能力；accept/decline 旧行为不变。
+- `src/panel.ts`：`ToolView` 增加 kind/entry/doc/scope/runnable/dryRunArg/writeConfirm；新增
+  `runTool(id, { dryRun?, confirm? })` + descriptor `runTool`；`src/client/remote.ts` 同步
+  （mechanism-smoke 的 host/client parity 断言仍通过）。
+- `src/webui.ts` 新增路由（x-sm-key 鉴权 + ws 工作区隔离）：`tool/run`（body { id, dryRun?, confirm? }，
+  needs-confirm 也返回 200 便于前端弹确认框）、`tool/register`、`tool/status`（active/retired）、
+  `tool/delete`。
+- `src/web/app.js`：组合工具页拆成「能力（可一键执行）」+「序列组合工具（自动固化）」两类卡片；
+  能力卡片显示入口命令（可复制）/适用范围/文档/预演参数/写操作徽标，操作 = 运行（预演）/
+  确认执行（writeConfirm 能力，二次确认弹窗）/停用/启用/删除；页内带「注册新能力」表单；
+  执行结果弹窗展示 stdout/stderr/退出码/耗时。空态文案改为同时说明两类来源。
+
+### 20.4 回归闸门（本机实测）
+
+- `pnpm typecheck` 0 错。
+- `pnpm smoke`：core 9 + mechanism 53 + webui 32 + client-sim OK。
+  - mechanism 新增 K1–K5：能力数据模型 / 执行与预演缺省 / 写操作闸门（无 confirm 拒绝且不执行、
+    confirm 才跑、无预演参数拒绝预演、未开放执行拒绝）/ 注册→持久化→重启重建拾取→同名原地
+    更新→宿主冲突拒绝→列表 / 面板 runTool（计数、needs-confirm 不计数、序列工具拒绝一键执行）。
+  - webui 新增 R22-1..4：tool/run 预演（HTTP 捕获 stdout/退出码并计数）、写操作闸门、
+    tool/register 落库与 400、tool/status + tool/delete + 未知 id + 序列工具不可一键执行。
+- `pnpm build` 全管线（tsdown + client + wrap-client）通过。
+- 行尾：CRLF 原生的文件保持整文件 CRLF（CR 数 = 行数），LF 原生的（mechanism-smoke /
+  docs/git-sync.md）保持 0 CR；无 BOM。本仓库无 .gitattributes、行尾混合，未做整文件 EOL 转换。
+
+### 20.5 生效方式与已知边界
+
+- 宿主 + 客户端都改了 → 插件重载后生效；**首条 git-sync 能力由中枢重载后通过
+  memory_toolize register 录入**（seed：name `git-sync-supermemory` → 工具名
+  `sm_composite_git_sync_supermemory`，entry `pnpm git:sync`，doc `docs/git-sync.md`，
+  scope `G:\09 - dsh\SuperMemory`，dryRunArg `--dry-run`，writeConfirm true，
+  tags [git, 同步, 推送, 流程固化]）；重载后 rebuildComposites 自动拾取。
+- 已知边界：① memory_toolize register 的 live 注册路径与 editCompositeTool 的「重新启用」需要
+  宿主 `@deepseek-ai/dsh-tools`，host-free 冒烟只覆盖到落库与停用/删除；② pnpm 12 下
+  `pnpm git:sync --dry-run` 不能加 `--`（会 exit 3），已写入 docs/git-sync.md；③ 未执行
+  git commit/push。
+
+## 22. 中断保留分支会话 + 恢复后用户决定续跑（需求 E，2026-11-18）
+
+### 22.1 宿主事实核查（只读参考 app.asar 内 dsh-agent / dsh-agent-loop 源码）
+
+- `ctx.agents.create()/resume()` 返回的 `AgentHandle.dispose()` 语义：停 loop、等退出、
+  注销 agent、**关闭会话写句柄**、拆 scope——不删持久日志（DSH 重启后 reconcile 一直
+  能 resume 死分支即为反证）。dsh-agent 编译产物里 `ownerCtx = this.ctx`（agents 服务
+  所在 ctx），但 loop 把生命周期 effect 挂在 ownerCtx 上，宿主侧「禁用/重载插件」会
+  连带打到分支 agent 的在途 turn（§12 实测 aborted）——**插件无法在宿主层面阻止**，
+  能做的是：插件自己的代码绝不 kill/abort/delete，并把台账/回执/续跑路径做稳。
+- 宿主支持重启后重连被保留会话：`ctx.agents.get(id)`（存活）+ `ctx.agents.resume({resumeSessionId})`
+  （重载持久会话，acquireBranch/reconcile/面板 sendSessionMessage 三处已在用）。
+
+### 22.2 改动
+
+- `src/schema.ts`：dispatches 增加两个**可选**字段 `resumeOf`/`resumedBy`（续跑双向关联），
+  存储域保持 v1 兼容（旧记录读作 undefined，同 D 的 interrupted/lastActivityAt 先例）。
+- `src/dispatch.ts`：新增 `detachIdleBranches()`——空闲分支**只摘除插件侧 handle**，
+  绝不调用 `handle.dispose()`（原 release sweep 会停掉分支 agent；会话与可恢复性保留，
+  acquireBranch 的 live→resume 路径随时续接）。判定沿用 `releasableBranches`（D5 不变）。
+- `src/observe.ts`：① `deliver()` 增加 `deliveryId` 覆写缝并导出 `deliverRelay()`；
+  ② `settleInterruptedDispatches()` 加固——投递抛错（如 dispose 期间宿主服务不可用）
+  也照样标记 `interrupted`（outbox 行已先行落账，flushObserve 自愈重投），修掉
+  「deliver 失败 → 派发永久 open → 回执永不送达」的尾部风险；③ 失败 relay 文案追加
+  续跑入口提示（memory_resume / /memory resume）。
+- `src/resume.ts`（新）：`listInterruptedDispatches()`（收录 interrupted + failed 且
+  终态原因是打断签名 aborted/branch-died/…；排除已交付、自主失败、已被续跑接续的行）、
+  `renderInterruptedList()`、`resumeDispatch()`（live handle → agents.get → agents.resume
+  续接原会话并续投「原始任务 + 已完成部分」；三条路都失败才带同样上下文 `mode=new`
+  重派发新分支；新派发 resumeOf=原、原派发 resumedBy=新）、`notifyInterruptedDispatches()`
+  （启动/巡检经 deliverRelay 把清单推给各 hub，幂等键 `dlv-resume-<hub>`，签名去重）。
+- `src/index.ts`：release sweep 改调 `detachIdleBranches`；巡检里追加中断清单通知；
+  启动对账后约 10s 出首份清单（等 reconcile 三路径跑完），插件卸载时定时器被 effect 清掉。
+- `src/tools.ts`：新增 `memory_resume` 工具（无参=清单；dispatchIds 可多个=续跑；
+  capabilities 可选，默认 read-write）。
+- `src/commands.ts`：`/memory resume`（别名 `/memory-resume`）行为一致，进 SUBCOMMANDS/HELP。
+
+### 22.3 冒烟（mechanism 新增 R1–R6，59 项全绿）
+
+- R1 空闲释放只摘除 handle，测试替身断言 **0 次 dispose 调用**、台账不动；
+- R2 重启扫描清单：interrupted + cut-off-failed 收录，已交付/在途/已续跑/自主失败排除，
+  已完成部分从回执摘出，工作区过滤；
+- R3 live 分支续接（不 resume）、followup 消息带原始任务+已完成部分、台账双向关联、
+  relay 目标=调用方 hub；R4 分支已死 → agents.resume 重连后续投并重登记 handle；
+- R5 会话无法恢复 → 带上下文重派发（断言任务文本含续跑上下文）并关联原 dispatchId，
+  重派发失败如实报错；R6 守卫：已交付/在途/不存在/已有续跑在进行 均拒绝。
+
+### 22.4 闸门与未验证项
+
+- `npx tsc --noEmit` 0 错；`npx tsdown` 通过（lib/supermemory.js 含 memory_resume/dlv-resume-/detached）；
+  core 9 + mechanism 59 + webui + client-sim 全绿；污染特征串（autoDispatch/ensureBranchLive/
+  finishRoute）src/lib 全无。
+- **未实时端到端验证**（SOP：禁用→启用只能在 hub/GUI 侧执行，分支会话内禁止）：建议人工
+  步骤 = ① hub 派发一个长任务；② 在 GUI 插件页禁用→启用（或重启 DSH Desktop）；
+  ③ 约 10s 后 hub 应收到「检测到 N 个被中断任务」清单（不在线则下次打开 hub 时补投）；
+  ④ `/memory resume` 查看清单，`/memory resume <dispatchId>` 续跑，观察分支在原会话
+  （或新分支）继续且结果回到 hub。
+- webui 管理台未加「被中断任务 + 继续按钮」（本次跳过，工具/命令/启动通知已覆盖需求）。

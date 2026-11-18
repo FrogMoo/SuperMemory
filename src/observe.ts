@@ -16,6 +16,7 @@ import type { Dispatch, Episode, Question } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId } from './store.ts'
 import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
+import { clipRelayResult, episodeResult } from './relay-text.ts'
 import { updateMember } from './topicsets.ts'
 
 export interface ObserveConfig {
@@ -117,6 +118,9 @@ function locateOwnership(events: ColdEvent[], startSeq: number): { messageSeq: n
   return undefined
 }
 
+/** `summary` is the memory-facing short form; the full answer lives in `result`. */
+const EPISODE_SUMMARY_MAX = 400
+
 /** Rule-based episode from the branch's owned turn (no LLM in the loop). */
 function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: string, branchSessionId: string): Episode {
   const timeStart = events[0]?.time ?? Date.now()
@@ -141,7 +145,9 @@ function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: strin
     }
   }
   const finalText = assistantTexts[assistantTexts.length - 1] ?? ''
-  const summary = finalText.length > 400 ? `${finalText.slice(0, 400)}…` : finalText
+  // `summary` stays short on purpose; `result` below keeps the full answer for
+  // the hub-facing relay (see schema.ts and relay-text.ts).
+  const summary = finalText.length > EPISODE_SUMMARY_MAX ? `${finalText.slice(0, EPISODE_SUMMARY_MAX)}…` : finalText
   for (const name of new Set(toolNames)) decisions.push(`调用了 ${name}`)
   return {
     topicSetId,
@@ -149,6 +155,7 @@ function buildEpisode(events: ColdEvent[], dispatchId: string, topicSetId: strin
     timeStart,
     timeEnd,
     summary,
+    result: finalText,
     decisions,
     files: [...new Set(files)].slice(0, 20),
     nextSteps: [],
@@ -170,12 +177,15 @@ function relayText(
   const questionBlock = renderQuestionsBlock(questions)
   const tail = questionBlock ? `\n\n${questionBlock}` : ''
   if (failure) {
-    // D: an aborted turn still produced work — keep the partial summary so the
+    // D: an aborted turn still produced work — keep the partial result so the
     // hub learns what DID land before the branch died.
-    const partial = episode?.summary ? `\n已完成部分：${episode.summary}` : ''
-    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。${partial}\n以上为失败事实，未伪装成答案。${tail}`
+    const partialText = episodeResult(episode)
+    const partial = partialText ? `\n已完成部分：${clipRelayResult(partialText, dispatch.branchSessionId)}` : ''
+    // E: 分支没跑完时告诉 hub 怎么继续——中断任务由用户决定续跑。
+    const resumeHint = '\n如需继续该任务：memory_resume（无参查看清单，带 dispatchId 续跑）或 /memory resume。'
+    return `${head}\n任务：${dispatch.task}\n结果：分支未成功完成（${failure}）。${partial}\n以上为失败事实，未伪装成答案。${resumeHint}${tail}`
   }
-  const body = episode?.summary || '（分支已完成，但未生成摘要）'
+  const body = clipRelayResult(episodeResult(episode), dispatch.branchSessionId) || '（分支已完成，但未生成摘要）'
   return `${head}\n任务：${dispatch.task}\n分支结果：\n${body}${tail}`
 }
 
@@ -339,15 +349,16 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
 /** Enqueue + send one relay delivery to the hub (at-least-once, idempotent). */
 async function deliver(
   deps: ObserveDeps,
-  input: { dispatchId: string; record: { hubSessionId: string }; text: string; groupId?: string },
+  input: { dispatchId: string; record: { hubSessionId: string }; text: string; groupId?: string; deliveryId?: string },
 ): Promise<void> {
   const { ctx, store, logger } = deps
   // STABLE idempotency key (file header contract): one relay per dispatch or
   // group, so a retried delivery overwrites its outbox row instead of piling up
-  // duplicates and the hub's confirmation can match it.
-  const deliveryId = input.groupId ? "dlv-grp-" + input.groupId : "dlv-" + input.dispatchId
+  // duplicates and the hub's confirmation can match it. E: an explicit override
+  // lets non-settle relays (startup interrupted notice) reuse this channel.
+  const deliveryId = input.deliveryId ?? (input.groupId ? "dlv-grp-" + input.groupId : "dlv-" + input.dispatchId)
   await store.outbox.put(deliveryId, {
-    dispatchId: input.groupId ? undefined : input.dispatchId,
+    dispatchId: input.groupId ? undefined : (input.dispatchId || undefined),
     groupId: input.groupId,
     kind: input.groupId ? 'group' : 'single',
     payload: input.text,
@@ -370,6 +381,22 @@ async function deliver(
   } catch (error) {
     logger.warn(`supermemory: relay ${deliveryId} failed: ${String(error).slice(0, 160)}`)
   }
+}
+
+/**
+ * Delivery seam for non-settle relays (the startup interrupted notice, resume.ts):
+ * same at-least-once outbox contract with a caller-supplied stable deliveryId.
+ */
+export async function deliverRelay(
+  deps: ObserveDeps,
+  input: { deliveryId: string; dispatchId?: string; hubSessionId: string; text: string },
+): Promise<void> {
+  await deliver(deps, {
+    dispatchId: input.dispatchId ?? '',
+    record: { hubSessionId: input.hubSessionId },
+    text: input.text,
+    deliveryId: input.deliveryId,
+  })
 }
 
 /**
@@ -498,10 +525,17 @@ export async function settleInterruptedDispatches(
     try {
       const partial = await partialSummary(deps, record)
       if (!record.groupId) {
-        await deliver(deps, {
-          dispatchId, record,
-          text: relayText(record, partial, reason, openQuestionsOfDispatch(store, dispatchId)),
-        })
+        // 投递失败（例如 dispose 期间宿主服务已不可用）绝不能把派发留在 open：
+        // outbox 行已先行落账，标记 interrupted 之后由 flushObserve 自愈重投，
+        // 回执永远不会丢（D 兜底与 E 续跑共同的前提）。
+        try {
+          await deliver(deps, {
+            dispatchId, record,
+            text: relayText(record, partial, reason, openQuestionsOfDispatch(store, dispatchId)),
+          })
+        } catch (error) {
+          logger.warn(`supermemory: interrupt relay ${dispatchId} deferred: ${String(error).slice(0, 160)}`)
+        }
       }
       await store.dispatches.update(dispatchId, (r) => ({
         ...r,

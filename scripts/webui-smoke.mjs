@@ -138,7 +138,7 @@ ok('app.js / style.css served from src/web')
 // sections, card lists instead of wide tables, and the responsive fold.
 const appSrc = await (await fetch(base + '/app.js')).text()
 const cssSrc = await (await fetch(base + '/style.css')).text()
-for (const marker of ['renderHubs', 'renderTools', '中枢会话', '组合工具', 'card-list']) {
+for (const marker of ['renderHubs', 'renderTools', '中枢会话', '固化能力', 'card-list']) {
   assert.ok(appSrc.includes(marker), 'app.js must include ' + marker)
 }
 assert.ok(/renderHubs/.test(appSrc) && !/<table>/.test(appSrc.slice(appSrc.indexOf('function renderDispatch'), appSrc.indexOf('function renderEpisodes'))),
@@ -339,6 +339,69 @@ const head = await fetch(base + '/', { method: 'HEAD' })
 assert.equal(head.status, 200)
 ok('404 / 405 / HEAD edges')
 
+// R22 能力（capability）：注册 / 一键执行 / 写操作闸门 / 启停 / 删除
+{
+  const capSpec = {
+    name: 'sm_composite_webui_cap', kind: 'capability', description: 'webui 执行冒烟', title: 'webui 能力',
+    entry: 'echo webui-capability-ok', steps: [], parameters: [], runnable: true, dryRunArg: '--dry-run',
+  }
+  const writeSpec = { ...capSpec, name: 'sm_composite_webui_w', writeConfirm: true }
+  store.toolMemory.put('tm-cap', { kind: 'composite', workspaceKey: ws, title: 'webui 能力', tags: ['git'], trigger: 'capability/x', description: 'webui 执行冒烟', entry: JSON.stringify(capSpec), useCount: 0, status: 'active' })
+  store.toolMemory.put('tm-w', { kind: 'composite', workspaceKey: ws, title: '写能力', tags: [], trigger: '', description: 'd', entry: JSON.stringify(writeSpec), useCount: 0, status: 'active' })
+
+  // 预演执行（dryRunArg 缺省附加）
+  const dry = await (await fetch(base + '/api/tool/run', json({ ws, id: 'tm-cap' }))).json()
+  assert.equal(dry.ok, true)
+  assert.equal(dry.status, 'completed')
+  assert.equal(dry.exitCode, 0)
+  assert.ok(dry.stdout.includes('webui-capability-ok'), 'stdout captured over HTTP')
+  assert.equal(dry.dryRun, true)
+  assert.ok(dry.command.includes('--dry-run'))
+  assert.equal(store.toolMemory.get('tm-cap').useCount, 1, 'a run bumps the durable counter')
+  ok('R22-1 tool/run 预演：捕获 stdout/退出码，自动附加预演参数并计数')
+
+  // 写操作闸门：显式实跑无 confirm → needs-confirm（不执行）；confirm=true → 真跑
+  const blocked = await (await fetch(base + '/api/tool/run', json({ ws, id: 'tm-w', dryRun: false }))).json()
+  assert.equal(blocked.ok, true)
+  assert.equal(blocked.status, 'needs-confirm')
+  assert.equal(store.toolMemory.get('tm-w').useCount, 0, 'needs-confirm executes nothing')
+  const confirmed = await (await fetch(base + '/api/tool/run', json({ ws, id: 'tm-w', confirm: true }))).json()
+  assert.equal(confirmed.status, 'completed')
+  assert.equal(confirmed.dryRun, false, 'confirm=true really runs')
+  assert.ok(confirmed.stdout.includes('webui-capability-ok'))
+  assert.equal(store.toolMemory.get('tm-w').useCount, 1)
+  ok('R22-2 tool/run 写操作闸门：无 confirm 拒绝执行，confirm=true 才真跑')
+
+  // 注册（headless ctx：只落库，重启后 rebuildComposites 补注册）
+  const reg = await (await fetch(base + '/api/tool/register', json({
+    ws, name: 'webui-registered', title: '控制台注册的能力', description: '通过管理台表单注册。',
+    entry: 'echo registered-from-webui', scope: cwd, doc: 'docs/git-sync.md', dryRunArg: '--dry-run',
+    writeConfirm: true, runnable: true, tags: ['git', '冒烟'],
+  }))).json()
+  assert.equal(reg.ok, true, 'register must succeed: ' + (reg.error || ''))
+  assert.equal(reg.name, 'sm_composite_webui_registered')
+  const regRow = store.toolMemory.get(reg.id)
+  assert.equal(JSON.parse(regRow.entry).kind, 'capability')
+  assert.equal(regRow.workspaceKey, ws)
+  const bad = await fetch(base + '/api/tool/register', json({ ws, name: 'x', description: 'd', entry: '' }))
+  assert.equal(bad.status, 400)
+  ok('R22-3 tool/register：落库（kind=composite + spec.kind=capability，按工作区隔离），非法入参 400')
+
+  // 启停 + 删除 + 未知 id + 序列工具不可一键执行
+  const st = await (await fetch(base + '/api/tool/status', json({ ws, id: 'tm-cap', status: 'retired' }))).json()
+  assert.equal(st.ok, true)
+  assert.equal(store.toolMemory.get('tm-cap').status, 'retired')
+  const unknownRun = await fetch(base + '/api/tool/run', json({ ws, id: 'tm-nope' }))
+  assert.equal(unknownRun.status, 400)
+  const del = await (await fetch(base + '/api/tool/delete', json({ ws, id: 'tm-cap' }))).json()
+  assert.equal(del.ok, true)
+  assert.equal(store.toolMemory.get('tm-cap'), undefined)
+  store.toolMemory.put('tm-seq', { kind: 'composite', title: '序列', tags: [], trigger: '', description: 'd', entry: JSON.stringify({ name: 'sm_composite_seq', steps: [{ tool: 'read', arguments: {} }], parameters: [] }), useCount: 0, status: 'active' })
+  const seqRun = await (await fetch(base + '/api/tool/run', json({ ws, id: 'tm-seq' }))).json()
+  assert.equal(seqRun.ok, false)
+  assert.match(seqRun.error, /只有能力/)
+  ok('R22-4 tool/status 停用 + tool/delete 删除 + 未知 id 拒绝 + 序列工具不可一键执行')
+}
 // dispose removes the route
 dispose()
 const after = await fetch(base + '/api/workspaces', { headers: auth })

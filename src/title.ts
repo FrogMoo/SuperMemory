@@ -23,22 +23,45 @@
  *   list keeps showing it unnamed; that limitation is reported, never faked.
  *
  * Naming rule (stable, readable, bounded):
- *   <topic-set title> · <first line of the task, markdown/brackets stripped, 16 chars>
- * duplicated titles inside one topic set get a full-width ordinal suffix
- * （2）,（3）…; the final title is capped at 40 characters.
+ *   <topic-set title> · <first line of the task, markdown/brackets stripped>
+ * A task of up to TITLE_TASK_SNIPPET_CHARS characters is shown whole; a
+ * longer one is clipped with a trailing "…" (the marker counts toward the
+ * budget), so an over-long title says it was clipped instead of ending
+ * mid-word. Duplicated titles inside one topic set get a full-width ordinal
+ * suffix （2）,（3）…; the final title is capped at TITLE_MAX_CHARS characters.
  * @module supermemory/title
  */
 import type { Store } from './store.ts'
 import { addMember, updateMember } from './topicsets.ts'
 
-/** Hard character cap of a plugin-assigned session title. */
-export const TITLE_MAX_CHARS = 40
+/**
+ * Hard character cap of a plugin-assigned session title. The host rename
+ * API normalizes the text but documents no shorter limit, and the GUI
+ * sidebar row ellipsizes a long title visually while the stored title stays
+ * complete — so this is a runaway guard, not a display budget. 80 characters
+ * keep "<topic-set> · <task>" informative; the previous 40 cut the task at
+ * 16 characters, which users reported as over-truncated.
+ */
+export const TITLE_MAX_CHARS = 80
 
-/** Characters kept from the task's first line. */
-export const TITLE_TASK_SNIPPET_CHARS = 16
+/**
+ * Characters kept from the task's first line. A task of up to this many
+ * characters is shown whole; a longer one is clipped with "…". 48 characters
+ * cover a normal one-line task sentence without wrapping the sidebar row.
+ */
+export const TITLE_TASK_SNIPPET_CHARS = 48
 
 /** Fallback title when both the topic-set title and the task are empty. */
 export const TITLE_FALLBACK = '新会话'
+
+/**
+ * Character cap for a TOPIC-SET title (not a session title). A topic-set
+ * title is an index label shown in lists, cards and /memory output, all of
+ * which ellipsize visually; 60 characters keep a descriptive title whole and
+ * only clip a runaway one, with "…" marking the cut. Every creation path
+ * used to slice to 12–40 characters with no marker at all.
+ */
+export const TOPIC_SET_TITLE_MAX_CHARS = 60
 
 /** Lifecycle access the title path needs from the host context. */
 export interface TitleSessionLike {
@@ -67,6 +90,19 @@ export function truncateChars(text: string, maxChars: number): string {
   const chars = Array.from(String(text ?? ''))
   if (chars.length <= maxChars) return chars.join('')
   return chars.slice(0, Math.max(0, maxChars)).join('')
+}
+
+/**
+ * Ellipsis-clip: text longer than maxChars is cut and gets a trailing "…",
+ * and the marker counts toward the budget, so the result never exceeds
+ * maxChars characters. Use this for user-visible titles so an over-long
+ * value says it was clipped instead of ending mid-word.
+ */
+export function clipEllipsis(text: string, maxChars: number): string {
+  const chars = Array.from(String(text ?? ''))
+  if (chars.length <= maxChars) return chars.join('')
+  if (maxChars <= 1) return '…'
+  return chars.slice(0, maxChars - 1).join('') + '…'
 }
 
 /** First non-empty line of a text. */
@@ -116,16 +152,16 @@ export function sessionTitleFor(
   const maxChars = Math.max(4, Math.floor(options.maxChars ?? TITLE_MAX_CHARS))
   const snippetChars = Math.max(1, Math.floor(options.snippetChars ?? TITLE_TASK_SNIPPET_CHARS))
   const topic = firstLine(cleanTitleText(topicTitle))
-  const snippet = truncateChars(firstLine(cleanTitleText(task)), snippetChars)
+  const snippet = clipEllipsis(firstLine(cleanTitleText(task)), snippetChars)
   const separator = ' · '
   let base: string
   if (topic && snippet) {
     const room = Math.max(4, maxChars - separator.length - snippet.length)
-    base = truncateChars(topic, room) + separator + snippet
+    base = clipEllipsis(topic, room) + separator + snippet
   } else if (topic) {
-    base = truncateChars(topic, maxChars)
+    base = clipEllipsis(topic, maxChars)
   } else if (snippet) {
-    base = truncateChars(snippet, maxChars)
+    base = clipEllipsis(snippet, maxChars)
   } else {
     base = TITLE_FALLBACK
   }
@@ -137,7 +173,7 @@ export function sessionTitleFor(
   if (!used.has(base)) return base
   for (let index = 2; index <= 999; index += 1) {
     const suffix = '（' + index + '）'
-    const candidate = truncateChars(base, Math.max(1, maxChars - suffix.length)) + suffix
+    const candidate = clipEllipsis(base, Math.max(1, maxChars - suffix.length)) + suffix
     if (!used.has(candidate)) return candidate
   }
   return base
@@ -191,8 +227,9 @@ export function applySessionTitle(
   sessionId: string,
   title: string,
   logger: { warn: (msg: string) => void },
+  options: { force?: boolean } = {},
 ): SessionTitleOutcome {
-  const clean = truncateChars(firstLine(cleanTitleText(title)), TITLE_MAX_CHARS)
+  const clean = clipEllipsis(firstLine(cleanTitleText(title)), TITLE_MAX_CHARS)
   if (!clean) return 'none'
   const session = ctx.sessions?.get(sessionId)
   if (!session) return 'none'
@@ -201,13 +238,17 @@ export function applySessionTitle(
   })() as
     | { get?(session: unknown): { title?: string } | undefined; rename?(session: unknown, text: string): unknown }
     | undefined
-  try {
-    if (service && typeof service.get === 'function') {
-      const current = service.get(session)
-      if (current && typeof current.title === 'string' && current.title.trim()) return 'already'
+  // The 'already' guard keeps a first naming from overwriting an existing
+  // title; the one-time title migration passes force to refresh a stale one.
+  if (!options.force) {
+    try {
+      if (service && typeof service.get === 'function') {
+        const current = service.get(session)
+        if (current && typeof current.title === 'string' && current.title.trim()) return 'already'
+      }
+    } catch (error) {
+      logger.warn('supermemory: session title read skipped: ' + String(error).slice(0, 160))
     }
-  } catch (error) {
-    logger.warn('supermemory: session title read skipped: ' + String(error).slice(0, 160))
   }
   try {
     if (service && typeof service.rename === 'function') {
@@ -227,4 +268,23 @@ export function applySessionTitle(
     logger.warn('supermemory: session title log append failed: ' + String(error).slice(0, 160))
   }
   return 'none'
+}
+
+/**
+ * The live HOST title of one session, or undefined when the session is not
+ * tracked, carries no title, or the title service is unavailable. The
+ * one-time title migration uses it to detect a title that somebody else
+ * renamed, so it never overwrites a human's choice.
+ */
+export function currentSessionTitle(ctx: TitleHost, sessionId: string): string | undefined {
+  const session = ctx.sessions?.get(sessionId)
+  if (!session) return undefined
+  try {
+    const service = ctx.get?.('sessionTitle') as
+      | { get?(target: unknown): { title?: string } | undefined }
+      | undefined
+    const current = service?.get?.(session)
+    if (current && typeof current.title === 'string' && current.title.trim()) return current.title
+  } catch { /* no title service: treat as untitled */ }
+  return undefined
 }

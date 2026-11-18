@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Memory, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Meta, type Memory, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -45,6 +45,8 @@ export interface Store {
   /** R20: branch-raised questions awaiting the hub's single user question. */
   questions: Table<Question>
   outbox: Table<OutboxItem>
+  /** One-time migration markers (title repair); see title-migration.ts. */
+  meta: Table<Meta>
   close(): Promise<void>
 }
 
@@ -130,6 +132,7 @@ export async function openStore(
       outbox: sd.domainTable(schemas.outbox),
       routing: sd.domainTable(schemas.routing),
       hotcache: sd.domainTable(schemas.hotcache),
+      meta: sd.domainTable(schemas.meta),
     },
   }) as SupermemorySpec
   const domain = await storageDomain.open(spec)
@@ -149,6 +152,7 @@ export async function openStore(
     dispatches: table<Dispatch>('dispatches'),
     questions: table<Question>('questions'),
     outbox: table<OutboxItem>('outbox'),
+    meta: table<Meta>('meta'),
     close: () => domain.close(),
   }
 }

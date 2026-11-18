@@ -9,6 +9,7 @@ import type { Store } from './store.ts'
 import type { Dispatch } from './schema.ts'
 import { newId } from './store.ts'
 import { openQuestionsOfGroup, renderQuestionsBlock } from './questions.ts'
+import { clipRelayResult, episodeResult } from './relay-text.ts'
 
 /** Members of one group, in creation order. */
 export function groupMembers(store: Store, groupId: string): Array<[string, Dispatch]> {
@@ -70,14 +71,17 @@ export function groupRelayText(store: Store, groupId: string, episodes: Map<stri
   return lines.join('\n')
 }
 
-/** Collect the episode summaries of a group's delivered members. */
+/** Collect the episode results (full answers) of a group's delivered members. */
 export function groupEpisodeSummaries(store: Store, groupId: string): Map<string, string> {
   const out = new Map<string, string>()
   const members = groupMembers(store, groupId)
   const branchIds = new Set(members.map(([, r]) => r.branchSessionId))
   for (const [, episode] of store.episodes.entries()) {
-    if (episode.branchSessionId && branchIds.has(episode.branchSessionId) && episode.summary) {
-      out.set(episode.branchSessionId, episode.summary)
+    // The full answer (`result`), not the 400-char `summary`: the group relay is
+    // these members' ONLY delivery, so it must carry their actual work.
+    const text = episodeResult(episode)
+    if (episode.branchSessionId && branchIds.has(episode.branchSessionId) && text) {
+      out.set(episode.branchSessionId, clipRelayResult(text, episode.branchSessionId))
     }
   }
   return out

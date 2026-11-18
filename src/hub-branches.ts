@@ -90,6 +90,14 @@ export function taskExcerpt(task: string, max = 32): string {
   return Array.from(text).length > max ? `${Array.from(text).slice(0, max).join('')}…` : text
 }
 
+/**
+ * Card-title fallback length for a branch that has no member title yet. 48
+ * characters match the session-title task budget, and taskExcerpt already
+ * marks a cut with "…" (the previous call site passed 20, which clipped most
+ * one-line tasks mid-word).
+ */
+const BRANCH_CARD_EXCERPT_CHARS = 48
+
 /** Human relative time for cards (coarse on purpose: the card is context, not a log). */
 export function relativeAgo(at: number, now = Date.now()): string {
   if (!Number.isFinite(at) || at <= 0) return '未知时间'
@@ -141,7 +149,7 @@ function projectBranch(
     ...rows.map((row) => Math.max(Number(row.updatedAt) || 0, Number(row.lastActivityAt) || 0)),
     Number(member?.lastActiveAt) || 0,
   )
-  const title = (member?.title ?? '').trim() || taskExcerpt(latest.task, 20)
+  const title = (member?.title ?? '').trim() || taskExcerpt(latest.task, BRANCH_CARD_EXCERPT_CHARS)
   const view: HubBranchView = {
     branchSessionId,
     title,
