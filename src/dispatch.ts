@@ -16,6 +16,9 @@ import {
   createTopicSet, getRouting, getTopicSet, rankMembers, setRouting, touchTopicSet, updateMember,
 } from './topicsets.ts'
 import {
+  findVerifyTopicSet, matchTopicSetForTask, renderTopicSetConfirm, verifyTopicSetTitle,
+} from './topicset-match.ts'
+import {
   TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine,
 } from './title.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
@@ -25,6 +28,7 @@ import { noteTopicSetActivated } from './topic-shape.ts'
 import { applyCapabilities, resolveCapabilities, type CapabilityProfile, type ResolvedCapability } from './capabilities.ts'
 import { buildDispatchScript } from './script-delegation.ts'
 import { isOpenDispatch } from './hub-branches.ts'
+import { DISPATCH_NEXT_ACTION } from './round-end.ts'
 
 export interface DispatchConfig {
   enabled: boolean
@@ -35,6 +39,8 @@ export interface DispatchDeps {
   ctx: Context
   store: Store
   logger: { warn: (msg: string) => void; info: (msg: string) => void }
+  /** R24 test seam: host message factory (默认经 host 锚加载 @deepseek-ai/dsh-llm)。 */
+  createMessage?: typeof CreateUserMessage
 }
 
 interface ToolExec {
@@ -43,14 +49,24 @@ interface ToolExec {
 
 /** The receipt/error shape `memory_dispatch` returns. */
 export interface DispatchResult {
-  status: 'dispatched' | 'error'
+  status: 'dispatched' | 'error' | 'need-confirm'
   dispatchId?: string
   branchSessionId?: string
   groupId?: string
   topicSetId?: string
   message?: string
+  /** R24: 收口提示——回执即结束本轮，不要 wait_agent/轮询等分支。 */
+  nextAction?: string
+  /**
+   * R23: the need-confirm payload. When a task is only MEDIUM similar to an
+   * existing set the plugin neither creates a set nor dispatches: it returns
+   * these candidates so the hub can ask the user which set to reuse (or to
+   * force a fresh one with forceNewTopicSet).
+   */
+  candidates?: Array<{ id: string; title: string; score: number }>
+  reason?: string
   /** R19 协同①: one row per task of a parallel group (receipts are observable). */
-  branches?: Array<{ branchSessionId?: string; task: string; status: 'dispatched' | 'error' }>
+  branches?: Array<{ branchSessionId?: string; task: string; status: 'dispatched' | 'error' | 'need-confirm' }>
 }
 
 /** Live branch registry: sessionId → AgentHandle-ish { agent, dispose }. */
@@ -258,6 +274,10 @@ export async function runDispatch(
     mode?: 'auto' | 'continue' | 'fork' | 'new'
     /** R18: capability boundary granted to the branch(es); default 'read-write'. */
     capabilities?: CapabilityProfile | string
+    /** R23: bypass topic-set matching and always create a fresh set. */
+    forceNewTopicSet?: boolean
+    /** R23: 'verify' routes the dispatch into the workspace's 「<目录名> · 验证」 set. */
+    kind?: 'verify'
   },
   exec: ToolExec,
 ): Promise<DispatchResult> {
@@ -269,29 +289,95 @@ export async function runDispatch(
   }
   const workspaceKey = workspaceKeyOf(cwd)
 
-  // ---- resolve the topic set ----
+  // ---- resolve the task text first: an empty task must never create a set ----
+  const firstTask = (args.task ?? args.tasks?.[0] ?? '').trim()
+  const hasAnyTask = Boolean(firstTask)
+    || (args.tasks ?? []).some((entry) => String(entry ?? '').trim().length > 0)
+  if (!hasAnyTask) {
+    return { status: 'error', message: 'task 不能为空。' }
+  }
+
+  // ---- resolve the topic set (R23 three-tier gate) ----
+  // explicit id > sticky routing > kind:'verify' > forceNewTopicSet >
+  // similarity match (high=reuse / medium=ask the user / none=auto-create).
   let topicSetId = args.topicSetId?.trim()
   if (topicSetId && !getTopicSet(store, topicSetId)) {
     return { status: 'error', message: `话题集 ${topicSetId} 不存在。` }
   }
+  let topicSetSource: 'explicit' | 'sticky' | 'verify' | 'reused' | 'force-new' | 'auto-created'
+    = topicSetId ? 'explicit' : 'auto-created'
+
   if (!topicSetId) {
     topicSetId = getRouting(store, hubSessionId)?.activeTopicSetId
+    if (topicSetId) topicSetSource = 'sticky'
   }
-  const firstTask = (args.task ?? args.tasks?.[0] ?? '').trim()
-  if (!topicSetId) {
+  if (!topicSetId && args.kind === 'verify') {
+    // 按项目验证集：一次性验证任务归拢到「<目录名> · 验证」，优先复用已有的。
+    const existing = findVerifyTopicSet(store, workspaceKey)
+    if (existing) {
+      topicSetId = existing
+      topicSetSource = 'reused'
+      logger.info(`supermemory: dispatch reused verify topic set ${topicSetId}`)
+    } else {
+      topicSetId = await createTopicSet(store, { workspaceKey, title: verifyTopicSetTitle(workspaceKey) })
+      topicSetSource = 'verify'
+      logger.info(`supermemory: dispatch created verify topic set ${topicSetId}`)
+    }
+    await setRouting(store, hubSessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
+    noteTopicSetActivated({ ctx, store, logger }, topicSetId)
+  }
+
+  if (!topicSetId && args.forceNewTopicSet) {
     topicSetId = await createTopicSet(store, {
       workspaceKey,
-      // An auto-created set is named after the task that created it: first
-      // line, markup stripped, shown whole up to TOPIC_SET_TITLE_MAX_CHARS
-      // and clipped with "…" beyond that (the old slice(0, 12) cut every
-      // auto-created title at 12 characters with no marker).
       title: clipEllipsis(firstLine(cleanTitleText(firstTask)), TOPIC_SET_TITLE_MAX_CHARS),
     })
+    topicSetSource = 'force-new'
     await setRouting(store, hubSessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
-    // R19 需求⑥: a dispatch that auto-created/bound a set activates it; the
-    // shape refresh is content-gated and throttled, so this is cheap.
     noteTopicSetActivated({ ctx, store, logger }, topicSetId)
-    logger.info(`supermemory: dispatch auto-created topic set ${topicSetId}`)
+    logger.info(`supermemory: dispatch force-created topic set ${topicSetId}`)
+  }
+
+  if (!topicSetId) {
+    // R23 匹配复用：同工作区内按任务与现有话题集的相似度三档处置。
+    const match = matchTopicSetForTask(store, {
+      task: firstTask,
+      tasks: args.tasks,
+      workspaceKey,
+      activeTopicSetId: getRouting(store, hubSessionId)?.activeTopicSetId,
+    })
+    if (match.tier === 'high' && match.topicSetId) {
+      topicSetId = match.topicSetId
+      topicSetSource = 'reused'
+      await setRouting(store, hubSessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
+      // R19 需求⑥: activation refreshes the shape only when content changed.
+      noteTopicSetActivated({ ctx, store, logger }, topicSetId)
+      logger.info(`supermemory: dispatch reused topic set ${topicSetId} (score ${match.score})`)
+    } else if (match.tier === 'medium') {
+      // Neither create nor dispatch: the hub turns this into ONE user question.
+      logger.info(`supermemory: dispatch needs topic-set confirmation (top score ${match.score})`)
+      return {
+        status: 'need-confirm',
+        message: renderTopicSetConfirm(match),
+        candidates: match.candidates.slice(0, 5),
+        reason: match.reason,
+      }
+    } else {
+      topicSetId = await createTopicSet(store, {
+        workspaceKey,
+        // An auto-created set is named after the task that created it: first
+        // line, markup stripped, shown whole up to TOPIC_SET_TITLE_MAX_CHARS
+        // and clipped with "…" beyond that (the old slice(0, 12) cut every
+        // auto-created title at 12 characters with no marker).
+        title: clipEllipsis(firstLine(cleanTitleText(firstTask)), TOPIC_SET_TITLE_MAX_CHARS),
+      })
+      topicSetSource = 'auto-created'
+      await setRouting(store, hubSessionId, { activeTopicSetId: topicSetId, driftCount: 0 })
+      // R19 需求⑥: a dispatch that auto-created/bound a set activates it; the
+      // shape refresh is content-gated and throttled, so this is cheap.
+      noteTopicSetActivated({ ctx, store, logger }, topicSetId)
+      logger.info(`supermemory: dispatch auto-created topic set ${topicSetId}`)
+    }
   }
   const topicSet = getTopicSet(store, topicSetId)
   if (!topicSet) return { status: 'error', message: '话题集解析失败。' }
@@ -340,6 +426,7 @@ export async function runDispatch(
       ...(firstId ? { dispatchId: firstId } : {}),
       groupId,
       topicSetId,
+      nextAction: DISPATCH_NEXT_ACTION,
       branches: receipts.map((row) => ({
         ...(row.result.branchSessionId ? { branchSessionId: row.result.branchSessionId } : {}),
         task: row.task,
@@ -348,6 +435,9 @@ export async function runDispatch(
       message: ok > 0
         ? `已派发 ${ok}/${tasks.length} 个分支任务（组 ${groupId}，每个任务独占一个分支并行执行）；`
           + '全部到达终态后只回送一次汇总，失败成员会单独标注。'
+          + (topicSetSource === 'explicit' || topicSetSource === 'sticky'
+            ? ''
+            : `（${topicSetSource === 'reused' ? '复用' : topicSetSource === 'verify' ? '验证集' : '新建'}话题集『${topicSet.title}』）`)
         : `全部任务派发失败（组 ${groupId}）。`,
     }
   }
@@ -355,6 +445,13 @@ export async function runDispatch(
   const task = firstTask
   if (!task) return { status: 'error', message: 'task 不能为空。' }
   const one = await dispatchOne(deps, { topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities, mode })
+  if (one.status === 'dispatched' && topicSetSource !== 'explicit' && topicSetSource !== 'sticky') {
+    // R23: the receipt names the set it landed in, so the hub can relay it.
+    const how = topicSetSource === 'reused' ? '复用'
+      : topicSetSource === 'verify' ? '验证集'
+        : topicSetSource === 'force-new' ? '强制新建' : '自动新建'
+    return { ...one, message: `已派发到分支 ${one.branchSessionId ?? ''}（${how}话题集『${topicSet.title}』）；完成后结果会主动送回本会话。` }
+  }
   return one
 }
 
@@ -475,7 +572,7 @@ async function dispatchOne(
 
   // ---- wake the branch ----
   try {
-    const factory = await messageFactory()
+    const factory = deps.createMessage ?? await messageFactory()
     // R18 需求④: the capability boundary is written into the branch's own first
     // message (not only enforced by the scope), so a host without the restrict
     // seam still sees the contract. R19: group membership is stated too, so the
@@ -523,6 +620,7 @@ async function dispatchOne(
   logger.info(`supermemory: dispatched ${dispatchId} → ${branchSessionId}`)
   return {
     dispatchId, branchSessionId, status: 'dispatched', topicSetId,
+    nextAction: DISPATCH_NEXT_ACTION,
     ...(groupId ? { groupId } : {}),
   }
 }

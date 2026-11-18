@@ -178,7 +178,9 @@ export function renderCard(topicSet: TopicSet | undefined): string {
       lines.push(`- ${m.title || m.sessionId}（${m.status}${m.model ? ' · ' + m.model : ''}）`)
     }
   }
-  lines.push('如需把实质工作分派到分支，调用 memory_dispatch；本会话是中枢，只做判断与整合。')
+  // R24: 派发回执后立即结束本轮——本轮里等分支只会把 relay 锁在队列里
+  // （分支不在中枢 subagent 树里，wait_agent 等不到）。
+  lines.push('如需把实质工作分派到分支，调用 memory_dispatch；本会话是中枢，只做判断与整合；派发回执后立即结束本轮回复，分支完成后 relay 会自动开启新一轮对话。')
   return lines.join('\n')
 }
 

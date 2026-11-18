@@ -1917,6 +1917,213 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   ok('R6 守卫：已交付/在途/不存在/已有续跑 均拒绝续跑')
 }
 
+
+// ---- R24: a receipt ends the hub's turn (dispatch / resume never block) ----
+{
+  const { DISPATCH_NEXT_ACTION, RESUME_NEXT_ACTION } = await import('../src/round-end.ts')
+  assert.ok(DISPATCH_NEXT_ACTION.includes('立即结束本轮回复'), 'the dispatch receipt tells the hub to end its turn')
+  assert.ok(DISPATCH_NEXT_ACTION.includes('relay'), 'the receipt names the relay that opens the next turn')
+  assert.ok(RESUME_NEXT_ACTION.includes('立即结束本轮回复'), 'the resume receipt repeats the rule')
+  assert.notEqual(DISPATCH_NEXT_ACTION, RESUME_NEXT_ACTION, 'dispatch and resume keep their own wording (已派发 / 已续跑)')
+  ok('R24-1 收口文案：派发/续跑回执都要求立即结束本轮，并说明 relay 会在新一轮送达')
+}
+
+{
+  // Drive the REAL single-dispatch receipt with a stubbed host message factory
+  // (a host-free gate has no @deepseek-ai/dsh-llm) and assert the field travels.
+  const { runDispatch } = await import('../src/dispatch.ts')
+  const { DISPATCH_NEXT_ACTION } = await import('../src/round-end.ts')
+  const cwd = process.cwd()
+  const store = {
+    topicsets: table([['ts-r23', {
+      workspaceKey: cwd, title: '收口验证', summary: '', keywords: [], status: 'active', members: [],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    }]]),
+    dispatches: table(), episodes: table(), outbox: table(), routing: table(),
+  }
+  const ctx = {
+    agents: {
+      get: () => undefined,
+      create: async (options) => ({
+        agent: { id: options.sessionId, followup: () => {}, session: { header: { cwd } } },
+        dispose: async () => {},
+      }),
+      resume: async () => { throw new Error('resume not available in the host-free gate') },
+      turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+    },
+    sessions: { get: () => ({ seq: 0 }) },
+    get: () => undefined,
+  }
+  const result = await runDispatch(
+    { ctx, store, logger, createMessage: () => ({ content: [], source: {} }) },
+    { topicSetId: 'ts-r23', task: '派发收口回执验证任务' },
+    { agent: { id: 'hub-r23', session: { header: { cwd } } } },
+  )
+  assert.equal(result.status, 'dispatched', 'a stubbed factory completes the wake')
+  assert.equal(result.nextAction, DISPATCH_NEXT_ACTION, 'the success receipt carries nextAction (single dispatch)')
+  assert.equal(store.dispatches.size, 1, 'the dispatch is still recorded exactly once')
+  ok('R24-2 单条派发回执带 nextAction（与 round-end.ts 同源，唤醒成功路径实测）')
+}
+
+{
+  // The hub prompt / tool / routing copy must carry the same rule. index.ts is
+  // not importable in a host-free process (parameter properties in its import
+  // graph), so the prompt contract is asserted at the source level.
+  const { readFileSync } = await import('node:fs')
+  const index = readFileSync('src/index.ts', 'utf8')
+  const route = readFileSync('src/route.ts', 'utf8')
+  const tools = readFileSync('src/tools.ts', 'utf8')
+  assert.ok(index.includes('立即结束本轮回复'), 'hub role text: end the turn right after the receipt')
+  assert.ok(index.includes('subagent 树') && index.includes('wait_agent'), 'hub role text: branches are not subagent-tree members')
+  assert.ok(index.includes('派发后即结束本轮回复'), 'the memory prompt block repeats the rule')
+  assert.ok(route.includes('立即结束本轮回复'), 'the routing card repeats the rule')
+  assert.ok(tools.includes('R24 收口') && tools.includes('wait_agent'), 'both tool descriptions repeat the rule')
+  assert.ok(tools.includes('RESUME_NEXT_ACTION'), 'memory_resume receipt is wired to the shared constant')
+  ok('R24-3 中枢/记忆提示/路由卡/两个工具描述与回执同源（文案不再只靠软提示）')
+}
+
+
+// ---- R23: dispatch-side topic-set matching (three tiers + verify set) ----
+{
+  const { runDispatch } = await import('../src/dispatch.ts')
+  const { matchTopicSetForTask, renderTopicSetConfirm, verifyTopicSetTitle } = await import('../src/topicset-match.ts')
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const { clipEllipsis, firstLine, cleanTitleText } = await import('../src/title.ts')
+  const cwd = process.cwd()
+  const ws = workspaceKeyOf(cwd)
+  const tsRow = (over = {}) => ({
+    workspaceKey: ws, title: '集合', summary: '', keywords: [], status: 'active', members: [],
+    createdAt: now, updatedAt: now, lastActiveAt: now, ...over,
+  })
+  const stubCtx = () => {
+    const created = []
+    return {
+      created,
+      ctx: {
+        agents: {
+          get: () => undefined,
+          create: async (options) => {
+            created.push(options.sessionId)
+            return { agent: { id: options.sessionId, followup: () => {}, session: { header: { cwd } } }, dispose: async () => {} }
+          },
+          resume: async () => { throw new Error('resume not available in the host-free gate') },
+          turnBoundaryOf: () => ({ openTurnStartSeq: null, lastTurn: 0 }),
+        },
+        sessions: { get: () => ({ seq: 0, append: () => {} }) },
+        get: () => undefined,
+      },
+    }
+  }
+  const deps = (ctx, store) => ({ ctx, store, logger, createMessage: () => ({ content: [], source: {} }) })
+  const hubExec = (id) => ({ agent: { id, session: { header: { cwd } } } })
+
+  // M0: the pure matcher — tier band, candidate list, and the active bonus
+  // never reaching the high tier on its own.
+  {
+    const store = fakeStore({ topicsets: [['ts-export', tsRow({ title: '导出功能', keywords: ['export'] })]] })
+    const medium = matchTopicSetForTask(store, { task: '导出 markdown 文档', workspaceKey: ws, now })
+    assert.equal(medium.tier, 'medium')
+    assert.equal(medium.candidates[0].id, 'ts-export')
+    assert.ok(renderTopicSetConfirm(medium).includes('ts-export'))
+    const zero = matchTopicSetForTask(store, { task: '完全无关的重构任务', workspaceKey: ws, activeTopicSetId: 'ts-export', now })
+    assert.notEqual(zero.tier, 'high', 'bonuses alone must never reach the high tier')
+    ok('M0 匹配器纯函数：中等分档 + 候选列表 + 活跃加分不越级')
+  }
+
+  // M1: high similarity reuses the set — no new set, receipt/routing/dispatch
+  // row all point at the reused set.
+  {
+    const store = fakeStore({ topicsets: [['ts-git', tsRow({ title: '同步并提交 SuperMemory 仓库的 Git', keywords: ['supermemory', 'git'] })]] })
+    const { ctx } = stubCtx()
+    const r = await runDispatch(deps(ctx, store), { task: '同步并提交 SuperMemory 仓库的 git 改动并推送' }, hubExec('hub-m1'))
+    assert.equal(store.topicsets.size, 1, 'high similarity must not create a new set')
+    assert.equal(r.status, 'dispatched')
+    assert.equal(r.topicSetId, 'ts-git', 'the receipt names the reused set')
+    assert.equal(store.routing.get('hub-m1').activeTopicSetId, 'ts-git')
+    assert.equal([...store.dispatches.entries()][0][1].topicSetId, 'ts-git')
+    assert.ok(r.message.includes('复用') && r.message.includes('同步并提交'), 'the receipt says which set was reused')
+    ok('M1 高相似：复用已有话题集（不新建，回执/routing/派发行都指向被复用集）')
+  }
+
+  // M2: medium similarity → need-confirm; nothing created, nothing dispatched.
+  {
+    const store = fakeStore({ topicsets: [['ts-export', tsRow({ title: '导出功能', keywords: ['export'] })]] })
+    const { ctx } = stubCtx()
+    const r = await runDispatch(deps(ctx, store), { task: '导出 markdown 文档' }, hubExec('hub-m2'))
+    assert.equal(r.status, 'need-confirm')
+    assert.equal(store.topicsets.size, 1, 'medium similarity must not create a set')
+    assert.equal(store.dispatches.size, 0, 'medium similarity must not dispatch')
+    assert.equal(store.routing.size, 0, 'medium similarity must not bind routing')
+    assert.equal(r.candidates[0].id, 'ts-export')
+    assert.ok(r.message.includes('候选话题集') && r.reason.includes('中等相似'))
+    ok('M2 中等相似：need-confirm + 候选列表，不创建不派发')
+  }
+
+  // M3: low similarity keeps the legacy auto-create (title = task first line).
+  {
+    const store = fakeStore({ topicsets: [['ts-release', tsRow({ title: '发布流程与回滚演练', keywords: ['发布', '回滚'] })]] })
+    const { ctx } = stubCtx()
+    const task = '给 CLI 增加一个 --json 输出参数'
+    const r = await runDispatch(deps(ctx, store), { task }, hubExec('hub-m3'))
+    assert.equal(store.topicsets.size, 2, 'low similarity keeps the legacy auto-create')
+    const created = [...store.topicsets.entries()].find(([id]) => id !== 'ts-release')
+    assert.equal(created[1].title, clipEllipsis(firstLine(cleanTitleText(task)), 60))
+    assert.equal(r.topicSetId, created[0])
+    ok('M3 低相似：保持现状自动新建（标题=任务首行 60 字）')
+  }
+
+  // M4: a cross-workspace set is never a candidate.
+  {
+    const store = fakeStore({ topicsets: [['ts-foreign', tsRow({ workspaceKey: 'G:/other-ws', title: '同步并提交 SuperMemory 仓库的 Git', keywords: ['supermemory', 'git'] })]] })
+    const { ctx } = stubCtx()
+    await runDispatch(deps(ctx, store), { task: '同步并提交 SuperMemory 仓库的 git 改动并推送' }, hubExec('hub-m4'))
+    assert.equal(store.topicsets.size, 2, 'a cross-workspace set is never a candidate')
+    const created = [...store.topicsets.entries()].find(([id]) => id !== 'ts-foreign')
+    assert.equal(created[1].workspaceKey, ws)
+    ok('M4 跨工作区不匹配：候选池仅限同工作区，直接新建')
+  }
+
+  // M5: forceNewTopicSet bypasses matching even at high similarity.
+  {
+    const store = fakeStore({ topicsets: [['ts-git', tsRow({ title: '同步并提交 SuperMemory 仓库的 Git', keywords: ['supermemory', 'git'] })]] })
+    const { ctx } = stubCtx()
+    const r = await runDispatch(deps(ctx, store), { task: '同步并提交 SuperMemory 仓库的 git 改动并推送', forceNewTopicSet: true }, hubExec('hub-m5'))
+    assert.equal(store.topicsets.size, 2, 'forceNewTopicSet bypasses matching')
+    assert.notEqual(r.topicSetId, 'ts-git')
+    ok('M5 forceNewTopicSet：绕过匹配直接新建')
+  }
+
+  // M6: kind='verify' funnels into 「<项目> · 验证」 — create once, reuse after.
+  {
+    const store = fakeStore({ topicsets: [] })
+    const first = stubCtx()
+    await runDispatch(deps(first.ctx, store), { task: '验证：只回复 OK', kind: 'verify' }, hubExec('hub-m6a'))
+    assert.equal(store.topicsets.size, 1)
+    const verifyId = [...store.topicsets.keys()][0]
+    assert.equal(store.topicsets.get(verifyId).title, verifyTopicSetTitle(ws))
+    const second = stubCtx()
+    await runDispatch(deps(second.ctx, store), { task: '再验证：只回复 OK', kind: 'verify' }, hubExec('hub-m6b'))
+    assert.equal(store.topicsets.size, 1, 'the second verify dispatch reuses the set (no new set)')
+    assert.equal(store.routing.get('hub-m6b').activeTopicSetId, verifyId)
+    assert.ok([...store.dispatches.entries()].every(([, row]) => row.topicSetId === verifyId), 'both dispatches land in the verify set')
+    ok("M6 kind='verify'：首次建「<项目> · 验证」，二次复用不新建")
+  }
+
+  // M7: an empty task errors BEFORE any set is created.
+  {
+    const store = fakeStore({ topicsets: [] })
+    const { ctx } = stubCtx()
+    const r1 = await runDispatch(deps(ctx, store), {}, hubExec('hub-m7'))
+    assert.equal(r1.status, 'error')
+    assert.ok(r1.message.includes('task'))
+    const r2 = await runDispatch(deps(ctx, store), { tasks: ['', '  '] }, hubExec('hub-m7'))
+    assert.equal(r2.status, 'error')
+    assert.equal(store.topicsets.size, 0, 'an empty task must not leave an empty-titled set behind')
+    assert.equal(store.dispatches.size, 0)
+    ok('M7 空任务护栏：先报错，不再先建空标题话题集')
+  }
+}
+
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 
 process.exit(0)

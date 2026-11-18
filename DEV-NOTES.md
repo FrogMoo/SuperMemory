@@ -1626,3 +1626,49 @@ wrap 后字符数 **87298 → 105183（+17885）**；磁盘 UTF-8 **89065 → 10
   ④ `/memory resume` 查看清单，`/memory resume <dispatchId>` 续跑，观察分支在原会话
   （或新分支）继续且结果回到 hub。
 - webui 管理台未加「被中断任务 + 继续按钮」（本次跳过，工具/命令/启动通知已覆盖需求）。
+
+## 24. 派发回执后立即结束本轮（R24，2026-11-18）
+
+### 24.1 需求
+中枢拿到 `memory_dispatch` / `memory_resume` 回执后必须**立即结束本轮回复**，不要 `wait_agent`
+等分支、不要轮询分支状态、不要边等边做无关工作把回合挂住；分支完成后 relay 作为新消息自动
+送达并开启新一轮，届时再 `memory_questions` 汇总、转述给用户。
+
+### 24.2 写作前的技术事实（核实结论，文案据此）
+- **relay 通道**：`src/observe.ts` 的 `deliver()` 用中枢会话句柄 `followup(createUserMessage(...))`
+  发回执。宿主对**空闲**会话收到 followup 会新开一个 turn；只有会话正忙时才进 inbox 队列
+  （`nextTurn` 在当前 turn 结束后才被 claim）。所以中枢在本轮里等分支 = 把 relay 锁在队列里，
+  回合被自己挂住——这正是用户在 GUI 里看到的"卡住"。
+- **分支不是中枢 subagent 树成员**：派发用 `ctx.agents.create` / `resume` 创建**顶层会话**
+  （`meta.cwd`），与 `ctx.subagent` 树无关；`wait_agent` 只能等 subagent 树成员，永远等不到分支。
+- **结论**：收口只能靠"模型立刻结束本轮"。宿主没有"回合收口"钩子，故本轮把规则写进三处可见面
+  （中枢角色提示、工具描述、路由卡），并由**回执字段 `nextAction`** 在工具结果本身里重复——
+  那是模型读完回执必定看到的最后一屏。
+
+### 24.3 改动（文件 + 行号，行号以本轮结束时为准）
+- 新增 `src/round-end.ts`：`DISPATCH_NEXT_ACTION` / `RESUME_NEXT_ACTION`（收口文案唯一来源，
+  回执、schema 渲染与冒烟断言都引用它，避免三处漂移）。
+- `src/dispatch.ts`：`DispatchResult.nextAction`（:58-59）；单条成功回执（:623）与并行组回执（:429）
+  都带 `nextAction`；`DispatchDeps.createMessage` 测试缝（:42，仅注入用，默认仍走 host 锚）。
+- `src/tools.ts`：`memory_dispatch` 描述追加「R24 收口」（:517）；输出 schema 增 `nextAction`（:562）；
+  `render` 把 `nextAction` 作为最后一行输出（:600-601）；`memory_resume` 描述（:647）、
+  输出 schema（:706）、续跑成功回执（:762，只查清单时不带）。
+- `src/index.ts`：`HUB_ROLE_TEXT` 新增 4 条（:275-283 附近，R24 注释写明动机）：回执后立即结束本轮 /
+  原因（非 subagent 树成员 + relay 排队）/ relay 会开启新一轮、届时汇总 / 同一轮可连续派发后一次性收口；
+  `PROMPT_TEXT` 的「实质工作必须开新对话执行」块补一句同义规则。
+- `src/route.ts`：`renderCard` 的中枢提示补「派发回执后立即结束本轮回复，分支完成后 relay 会自动
+  开启新一轮对话」（:181-183）。
+- `scripts/mechanism-smoke.mjs`：R24-1（两条常量文案）、R24-2（用测试缝驱动**真实** `runDispatch`
+  的成功回执，断言 `nextAction` 透传）、R24-3（index/route/tools 源码级断言四处文案同源）。
+
+### 24.4 闸门（本分支实测）
+- `pnpm typecheck`（tsc 双配置）0 错。
+- `pnpm smoke` 全绿：core 9 + mechanism **75**（含 R24-1..3）+ webui 32 + client-sim。
+- `pnpm build` 全管线通过；`lib/supermemory.js` 含「立即结束本轮回复」「R24 收口」与 `nextAction`。
+- 编号说明：并行分支的话题集匹配在 `src/topicset-match.ts` 里同样标注 R23，本需求按其后顺延为 **R24**。
+
+### 24.5 生效方式与边界
+- 需在 hub/GUI 的插件页 **禁用→启用**（或重启 DSH Desktop）重载；分支会话内禁止自己重载。
+- 收口是**软契约**（提示词 + 回执字段），宿主不强制：模型仍可能选择等待。若将来宿主提供
+  "turn 收口/回合结束"钩子，可升级为硬拦截；当前 DSH 无此 API，故明确降级为提示词 + 回执字段。
+

@@ -272,6 +272,15 @@ const HUB_ROLE_TEXT = [
   '- 系统上下文会注入「[supermemory 关联分支]」卡：它列出你已拉起的分支（名称/状态/话题集/是否被多个中枢共享），先看它再决定派发。',
   '- 分支归属话题集，可被同一话题集下的其他中枢复用/共享：继续同一条分支用 mode=continue（忙则排队），新任务用 mode=auto（复用空闲分支，否则新建）。',
   '- 不要为同一件工作反复新建分支造成重复/分裂；已完成或空闲的分支优先续派。',
+  // R24: a receipt ENDS the hub's turn. The host starts a NEW turn for an idle
+  // session when a relay lands, and only queues it while a turn is running —
+  // so waiting inside the turn stalls the relay. Branches are NOT subagent-tree
+  // members either: wait_agent can never observe them. Same rule is repeated in
+  // the tool descriptions and carried by the receipt's nextAction field.
+  '- memory_dispatch / memory_resume 返回回执后，立即结束本轮回复：不要调用 wait_agent 等分支、不要轮询分支状态、也不要边等边做无关工作把本轮挂住。',
+  '- 原因：分支不是中枢 subagent 树的成员，wait_agent 等不到它们；在本轮内等待只会让分支 relay 在队列里排队，把中枢回合卡住。',
+  '- 分支完成后 relay 会作为新消息自动送回本会话并开启新一轮对话；届时再调用 memory_questions 汇总未决问题、把结果转述给用户。',
+  '- 同一轮可以连续派发多个任务（含 tasks[] 并行组），全部派发完成后一次性结束本轮回复。',
   // R20: a branch never asks the user itself — it raises a structured question
   // to the hub, and the hub aggregates EVERY branch's open questions into one
   // ask_user_question. That is the only user-facing question of a round.
@@ -293,6 +302,7 @@ const PROMPT_TEXT = [  '[SuperMemory 记忆]',
   '- 实质工作必须开新对话执行：当用户提出问题需要实际操作（读改文件、执行命令、多步调研、修复与验证等）时，',
   '  调用 memory_dispatch 把任务派发到话题集分支会话中完成，由分支汇报结果——不要在主对话框里直接完成整套操作或长篇大论；',
   '  主对话框（中枢）只做：判断、派发、收到 relay 结果后轻量转述与交付用户要的最终信息；不要直接读改文件、执行命令或长篇推理。',
+  '  派发后即结束本轮回复，不要 wait_agent 等待分支；分支完成后 relay 会自动开启新一轮对话。',
   '  派发前用 capabilities 设定分支能力边界（改代码/跑命令用 full，只审阅用 read，纯编辑用 read-write，汇总/轻量核对用 minimal）；',
   '  纯问答、简单确认、记忆检索类问题不要派发。',
   '- 用户要求可视化管理记忆/打开记忆面板时：SuperMemory 面板已内置在左侧边栏（插件/自动化任务下方的"超级记忆"入口），',

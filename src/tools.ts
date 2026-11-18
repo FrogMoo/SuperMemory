@@ -21,6 +21,7 @@ import { newId, workspaceKeyOf } from './store.ts'
 import { createTopicSet, listTopicSets, setRouting, topicSetIdsOf } from './topicsets.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { questionsForHub, raiseQuestion, renderQuestionList, resolveQuestions } from './questions.ts'
+import { RESUME_NEXT_ACTION } from './round-end.ts'
 
 export interface ToolsDeps {
   ctx: Context
@@ -45,13 +46,18 @@ interface ToolExec {
 
 /** The receipt/error shape `memory_dispatch` returns (matches its output schema). */
 interface DispatchResult {
-  status: 'dispatched' | 'error'
+  status: 'dispatched' | 'error' | 'need-confirm'
   dispatchId?: string
   branchSessionId?: string
   groupId?: string
   topicSetId?: string
   message?: string
-  branches?: Array<{ branchSessionId?: string; task: string; status: 'dispatched' | 'error' }>
+  /** R24: 收口提示（与 dispatch.ts 的回执同源）。 */
+  nextAction?: string
+  /** R23: need-confirm 负载（与 dispatch.ts 同源）：候选话题集与判定理由。 */
+  candidates?: Array<{ id: string; title: string; score: number }>
+  reason?: string
+  branches?: Array<{ branchSessionId?: string; task: string; status: 'dispatched' | 'error' | 'need-confirm' }>
 }
 
 /** Attach all tools; returns the effect disposer. */
@@ -493,6 +499,13 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       + 'mode 语义：auto（默认）复用空闲的匹配分支、否则新建，绝不在忙碌分支里合并另一个任务；'
       + 'continue 显式续派同一条分支（忙则排队，用于同一任务的后续）；fork 从父分支最近已完成轮次开新分支；new 强制新建。'
       + '分支归属话题集、可被同一话题集下的多个中枢复用/共享（不按中枢隔离）；不要为同一件工作反复新建分支造成重复或分裂。'
+      + '话题集匹配（未显式给 topicSetId 且本会话没有激活话题集时）：插件按任务与同工作区现有话题集的相似度三档处置——'
+      + '高相似：直接复用该话题集（不新建，回执注明复用了哪个集）；'
+      + '中等相似：不派发也不新建，返回 need-confirm 与候选列表（id/标题/分数），中枢应立即用 ask_user_question 转问用户：'
+      + '复用哪个候选（用户选定后带 topicSetId 重新派发）、强制新建（forceNewTopicSet=true）还是改述任务；'
+      + '低相似/无候选：才自动新建（标题=任务首行）。跨工作区的话题集绝不参与匹配。'
+      + '一次性验证类任务传 kind:"verify"：归入「<工作区目录名> · 验证」话题集（优先复用已有的），不要为每次验证新建话题集。'
+      + '派发前优先考虑复用已有话题集；确认必须开新话题时才用 forceNewTopicSet=true，不要人为制造碎片化。'
       + 'capabilities 在派发前设定分支的能力边界（写进分支首条消息并尽量用 tools.restrict 落实）：'
       + 'full=与中枢一致（可读写文件 + 跑命令，改代码/构建/验证时用）；'
       + 'read-write=可读改文件但不能跑命令（默认，纯代码编辑/审阅改动用）；'
@@ -500,7 +513,9 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       + 'minimal=最小（只读文件 + memory_* / send_message / wait_agent，做汇总或轻量核对）。'
       + '派发前先想清楚是否需要改代码/跑命令，不要一律用 full。'
       + '分支遇到需要用户裁决的问题会用 memory_raise_question 上交中枢（永不直接问用户）；'
-      + '收到 relay 或用户新消息时用 memory_questions 汇总所有分支的问题，再用 ask_user_question 一次提问。',
+      + '收到 relay 或用户新消息时用 memory_questions 汇总所有分支的问题，再用 ask_user_question 一次提问。'
+      + 'R24 收口：本工具立即返回回执、不阻塞；拿到回执后请直接结束本轮回复——不要调用 wait_agent 等分支、不要轮询分支状态。'
+      + '分支完成后 relay 会作为新消息自动送达本会话并开启新一轮对话，届时再汇总转述。',
     parameters: {
       task: { type: 'string', description: '单个任务描述（自包含）；与 tasks 二选一' },
       tasks: {
@@ -509,6 +524,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         items: { type: 'string' },
       },
       topicSetId: { type: 'string', description: '目标话题集；省略则用本会话当前激活的话题集' },
+      forceNewTopicSet: { type: 'boolean', description: '强制新建话题集（绕过相似度匹配复用）；默认 false' },
+      kind: { type: 'string', enum: ['verify'], description: '任务性质：verify=一次性验证，归入「<工作区目录名> · 验证」话题集（优先复用已有的）' },
       mode: { type: 'string', enum: ['auto', 'continue', 'fork', 'new'], description: '分支获取方式；默认 auto' },
       capabilities: {
         type: 'string',
@@ -521,12 +538,28 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       schema: {
         type: 'object',
         properties: {
-          status: { type: 'string', enum: ['dispatched', 'error'], required: true },
+          status: { type: 'string', enum: ['dispatched', 'error', 'need-confirm'], required: true },
           dispatchId: { type: 'string' },
           branchSessionId: { type: 'string' },
           groupId: { type: 'string' },
           topicSetId: { type: 'string' },
           message: { type: 'string' },
+          // R23: need-confirm payload — the hub offers these to the user.
+          candidates: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                title: { type: 'string' },
+                score: { type: 'number' },
+              },
+              additionalProperties: false,
+            },
+          },
+          reason: { type: 'string' },
+          // R23: the hub ends its turn on this receipt instead of polling.
+          nextAction: { type: 'string' },
           // R19 协同①: a parallel group reports every task + the branch it got,
           // so the hub can name the branches in its own summary immediately.
           branches: {
@@ -546,11 +579,26 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       },
       render: (_args, value) => {
         const v = value as {
-          status: string; branchSessionId?: string; groupId?: string; message?: string
+          status: string; branchSessionId?: string; groupId?: string; message?: string; nextAction?: string
+          candidates?: Array<{ id?: string; title?: string; score?: number }>
+          reason?: string
           branches?: Array<{ branchSessionId?: string; task: string; status: string }>
+        }
+        if (v.status === 'need-confirm') {
+          const lines = [v.message ?? '任务与现有话题集中等相似，尚未派发，等待用户裁决。']
+          if (v.candidates && v.candidates.length > 0) {
+            lines.push('候选话题集：')
+            v.candidates.forEach((row, index) => {
+              lines.push(`${index + 1}. 『${row.title ?? ''}』（${row.id ?? ''}${row.score !== undefined ? `，分数 ${row.score}` : ''}）`)
+            })
+          }
+          if (v.reason) lines.push('判定理由：' + v.reason)
+          return [{ type: 'text', text: lines.join('\n') }]
         }
         if (v.status === 'dispatched') {
           const lines = [v.message ?? `已派发到分支 ${v.branchSessionId}；完成后结果会主动送回本会话。`]
+          // R24: the last line tells the hub to END this turn (relay starts the next one).
+          if (v.nextAction) lines.push(v.nextAction)
           if (v.branches && v.branches.length > 0) {
             lines.push('分支清单：')
             v.branches.forEach((row, index) => {
@@ -570,6 +618,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         topicSetId?: string
         mode?: 'auto' | 'continue' | 'fork' | 'new'
         capabilities?: 'read' | 'read-write' | 'full' | 'minimal'
+        forceNewTopicSet?: boolean
+        kind?: 'verify'
       },
       exec: ToolExec,
     ): Promise<DispatchResult> {
@@ -593,7 +643,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       + '无参 = 返回被中断任务清单（dispatchId、话题集、任务摘要、分支会话标识、中断时间、已完成部分）；'
       + '带 dispatchIds（可多个）= 续跑指定任务：优先续接被保留的分支会话（同一会话同一日志续投「原始任务 + 已完成部分」），'
       + '会话无法恢复时才带同样上下文重派发到新分支，并用 resumeOf/resumedBy 在台账关联原 dispatchId。'
-      + '已交付、仍在进行中或自主失败（max-tokens 等）的任务不会被续跑。',
+      + '已交付、仍在进行中或自主失败（max-tokens 等）的任务不会被续跑。'
+      + 'R24 收口：续跑同样立即返回、不阻塞；返回后请直接结束本轮回复，不要 wait_agent 或轮询等待分支——分支完成后 relay 会自动开启新一轮对话。',
     parameters: {
       dispatchIds: {
         type: 'array',
@@ -651,6 +702,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           },
           total: { type: 'integer', required: true },
           message: { type: 'string', required: true },
+          // R24: 续跑成功后同样提示结束本轮（清单查询不带）。
+          nextAction: { type: 'string' },
         },
         additionalProperties: false,
       },
@@ -704,7 +757,10 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           : resumed > 0 ? 'partial' : 'error'
         const message = results.map((row, index) =>
           index + 1 + '. ' + (row.status === 'resumed' ? '✅' : '❌') + ' ' + row.dispatchId + '：' + row.message).join('\n')
-        return { status, items: [], results, total: results.length, message }
+        return {
+          status, items: [], results, total: results.length, message,
+          ...(resumed > 0 ? { nextAction: RESUME_NEXT_ACTION } : {}),
+        }
       } catch (error) {
         deps.logger.warn(`supermemory: memory_resume threw: ${String(error).slice(0, 200)}`)
         return { status: 'error' as const, items: [], results: [], total: 0, message: `续跑异常：${String(error).slice(0, 200)}` }
