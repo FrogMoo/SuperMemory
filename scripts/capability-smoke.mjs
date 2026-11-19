@@ -266,7 +266,8 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.equal(spec.scope, BUILTIN_CAPABILITIES[0].scope, 'scope 升级为内置（推导）定义')
   assert.equal(row.workspaceKey, workspaceKeyOf(BUILTIN_CAPABILITIES[0].scope), '继承自旧 scope 的归属随 scope 迁移')
   assert.equal(row.status, 'active')
-  assert.ok(spec.changelog[0].includes('v2'), 'changelog 含 v2 说明: ' + spec.changelog[0])
+  // 升级行的 changelog 顶端必须是内置最新一条（不写死版本号，内置升到 v3/v4 也成立）。
+  assert.equal(spec.changelog[0], BUILTIN_CAPABILITIES[0].changelog[0], 'changelog 顶端是内置最新说明: ' + spec.changelog[0])
   assert.ok(spec.updatedAt > 0)
   ok('C4 内置升级：旧版/无版本行→定义覆盖、计数与 usage 保留、changelog 记录、归属随 scope 迁移')
 }
