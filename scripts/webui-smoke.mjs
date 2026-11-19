@@ -7,9 +7,21 @@
  */
 import assert from 'node:assert/strict'
 import http from 'node:http'
+import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+// src/panel.ts 用了 TypeScript 参数属性，Node 的 strip-only 模式会拒绝——整体
+// 重放一次带 transform 的节点（与 capability/workspace-scope 两套 smoke 一致）。
+if (!process.execArgv.includes('--experimental-transform-types')) {
+  const child = spawnSync(
+    process.execPath,
+    ['--experimental-transform-types', process.argv[1], ...process.argv.slice(2)],
+    { stdio: 'inherit' },
+  )
+  process.exit(child.status ?? 1)
+}
 
 const { attachWebui, getWebui } = await import('../src/webui.ts')
 const { workspaceKeyOf } = await import('../src/store.ts')
@@ -52,6 +64,8 @@ const store = {
   outbox: table([['ob-1', { dispatchId: 'd-1', kind: 'single', payload: '交付内容', status: 'confirmed', enqueuedAt: now }]]),
   routing: table([['sess-1', { driftCount: 0, updatedAt: now }]]),
   hotcache: table(),
+  // R22 需求④⑤: 记忆集合表（真实 domain 里是新表；管理台的写路径会用它归集）。
+  memoryCollections: table(),
 }
 
 const server = http.createServer()
@@ -226,6 +240,12 @@ assert.equal(store.memories.size, 2)
 assert.deepEqual(store.memories.get(memId).keywords, ['a', 'b'], 'explicit tags are kept verbatim (no auto-keyword noise)')
 assert.equal(store.memories.get(memId).title, '测试标题', 'the title column is stored (trimmed)')
 assert.equal(store.memories.get(memId).status, 'active')
+// R22 需求⑤: the console write path joins the collection layer immediately
+// (related collection → append entry), not only through recall's lazy migration.
+const createdCollection = store.memories.get(memId).collectionId
+assert.equal(typeof createdCollection, 'string', 'new memory carries a collection id')
+assert.ok(createdCollection && createdCollection.length > 0, 'new memory lands in a collection')
+assert.equal(store.memoryCollections.get(createdCollection).title, '测试标题', 'the collection is seeded from the entry title')
 ok('memory create')
 
 const upd = await fetch(base + '/api/memory/update', json({ ws, id: memId, title: '改过的标题', text: '改过的记忆', keywords: ['c'] }))
@@ -401,6 +421,47 @@ ok('404 / 405 / HEAD edges')
   assert.equal(seqRun.ok, false)
   assert.match(seqRun.error, /只有能力/)
   ok('R22-4 tool/status 停用 + tool/delete 删除 + 未知 id 拒绝 + 序列工具不可一键执行')
+
+  // R22 需求③：面板 listTools 必须把一条能力的完整定义带出来（入口命令、文档、
+  // 适用范围、路由描述、执行/预演方式、健康信号），否则面板详情只能显示描述。
+  {
+    const goodSpec = {
+      name: 'sm_composite_webui_detail', kind: 'capability', title: '详情能力',
+      description: '详情冒烟', entry: 'echo detail', doc: 'README.md', scope: cwd,
+      routeNote: '重复构建类事务优先用它', runnable: true, dryRunArg: '--dry-run',
+      writeConfirm: true, steps: [], parameters: [], version: 1,
+    }
+    const badSpec = { ...goodSpec, name: 'sm_composite_webui_bad', scope: join(cwd, 'nope'), doc: 'gone.md' }
+    store.toolMemory.put('tm-detail', {
+      kind: 'composite', workspaceKey: ws, title: '详情能力', tags: [], trigger: '',
+      description: '详情冒烟', entry: JSON.stringify(goodSpec), useCount: 0, status: 'active',
+    })
+    store.toolMemory.put('tm-detail-bad', {
+      kind: 'composite', workspaceKey: ws, title: '坏范围', tags: [], trigger: '',
+      description: '坏范围冒烟', entry: JSON.stringify(badSpec), useCount: 0, status: 'active',
+    })
+    const { SupermemoryPanelService } = await import('../src/panel.ts')
+    const rows = new SupermemoryPanelService(store).listTools(cwd)
+    const row = rows.find((tool) => tool.name === 'sm_composite_webui_detail')
+    assert.ok(row, 'the panel lists the capability for its workspace')
+    assert.equal(row.kind, 'capability')
+    assert.equal(row.entry, 'echo detail')
+    assert.equal(row.doc, 'README.md')
+    assert.equal(row.scope, cwd)
+    assert.equal(row.routeNote, '重复构建类事务优先用它')
+    assert.equal(row.runnable, true)
+    assert.equal(row.dryRunArg, '--dry-run')
+    assert.equal(row.writeConfirm, true)
+    assert.equal(row.builtin, false)
+    assert.equal(row.docMissing, false)
+    assert.equal(row.scopeMissing, false)
+    assert.ok(Array.isArray(row.notes), 'health notes ship with the row')
+    const badRow = rows.find((tool) => tool.name === 'sm_composite_webui_bad')
+    assert.ok(badRow, 'a capability whose scope vanished is still listed (row-level ownership wins)')
+    assert.equal(badRow.scopeMissing, true)
+    assert.ok(badRow.notes.some((note) => note.includes('适用范围目录不存在')), 'the health note explains the missing scope')
+    ok('R22-5 面板 listTools 带出能力详情（入口/文档/适用范围/路由/执行方式/健康信号）')
+  }
 }
 // dispose removes the route
 dispose()

@@ -56,6 +56,25 @@ export interface ToolView {
   useCount: number
   status: string
   live: boolean
+  /**
+   * R22 需求③: the capability's own definition, so the panel can render a
+   * detail view (entry / doc / scope / routing / how it runs) instead of only
+   * the description. Sequence tools leave these empty.
+   */
+  kind?: 'sequence' | 'capability'
+  entry?: string
+  doc?: string
+  scope?: string
+  runnable?: boolean
+  dryRunArg?: string
+  writeConfirm?: boolean
+  routeNote?: string
+  /** R22: maintenance signals mirrored from the host's capabilityHealthOf. */
+  builtin?: boolean
+  builtinVersion?: number
+  scopeMissing?: boolean
+  docMissing?: boolean
+  notes?: string[]
   /** R26: 能力定义版本与使用明细（面板能力卡片展示）。 */
   version?: number
   usage?: {
@@ -190,6 +209,77 @@ export interface SessionChatView {
   messages: SessionMessageView[]
   truncated: boolean
   note?: string
+}
+
+/**
+ * R22 需求③: one composite tool / capability rendered as readable detail rows.
+ * Every field comes from the host (panel.listTools now ships routeNote /
+ * builtin / scopeMissing / docMissing / notes); a missing field is simply
+ * omitted — never printed as "undefined".
+ */
+function capabilityDetail(
+  tool: ToolView,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): ReactNode[] {
+  const rows: ReactNode[] = []
+  const row = (key: string, label: string, value: ReactNode): void => {
+    rows.push(h('div', { key, className: 'sm-kv' },
+      h('span', { key: 'k', className: 'sm-kv-k' }, label),
+      h('span', { key: 'v', className: 'sm-kv-v' }, value),
+    ))
+  }
+  const code = (key: string, value: string): ReactNode => h('code', { key, className: 'sm-code' }, value)
+  row('kind', t('tool.detail.kind'),
+    tool.kind === 'capability' ? t('tool.kind.capability') : t('tool.kind.sequence'))
+  if (tool.version !== undefined) {
+    row('version', t('tool.detail.version'),
+      `v${tool.version}`
+      + (tool.builtin && tool.builtinVersion !== undefined
+        ? ` · ${t('tool.detail.builtin', { version: tool.builtinVersion })}`
+        : ''))
+  }
+  if (tool.entry) row('entry', t('tool.detail.entry'), code('code', tool.entry))
+  if (tool.doc) {
+    row('doc', t('tool.detail.doc'),
+      h('span', null, code('code', tool.doc),
+        tool.docMissing ? h('span', { key: 'w', className: 'sm-warn' }, t('tool.detail.missing')) : null))
+  }
+  if (tool.scope) {
+    row('scope', t('tool.detail.scope'),
+      h('span', null, code('code', tool.scope),
+        tool.scopeMissing ? h('span', { key: 'w', className: 'sm-warn' }, t('tool.detail.missing')) : null))
+  }
+  if (tool.routeNote) row('route', t('tool.detail.route'), tool.routeNote)
+  if (tool.kind === 'capability') {
+    const how = tool.runnable === false
+      ? t('tool.detail.noRun')
+      : [
+          tool.dryRunArg ? `${t('tool.detail.dryRun')}（${tool.dryRunArg}）` : t('tool.detail.realRun'),
+          tool.writeConfirm ? t('tool.detail.confirm') : null,
+        ].filter(Boolean).join(' · ')
+    row('run', t('tool.detail.run'), how)
+  }
+  const usage = tool.usage
+  const stats = [
+    `${t('tool.uses')} ${tool.useCount}`,
+    usage ? `${t('tool.detail.success')} ${usage.successCount} / ${t('tool.detail.fail')} ${usage.failCount}` : null,
+    usage && usage.consecutiveFailures >= 2 ? `${t('tool.detail.streak')} ${usage.consecutiveFailures}` : null,
+    usage?.lastStatus
+      ? `${t('tool.detail.last')} ${usage.lastStatus === 'completed' ? t('tool.detail.ok') : t('tool.detail.failed')}${usage.lastDryRun ? `（${t('tool.detail.preview')}）` : ''}`
+      : null,
+  ].filter(Boolean).join(' · ')
+  row('stats', t('tool.detail.stats'), stats)
+  if (usage?.lastSummary) row('lastSummary', t('tool.detail.lastSummary'), usage.lastSummary)
+  if (tool.notes && tool.notes.length > 0) {
+    rows.push(h('div', { key: 'notes', className: 'sm-kv' },
+      h('span', { key: 'k', className: 'sm-kv-k' }, t('tool.detail.health')),
+      h('ul', { key: 'v', className: 'sm-kv-v sm-notes' },
+        tool.notes.map((note, index) => h('li', { key: index }, note))),
+    ))
+  }
+  if (tool.steps.length > 0) row('steps', t('tool.steps'), tool.steps.join(' → '))
+  if (tool.parameters.length > 0) row('params', t('tool.params'), tool.parameters.join('、'))
+  return rows
 }
 
 /** R18 需求②: title/tags the host derives from a memory body. */
@@ -362,6 +452,19 @@ const PANEL_CSS = `
 .sm-tag[data-hit="true"]{border-color:var(--dsw-alias-link,#7aaaff);color:var(--dsw-alias-link,#7aaaff);opacity:1}
 .sm-body-text{margin-top:4px;font-size:12px;line-height:1.55;white-space:pre-wrap;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
 .sm-body-text[data-open="true"]{-webkit-line-clamp:unset;overflow:visible}
+
+/* ---- R22: 派发卡片（需求②）与能力详情（需求③） ---- */
+.sm-dispatch h3{margin:0}
+.sm-dispatch .sm-composer-opts{margin-top:8px}
+.sm-dispatch .sm-actions{margin-top:10px;padding-top:10px;border-top:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1))}
+.sm-caret{flex:none;width:10px;font-size:10px;opacity:.55;text-align:center}
+.sm-detail{display:flex;flex-direction:column;gap:3px;margin:8px 0 2px;padding-top:8px;border-top:1px dashed var(--dsw-alias-border-l2,rgba(255,255,255,.12))}
+.sm-kv{display:flex;align-items:flex-start;gap:8px;font-size:11.5px;line-height:1.65}
+.sm-kv-k{flex:none;width:74px;opacity:.55}
+.sm-kv-v{flex:1;min-width:0;word-break:break-word;white-space:pre-wrap}
+.sm-code{display:inline-block;padding:0 5px;border-radius:5px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;word-break:break-all}
+.sm-notes{margin:0;padding-left:15px}
+.sm-warn{margin-left:4px;font-size:10.5px;color:var(--dsw-alias-state-error-primary,#f25a5a)}
 
 /* ---- R19: global workspace selector, in-panel chat, memory modal ---- */
 .sm-ws{display:inline-flex;align-items:center;gap:5px;font-size:11px;opacity:.9;min-width:0}
@@ -561,6 +664,11 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string } | undefined>()
   const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string } | undefined>()
   const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
+  // R22 需求③: 固化能力可展开看完整定义（入口/文档/适用范围/路由/执行方式/健康度）。
+  const [expandedTool, setExpandedTool] = useState<string | undefined>()
+  // R27: 记忆删除不可恢复，和固化能力一样先就地问一次（内联两段确认），
+  // 不再一点就永久删除。
+  const [confirmDeleteMemory, setConfirmDeleteMemory] = useState<string | undefined>()
   // R7 quick launcher (中枢会话页签): the new-session-page choices — workspace,
   // agent preset, model, permission — beside the topic-set selection.
   const [presets, setPresets] = useState<AgentPresetView[]>([])
@@ -895,7 +1003,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     ]
   }, [hub, setsQuery])
 
-  const activeTopicSet = hub?.topicSets.find((topicSet) => topicSet.id === hub.activeTopicSetId)
   const currentTopicSet = view.kind === 'topic'
     ? hub?.topicSets.find((topicSet) => topicSet.id === view.id)
     : undefined
@@ -917,8 +1024,17 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }
 
+  // R27: 会话视图（chat）属于「中枢会话」，话题集详情（topic）属于「话题集」——
+  // 否则在这两个二级视图里四个页签全都不高亮，用户看不出自己在哪一层。
+  const tabActive = (kind: View['kind']): boolean => {
+    if (view.kind === kind) return true
+    if (kind === 'hub') return view.kind === 'chat'
+    if (kind === 'sets') return view.kind === 'topic'
+    return false
+  }
+
   const tabProps = (kind: View['kind']) => ({
-    'data-active': String(view.kind === kind),
+    'data-active': String(tabActive(kind)),
     className: 'sm-tab',
     onClick: () => setView(
       kind === 'hub' ? { kind: 'hub' }
@@ -928,21 +1044,21 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     ),
   })
 
-  // R8: the hub tab opens like the shell's new-session page — a title, one
-  // multiline composer and a primary action. The creation choices (workspace,
-  // agent preset, model, permission) are demoted to inline pills under the
-  // composer, and topic sets are toggle chips that bind the new session to
-  // them. Submitting creates the session host-side, DELIVERS the message as
-  // its first turn, and renders the receipt in place: no navigation to the
-  // shell's new-session page any more (the user opens it from the receipt
-  // only when they want to follow the conversation there).
-  const composerView: ReactNode = h('div', { key: 'composer', className: 'sm-composer' },
-    h('div', { key: 'head', className: 'sm-composer-head' },
-      h('h2', { key: 'title', className: 'sm-composer-title' }, t('composer.title')),
-      h('p', { key: 'desc', className: 'sm-composer-desc' }, t('composer.desc')),
+  // The dispatch card: submitting creates the session host-side, DELIVERS the
+  // message as its first turn, and renders the receipt in place: no navigation
+  // to the shell's new-session page (the user opens it from the receipt only
+  // when they want to follow the conversation there).
+  // R22 需求②: 派发回到「卡片」形态——与面板其它卡片（记忆 / 固化能力）同一套
+  // 视觉语言：小标题 + 一句说明 + 紧凑输入 + 行内选项 + 底部动作。字段与功能
+  // 一个都不少：任务文本、工作区/Agent 模式/模型/权限、话题集绑定 chips、
+  // ＋新话题集、开始对话 / 仅创建会话、Ctrl/Cmd+Enter、就地回执。
+  const composerView: ReactNode = h('div', { key: 'composer', className: 'sm-card sm-dispatch' },
+    h('div', { key: 'head', className: 'sm-row' },
+      h('h3', { key: 'title' }, t('composer.title')),
+      h('span', { key: 'desc', className: 'sm-muted' }, t('composer.desc')),
     ),
     h('textarea', {
-      key: 'input', className: 'sm-composer-input', rows: 4,
+      key: 'input', className: 'sm-textarea', rows: 3,
       value: composerText,
       placeholder: t('composer.placeholder'),
       onChange: (event: { target: { value: string } }) => setComposerText(event.target.value),
@@ -953,19 +1069,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         }
       },
     }),
-    h('div', { key: 'bar', className: 'sm-composer-bar' },
-      h(Button, {
-        key: 'send', variant: 'primary', label: t('composer.start'),
-        disabled: launching || !composerText.trim() || !launchCwd,
-        onClick: () => void startLaunch('chat'),
-      }),
-      h(Button, {
-        key: 'bare', label: t('composer.createOnly'), title: t('composer.createOnly.hint'),
-        disabled: launching || !launchCwd,
-        onClick: () => void startLaunch('bare'),
-      }),
-      h('span', { key: 'hint', className: 'sm-muted' }, t('composer.hint')),
-    ),
     h('div', { key: 'opts', className: 'sm-composer-opts' },
       h('label', { key: 'ws', className: 'sm-opt' },
         h('span', { key: 'label', className: 'sm-opt-label' }, t('launch.workspace')),
@@ -1071,6 +1174,19 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
           createdSet.tags.length > 0 ? tagChips(createdSet.tags) : null,
         )
       : null,
+    h('div', { key: 'actions', className: 'sm-actions' },
+      h(Button, {
+        key: 'send', variant: 'primary', label: t('composer.start'),
+        disabled: launching || !composerText.trim() || !launchCwd,
+        onClick: () => void startLaunch('chat'),
+      }),
+      h(Button, {
+        key: 'createOnly', label: t('composer.createOnly'), title: t('composer.createOnly.hint'),
+        disabled: launching || !launchCwd,
+        onClick: () => void startLaunch('bare'),
+      }),
+      h('span', { key: 'hint', className: 'sm-muted' }, t('composer.hint')),
+    ),
   )
 
   // The in-place receipt: created session + delivery state, shown where the
@@ -1094,48 +1210,15 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     receiptView,
     // R19 协同②: the current hub's own delegates, with state / set / sharing.
     BranchList({ rows: hubBranches, t, onOpen: openChat }),
+    // R22 需求⑦: 中枢会话页签只留「派发 + 回执 + 本中枢的分支 + 当前会话」。
+    // 话题集列表、激活话题集、会话数/在线数统计都属于话题集页签，这里不再
+    // 重复展示——用户已明确「这部分都在话题集页签里看」。
     h('div', { key: 'current', className: 'sm-card' },
       h('h3', null, t('hub.current')),
       h('div', { className: 'sm-row' },
         h('span', { className: 'sm-muted' }, sessionId || '—'),
         h(Button, { key: 'refresh', label: t('hub.refresh'), onClick: () => void refreshHub() }),
       ),
-      h('div', { className: 'sm-row', style: { marginTop: 6 } },
-        h('span', { className: 'sm-muted' }, `${t('hub.active')}：`),
-        activeTopicSet
-          ? h(Button, {
-              key: 'open', label: activeTopicSet.title,
-              onClick: () => setView({ kind: 'topic', id: activeTopicSet.id }),
-            })
-          : h('span', { className: 'sm-muted' }, t('hub.none')),
-      ),
-    ),
-    h('div', { key: 'list', className: 'sm-list' },
-      (hub?.topicSets ?? []).length === 0
-        ? h(EmptyState, { key: 'empty', label: t('hub.empty'), hint: t('hub.empty.hint') })
-        : (hub?.topicSets ?? []).map((topicSet) =>
-            h('div', {
-              key: topicSet.id, className: 'sm-item', 'data-clickable': 'true',
-              onClick: () => { setView({ kind: 'topic', id: topicSet.id }); setSummaryDraft(undefined); setReply('') },
-            },
-              h('div', { className: 'sm-row' },
-                h('span', { className: 'sm-title' }, topicSet.title),
-                hub?.activeTopicSetId === topicSet.id ? h('span', { key: 'b', className: 'sm-badge' }, t('hub.active')) : null,
-                topicSet.model ? h('span', { key: 'm', className: 'sm-badge' }, topicSet.model) : null,
-              ),
-              h('div', { className: 'sm-sub' }, topicSet.summary || '—'),
-              h('div', { className: 'sm-sub' }, `${t('topic.members')}：${topicSet.branches.length}`),
-              h('div', { className: 'sm-actions' },
-                h(Button, {
-                  key: 'act', label: t('hub.activate'),
-                  onClick: (event: { stopPropagation: () => void }) => {
-                    event.stopPropagation()
-                    void run(async () => api.activate(sessionId, topicSet.id), () => void refreshHub())
-                  },
-                }),
-              ),
-            ),
-          ),
     ),
   ]
 
@@ -1194,7 +1277,9 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
 
   const topicView: ReactNode = currentTopicSet
     ? [
-        h(Button, { key: 'back', className: 'sm-back', label: t('topic.back'), onClick: () => setView({ kind: 'hub' }) }),
+        // R22 需求⑥: 详情是从「话题集」列表进来的，返回目标就是那张列表
+        // （不再把用户丢回中枢页签，那里已经没有话题集内容了）。
+        h(Button, { key: 'back', className: 'sm-back', label: t('topic.back'), onClick: () => setView({ kind: 'sets' }) }),
         h('div', { key: 'card', className: 'sm-card' },
           h('h3', null, currentTopicSet.title),
           tagChips(currentTopicSet.tags),
@@ -1355,10 +1440,22 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                   key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
                   onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
                 }),
-                h(Button, {
-                  key: 'del', variant: 'danger', label: t('memory.delete'),
-                  onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => void refreshMemories()),
-                }),
+                // R27: 永久删除先就地问一次（与固化能力的删除确认一致）。
+                confirmDeleteMemory === memory.id
+                  ? h(Button, {
+                      key: 'delYes', variant: 'danger', label: t('memory.deleteConfirm'),
+                      onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => {
+                        setConfirmDeleteMemory(undefined)
+                        void refreshMemories()
+                      }),
+                    })
+                  : h(Button, {
+                      key: 'del', variant: 'danger', label: t('memory.delete'),
+                      onClick: () => setConfirmDeleteMemory(memory.id),
+                    }),
+                confirmDeleteMemory === memory.id
+                  ? h(Button, { key: 'delNo', label: t('memory.cancel'), onClick: () => setConfirmDeleteMemory(undefined) })
+                  : null,
               ),
             ),
           ),
@@ -1375,12 +1472,25 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         ? h(EmptyState, { key: 'empty', label: t('tool.empty'), hint: t('tool.empty.hint') })
         : tools.map((tool) =>
             h('div', { key: tool.id, className: 'sm-item' },
-              h('div', { className: 'sm-row' },
-                h('span', { className: 'sm-title' }, tool.title || tool.name),
-                h('span', { className: 'sm-badge' }, tool.status),
-                h('span', { className: 'sm-badge' }, tool.live ? t('tool.live') : t('tool.offline')),
+              // R22 需求③: 点标题行展开/收起该能力的完整定义——入口命令、文档、
+              // 适用范围、路由描述、执行/预演方式、健康度与使用统计都在下面。
+              h('div', {
+                key: 'head', className: 'sm-row', 'data-clickable': 'true',
+                title: t('tool.detail.toggle'),
+                style: { cursor: 'pointer' },
+                onClick: () => setExpandedTool(expandedTool === tool.id ? undefined : tool.id),
+              },
+                h('span', { key: 'caret', className: 'sm-caret' }, expandedTool === tool.id ? '▾' : '▸'),
+                h('span', { key: 'title', className: 'sm-title' }, tool.title || tool.name),
+                h('span', { key: 'kind', className: 'sm-badge' },
+                  tool.kind === 'capability' ? t('tool.kind.capability') : t('tool.kind.sequence')),
+                h('span', { key: 'status', className: 'sm-badge' }, tool.status),
+                h('span', { key: 'live', className: 'sm-badge' }, tool.live ? t('tool.live') : t('tool.offline')),
               ),
               tagChips(tool.tags),
+              expandedTool === tool.id
+                ? h('div', { key: 'detail', className: 'sm-detail' }, capabilityDetail(tool, t))
+                : null,
               editingTool && editingTool.id === tool.id
                 ? h('div', { key: 'edit' },
                     h('div', { key: 'title', className: 'sm-form-row' },

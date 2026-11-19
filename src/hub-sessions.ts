@@ -29,6 +29,17 @@
  * Reads go through `ctx.sessionQuery` (get, not inject: optional seam). Titles
  * come from one `readTitleSnapshots` batch, so a workspace with 50 sessions is
  * one read, not 50.
+ *
+ * Activity rule (R22 需求⑧ — the permanent-green-dot bug): the rail's dot means
+ * "this session is ACTIVE NOW" (locale label 「运行中」), not "this session is
+ * loaded". `sessionQuery`'s `live` fact only says the id currently exists in
+ * `ctx.sessions`; a conversation that finished its turn stays attached, so the
+ * old mapping kept the dot green on every session the user had opened that day.
+ * The only positive activity fact the host exposes is `Agent.status` (`idle` ⇄
+ * `running`, see @deepseek-ai/dsh-agent): the dot is lit ONLY while the agent is
+ * running a turn, and an unknown state (no agent registry, a throwing lookup)
+ * is dark — never optimistically green. Attachment is still reported as
+ * {@link HubSessionView.online} for a future 「在线」 indicator.
  * @module supermemory/hub-sessions
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -40,7 +51,21 @@ import { isOpenDispatch } from './hub-branches.ts'
 export interface HubSessionView {
   sessionId: string
   title: string
+  /**
+   * R22 需求⑧: the session is RUNNING a turn right now — the green dot. This is
+   * `Agent.status === 'running'`, not "attached to the host": a finished but
+   * still-attached conversation is {@link online} and must NOT be green. When
+   * the activity state is unknown (host without an agent registry) this is
+   * `false` — the requirement is "unknown stays dark".
+   */
   live: boolean
+  /**
+   * R22 需求⑧: the session is currently attached to the host (the session-query
+   * corpus `live` fact) — it can be messaged without a cold resume, but it may
+   * be idle/completed. Informational only: the rail's dot keys off {@link live}.
+   * A future 「在线」 indicator can map this field without changing the host.
+   */
+  online: boolean
   updatedAt: number
   createdAt: number
   origin: 'hub'
@@ -117,6 +142,61 @@ function serviceOf<T>(ctx: Context, name: string): T | undefined {
     return (ctx as unknown as { get?: (key: string) => unknown }).get?.(name) as T | undefined
   } catch {
     return undefined
+  }
+}
+
+/** Structural view of one host Agent (activity only; no host import needed). */
+interface AgentLike {
+  id?: string
+  status?: string
+}
+
+/** Structural view of `ctx.agents` (the host agent registry). */
+interface AgentsLike {
+  get?(sessionId: string): AgentLike | undefined
+  list?(): AgentLike[]
+}
+
+/**
+ * Build the "is this session running right now?" probe for the rail's dot.
+ *
+ * `Agent.status` is the host's ONLY positive activity signal (`idle` ⇄
+ * `running`; agent disposal removes the registry entry — see dsh-agent
+ * runtime-types). Session attachment (`ctx.sessions` / `sessionQuery` `live`) is
+ * NOT activity: a session that ended its turn stays attached, which is exactly
+ * why the old `live` mapping showed green dots on ended conversations.
+ *
+ * One `agents.list()` enumeration is preferred (O(sessions)); a host that only
+ * exposes `agents.get()` degrades to one lookup per row. Every failure mode —
+ * no agents service, a thrown lookup, a malformed value — answers `false`,
+ * because the requirement is "unknown stays dark".
+ */
+function runningProbe(ctx: Context | undefined): (sessionId: string) => boolean {
+  if (!ctx) return () => false
+  const agents = serviceOf<AgentsLike>(ctx, 'agents')
+  if (!agents) return () => false
+  try {
+    if (typeof agents.list === 'function') {
+      const rows = agents.list()
+      if (Array.isArray(rows)) {
+        const running = new Set<string>()
+        for (const agent of rows as AgentLike[]) {
+          if (agent?.status !== 'running') continue
+          const id = String(agent.id ?? '')
+          if (id) running.add(id)
+        }
+        return (sessionId) => running.has(sessionId)
+      }
+    }
+  } catch { /* fall through to the per-session lookup */ }
+  const get = agents.get
+  if (typeof get !== 'function') return () => false
+  return (sessionId) => {
+    try {
+      return get.call(agents, sessionId)?.status === 'running'
+    } catch {
+      return false
+    }
   }
 }
 
@@ -253,6 +333,9 @@ export async function listHubSessions(
     } catch { /* a title failure keeps the fallback names */ }
   }
 
+  // R22 需求⑧: the dot is "running NOW", resolved through the agent registry;
+  // attachment (`record.live`) becomes the informational `online` field.
+  const isRunning = runningProbe(ctx)
   const rows: HubSessionView[] = hubs.map(({ record, sessionId }) => {
     const title = titles.get(sessionId)
     const createdAt = typeof record.header.createdAt === 'number' ? record.header.createdAt : 0
@@ -262,7 +345,8 @@ export async function listHubSessions(
     return {
       sessionId,
       title: title?.title ?? fallbackTitle(sessionId),
-      live: record.live === true,
+      live: isRunning(sessionId),
+      online: record.live === true,
       // The header has no updatedAt; the latest title event is the only cheap
       // activity fact, so it wins and creation time is the fallback.
       updatedAt: title?.updatedAt ?? createdAt,

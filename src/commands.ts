@@ -23,6 +23,7 @@ import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, firstLine } from './title.ts'
 import { migrateTruncatedTitles, renderTitlesMigrationReport } from './title-migration.ts'
 import { mergeTopicSets, renderMergeReport } from './topicset-merge.ts'
+import { applyMemoryOrganize, previewMemoryOrganize, renderMemoryOrganizeReport } from './memory-organize.ts'
 
 export interface CommandsDeps {
   ctx: Context
@@ -50,6 +51,7 @@ const SUBCOMMANDS: ReadonlyArray<readonly [string, string]> = [
   ['export', '导出 .supermemory-export.md 到工作区根目录'],
   ['titles', '补正刷新被旧截断逻辑损坏的话题集/分支标题（dry-run 只预览不写库）'],
   ['merge', '话题集合并治理：/memory-merge [dry-run|apply] [--rename <标题>]（默认 dry-run 不写库；--rename 只改「已有主集」簇的目标标题）'],
+  ['organize', '整理记忆集合：/memory-organize [preview|apply]（默认查看整理后状态；preview 只预演不写库）'],
   ['help', '查看 /memory 命令族全部用法'],
 ]
 
@@ -130,6 +132,21 @@ async function runMemory(
         return { kind: 'error', text: String((error as { message?: string })?.message ?? error).slice(0, 300) }
       }
       return { kind: 'success', text: renderMergeReport(result) }
+    }
+    case 'organize': {
+      // R23: 一次性整理（集合重排 / 合并近重复 / 清理占位）。启动时已按标记
+      // 自动执行过一次；这里提供报告与手动重跑（preview 只读、不改库）。
+      const mode = arg.trim().toLowerCase()
+      if (mode === 'preview' || mode === 'dry-run' || mode === '预演') {
+        return { kind: 'success', text: renderMemoryOrganizeReport(await previewMemoryOrganize(store, workspaceKey)) }
+      }
+      if (mode === 'apply' || mode === '执行' || mode === '应用') {
+        const result = await applyMemoryOrganize(store, workspaceKey, { ignoreMarker: true, logger: deps.logger })
+        return { kind: 'success', text: renderMemoryOrganizeReport(result) }
+      }
+      if (mode) return { kind: 'error', text: '用法：/memory-organize [preview|apply]（默认查看当前集合状态；preview 只预演；apply 手动重跑并写库）' }
+      const result = await applyMemoryOrganize(store, workspaceKey, { logger: deps.logger })
+      return { kind: 'success', text: renderMemoryOrganizeReport(result) }
     }
     case 'help':
       return { kind: 'success', text: HELP }
@@ -276,6 +293,7 @@ const HELP = 'status 状态总览 · topicsets 话题集列表 · switch <名> �
   + 'model 模型管理 · tools 组合工具 · reqs 需求 · resume 续跑中断任务 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
   + 'merge：存量话题集合并治理（相似簇→主集，源集 archived 不删）。/memory-merge 预览清单（dry-run 不写库）；/memory-merge apply 执行；\n'
   + '  --rename <标题>：同时把「已有主集」簇的目标集改名（dry-run 预览即最终形态；存在多个已有主集簇时请分批或用管理台）。\n'
+  + 'organize：记忆集合整理（集合重排 / 合并近重复 / 清理占位）。/memory-organize 查看整理后状态；/memory-organize preview 预演不写库；apply 手动重跑；启动时已标记守卫自动执行一次。\n'
   + 'resume：被中断的任务（插件重载/关闭或 DSH 退出导致，分支会话已保留）。'
   + '/memory-resume 查看清单；/memory-resume <dispatchId...> 续跑指定任务（优先续接原分支会话）。\n'
   + '快捷方式：每个子命令都是独立命令，输入 /memory 后可在列表里直接选择'

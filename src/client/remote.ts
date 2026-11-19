@@ -61,7 +61,10 @@ export const PANEL_REMOTE = Object.freeze({
     method('listModelCatalog', []),
     method('listPermissions', []),
     method('followupTopicSet', [param('cwd'), param('topicSetId'), param('text')]),
-    method('listTools', []),
+    // A3: the panel scopes the tool list to the current workspace, so the
+    // declaration must accept the cwd the call site passes (0-arity here made
+    // the mounted client api reject the call: "expected 0 argument(s), got 1").
+    method('listTools', [param('cwd', true)]),
     method('editTool', [param('id'), param('patch')]),
     method('deleteTool', [param('id')]),
     // R22: 一键执行能力（默认预演；writeConfirm 能力需 options.confirm=true）。

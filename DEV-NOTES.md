@@ -1771,3 +1771,151 @@ wrap 后字符数 **87298 → 105183（+17885）**；磁盘 UTF-8 **89065 → 10
 - 面板 runTool/editTool/deleteTool 的 RPC 未带 cwd（列表已过滤，界面点不到跨工作区行；如需校验给描述符加 cwd）。
 - 内置 git-sync 的 scope 是绝对路径：换机器/克隆目录后失效，健康报告报 scopeMissing。
 
+
+## 27. 前端按钮与交互全量验证 + 前端修复（第 27 轮，R27）
+
+**范围**：只用真实浏览器点击，逐个验证「超级记忆」面板（`src/client/panel-page.tsx` + `new-session.tsx`）与管理台（`src/web/app.js`）的可交互元素，发现即修（仅改前端）。宿主后端与测试文件未动。
+
+**验证方式（重要约束）**：DSH Web GUI 使用「每次启动随机生成、只打印一次」的 launch token 换 cookie（`dsh web` 外壳，`/connect?token=`），第三方浏览器拿不到；因此面板用**本仓库真实产物**在本地验证台里跑：
+- 管理台：`memory_ui` 的令牌 URL 直接用 ego-browser 真点真输入（真实宿主数据）。逐项覆盖 10 个导航分区、话题集 CRUD/激活/归档、记忆 CRUD/软删恢复/弹窗编辑/搜索/过滤、能力卡（复制/预演执行/确认弹窗/启停/注册/删除）、需求 CRUD、导出、扫描、刷新、自动刷新开关、760px 与暗色主题。
+- 面板：`lib/client.js`（真实构建产物）经 `__ModuleLoader__` shim + 真实 React 渲染，`PanelApi` 用真实宿主 state 生成的 fixtures（18 中枢 / 8 话题集 / 17 记忆 / 3 能力 / 14 分支），点击走真实 DOM。覆盖侧栏（在线点/当前高亮/＋新中枢会话/行点击进对话）、四页签、composer（空消息禁用、Ctrl+Enter、选项透传、话题集 chip、＋新话题集、回执打开/收起）、记忆（onBlur 自动补全、增改/停启/删、搜索、弹窗保存/取消/点遮罩）、话题集（搜索/清空/激活/进入）、话题集详情（回复、梗概保存、成员进对话、返回中枢）、固化能力（编辑保存/取消/停启/删除两段确认）、新会话覆盖层（中枢会话 vs 话题集会话、新建标题、空选择报错、Esc/取消/遮罩关闭）、空状态、错误态、760/700/600px、明暗主题变量。
+
+**修复（全部前端）**
+1. **管理台弹窗里的按钮全是死的**（`src/web/app.js`）：三个弹窗都用内联 `onclick="event.stopPropagation()"` 阻止冒泡，连 document 上的委托监听一起挡掉 → 记忆弹窗「保存/取消」、能力结果弹窗「关闭」、确认执行弹窗「确认执行/取消」点了没反应。改为删掉内联 onclick，并让 `modal-close` 守卫只在「点击落在遮罩、且目标在 .modal 内」时忽略，弹窗内显式关闭按钮照常生效。
+2. **会话 id 全渲染成 `session-`**（`src/web/app.js`）：`short()` 只截前 8 字符，DSH 会话 id 都是 `session-<uuid>` → 话题集卡片的下拉里 8 个选项长得一模一样。改为短 id 原样、长 id「头 8 + … + 尾 6」。
+3. **搜索框要失焦才筛选**（`src/web/app.js`）：`#mem-q/#ts-q` 只听 `change`。新增 `input` 监听（140ms 去抖 + 输入法合成期不重绘 + 重绘后还原焦点与光标）。
+4. **中枢卡片重复显示话题集徽标**（`src/web/app.js`）：`renderHubs` 里同一标题渲染了两次（「话题集 · X」再一个「X」），删掉多余那个。
+5. **「注册新能力」表单一点开就折叠**（`src/web/app.js`）：`render()` 重建 `#content` 丢掉 `<details open>`，注册完/自动刷新一过表单就消失。记住展开状态（`state.capOpen` + `toggle` 捕获监听）。
+6. **面板二级视图没有页签高亮**（`src/client/panel-page.tsx`）：进对话/话题集详情后四个页签都不高亮，看不出层级。`tabActive()`：chat → 中枢会话，topic → 话题集。
+7. **面板删除记忆没有确认**（`src/client/panel-page.tsx` + `locales.ts`）：不可恢复的永久删除一点就执行，与固化能力的「删除→确认删除/取消」不一致。改为内联两段确认，新增 `memory.deleteConfirm` 词条（中/英）。
+
+**闸门**：`pnpm typecheck` 0 错；`pnpm build` exit 0（宿主 9 文件 / client 109.66 kB → wrap 107400 bytes）；`pnpm smoke` 全绿（core、mechanism 全项、webui 32、client-sim OK、capability 10、workspace-scope 6）。
+
+**复验**：修复项在真实浏览器（管理台，重载后）与验证台（面板，重建产物）逐条复测通过；管理台 10 分区零 console 错误、零 4xx/5xx。
+
+**遗留**
+- 面板与管理台的 760px 折叠、明暗主题都靠宿主 `--dsw-alias-*` 变量；验证台里用变量注入模拟，真实宿主切换主题时仍需人工看一眼对比度。
+- 管理台「注册新能力」表单值仍是 DOM 状态（自动刷新在失焦后可能清空已填内容）；展开状态已保留，值持久化留待需要时再做。
+- 管理台能力「运行（预演）」实测 exit 127：`pnpm` 不在能力执行环境的 PATH 里（`pnpm git:sync --dry-run` 找不到命令）——属后端执行环境问题，本轮未改（前端已正确显示 exit/成败/最近执行）。
+- 面板与管理台接线仍依赖宿主 remote（客户端走 `remote.supermemoryPanel`）；真实宿主内的端到端点击需刷新 GUI 后人工确认（https 令牌每进程不同，无法在外部浏览器复现）。
+
+## 28. 能力「运行（预演）」exit 127 的真实根因与修复 + 执行环境 PATH 兜底（R27 集成收尾）
+
+**症状**：固化能力「git 同步/提交/推送」的「运行（预演）」返回 `exit 127`，stderr 只有
+`/bin/bash: F:/10-SuperMemory/scripts/git-sync-push.sh: No such file or directory`。
+
+**根因（与最初猜测不同）**：不是 PATH 缺 node/pnpm。实测宿主执行环境的 PATH **同时包含**
+`C:\Program Files\nodejs` 与 `C:\Users\admin\AppData\Roaming\npm`，`where pnpm` 与
+`pnpm --version` 在能力子进程里都正常（用临时探针能力打印 `set PATH` 验证）。真正的坑是
+`scripts/git-sync-push.mjs` 的 bash 候选顺序把**裸 `bash`** 排在最前，Windows 上解析到
+`C:\Windows\System32\bash.exe` —— 那是 **WSL 启动器**，它把 `F:/...` 盘符路径原样交给 WSL 的
+`/bin/bash`，于是 127。pnpm 再把 127 透传出来。
+
+**修复**
+1. `scripts/git-sync-push.mjs`（唯一影响面，无需重载宿主）：候选改为 `$SM_BASH` → 由
+   `where git` 推导的 `<git 根>/bin/bash.exe` → `%ProgramFiles%`/`%ProgramFiles(x86)%`/
+   `%LOCALAPPDATA%\Programs\Git\bin\bash.exe` → 非 Windows 的 `sh`/`bash` → `where bash`
+   命中（**排除 `<SystemRoot>\System32\bash.exe`**）；每个候选都做**双探针**
+   （`bash -c "exit 0"` + `bash -c "test -f <脚本绝对路径>"`），单选「真的看得见本脚本」的那个。
+   纯函数导出（`isWslBash`/`bashCandidates`/`usableBash`/`findBash`），主流程用
+   `import.meta.url === argv[1]` 守卫，供 smoke import。
+2. `src/composite.ts`：新增 `capabilityExecEnv()`，`runCapability` 用它替换裸 `process.env`——
+   把 `dirname(process.execPath)`、`PNPM_HOME`、`%APPDATA%\npm`、`%ProgramFiles%\nodejs`、
+   `%LOCALAPPDATA%\pnpm` 等**确实存在**的目录追加进 PATH（不硬编码盘符；原顺序保留、大小写
+   不敏感去重；`Path`/`PATH` 大小写变体只留一个）。**这一项需要插件重载才生效**；第 1 项立即生效。
+3. `scripts/capability-smoke.mjs` 新增 **C8**（capability 由 10 → 11 项）：stripped PATH 下
+   `capabilityExecEnv` 注回宿主 node 目录且 `node --version` 仍可解析、注入幂等、PATH 无重复；
+   `isWslBash(System32\bash.exe) === true`、候选不含 WSL、`findBash()` 选中的 bash 能
+   `test -f` 看见脚本；`runCapability` 子进程实际收到的 PATH 含宿主 node 目录。
+
+**结果**：`pnpm git:sync --dry-run` 真的跑起来（工作区检查 → fetch）；能力「运行（预演）」
+`exit 127` → `exit 1`，stderr 变成真实原因 `fatal: could not read Username for
+'http://zrynas.7766.org:8418': terminal prompts disabled / ERROR: fetch 失败（凭据或网络问题）`。
+**遗留**：`~/.git-credentials` 在本机不存在（`git config` 现在只有 GCM helper），所以 dry-run 仍在
+fetch 阶段因无凭据失败——属外部凭据配置，不是插件缺陷；`tests`/docs 已更新 §4.2b。
+
+## 29. 记忆集合 + 条目两级模型（R22 需求④⑤）
+
+**目标**：记忆的存储与检索改成「记忆集合（collection）+ 多条独立条目（entry）」，语义对齐话题集；有相关集合时优先追加条目而不是新开集合；检索先匹配集合再精选条目，提升精确度，同时旧扁平记忆与既有读路径不破。
+
+**数据模型（domain 仍 v1，加表 + 加可选字段）**
+- 新表 `memory_collections`：`{ workspaceKey, title, keywords(标签), summary, status: active|archived, createdAt, updatedAt }`，语义/形态与 `topicsets` 一致（`src/schema.ts`、`src/store.ts:memoryCollections`）。加表不升版本：旧介质没有该表即空表（同 R20 `questions` 的做法）。
+- 条目仍是原 `memories` 表：新增**可选**字段 `collectionId`（`src/schema.ts`）。可选是刻意的——面板、管理台、fact 抽取等既有写路径不设置它也能通过 schema，旧记录读出为 `undefined`，所有旧字段语义不变。
+- 索引实现：`src/memory-collections.ts`（新，唯一判定处）——相似度、三档、集合匹配、迁移、两级检索、同 key 判定都在这里，tools.ts 只做接线。
+
+**remember（需求⑤）**
+1. 先做惰性迁移（把无归属旧条目按标签/标题聚类归入集合）；
+2. 同 key / 重复判定（原语义不变：同 key 同文本 duplicate、不同文本 conflict，且回执带所属集合）；
+3. 集合决策：高相似（分值 ≥4）或中等相似（≥1.75）→ **复用**该集合追加条目，回执写明「归入记忆集合「X」（高/中等相似复用）」；低相似/无匹配 → 新建集合，标题=条目标题、标签=条目标签、正文=条目正文（截断）；
+4. 显式参数：`collection`（标题，同名或相似则复用，否则以该标题新建）/ `collectionId`（必须已存在，否则报错并列候选）；
+5. 输出新增 `collectionId/collectionTitle/collectionTier(high|medium|low|explicit)/collectionCreated`。
+- 相似度 = 标题×4 + 标签×3 + 正文×1 的**加权重合率**（各项有界 0–1），所以阈值可解释、与标题长短无关。
+
+**recall（需求④）**
+- 两级：第一级 `matchCollections`（同一套 4/3/1 权重作用在集合三字段）给出命中集合与档位；第二级在「直接命中阈值 ∪ 命中集合内条目」中精选。
+- 排序分 = 直接分（标题×4/标签×3/正文×1）+ 0.5×集合分（封顶 12），再乘时间衰减；只被集合上下文带出的条目要求集合本身 ≥ 高相似阈值，避免「集合一命中就把整集倒出来」。
+- 返回：条目带 `collectionId/collectionTitle/collectionTags`，并新增 `collections` 数组（id/title/tags/score/tier）；`limit`、`topicSets` 与既有字段全部保留（旧调用/旧渲染不变）。
+- 渲染（模型可见文本）：条目行尾追加「｜集合: X」，并附「相关记忆集合：…」提示。
+
+**导出**：`memory_export` 按集合分节（`### 记忆集合：标题（标签：…）` + 集合梗概 + 条目），没有归属的条目落 `### 未归集`，条目总数不变（`ExportResult.collections` 报告集合数）。
+
+**旧数据兼容**：`migrateFlatMemories` 只做加法——补 `collectionId` + 可能新建集合，绝不改正文/标题/标签；按标签 Jaccard / 标题 token 重合聚类；软删（superseded）条目不参与；已有同名集合则并入；**幂等**（第二次 0/0）。在 remember/recall/export 之前惰性触发。
+
+**不动的边界**：`src/client/**`、`src/panel.ts`、`src/hub-sessions.ts`、`src/dispatch.ts`、`src/round-end.ts`、`src/prompt*`、`src/script-delegation.ts` 未改；`src/index.ts` 无需改动（工具注册路径不变）。
+
+**测试**：`scripts/memory-collections-smoke.mjs`（新，6 项）由 core-smoke 调用并入其计数；mechanism-smoke 新增 2 项（工具契约 + 连续写入复用回归）。闸门：`pnpm typecheck` 0/0，`pnpm smoke` 全绿（core 15 / mechanism 93 / webui 33 / client-sim / capability 11 / workspace-scope 6）。
+
+**遗留 / 集成轮接线**
+- 面板与管理台仍以扁平列表展示记忆（不显示集合层级）——本轮按范围未改客户端；集合归属已在 API（panel listMemories 的条目带 `collectionId`，`/api/state` 的 memories 同样带）与 `memory_recall` 输出里可用，集成轮可加「按集合分组」展示。
+- 面板/管理台创建的记忆不带 `collectionId`（写路径在 panel.ts/webui.ts，本轮禁改），它们会在下一次 remember/recall 时被惰性迁移归类。
+- 迁移聚类是 O(n²)（n=当前工作区未归属条目数），当前量级（<100）无问题；条目量级很大时可在维护轮分批。
+
+## 30. R22 集成收尾：三路合并 + 必要接线 + 全量闸门（2026-11-19）
+
+三路并行分支（A 记忆集合 / B 面板 UI / C 会话生命周期）合入同一工作树后，本轮的集成工作：
+
+**1. 审查结论（无互相覆盖）**
+- 行尾：全部改动文件的 CRLF/LF 与 HEAD 一致（此前 A 轮曾把 `tools.ts`/`store.ts` 整文件转成 LF，已还原；本轮新增/改动均按文件原有行尾写入）。
+- 无冲突标记、无重复函数定义；`git diff --numstat` 与各分支自报的改动规模一致。
+- `pnpm typecheck` 双端 0 错（B 的 `ToolView` 扩展 ↔ 客户端 `ToolView` 字段、C 的 `HubSessionView.online` ↔ 宿主/管理台投影均已对齐）。
+
+**2. 必要接线（本轮新增）**
+- `src/web/app.js`（管理台中枢会话徽标）：`live` → 「运行中」，`online` → 「在线」，其余 → 「离线」（C 的 `online` 字段落地；避免 attached-idle 显示「离线」的矛盾）。
+- `src/panel.ts`、`src/webui.ts`、`src/maintenance.ts` 的记忆写入路径调用 `resolveCollectionForEntry` 写 `collectionId`：面板/管理台新建记忆、自动抽取的事实记忆都会**立即复用相关集合**（需求⑤的完整闭环），旧条目仍由 recall/remember 的惰性迁移兜底。写路径在集合表缺失时降级为「不归属」，不阻断写入（显式指定集合时才报错）。
+- `scripts/webui-smoke.mjs`：stub store 补 `memoryCollections` 表，并断言管理台新建记忆立即落集合（集合由条目标题派生）。
+- 无需改 `src/index.ts`（工具注册路径不变；hub-role 提示里的「回执即结束本轮」已与 round-end 文案一致）。
+
+**3. 闸门（顺序：typecheck → build → smoke，client-sim 校验新产物）**
+`pnpm typecheck` 0/0；`pnpm build` 宿主 10 文件 / 539.73 kB + client 114.75 kB → wrap 112256 bytes；`pnpm smoke` 全绿：core 15 / mechanism 93 / webui 33 / client-sim OK / capability 11 / workspace-scope 6。
+产物抽查：`memory_collections`（store/memory-collections chunk）、`collectionId`、`collectionTitle`、`resolveCollectionForEntry`、`online`（composite chunk）、`已派发，结束本轮`/`已续跑，结束本轮`（宿主）、`sm-dispatch`（4）、`sm-detail`（2）、`返回话题集页签`、`tool.detail.toggle`（client）。
+
+**4. 遗留**
+- 面板侧栏只有「运行中」绿点（无「在线」文案）：`HubSessionView.online` 已在宿主与管理台可用；面板若要显示「在线」徽标，是 `src/client/panel-page.tsx` 的一处字段映射（本轮未改客户端 UI）。
+- 注入卡（prestep）仍用旧的 `recallMemories`（不带集合上下文）；要求只在 `memory_recall` 工具输出上，若要注入卡也带集合，需要把 `recallEntriesWithCollections` 接进 `prestep.ts`。
+- 需中枢执行 `pnpm build` 后的插件重载 + 用户刷新 GUI；工作树未 commit/push。
+
+## 31. R23 记忆整理：按「集合 + 条目」重新排布存量记忆（2026-11-19）
+
+**问题**：R22 只把集合表与惰性迁移接通，存量集合是历史写入顺序/标签聚类自动长出来的：6 个集合、22 条记忆里有一个 12 条的大杂烩（`supermemory 记忆`）、`r8 记忆`/`写入 记忆` 这类轮次或占位名，以及 6 条自动抽取误抓的包装文本（「写结论性记忆」×2、并行组「本任务是…的一员」×2、续跑「本消息是被中断任务的续跑」×2）。
+
+**方案**：数据计划 + 启动时一次性迁移（`src/memory-organize.ts`），不靠启发式重聚类。计划是显式表：5 个主题集合、12 条保留条目的最终标题/标签/正文、10 条删除/吸收（6 占位 + 4 近重复）与理由。合并条目保留双方事实（R18 完成+验收、git 凭据+仓库同步、集合匹配两条近重复）。
+
+**为什么在 apply() 里做，而不是离线改 JSON**：storage-json 的 `single` 布局**内存权威**，每次写入整单元原子重写；宿主运行期间直接改 `~/.dsh/storages/supermemory.json` 会被下一次写覆盖（甚至更糟）。因此整理通过运行中的 storage domain 写，在插件加载（`src/index.ts` 的 `applyMemoryOrganize(store, workspaceKeyOf(PLUGIN_REPO_ROOT))`）时执行一次。
+
+**安全守卫**：
+- 标记：`meta` 行 `organize-<sha256(workspaceKey).slice(0,16)>`（key 也兼容 per-record 布局），版本号挡住第二次执行；
+- 正文哈希：计划里每个会改写/删除的条目都带 `expectTextSha256`，正文被手动改过 → 保留原样并进冲突清单，绝不覆盖/删除；合并只有在 keeper 确实带上合并正文后才删被合并条目；
+- 备份：首次写前把该工作区的 memories/memory_collections 全量快照写到 `DSH_HOME/storages/supermemory-backups/organize-v1-<ISO>.json`，写失败则整个 pass 中止；
+- 兜底：计划外的新记忆按「中/高相似才归集，否则落到『其他结论（待归类）』」处理；扫描所有条目（含 superseded）补有效 `collectionId`，再删除旧集合，保证无孤儿；
+- 改名保护：旧集合标题与计划不符（被人工改名）时保留该集合、不迁走其条目；
+- 工作区限定：只整理插件仓库自身工作区，其他工作区/其他克隆不受影响（计划 id 不存在时 `nothing-to-do`，不建空集合）。
+
+**结果（真实存储只读预演验证）**：22 条 / 6 集合 → **12 条 / 5 集合**（3/3/2/2/2），未归集 0、空集合 0；6 条占位包装文本删除，4 条近重复合并吸收（独有信息并入 keeper 正文）。
+
+**工具**：`scripts/memory-organize.mjs` 对停止的宿主做只读预演（默认）或 `--apply --force` 离线写（先整文件备份，原子替换）；`--verify` 校验无孤儿/无旧集合。`/memory-organize [preview|apply]` 提供整理后报告与手动重跑；启动自动执行受标记保护。
+
+**测试**：`scripts/memory-organize-smoke.mjs`（8 项，并入 core-smoke 计数）：计划形态、只读预演、完整执行、正文哈希冲突、幂等、合并安全、内容幂等、可重入。闸门：`pnpm typecheck` 0/0；`pnpm build` 宿主 10 文件 / 574.11 kB + client 112256 bytes；`pnpm smoke` 全绿（core 23 / mechanism 93 / webui 33 / client-sim OK / capability 11 / workspace-scope 6）。
+
+**生效条件**：宿主改动 → 需中枢在 GUI/hub 对 `include:supermemory` 禁用→启用重载（分支内重载会自杀）；重载时整理自动执行，日志 Info 会打印备份路径与条目数。用户刷新 `http://127.0.0.1:62590` 后，面板里标题/标签已清理、条目数 12；集合层级在 `/memory-organize`、`memory_recall` 输出与 `memory_export` 分节中可见（面板仍为扁平列表，集合分组展示是 R22 遗留的可选后续）。
+
+**回滚**：把备份 JSON 里的 `memories` / `memoryCollections` 两表写回（或 `--apply` 前整文件备份 `supermemory.backup-organize-*.json`）。工作树未 commit/push。

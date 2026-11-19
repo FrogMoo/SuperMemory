@@ -21,11 +21,13 @@ import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, ensureMembe
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
-  bumpCompositeUse, capabilityAppliesToWorkspace, deleteCompositeTool, editCompositeTool,
+  bumpCompositeUse, capabilityAppliesToWorkspace, capabilityHealthOf, deleteCompositeTool, editCompositeTool,
   liveCompositeSpecs, runCapability, type CapabilityRunResult, type CompositeSpec,
 } from './composite.ts'
 import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
+// R22 需求⑤: 面板新建记忆与 memory_remember 共用同一套集合归属判定。
+import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
 import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
 import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
@@ -95,6 +97,15 @@ export interface ToolView {
   runnable?: boolean
   dryRunArg?: string
   writeConfirm?: boolean
+  // R22 需求③: 能力详情面板要能读完一条能力的全部定义与健康信号——
+  // 路由描述（何时优先用它）、是否内置及版本关系、文档/适用范围是否缺失、
+  // 以及 capabilityHealthOf 给出的人读维护 notes。
+  routeNote?: string
+  builtin?: boolean
+  builtinVersion?: number
+  scopeMissing?: boolean
+  docMissing?: boolean
+  notes?: string[]
   // R26: 能力定义版本与使用明细（register 同名更新 +1；成败分列/连续失败/最近一次结果）。
   version?: number
   usage?: {
@@ -553,17 +564,35 @@ export class SupermemoryPanelService {
         return { status: 'ok', message: '相同记忆已存在。', id: memoryId }
       }
     }
+    // R22 需求⑤: a memory typed in the panel joins the SAME collection layer as
+    // memory_remember (the write path is the closure of the reuse rule: related
+    // collection → append entry, no new collection). Legacy entries stay covered
+    // by the lazy migration in recall/remember.
+    const assignment = await resolveCollectionForEntry(
+      this.store, workspaceKey, { title: cleanTitle, keywords: cleanTags, text: body }, { now },
+    )
+    if ('error' in assignment) return { status: 'error', message: assignment.error }
     const memoryId = newId('mem')
     const memory: Memory = {
       workspaceKey, title: cleanTitle, text: body, key: stableKey,
       keywords: cleanTags,
+      ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
       // Typed in the panel: there is no source session to locate.
       sourceSessionId: '',
       sourceSeq: 0,
       status: 'active', createdAt: now, updatedAt: now,
     }
     await this.store.memories.put(memoryId, memory)
-    return { status: 'ok', message: '已记住。', id: memoryId }
+    if (assignment.collectionId) await touchCollection(this.store, assignment.collectionId, now)
+    return {
+      status: 'ok',
+      message: assignment.title === ''
+        ? '已记住。'
+        : assignment.created
+          ? `已记住（新建记忆集合「${assignment.title}」）。`
+          : `已记住（归入记忆集合「${assignment.title}」）。`,
+      id: memoryId,
+    }
   }
 
   /** Update one memory's text (and optional key). */
@@ -1107,6 +1136,9 @@ export class SupermemoryPanelService {
    */
   listTools(cwd?: string): ToolView[] {
     const workspaceKey = cwd ? this.wk(cwd) : undefined
+    // R22 需求③: 能力详情面板需要维护信号，这里与 capabilityHealthOf 同源一次性取齐
+    // （按工具名对齐；序列组合工具没有这些字段）。
+    const health = new Map(capabilityHealthOf(this.store).map((row) => [row.name, row]))
     const rows: ToolView[] = []
     for (const [id, record] of this.store.toolMemory.entries()) {
       if (record.kind !== 'composite') continue
@@ -1121,6 +1153,7 @@ export class SupermemoryPanelService {
       let dryRunArg: string | undefined
       let writeConfirm: boolean | undefined
       let version: number | undefined
+      let routeNote: string | undefined
       let usage: ToolView["usage"]
       try {
         const spec = JSON.parse(record.entry) as {
@@ -1134,6 +1167,7 @@ export class SupermemoryPanelService {
           runnable?: boolean
           dryRunArg?: string
           writeConfirm?: boolean
+          routeNote?: string
           version?: number
           usage?: ToolView["usage"]
         }
@@ -1148,10 +1182,12 @@ export class SupermemoryPanelService {
         dryRunArg = spec.dryRunArg
         writeConfirm = spec.writeConfirm
         version = typeof spec.version === 'number' ? spec.version : undefined
+        routeNote = spec.routeNote
         usage = spec.usage
       } catch { /* a broken definition still lists with its description */ }
       // A3: 跨工作区的工具不列出（能力按行级归属/scope 判定；序列无归属=全局）。
       if (!capabilityAppliesToWorkspace({ scope }, workspaceKey, record.workspaceKey)) continue
+      const healthRow = health.get(name)
       rows.push({
         id, name,
         title: record.title || record.description.slice(0, TITLE_MAX),
@@ -1162,6 +1198,16 @@ export class SupermemoryPanelService {
         status: record.status,
         live: liveCompositeSpecs.has(name),
         kind, entry, doc, scope, runnable, dryRunArg, writeConfirm,
+        ...(routeNote ? { routeNote } : {}),
+        ...(healthRow
+          ? {
+              builtin: healthRow.builtin,
+              ...(healthRow.builtinVersion !== undefined ? { builtinVersion: healthRow.builtinVersion } : {}),
+              scopeMissing: healthRow.scopeMissing,
+              docMissing: healthRow.docMissing,
+              notes: healthRow.notes,
+            }
+          : {}),
         ...(version !== undefined ? { version } : {}),
         ...(usage ? { usage } : {}),
       })
@@ -1451,8 +1497,10 @@ const PANEL_DESCRIPTORS = Object.freeze([
     invocation: { kind: 'direct' },
     result: { mode: 'strict', typeSymbol: 'dsh-supermemory#ToolViews', create: () => ({ parse: (v: unknown) => v }) },
     // A3: 面板按当前工作区拉取工具列表（cwd 由面板传入）。
+    // 与 listTools(cwd?: string) 的签名一致：cwd 可省略（无 cwd 时不过滤），
+    // 客户端声明端同为 optional，两端参数个数必须一致，否则客户端 api 直接拒调。
     parameters: [
-      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'cwd', wire: 'cwd', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Meta, type Memory, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Meta, type Memory, type MemoryCollection, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -34,6 +34,8 @@ export interface Store {
   readonly domain: StorageDomain.Domain<SupermemorySpec>
   topicsets: Table<TopicSet>
   memories: Table<Memory>
+  /** R22 需求④: memory collections (entries stay in `memories`). */
+  memoryCollections: Table<MemoryCollection>
   episodes: Table<Episode>
   requirements: Table<Requirement>
   filemap: Table<FileMapEntry>
@@ -122,6 +124,7 @@ export async function openStore(
     tables: {
       topicsets: sd.domainTable(schemas.topicsets),
       memories: sd.domainTable(schemas.memories),
+      memory_collections: sd.domainTable(schemas.memory_collections),
       episodes: sd.domainTable(schemas.episodes),
       requirements: sd.domainTable(schemas.requirements),
       filemap: sd.domainTable(schemas.filemap),
@@ -142,6 +145,7 @@ export async function openStore(
     domain,
     topicsets: table<TopicSet>('topicsets'),
     memories: table<Memory>('memories'),
+    memoryCollections: table<MemoryCollection>('memory_collections'),
     episodes: table<Episode>('episodes'),
     requirements: table<Requirement>('requirements'),
     filemap: table<FileMapEntry>('filemap'),

@@ -23,9 +23,9 @@ cp lib/supermemory.js "$TARGET"
 # keep the workspace tidy: drop older dev copies (keep the newest 3)
 ls -t lib/dev-*.js 2>/dev/null | tail -n +4 | xargs -r rm -f
 
-python - "$STAMP" <<'EOF'
+python - "$STAMP" "$(pwd -W 2>/dev/null || pwd)" <<'EOF'
 import os, sys
-stamp = sys.argv[1]
+stamp, repo = sys.argv[1], sys.argv[2].replace('\\', '/')
 p = os.path.expanduser('~/.dsh/profiles/desktop/cordis.patch.yml')
 lines = open(p, encoding='utf-8').read().splitlines(keepends=True)
 out, i = [], 0
@@ -35,7 +35,7 @@ while i < len(lines):
         continue
     out.append(lines[i])
     i += 1
-out.append(f"\n# SuperMemory dev load (unique module URL per build; see scripts/dev-load.sh)\n- insert:\n    - id: supermemory\n      name: 'G:/09 - dsh/SuperMemory/lib/dev-{stamp}.js'\n")
+out.append(f"\n# SuperMemory dev load (unique module URL per build; see scripts/dev-load.sh)\n- insert:\n    - id: supermemory\n      name: '{repo}/lib/dev-{stamp}.js'\n")
 tmp = p + '.tmp'
 with open(tmp, 'w', encoding='utf-8') as f:
     f.write(''.join(out))

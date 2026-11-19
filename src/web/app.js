@@ -39,12 +39,22 @@ const state = {
   // R22 能力：执行结果弹窗 + 写操作二次确认弹窗。
   capRun: null,
   capConfirm: null,
+  // R27：注册新能力表单的展开状态（render 重建 #content 后要保留）。
+  capOpen: false,
 }
 
 const $ = (sel) => document.querySelector(sel)
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 const fmtTime = (ms) => (ms ? new Date(ms).toLocaleString('zh-CN', { hour12: false }) : '—')
-const short = (id) => esc(id ? String(id).slice(0, 8) : '—')
+// R27 修复：会话 id 形如 session-<uuid>，只截前 8 字符会把每条都渲染成
+// "session-"，下拉框里所有选项看起来一模一样。改为「头 8 + … + 尾 6」的中间
+// 省略，短 id 原样显示。
+const short = (id) => {
+  const s = String(id == null ? '' : id)
+  if (!s) return '—'
+  if (s.length <= 14) return esc(s)
+  return esc(s.slice(0, 8) + '…' + s.slice(-6))
+}
 const kwHtml = (kws) => (kws || []).map((k) => `<span class="kw">${esc(k)}</span>`).join(' ')
 const badge = (s) => `<span class="badge ${esc(s)}">${esc(s)}</span>`
 
@@ -277,7 +287,7 @@ function memoryModal() {
   if (!m) return ''
   return `
   <div class="modal-backdrop" data-action="modal-close">
-    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+    <div class="modal" role="dialog" aria-modal="true">
       <h3>编辑记忆</h3>
       <p class="modal-hint">只写结论性、可复用的事实/决策；过程步骤留在会话里。标题与标签用于检索。</p>
       <div class="toolbar" style="margin:0 0 8px">
@@ -443,8 +453,11 @@ function renderHubs(d) {
       <div class="list-card-head">
         <b>${esc(h.title)}</b>
         ${h.topicSetTitle ? `<span class="badge info" title="该中枢是该话题集的 root 会话">话题集 · ${esc(h.topicSetTitle)}</span>` : ''}
-        ${h.live ? '<span class="badge ok">运行中</span>' : '<span class="badge">离线</span>'}
-        ${h.topicSetTitle ? `<span class="badge info">${esc(h.topicSetTitle)}</span>` : ''}
+        ${h.live
+          ? '<span class="badge ok">运行中</span>'
+          : h.online
+            ? '<span class="badge info">在线</span>'
+            : '<span class="badge">离线</span>'}
         <span class="grow"></span>
         <span class="muted">更新 ${fmtTime(h.updatedAt)}</span>
       </div>
@@ -539,7 +552,7 @@ function capRunModal() {
   const pre = 'white-space:pre-wrap;word-break:break-all;max-height:280px;overflow:auto;background:rgba(0,0,0,.06);padding:8px;border-radius:6px'
   return `
   <div class="modal-backdrop" data-action="modal-close">
-    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+    <div class="modal" role="dialog" aria-modal="true">
       <h3>执行结果</h3>
       <p class="modal-hint">${esc(r.command || '')} · ${r.dryRun ? '预演' : '实跑'} · ${r.durationMs}ms · exit ${r.exitCode === undefined ? '—' : r.exitCode}</p>
       ${r.summary ? `<p class="modal-hint">${esc(r.summary)}</p>` : ''}
@@ -558,7 +571,7 @@ function capConfirmModal() {
   if (!c) return ''
   return `
   <div class="modal-backdrop" data-action="modal-close">
-    <div class="modal" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
+    <div class="modal" role="dialog" aria-modal="true">
       <h3>确认执行（写操作）</h3>
       <p class="modal-hint">将在 <code>${esc(c.scope || '当前目录')}</code> 内真实执行：</p>
       <pre style="white-space:pre-wrap;word-break:break-all;background:rgba(0,0,0,.06);padding:8px;border-radius:6px">${esc(c.command)}</pre>
@@ -590,12 +603,12 @@ function renderTools(d) {
     + (caps.length
       ? `<div class="card-list">${caps.map(([t, spec]) => capabilityCard(t, spec)).join('')}</div>`
       : '<div class="empty">还没有能力。用 memory_toolize register 注册，或在下面表单录入（首个样板：git 同步/提交/推送）。</div>')
-    + `<details style="margin-top:10px"><summary>注册新能力</summary>
+    + `<details id="cap-form" style="margin-top:10px"${state.capOpen ? " open" : ""}><summary>注册新能力</summary>
       <form data-form="cap-create" class="form-inline">
         <input type="text" name="name" placeholder="能力名（git-sync-supermemory）" required style="flex:0 0 220px">
         <input type="text" name="title" placeholder="标题" style="flex:1;min-width:160px">
         <input type="text" name="entry" placeholder="入口命令（pnpm git:sync）" required style="flex:1;min-width:220px">
-        <input type="text" name="scope" placeholder="适用范围目录（G:\\09 - dsh\\SuperMemory）" style="flex:1;min-width:200px">
+        <input type="text" name="scope" placeholder="适用范围目录（仓库根，通常留空=全局）" style="flex:1;min-width:200px">
         <input type="text" name="doc" placeholder="文档路径（docs/git-sync.md）" style="flex:1;min-width:200px">
         <input type="text" name="dryRunArg" placeholder="预演参数（--dry-run）" style="flex:0 0 160px">
         <input type="text" name="tags" placeholder="标签，逗号分隔" style="flex:0 0 180px">
@@ -639,8 +652,12 @@ document.addEventListener('click', async (ev) => {
   const btn = ev.target.closest('[data-action]')
   if (!btn) return
   const action = btn.dataset.action
-  // Clicking inside the dialog must not bubble to the backdrop's close action.
-  if (action === 'modal-close' && ev.target.closest('.modal')) return
+  // R27 修复：过去弹窗用内联 onclick="event.stopPropagation()" 阻止冒泡，结果把
+  // document 上的委托监听也一起挡掉——弹窗里的「保存 / 取消 / 关闭 / 确认执行」
+  // 全是死按钮。现在改为只忽略「点遮罩空白处」：遮罩自身带 modal-close，点击
+  // 落在 .modal 内部且命中的就是遮罩时才忽略；弹窗里显式的 modal-close 按钮照常
+  // 生效。
+  if (action === 'modal-close' && btn.classList.contains('modal-backdrop') && ev.target.closest('.modal')) return
   const id = btn.dataset.id || ''
   const post = (path, body) => api(path, { method: 'POST', body })
   const run = async (fn) => {
@@ -778,6 +795,43 @@ document.addEventListener('click', async (ev) => {
   }
 })
 
+/* R27 修复：搜索框「输入即筛选」。#mem-q / #ts-q 过去只监听 change（失焦或回车
+ * 才生效），用户敲完字看不到列表变化。render() 会整体重建 #content，所以重绘后
+ * 要把焦点和光标位置还原；中文输入法合成期间（isComposing）不重绘，否则合成串
+ * 会被打断，改为合成结束后再触发。 */
+let searchTimer = 0
+document.addEventListener('input', (ev) => {
+  const t = ev.target
+  if (!t || (t.id !== 'mem-q' && t.id !== 'ts-q')) return
+  if (ev.isComposing) return
+  const id = t.id
+  const value = t.value
+  const pos = t.selectionStart == null ? value.length : t.selectionStart
+  clearTimeout(searchTimer)
+  searchTimer = setTimeout(() => {
+    if (id === 'mem-q') {
+      if (state.memQuery === value) return
+      state.memQuery = value
+    } else {
+      if (state.tsQuery === value) return
+      state.tsQuery = value
+    }
+    render()
+    const next = $('#' + id)
+    if (!next) return
+    next.focus()
+    try { next.setSelectionRange(pos, pos) } catch { /* 输入框已被替换 */ }
+  }, 140)
+})
+
+// R27 修复：render() 会整体重建 #content，「注册新能力」的展开状态原本每次都
+// 丢失（注册完/自动刷新一过就折叠，正在填的表单也随之消失）。记住展开状态，
+// 重绘后保留。
+document.addEventListener('toggle', (ev) => {
+  const t = ev.target
+  if (t && t.id === 'cap-form') state.capOpen = t.open
+}, true)
+
 document.addEventListener('change', async (ev) => {
   const t = ev.target
   if (t.id === 'ws-select') {
@@ -791,12 +845,14 @@ document.addEventListener('change', async (ev) => {
     state.memFilter = t.value
     render()
   } else if (t.id === 'mem-q') {
+    if (state.memQuery === t.value) return
     state.memQuery = t.value
     const pos = t.selectionStart
     render()
     const q = $('#mem-q')
     if (q) { q.focus(); q.setSelectionRange(pos, pos) }
   } else if (t.id === 'ts-q') {
+    if (state.tsQuery === t.value) return
     state.tsQuery = t.value
     const pos = t.selectionStart
     render()

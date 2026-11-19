@@ -121,11 +121,18 @@ export function tagsOfBody(body: string): string[] {
   return normalizeTags(keywordsOf(body))
 }
 
-/** The card line every UI and the model-facing render share. */
-export function renderRecordLine(record: { title?: string; text: string; tags?: readonly string[] }): string {
+/**
+ * The card line every UI and the model-facing render share.
+ *
+ * R22 需求④: an entry may name its memory collection — the collection is part of
+ * the record's context (like a topic set for episodes), so the line carries it
+ * only when the caller knows it. Existing callers pass nothing and are unchanged.
+ */
+export function renderRecordLine(record: { title?: string; text: string; tags?: readonly string[]; collection?: string }): string {
   const title = record.title?.trim()
   const tags = (record.tags ?? []).filter(Boolean)
   const head = title && title !== record.text.trim() ? `【${title}】` : ''
   const tail = tags.length > 0 ? ` ｜标签: ${tags.join('、')}` : ''
-  return `${head}${record.text}${tail}`
+  const collection = record.collection?.trim() ? ` ｜集合: ${record.collection.trim()}` : ''
+  return `${head}${record.text}${tail}${collection}`
 }

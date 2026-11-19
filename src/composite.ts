@@ -19,7 +19,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
 import { loadHostModule } from './host.ts'
@@ -63,7 +63,7 @@ export interface CompositeSpec {
   entry?: string
   /** 文档路径（相对仓库根），如 "docs/git-sync.md"。 */
   doc?: string
-  /** 适用范围：入口命令的执行目录，如 "G:\09 - dsh\SuperMemory"。 */
+  /** 适用范围：入口命令的执行目录，如 "F:\10-SuperMemory"（通常是本仓库根；内置能力由插件位置推导）。 */
   scope?: string
   /** 是否允许执行；false = 只作路由/文档存在，不执行。缺省 true。 */
   runnable?: boolean
@@ -649,6 +649,54 @@ function clipCapOutput(text: string): string {
     : text
 }
 
+/** PATH 分隔符与键名（Windows 上 env 里可能是 `Path`）。 */
+const PATH_SEP = process.platform === 'win32' ? ';' : ':'
+
+/**
+ * 能力执行环境的 PATH 兜底（R27）。
+ *
+ * 子进程继承 `process.env`，但桌面宿主/服务启动方式的差异会让 PATH 缺少 node 或
+ * pnpm 所在目录（注册表 PATH 里通常有 `%APPDATA%\npm`、`%ProgramFiles%\nodejs`）。
+ * 这里把「确实存在」的可执行目录**追加**进 PATH：
+ *   - `dirname(process.execPath)`（当前宿主用的 node/Electron 目录）；
+ *   - `PNPM_HOME`（pnpm 自己的约定变量）；
+ *   - Windows 上再由 `APPDATA/ProgramFiles/LOCALAPPDATA` 推导 npm/nodejs/pnpm 目录。
+ * 全部由环境变量与实际存在性推导，不硬编码盘符；原 PATH 顺序保持不变，大小写不敏感
+ * 去重。找不到目录时原样返回（不影响调用方）。
+ */
+export function capabilityExecEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base }
+  // Windows 的环境变量名大小写不敏感，保留调用方原有的写法（Path / PATH）；
+  // 极端情况下 env 里同时存在 `Path` 与 `PATH`（大小写变体），只留一个，避免
+  // 子进程读到哪个不确定。
+  const variants = Object.keys(env).filter((name) => name.toLowerCase() === 'path')
+  const key = variants[0] ?? 'PATH'
+  for (const variant of variants.slice(1)) delete env[variant]
+  const parts = String(env[key] ?? '').split(PATH_SEP).map((part) => part.trim()).filter(Boolean)
+  const seen = new Set(parts.map((part) => (process.platform === 'win32' ? part.toLowerCase() : part)))
+  const candidates: string[] = []
+  const add = (dir: string | undefined): void => {
+    if (dir && isAbsolute(dir)) candidates.push(dir)
+  }
+  add(dirname(process.execPath))
+  add(env.PNPM_HOME)
+  if (process.platform === 'win32') {
+    if (env.APPDATA) add(join(env.APPDATA, 'npm'))
+    if (env.LOCALAPPDATA) add(join(env.LOCALAPPDATA, 'pnpm'))
+    if (env.ProgramFiles) add(join(env.ProgramFiles, 'nodejs'))
+    if (env['ProgramFiles(x86)']) add(join(env['ProgramFiles(x86)'], 'nodejs'))
+  }
+  for (const dir of candidates) {
+    const dedupe = process.platform === 'win32' ? dir.toLowerCase() : dir
+    if (seen.has(dedupe)) continue
+    if (!existsSync(dir)) continue
+    seen.add(dedupe)
+    parts.push(dir)
+  }
+  env[key] = parts.join(PATH_SEP)
+  return env
+}
+
 /**
  * Execute one capability's entry command inside its scope directory.
  *
@@ -691,7 +739,8 @@ export function runCapability(spec: CompositeSpec, options: { dryRun?: boolean; 
     encoding: 'utf8',
     timeout: CAP_TIMEOUT_MS,
     maxBuffer: 16 * 1024 * 1024,
-    env: process.env,
+    // R27: 注入 node/pnpm 目录（见 capabilityExecEnv），能力命令不再依赖宿主继承到的 PATH。
+    env: capabilityExecEnv(),
   })
   const durationMs = Date.now() - started
   const stdout = clipCapOutput(String(child.stdout ?? ''))
@@ -944,8 +993,12 @@ export interface BuiltinMergeReport {
  * 升级策略（覆盖而非保留现场定义）：内置定义随插件代码与文档一起发布，旧版
  * 定义本身就是「文档与现状不符」的故障形态；唯一有意的本地修改路径是
  * memory_toolize register（version+1 超过内置），因此版本旧于内置的行不可能是
- * 认真的本地编辑。升级保留 useCount/usage 与 workspaceKey——不丢任何使用数据，
- * 也不改行属于哪个工作区。
+ * 认真的本地编辑。升级保留 useCount/usage——不丢任何使用数据。
+ *
+ * 行级归属（workspaceKey）是唯一例外：若它恰好等于「旧 scope 推导出的工作区键」
+ * （说明是内置定义自己播种/继承的，不是现场指定），而新定义的 scope 指向别处
+ * （v2 起 scope 由插件位置推导，换克隆目录就会变），归属随之迁移；现场显式登记到
+ * 其他工作区的行不会被改写。
  *
  * opts.ctx + opts.register 提供时，变化的 spec 立即重新注册（refresh-builtin
  * 运行时刷新用）；rebuildComposites 只做数据合并，注册交给随后的统一循环。
@@ -1011,16 +1064,27 @@ export async function mergeBuiltinCapabilities(
         consecutiveFailures: 0,
       },
     }
+    // scope 随插件位置变化时（v2 起内置 scope 自动推导）原先由**旧 scope 推导**
+    // 出来的行级归属必须跟着搬：否则行仍锁在旧工作区键上，能力在新工作区依旧
+    // 不生效——这正是「换克隆目录后能力失效」的另一半原因。
+    // 只迁移「继承自旧 scope」的归属；现场显式登记到别的工作区的行保持不动
+    // （工作区归属是现场事实），且那种行注册时已 version+1，根本走不到升级分支。
+    const previousScopeKey = spec?.scope ? workspaceKeyOf(spec.scope) : undefined
+    const nextScopeKey = next.scope ? workspaceKeyOf(next.scope) : undefined
+    const inheritedWorkspace = Boolean(row.workspaceKey && previousScopeKey && row.workspaceKey === previousScopeKey)
+    const workspaceKey = inheritedWorkspace && nextScopeKey ? nextScopeKey : row.workspaceKey
     await store.toolMemory.update(rowId, (r) => ({
       ...r,
       title: next.title ?? r.title,
       tags: next.tags ?? r.tags,
       description: next.description,
       entry: JSON.stringify(next),
-      // status / workspaceKey 不碰：停用是现场决定，工作区归属是现场事实。
+      // 行级归属只在「继承自旧 scope」时随 scope 迁移（见上）；否则不碰。
+      ...(workspaceKey !== r.workspaceKey ? { workspaceKey } : {}),
+      // status 仍不碰：停用是现场决定。
     }))
     report.upgraded.push(toolName)
-    report.changed.push({ spec: next, workspaceKey: row.workspaceKey })
+    report.changed.push({ spec: next, workspaceKey })
   }
   // 运行时刷新：立即重新注册变化的 spec，模型当场看到新描述/新语义。
   if (opts?.ctx && opts?.register) {

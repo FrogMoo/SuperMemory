@@ -44,6 +44,7 @@ if (typeof moduleExports.name !== 'string') throw new Error('exports.name missin
 if (!Array.isArray(moduleExports.inject)) throw new Error('exports.inject missing')
 
 // mock context
+let mountedContribution
 const remoteNamespace = new Proxy({}, {
   get: (_target, method) => async () => ({ ok: true, value: { status: 'ok', message: 'mock', id: 'mock-id', topicSets: [], memories: [], counts: {} } }),
 })
@@ -54,7 +55,7 @@ const ctx = {
     bind: () => (key) => key,
   },
   get: (key) => {
-    if (key === 'remote') return { $mount: async () => () => {} }
+    if (key === 'remote') return { $mount: async (contribution) => { mountedContribution = contribution; return () => {} } }
     if (key === 'remote.supermemoryPanel') return remoteNamespace
     if (key === 'uiWorkspace') return { openSession: () => {}, startSession: () => {} }
     return undefined
@@ -121,6 +122,29 @@ for (const name of [
   assert.ok(consoleCss.includes(name), 'the console stylesheet must define the DSH theme variable ' + name)
 }
 assert.ok(/prefers-color-scheme:\s*dark/.test(consoleCss), 'the console must follow the system color scheme like the host boot theme')
+
+// Mounted-contract arity (2026-11-18 regression): the shell's client api builds
+// each remote method from THIS contribution and rejects a call whose argument
+// count exceeds the declared parameters — "client api:
+// supermemoryPanel/listTools expected 0 argument(s), got 1" took the whole panel
+// down to 「加载失败」 while every source-level check stayed green. Assert on the
+// BUILT bundle contract that the panel's call sites fit.
+const mountedDescriptors = mountedContribution?.descriptors ?? []
+if (mountedDescriptors.length === 0) throw new Error('the client half mounted no panel descriptors')
+const contractOf = (method) => {
+  const descriptor = mountedDescriptors.find((d) => d.method === method)
+  if (!descriptor) throw new Error(`mounted contract is missing supermemoryPanel/${method}`)
+  return descriptor.parameters
+}
+const listToolsParameters = contractOf('listTools')
+// panel-page.tsx:716 calls `api.listTools(cwd)` — one argument, always a real cwd
+// (guarded by `if (!cwd) return`); the declaration must accept it.
+assert.equal(listToolsParameters.length, 1, 'supermemoryPanel/listTools must declare the cwd argument the panel passes')
+assert.equal(listToolsParameters[0].name, 'cwd')
+assert.equal(listToolsParameters[0].acceptsUndefined, true, 'cwd is optional (old hosts / headless callers omit it)')
+for (const descriptor of mountedDescriptors) {
+  assert.ok(Array.isArray(descriptor.parameters), `supermemoryPanel/${descriptor.method} must declare its parameters`)
+}
 
 console.log('SIM SMOKE OK')
 console.log('  name:', moduleExports.name)

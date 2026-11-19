@@ -13,6 +13,14 @@
  */
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// The health report resolves `doc` relative to `scope` on the REAL filesystem, so
+// the fixtures below must not hardcode one machine's clone path (the repo moved
+// from G:\09 - dsh\SuperMemory to F:\10-SuperMemory and C6 went red): anchor on
+// this repository instead.
+const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 // src/composite.ts 等源码是 TypeScript；Node strip-only 模式不够时整体重放一次。
 if (!process.execArgv.includes('--experimental-transform-types')) {
@@ -26,7 +34,8 @@ if (!process.execArgv.includes('--experimental-transform-types')) {
 
 const {
   bumpCompositeUse, buildCapabilitySpec, capabilityToolDef, capabilityToolDescription,
-  capabilityHealthOf, mergeBuiltinCapabilities, persistComposite, rebuildComposites, registerCapability,
+  capabilityExecEnv, capabilityHealthOf, mergeBuiltinCapabilities, persistComposite, rebuildComposites,
+  registerCapability, runCapability,
 } = await import('../src/composite.ts')
 const { BUILTIN_CAPABILITIES } = await import('../src/builtin-capabilities.ts')
 const { CAPABILITY_ROUTING_RULES } = await import('../src/route.ts')
@@ -212,7 +221,7 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.equal(spec.doc, 'docs/git-sync.md')
   assert.equal(spec.dryRunArg, '--dry-run')
   assert.equal(spec.writeConfirm, true)
-  assert.equal(row.workspaceKey, workspaceKeyOf('G:\\09 - dsh\\SuperMemory'), '播种落到适用范围的工作区')
+  assert.equal(row.workspaceKey, workspaceKeyOf(BUILTIN_CAPABILITIES[0].scope), '播种落到适用范围（自动推导的 scope）的工作区')
   assert.equal(row.trigger, 'capability/' + GIT_TOOL)
   // 重启：rebuildComposites 注册拾取（含刚播种的内置能力）。
   const registered = []
@@ -247,16 +256,37 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.deepEqual(report.upgraded, [GIT_TOOL])
   const row = store.toolMemory.get('tm-legacy')
   const spec = JSON.parse(row.entry)
-  assert.equal(spec.version, 1, '升级到内置版本')
+  assert.equal(spec.version, BUILTIN_CAPABILITIES[0].version, '升级到内置版本')
   assert.equal(spec.description, BUILTIN_CAPABILITIES[0].description, '定义恢复为内置')
   assert.ok(spec.routeNote && spec.routeNote.length > 0, '补上路由描述')
   assert.equal(row.useCount, 6, '行级计数保留')
   assert.deepEqual(spec.usage, { useCount: 6, successCount: 4, failCount: 2, consecutiveFailures: 2 }, 'usage 明细保留')
-  assert.equal(row.workspaceKey, 'G:\\09 - dsh\\SuperMemory', '工作区归属不改写')
+  // v2：scope 由插件位置推导，旧 scope 与本机不同；该行归属恰好等于旧 scope 推导值
+  // ⇒ 是内置定义自己继承来的，必须随 scope 一起迁移，否则能力在新工作区仍不生效。
+  assert.equal(spec.scope, BUILTIN_CAPABILITIES[0].scope, 'scope 升级为内置（推导）定义')
+  assert.equal(row.workspaceKey, workspaceKeyOf(BUILTIN_CAPABILITIES[0].scope), '继承自旧 scope 的归属随 scope 迁移')
   assert.equal(row.status, 'active')
-  assert.ok(spec.changelog[0].includes('v1'), 'changelog 含内置说明: ' + spec.changelog[0])
+  assert.ok(spec.changelog[0].includes('v2'), 'changelog 含 v2 说明: ' + spec.changelog[0])
   assert.ok(spec.updatedAt > 0)
-  ok('C4 内置升级：旧版/无版本行→定义覆盖、计数与 usage 保留、changelog 记录')
+  ok('C4 内置升级：旧版/无版本行→定义覆盖、计数与 usage 保留、changelog 记录、归属随 scope 迁移')
+}
+
+// ---- C4b 归属迁移边界：现场显式指定别的工作区的行不被改写 ----
+{
+  const store = fakeStore()
+  const elsewhere = workspaceKeyOf('G:\\scope-elsewhere')
+  const legacy = {
+    name: GIT_TOOL, kind: 'capability', entry: 'pnpm git:sync', doc: 'docs/git-sync.md',
+    scope: 'G:\\09 - dsh\\SuperMemory', steps: [], parameters: [], runnable: true,
+  }
+  await store.toolMemory.put('tm-elsewhere', {
+    kind: 'composite', workspaceKey: elsewhere, trigger: 'capability/' + GIT_TOOL,
+    title: '现场行', tags: [], description: 'd', entry: JSON.stringify(legacy), useCount: 0, status: 'active',
+  })
+  const report = await mergeBuiltinCapabilities(store)
+  assert.deepEqual(report.upgraded, [GIT_TOOL])
+  assert.equal(store.toolMemory.get('tm-elsewhere').workspaceKey, elsewhere, '现场显式指定的归属不被改写')
+  ok('C4b 归属迁移边界：只搬「继承自旧 scope」的行，现场指定别的工作区的行保持不动')
 }
 
 // ---- C5 现场保留：本地版本新于内置时不覆盖 ----
@@ -286,7 +316,7 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   const store = fakeStore()
   const badSpec = {
     name: 'sm_composite_cap_bad', kind: 'capability', description: '坏能力', title: '坏能力',
-    entry: 'pnpm health', doc: 'docs/nope.md', scope: 'G:\\09 - dsh\\SuperMemory',
+    entry: 'pnpm health', doc: 'docs/__sm_missing_doc__.md', scope: REPO_ROOT,
     steps: [], parameters: [], runnable: true,
     usage: { useCount: 3, successCount: 0, failCount: 3, consecutiveFailures: 3, lastStatus: 'failed' },
   }
@@ -337,6 +367,71 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.ok(text.includes('confirm=true'), '描述带写操作确认语义')
   assert.ok(text.includes(CAPABILITY_ROUTING_RULES), '描述带能力路由规则')
   ok('C7 路由规则：单一来源文案进入每个能力工具的描述')
+}
+
+// ---- C8 执行环境 PATH 兜底 + git-sync 的 bash 解析（R27 的 exit 127 回归） ----
+{
+  // (a) PATH 里连 node 目录都没有时，capabilityExecEnv 必须把「宿主 node 目录」补回来，
+  //     且不破坏原有顺序、不重复追加。用真实 stripped PATH 跑一次 `node --version`：
+  //     解析得出来 → exit 0，这就是「模拟 PATH 不含 pnpm/node 仍可解析」的端到端断言。
+  const strippedPath = process.platform === 'win32'
+    ? 'C:' + String.fromCharCode(92) + 'Windows' + String.fromCharCode(92) + 'system32'
+    : '/nonexistent-bin'
+  const originalPathKey = Object.keys(process.env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
+  const injected = capabilityExecEnv({ ...process.env, [originalPathKey]: strippedPath })
+  const injectedPath = String(injected[Object.keys(injected).find((k) => k.toLowerCase() === 'path') ?? 'PATH'] ?? '')
+  assert.ok(injectedPath.startsWith(strippedPath), '原有 PATH 顺序保持不变: ' + injectedPath)
+  assert.ok(
+    injectedPath.toLowerCase().includes(dirname(process.execPath).toLowerCase()),
+    '注入宿主 node 目录: ' + dirname(process.execPath),
+  )
+  const entries = injectedPath.split(process.platform === 'win32' ? ';' : ':')
+  assert.equal(new Set(entries.map((e) => e.toLowerCase())).size, entries.length, 'PATH 不出现重复项')
+  // 用注入后的 PATH 执行 node：宿主 node 目录被补进 PATH，因此能被解析到。
+  const probe = spawnSync('node --version', { shell: true, encoding: 'utf8', env: injected, timeout: 30000 })
+  assert.equal(probe.status, 0, 'stripped PATH + 注入后仍能解析 node: ' + String(probe.stdout || probe.stderr).slice(0, 200))
+  assert.match(String(probe.stdout), /^v\d+\./, 'node 版本输出正常: ' + String(probe.stdout).trim())
+  // 幂等：对已注入过的 env 再注入一次不改变结果。
+  assert.equal(capabilityExecEnv(injected)[originalPathKey], injected[originalPathKey], '重复注入幂等')
+
+  // (b) git-sync 的 bash 解析：WSL 启动器必须被识别并排除，Git for Windows 的 bash
+  //     必须排在候选里（这就是 exit 127 的根因：旧实现先命中 System32 里的 bash.exe）。
+  const bashMod = await import('../scripts/git-sync-push.mjs')
+  if (process.platform === 'win32') {
+    const sysRoot = process.env.SystemRoot || 'C:' + String.fromCharCode(92) + 'WINDOWS'
+    const wsl = join(sysRoot, 'system32', 'bash.exe')
+    assert.equal(bashMod.isWslBash(wsl), true, 'System32\bash.exe = WSL 启动器: ' + wsl)
+    assert.equal(bashMod.isWslBash(join(sysRoot, 'system32', 'cmd.exe')), false, 'cmd.exe 不是 bash')
+    const candidates = bashMod.bashCandidates()
+    assert.ok(candidates.length > 0, 'Windows 上至少有一个候选')
+    assert.ok(
+      candidates.every((c) => !bashMod.isWslBash(c)),
+      '候选里排除 WSL 启动器: ' + JSON.stringify(candidates),
+    )
+    const findBash = bashMod.findBash()
+    assert.ok(findBash, '真实环境中能选出一个可用 bash: ' + JSON.stringify(candidates))
+    assert.equal(bashMod.isWslBash(findBash), false, '选中的不是 WSL 启动器: ' + findBash)
+    assert.equal(bashMod.usableBash(findBash), true, '选中的 bash 能看见 git-sync-push.sh: ' + findBash)
+  } else {
+    assert.equal(bashMod.isWslBash('/bin/bash'), false, '非 Windows 不判定 WSL')
+    assert.ok(bashMod.findBash(), 'POSIX 上能找到 bash/sh')
+  }
+
+  // (c) runCapability 确实把自己的 env（含注入）交给子进程：让入口命令把子进程看到的
+  //     PATH 打出来，必须包含宿主 node 目录。
+  const echoPath = {
+    name: 'sm_composite_cap_env_probe', kind: 'capability', description: '执行环境探针',
+    // `set`（cmd）/ `env`（POSIX）都是纯内建，不需要引号，把子进程环境原样打出来。
+    entry: process.platform === 'win32' ? 'set' : 'env',
+    steps: [], parameters: [], runnable: true,
+  }
+  const envRun = runCapability(echoPath, { dryRun: false })
+  assert.equal(envRun.status, 'completed', '能力子进程能执行 node: ' + envRun.summary + ' / ' + envRun.stderr.slice(0, 120))
+  assert.ok(
+    String(envRun.stdout).toLowerCase().includes(dirname(process.execPath).toLowerCase()),
+    '子进程 PATH 含宿主 node 目录: ' + String(envRun.stdout).slice(0, 200),
+  )
+  ok('C8 执行环境：PATH 兜底注入宿主 node 目录（stripped PATH 下 node 仍可解析）+ WSL bash 排除')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

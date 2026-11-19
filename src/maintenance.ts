@@ -17,6 +17,8 @@ import { deriveTitle, mergeTags } from './retrieval.ts'
 import type { Memory, Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
+// R22 需求⑤: 自动抽取的事实记忆与 memory_remember 共用集合归属判定。
+import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
 import './services.ts'
 
 
@@ -359,13 +361,23 @@ async function countSequenceSignal(
       return undefined
     }
   }
+  // R22 需求⑤: an auto-extracted fact joins the SAME collection layer as
+  // memory_remember — a related collection is appended to, never duplicated.
+  // A medium without the collection table degrades to an uncollected entry
+  // (the migration in recall/remember folds it later).
+  const title = deriveTitle(text)
+  const tags = mergeTags([], keywords)
+  const assignment = await resolveCollectionForEntry(store, workspaceKey, { title, keywords: tags, text }, { now })
+  if ('error' in assignment) return undefined
   const memoryId = newId('mem')
   const memory: Memory = {
-    workspaceKey, title: deriveTitle(text), text,
-    keywords: mergeTags([], keywords), sourceSessionId, sourceSeq,
+    workspaceKey, title, text,
+    keywords: tags, sourceSessionId, sourceSeq,
+    ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
     status: 'active', createdAt: now, updatedAt: now,
   }
   await store.memories.put(memoryId, memory)
+  if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
   return memoryId
 }
 

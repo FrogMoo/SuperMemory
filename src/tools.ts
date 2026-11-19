@@ -13,6 +13,10 @@ import { listInterruptedDispatches, renderInterruptedList, resumeDispatch, type 
 import { loadHostModule } from './host.ts'
 import { applyModelSelection, askDefaultModel, enumerateModels, type ModelDeps } from './model.ts'
 import { matchTopicSets, recallMemories, type RecallOptions } from './recall.ts'
+import {
+  findMemoryConflict, listCollections, migrateFlatMemories, recallEntriesWithCollections,
+  resolveCollectionForEntry, touchCollection,
+} from './memory-collections.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, renderRecordLine, tagsOfBody } from './retrieval.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
@@ -74,6 +78,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         + '禁止记录过程流水账（先做了什么、执行了哪些命令、第几步、工具调用日志、大段输出），这些留在会话里。'
         + '必须同时给出 title + tags + 正文：标题是一句可扫读的结论（≤48 字），标签是 3–8 个短词（检索索引），正文自包含。'
         + '过长（>1500 字）或明显是步骤/命令日志的内容会被拒绝，请先改写成结论。'
+        + '记忆按「记忆集合 + 条目」组织：写入时会先按标题/标签/正文匹配已有集合，高/中相似直接复用该集合并追加条目（回执注明集合），'
+        + '低相似才新建集合；可用 collection 指定集合标题、collectionId 指定集合 id。'
         + '同一 key 已存不同文本时返回冲突提示（不覆盖），由你向用户裁决。',
       parameters: {
         text: { type: 'string', required: true, description: '结论正文（自包含、可复用的事实/决策；不要过程流水账）' },
@@ -85,6 +91,9 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           description: '标签（3–8 个短词）：检索索引，与正文分离',
           items: { type: 'string' },
         },
+        // R22 需求⑤: 相关集合优先复用；显式指定用于模型已经知道该写哪一集的情况。
+        collection: { type: 'string', description: '可选：目标记忆集合标题（同名/相似集合会被复用，否则以该标题新建）' },
+        collectionId: { type: 'string', description: '可选：目标记忆集合 id（必须已存在）' },
       },
       output: {
         schema: {
@@ -94,6 +103,15 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
             memoryId: { type: 'string' },
             title: { type: 'string' },
             tags: { type: 'array', items: { type: 'string' } },
+            // R22 需求④⑤: which memory collection the entry landed in, and how.
+            collectionId: { type: 'string', description: '所属记忆集合 id' },
+            collectionTitle: { type: 'string', description: '所属记忆集合标题' },
+            collectionTier: {
+              type: 'string',
+              enum: ['high', 'medium', 'low', 'explicit'],
+              description: '复用档位：high/medium=命中已有集合，low=新建集合，explicit=调用方指定',
+            },
+            collectionCreated: { type: 'boolean', description: '本次是否新建了集合' },
             message: { type: 'string', required: true },
             conflict: {
               type: 'object',
@@ -108,7 +126,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         },
         render: (_args, value) => [{ type: 'text', text: String((value as { message?: string }).message ?? '') }],
       },
-      async execute(args: { text: string; key?: string; title?: string; tags?: string[] | string }, exec: ToolExec) {
+      async execute(args: { text: string; key?: string; title?: string; tags?: string[] | string; collection?: string; collectionId?: string }, exec: ToolExec) {
         const cwd = exec.agent?.session?.header?.cwd
         if (!cwd) return { status: 'conflict' as const, message: '无法确定当前工作区（agent 会话缺少 cwd），已拒绝写入。' }
         const workspaceKey = workspaceKeyOf(cwd)
@@ -126,52 +144,72 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         if (tags.length === 0) return { status: 'conflict' as const, message: '至少需要 1 个标签（3–8 个短词）作为检索索引。' }
         const now = Date.now()
 
-        if (key) {
-          for (const [memoryId, record] of store.memories.entries()) {
-            if (record.workspaceKey !== workspaceKey || record.status !== 'active' || record.key !== key) continue
-            if (record.text.trim().toLowerCase() === text.toLowerCase()) {
-              return {
-                status: 'duplicate' as const,
-                memoryId,
-                title: record.title,
-                tags: record.keywords,
-                message: '该 key 已存相同内容，未重复写入。',
-              }
-            }
-            return {
-              status: 'conflict' as const,
-              memoryId,
-              title: record.title,
-              tags: record.keywords,
-              message: `key「${key}」已存不同内容：「${renderRecordLine({ title: record.title, text: record.text, tags: record.keywords })}」。请与用户裁决后再写入。`,
-              conflict: { memoryId, text: record.text },
-            }
+        // R22 需求④: assign legacy flat records to collections before deciding
+        // where this entry goes — a reused collection must include the entries
+        // that already exist for the same tags/title.
+        await migrateFlatMemories(store, workspaceKey, now)
+        const existing = findMemoryConflict(store, workspaceKey, { text, ...(key ? { key } : {}) })
+        if (existing) {
+          const where = existing.collectionTitle ? `（所属集合「${existing.collectionTitle}」）` : ''
+          const same = existing.kind === 'duplicate'
+          return {
+            status: same ? 'duplicate' as const : 'conflict' as const,
+            memoryId: existing.memoryId,
+            title: existing.title,
+            tags: existing.tags,
+            ...(existing.collectionId ? { collectionId: existing.collectionId } : {}),
+            ...(existing.collectionTitle ? { collectionTitle: existing.collectionTitle } : {}),
+            message: same
+              ? (key ? '该 key 已存相同内容，未重复写入。' : '相同记忆已存在，未重复写入。') + where
+              : `key「${key}」已存不同内容：「${renderRecordLine({ title: existing.title, text: existing.text, tags: existing.tags })}」。请与用户裁决后再写入。`,
+            ...(same ? {} : { conflict: { memoryId: existing.memoryId, text: existing.text } }),
           }
         }
-        for (const [memoryId, record] of store.memories.entries()) {
-          if (record.workspaceKey === workspaceKey && record.status === 'active'
-            && record.text.trim().toLowerCase() === text.toLowerCase()) {
-            return {
-              status: 'duplicate' as const,
-              memoryId,
-              title: record.title,
-              tags: record.keywords,
-              message: '相同记忆已存在，未重复写入。',
-            }
+
+        // R22 需求⑤: prefer an existing related collection over opening a new one.
+        const assignment = await resolveCollectionForEntry(
+          store, workspaceKey, { title, keywords: tags, text }, {
+            ...(args.collectionId ? { collectionId: String(args.collectionId) } : {}),
+            ...(args.collection ? { collection: String(args.collection) } : {}),
+            now,
+          },
+        )
+        if ('error' in assignment) {
+          return {
+            status: 'conflict' as const,
+            message: assignment.error
+              + (assignment.candidates && assignment.candidates.length > 0
+                ? `候选集合：${assignment.candidates.map((c) => `「${c.title}」(${c.collectionId})`).join('、')}`
+                : ''),
           }
         }
         const memoryId = newId('mem')
         const memory: Memory = {
           workspaceKey, title, text, key,
           keywords: tags,
+          ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
           sourceSessionId: String((exec.agent as { id?: string } | undefined)?.id ?? 'tool'),
           sourceSeq: 0,
           status: 'active', createdAt: now, updatedAt: now,
         }
         await store.memories.put(memoryId, memory)
+        if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
+        const tierNote = assignment.title === '' ? null : assignment.created
+          ? `新建记忆集合并写入：「${assignment.title}」`
+          : assignment.tier === 'high'
+            ? `归入记忆集合「${assignment.title}」（高相似复用）`
+            : assignment.tier === 'medium'
+              ? `归入相关记忆集合「${assignment.title}」（中等相似复用）`
+              : `已写入指定记忆集合「${assignment.title}」`
         return {
           status: 'stored' as const, memoryId, title, tags,
-          message: `已记住：${renderRecordLine({ title, text, tags })}`,
+          ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+          ...(assignment.title ? { collectionTitle: assignment.title } : {}),
+          collectionTier: assignment.tier,
+          collectionCreated: assignment.created,
+          message: tierNote === null
+            ? `已记住：${renderRecordLine({ title, text, tags })}`
+            : `${tierNote}：${renderRecordLine({ title, text, tags, collection: assignment.title })}`,
         }
       },
     })))
@@ -181,6 +219,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
     name: 'memory_recall',
     description: '检索 SuperMemory：结论性事实记忆（memories）、归档梗概（episodes）、需求（requirements）与项目文件地图（filemap），按当前工作区隔离，'
       + '关键词 + 时间衰减规则评分。回答"之前说过什么/做过什么"类问题前先用本工具检索；记忆只存结论，不是过程日志。'
+      + '记忆采用两级检索：先按查询匹配「记忆集合」，再在集合内精选条目（标题×4/标签×3/正文×1 + 集合级上下文），'
+      + '命中的记忆条目会带上所属集合的 id/标题/标签；collections 是命中的记忆集合（按分排序）。'
       + '返回的 topicSets 是命中的话题集（结论属于哪个集），命中时优先直接回答或把任务派发到该集，不要重复检索。',
     parameters: {
       query: { type: 'string', required: true, description: '检索问题或关键词' },
@@ -201,6 +241,10 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
                 title: { type: 'string', description: '标题：检索命中的索引字段，优先阅读' },
                 tags: { type: 'array', items: { type: 'string' }, description: '标签' },
                 text: { type: 'string', required: true, description: '正文' },
+                // R22 需求④: the memory collection this entry belongs to.
+                collectionId: { type: 'string', description: '所属记忆集合 id（未归集时为空）' },
+                collectionTitle: { type: 'string', description: '所属记忆集合标题' },
+                collectionTags: { type: 'array', items: { type: 'string' }, description: '所属记忆集合标签' },
                 score: { type: 'number', required: true },
                 createdAt: { type: 'integer' },
               },
@@ -224,26 +268,44 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
               additionalProperties: false,
             },
           },
+          // R22 需求④⑤: the memory collections matched by this query (stage 1).
+          collections: {
+            type: 'array',
+            description: '命中的记忆集合（两级检索第一级，按匹配分排序）',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', required: true },
+                title: { type: 'string', required: true },
+                tags: { type: 'array', items: { type: 'string' } },
+                score: { type: 'number', required: true },
+                tier: { type: 'string', enum: ['high', 'medium', 'low'] },
+              },
+              additionalProperties: false,
+            },
+          },
         },
         additionalProperties: false,
       },
       render: (_args, value) => {
-        const items = (value as { items?: Array<{ title?: string; text: string; tags?: string[] }> }).items ?? []
+        const items = (value as { items?: Array<{ title?: string; text: string; tags?: string[]; collectionTitle?: string }> }).items ?? []
         const topicSets = (value as { topicSets?: Array<{ title: string }> }).topicSets ?? []
-        const hint = topicSets.length > 0 ? `\n相关话题集：${topicSets.map((topicSet) => topicSet.title).join('、')}` : ''
+        const collections = (value as { collections?: Array<{ title: string }> }).collections ?? []
+        const collectionHint = collections.length > 0 ? `\n相关记忆集合：${collections.map((c) => c.title).join('、')}` : ''
+        const hint = (topicSets.length > 0 ? `\n相关话题集：${topicSets.map((topicSet) => topicSet.title).join('、')}` : '') + collectionHint
         if (items.length === 0) return [{ type: 'text', text: `（未检索到相关记忆）${hint}` }]
         return [{
           type: 'text',
-          text: items.map((item, i) => `${i + 1}. ${renderRecordLine({ title: item.title, text: item.text, tags: item.tags })}`).join('\n') + hint,
+          text: items.map((item, i) => `${i + 1}. ${renderRecordLine({ title: item.title, text: item.text, tags: item.tags, collection: item.collectionTitle })}`).join('\n') + hint,
         }]
       },
     },
     async execute(args: { query: string; limit?: number }, exec: ToolExec) {
       const cwd = exec.agent?.session?.header?.cwd
-      if (!cwd) return { items: [], total: 0, topicSets: [] }
+      if (!cwd) return { items: [], total: 0, topicSets: [], collections: [] }
       const workspaceKey = workspaceKeyOf(cwd)
       const query = String(args.query ?? '').trim()
-      if (!query) return { items: [], total: 0, topicSets: [] }
+      if (!query) return { items: [], total: 0, topicSets: [], collections: [] }
       const options: RecallOptions = {
         limit: Math.max(1, Math.min(20, Number(args.limit) || config.recall.maxItems)),
         minScore: config.recall.minScore,
@@ -258,15 +320,27 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         text: string
         score: number
         createdAt: number
+        collectionId?: string
+        collectionTitle?: string
+        collectionTags?: string[]
       }> = []
+      // R22 需求④⑤: two-stage retrieval — legacy flat records are folded into
+      // collections first, then stage 1 ranks collections and stage 2 ranks the
+      // entries (direct title/tag/body score + collection-level context).
+      await migrateFlatMemories(store, workspaceKey, options.now)
+      const collections = listCollections(store, workspaceKey)
       const memories: Array<[string, Memory]> = []
       for (const entry of store.memories.entries()) {
         if (entry[1].workspaceKey === workspaceKey && entry[1].status === 'active') memories.push(entry)
       }
-      for (const item of recallMemories(memories, query, options)) {
+      const collectionRecall = recallEntriesWithCollections(collections, memories, query, options)
+      for (const item of collectionRecall.items) {
         items.push({
           kind: 'memory', id: item.memoryId, title: item.title, tags: item.keywords,
           text: item.text, score: item.score, createdAt: item.createdAt,
+          collectionId: item.collectionId,
+          collectionTitle: item.collectionTitle,
+          collectionTags: item.collectionTags,
         })
       }
       // Workspace isolation (D4): episodes have no workspaceKey of their own —
@@ -322,7 +396,14 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       // R19 需求⑧: rank the workspace's topic sets by the same query so a
       // remembered conclusion points at the set it came from.
       const topicSets = matchTopicSets(listTopicSets(store, workspaceKey), query, 3)
-      return { items: items.slice(0, options.limit), total: items.length, topicSets }
+      return {
+        items: items.slice(0, options.limit),
+        total: items.length,
+        topicSets,
+        collections: collectionRecall.collections.map((match) => ({
+          id: match.collectionId, title: match.title, tags: match.keywords, score: match.score, tier: match.tier,
+        })),
+      }
     },
   })))
 
@@ -1130,7 +1211,7 @@ ${listText}` : listText
       description: { type: 'string', description: '能力描述 + 路由：何时优先用它、关键坑是什么（模型据此路由）' },
       entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（在 scope 目录内经 shell 执行）' },
       doc: { type: 'string', description: '文档路径（相对仓库根），如 "docs/git-sync.md"' },
-      scope: { type: 'string', description: '适用范围：入口命令的执行目录，如 "G:\\09 - dsh\\SuperMemory"' },
+      scope: { type: 'string', description: '适用范围：入口命令的执行目录，如 "F:\\10-SuperMemory"（通常是仓库根）' },
       runnable: { type: 'boolean', description: '是否允许执行；缺省 true' },
       dryRunArg: { type: 'string', description: '预演参数，如 "--dry-run"；定义后默认预演执行' },
       writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },

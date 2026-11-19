@@ -12,6 +12,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
+import { fileURLToPath } from 'node:url'
 
 if (!process.execArgv.includes('--experimental-transform-types')) {
   const child = spawnSync(
@@ -30,6 +31,7 @@ const { listTopicSets } = await import('../src/topicsets.ts')
 const { listWorkspaceBranches } = await import('../src/hub-branches.ts')
 const { SupermemoryPanelService } = await import('../src/panel.ts')
 const { workspaceKeyOf } = await import('../src/store.ts')
+const { BUILTIN_CAPABILITIES } = await import('../src/builtin-capabilities.ts')
 
 function table(seed = []) {
   const map = new Map(seed)
@@ -62,7 +64,10 @@ const fakeStore = (seed = {}) => ({
 const now = Date.now()
 // 两个工作区：A 用真实仓库路径（workspaceKeyOf 走 realpath），B 用虚构路径
 // （workspaceKeyOf 对不存在的目录退化为 resolve，键值稳定可断言）。
-const WS_A = 'G:\\09 - dsh\\SuperMemory'
+// A 必须取自本仓库：W3 会真的在这个 cwd 里 spawn（硬编码旧克隆路径 G:\09 - dsh\
+// SuperMemory 在本机不存在，spawnSync 直接 ENOENT）；用 workspaceKeyOf 归一化还能
+// 保证行级归属键与过滤时算出的键严格一致（realpath 幂等）。
+const WS_A = workspaceKeyOf(fileURLToPath(new URL('..', import.meta.url)))
 const WS_B = 'G:\\scope-smoke-b'
 const GIT_TOOL = 'sm_composite_git_sync_supermemory'
 const capSpec = (name, scope, extra = {}) => ({
@@ -203,7 +208,11 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.equal(capA && capA.workspaceKey, WS_A, 'rebuild 把行级工作区归属传给注册')
   const capB = seen.find((s) => s.name === 'sm_composite_scope_b')
   assert.equal(capB && capB.workspaceKey, WS_B)
-  const builtinRow = [...store.toolMemory.values()].find((r) => r.workspaceKey === WS_A && JSON.parse(r.entry).name === GIT_TOOL)
+  // 播种键来自内置定义自己的 scope（composite.ts: `workspaceKeyOf(builtin.scope)`），
+  // 不是测试里的 WS_A——scope 是本仓库的绝对路径，换克隆目录即不同，断言必须通过定义推导。
+  const builtinDef = BUILTIN_CAPABILITIES.find((c) => c.name === 'git-sync-supermemory')
+  assert.ok(builtinDef && builtinDef.scope, '内置能力定义带 scope')
+  const builtinRow = [...store.toolMemory.values()].find((r) => r.workspaceKey === workspaceKeyOf(builtinDef.scope) && JSON.parse(r.entry).name === GIT_TOOL)
   assert.ok(builtinRow, '内置能力播种并落到 scope 所属工作区')
   // 重新合并（幂等）：不再播种。
   const again = await mergeBuiltinCapabilities(store)

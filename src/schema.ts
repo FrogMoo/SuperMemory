@@ -69,10 +69,29 @@ export async function buildSchemas() {
     text: z.string(),
     key: z.string().optional(),
     keywords: z.array(z.string()).default([]),
+    // R22 需求④: an entry belongs to a memory collection. Optional on purpose:
+    // records written before collections existed (and every producer outside
+    // this module — panel, web console, fact extraction) stay valid, and a
+    // lazy migration assigns them on the next recall/remember/export.
+    collectionId: z.string().optional(),
     sourceSessionId: z.string(),
     sourceSeq: z.number().int().nonnegative(),
     status: z.enum(['active', 'superseded']).default('active'),
     supersededBy: z.string().optional(),
+    createdAt: z.number().int(),
+    updatedAt: z.number().int(),
+  })
+
+  // R22 需求④: 记忆集合 —— the same shape as a topic set (title + tags + body)
+  // but for conclusions instead of conversations. A new table keeps the flat
+  // `memories` table and every existing reader untouched: an old medium simply
+  // has no rows here, so the domain stays v1-compatible (same as `questions`).
+  const memoryCollections = z.object({
+    workspaceKey: z.string(),
+    title: z.string(),
+    keywords: z.array(z.string()).default([]),
+    summary: z.string().default(''),
+    status: z.enum(['active', 'archived']).default('active'),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })
@@ -237,11 +256,20 @@ export async function buildSchemas() {
     mergesVersion: z.number().int().optional(),
     mergeSignatures: z.array(z.string()).optional(),
     lastMergeAt: z.number().int().optional(),
+    // R23 memory re-layout marker (meta row 'organize-<digest>'): one
+    // pass per workspace; an older version re-runs the plan. The fields are
+    // declared here because the meta schema strips unknown keys on load — a
+    // marker outside the schema would silently vanish on the next open.
+    organizeVersion: z.number().int().optional(),
+    organizeAppliedAt: z.number().int().optional(),
+    organizeWorkspace: z.string().optional(),
+    organizeBackup: z.string().optional(),
+    organizeSummary: z.string().optional(),
   })
 
   return {
-    topicsets, memories, episodes, requirements, filemap, tool_memory: toolMemory,
-    signals, dispatches, questions, outbox, routing, hotcache, meta,
+    topicsets, memories, memory_collections: memoryCollections, episodes, requirements, filemap,
+    tool_memory: toolMemory, signals, dispatches, questions, outbox, routing, hotcache, meta,
   }
 }
 
@@ -249,6 +277,7 @@ export type Schemas = Awaited<ReturnType<typeof buildSchemas>>
 
 export type TopicSet = z.infer<Schemas['topicsets']>
 export type Memory = z.infer<Schemas['memories']>
+export type MemoryCollection = z.infer<Schemas['memory_collections']>
 export type Episode = z.infer<Schemas['episodes']>
 export type Requirement = z.infer<Schemas['requirements']>
 export type FileMapEntry = z.infer<Schemas['filemap']>

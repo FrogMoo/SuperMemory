@@ -23,6 +23,8 @@ import { isPluginBranchId } from './hub-sessions.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
+import { applyMemoryOrganize } from './memory-organize.ts'
+import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
 import type { Signal } from './schema.ts'
@@ -496,6 +498,16 @@ export async function apply(ctx: Context, config: Config) {
     // restart never repeats the work; a manual re-scan is /memory titles.
     void migrateTruncatedTitles({ ctx, store, logger }).catch((error) => {
       logger.warn('supermemory: title migration failed: ' + String(error).slice(0, 160))
+    })
+    // R23: one-time memory re-layout into the R22 collection model. Marker-
+    // guarded (meta row `organize-<digest>`), only targets this plugin
+    // repo's workspace, and every destructive step is SHA-guarded against
+    // bodies edited after the plan was authored. It runs HERE, through the
+    // live domain, because the JSON backend's `single` layout rewrites the
+    // whole unit on every write — an offline edit behind a running host would
+    // be lost. `/memory-organize` previews/applies it manually.
+    void applyMemoryOrganize(store, workspaceKeyOf(PLUGIN_REPO_ROOT), { logger }).catch((error) => {
+      logger.warn('supermemory: memory organize failed: ' + String(error).slice(0, 200))
     })
     // D: a dispatch that died before it could relay (crash/reload between settle and
     // deliver) is backfilled here; open dispatches wait for the periodic sweep.

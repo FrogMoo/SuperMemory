@@ -1,9 +1,9 @@
 # git 同步 / 提交 / 推送流程（SuperMemory 仓库 · 流程固化样板）
 
 > **⚠️ 遇到本仓库的 git 同步、提交、推送类问题，优先使用 `scripts/git-sync-push`，不要手敲 `git fetch` / `git rebase` / `git push`。**
-> 手敲极易踩本机凭据坑（见 §4.1）：本机 Git Credential Manager 接管了远端认证且失败，直接 push 会认证失败或卡在用户名提示。脚本已把坑全部封装——先 `--dry-run` 看计划，确认后再真跑。
+> 凭据说明（2026-11-19 现状）：网络 git 调用直接用仓库本地配置的 Git Credential Manager（GCM / manager，见 §4.1），凭据由 Windows 凭据存储托管。先 `--dry-run` 看计划，确认后再真跑。
 
-- 适用范围：本仓库 `G:\09 - dsh\SuperMemory`
+- 适用范围：本仓库（固化能力的 `scope` 由插件位置自动推导，不再硬编码克隆路径；换机器/换目录自动跟随）
 - 远端：`origin = http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git`，默认分支 `main`
 - 命令均在仓库根目录执行；脚本自身会 `cd` 到仓库根（`git rev-parse --show-toplevel`），在子目录下调用也可以
 
@@ -36,7 +36,7 @@
 | 维度 | `.sh`（唯一实现） | `.mjs`（启动器） |
 |---|---|---|
 | 参数 / 退出码 / 安全约束 | 唯一定义处 | 原样透传，不自定义任何语义 |
-| bash 定位 | 要求调用方环境里 bash 可用（PATH） | 自动探测，顺序：`$SM_BASH` → `bash` → `sh`（非 Windows）→ `where bash` 结果 → 由 `where git` 推导 `<git 根>/bin/bash.exe` → `%ProgramFiles%\Git\bin\bash.exe` → `%ProgramFiles(x86)%\Git\bin\bash.exe` → `%LOCALAPPDATA%\Programs\Git\bin\bash.exe`；每个候选都用 `bash -c "exit 0"` 实测可用性 |
+| bash 定位 | 要求调用方环境里 bash 可用（PATH） | 自动探测，顺序：`$SM_BASH` → 由 `where git` 推导 `<git 根>/bin/bash.exe` → `%ProgramFiles%\Git\bin\bash.exe` → `%ProgramFiles(x86)%\Git\bin\bash.exe` → `%LOCALAPPDATA%\Programs\Git\bin\bash.exe` → 非 Windows 的 `sh`/`bash` → `where bash` 结果（**排除 WSL 启动器** `<SystemRoot>\System32\bash.exe`）；每个候选都用 `bash -c "exit 0"` **和** `bash -c "test -f <脚本绝对路径>"` 双实测，确保它真的看得见本脚本（R27，见 §4.2b） |
 | 独有失败模式 | 无 | ① 找不到 bash → exit 1；② 找不到 `.sh` → exit 1；③ bash 被信号终止 → exit 1 |
 | cwd 要求 | 仓库内任意目录（自身 `cd` 到 toplevel） | 任意目录（按自身文件位置定位 `.sh`） |
 
@@ -45,7 +45,7 @@
 ## 3. 流程步骤（`.sh` 内部顺序）
 
 1. **工作区检查**：`git status --porcelain`。有未提交改动时：非 dry-run → 打印前 10 条并 exit 2；dry-run → 仅报告，继续。
-2. **fetch**：`GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=store fetch <remote> --prune`。失败 → exit 1。
+2. **fetch**：`GIT_TERMINAL_PROMPT=0 git fetch <remote> --prune`（凭据由仓库本地 GCM 提供）。失败 → exit 1。
 3. **校验远端跟踪分支**：fetch 后 `refs/remotes/<remote>/<branch>` 必须存在，否则 exit 1。
 4. **计算 ahead/behind**：`git rev-list --left-right --count <remote>/<branch>...HEAD`。
 5. **rebase（仅 behind>0，绝不 merge）**：`git rebase <remote>/<branch>`；冲突 → 打印冲突文件清单（`git diff --name-only --diff-filter=U`）+ 自动 `git rebase --abort` + exit 1，仓库回到 rebase 前状态。
@@ -56,21 +56,45 @@
 
 ## 4. 坑与规避（全部实测）
 
-### 4.1 凭据 helper 混用（最容易卡死的一坑）
+### 4.1 凭据：仓库本地 GCM（2026-11-19 起）
 
-- 本机 `C:/Users/Administrator/.gitconfig` **没有** `credential.helper`，但有：
-  - `credential.helperselector.selected=manager`
-  - `credential.http://zrynas.7766.org:8418.provider=generic`
+- 仓库本地 `git config` 已配 Git Credential Manager：
 
-  即 Git Credential Manager（GCM）接管了 `zrynas.7766.org:8418` 的认证，且对该主机认证失败。
-- **只加 `-c credential.helper=store` 不够**，必须先清空 helper 列表再显式指定：
-
-  ```bash
-  GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=store <fetch|push|ls-remote> origin main
+  ```
+  credential.helper=!"C:/Users/admin/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe"
   ```
 
-- 凭据存放于 `~/.git-credentials`（即 `C:/Users/Administrator/.git-credentials`），host 条目为 `zrynas.7766.org%3a8418`。
-- 脚本已封装该写法（`export GIT_TERMINAL_PROMPT=0` + `GIT=(git -c credential.helper= -c credential.helper=store)`），**不要手敲 git push 绕过脚本**。
+  凭据由 Windows 凭据存储托管，网络 git 调用（fetch/push/ls-remote）**直接使用仓库配置**即可，不再额外传 `-c credential.helper=...`。
+- `GIT_TERMINAL_PROMPT=0` 保留：凭据缺失时立即失败并打印真实错误，而不是卡在用户名/密码提示。
+- **旧方案已失效**（2026-11-19 实测）：历史上曾用「先清空 helper 列表、再用 store 读 `~/.git-credentials`」——
+  `git -c credential.helper= -c credential.helper=store fetch` 现在会报
+  `fatal: could not read Username for 'http://zrynas.7766.org:8418': terminal prompts disabled`（exit 1），
+  因为本机 `~/.git-credentials` 不存在。脚本已改为直接用 git，不再清空 helper。
+- 脚本对应实现：`export GIT_TERMINAL_PROMPT=0` + `GIT=(git)`；**不要手敲 git push 绕过脚本**。
+- GCM 也取不到凭据时：**停下来找用户要凭据或确认登录状态**；不要改全局 git config、不要改 remote URL、不要去找其他凭据方案。
+
+### 4.2b PATH 里的 `bash` 是 WSL 启动器 → exit 127（R27 修复）
+
+- 现象：固化能力「运行（预演）」（入口 `pnpm git:sync`）返回 `exit 127`，stderr 只有
+  `/bin/bash: F:/10-SuperMemory/scripts/git-sync-push.sh: No such file or directory`
+  和 `[ELIFECYCLE] Command failed with exit code 127.`。
+- 根因：Windows PATH 含 `C:\Windows\System32`，那里的 `bash.exe` 是 **WSL 启动器**，
+  不是 Git for Windows 的 bash。旧版 `.mjs` 候选顺序里把裸 `bash` 排在最前，命中 WSL；
+  WSL 的 `/bin/bash` 看不懂 `F:/...` 盘符路径 → 127。**与 node/pnpm 是否在 PATH 无关**
+  （实测宿主 PATH 同时含 `C:\Program Files
+odejs` 与 `%APPDATA%
+pm`，`where pnpm`
+  与 `pnpm --version` 都正常）。
+- 修复：`.mjs` 先按绝对路径找 Git for Windows 的 bash（由 `where git` /
+  `ProgramFiles` / `LOCALAPPDATA` 推导，不硬编码盘符），排除 `<SystemRoot>\System32ash.exe`，
+  并对每个候选实测「能否 `test -f` 看见本脚本」；都不行才报 exit 1 的明确错误。
+- 现在 `pnpm git:sync --dry-run` 会真的跑起来（工作区检查 → fetch …），127 不再出现。
+- 额外兜底（能力执行侧）：`runCapability` 用 `capabilityExecEnv()` 注入 PATH——把
+  `dirname(process.execPath)`、`PNPM_HOME`、`%APPDATA%
+pm`、`%ProgramFiles%
+odejs`
+  等**确实存在**的目录追加进 PATH（原顺序保留、去重），避免宿主启动方式差异导致子进程
+  找不到 node/pnpm。
 
 ### 4.2 bash 不在 PATH（Windows cmd / PowerShell）
 
@@ -84,7 +108,8 @@
 
 ### 4.4 凭据存放位置
 
-`~/.git-credentials`（`C:/Users/Administrator/.git-credentials`），host 条目 `zrynas.7766.org%3a8418`。**不要**改全局 git config、**不要**改 remote URL 来解决认证问题。
+由仓库本地 GCM（manager）托管在 **Windows 凭据存储**（控制面板 → 凭据管理器 → Windows 凭据，目标含 `zrynas.7766.org:8418`）。
+本机 `~/.git-credentials` **不存在**（旧的 store 方案已失效，见 §4.1）。**不要**改全局 git config、**不要**改 remote URL 来解决认证问题。
 
 ### 4.5 行尾（写 .md / 文本文件时）
 
@@ -150,7 +175,7 @@ bash scripts/git-sync-push.sh --dry-run -r origin -b main
 
 ### 7.6 push 认证失败时
 
-不要改 git config / remote URL；检查 `~/.git-credentials` 是否有 `zrynas.7766.org%3a8418` 条目。脚本用的就是「先清空 helper 再 store」写法（§4.1）。
+不要改 git config / remote URL；检查仓库本地 `credential.helper` 是否仍指向 GCM（`git config --get credential.helper`），以及 Windows 凭据管理器里是否还有 `zrynas.7766.org:8418` 的条目（§4.1 / §4.4）。脚本直接用仓库本地 GCM，不再使用 `~/.git-credentials`。
 
 ## 8. 实测记录（2026-11-18）
 

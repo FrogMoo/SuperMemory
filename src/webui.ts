@@ -24,6 +24,8 @@ import type { Context } from '@deepseek-ai/cordis'
 import { buildExport } from './export.ts'
 import { scanWorkspace } from './filemap.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
+// R22 需求⑤: 管理台新建记忆与 memory_remember 共用集合归属判定。
+import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import type { Dispatch, Episode, FileMapEntry, Memory, OutboxItem, Requirement, Routing, Signal, ToolMemory, TopicSet } from './schema.ts'
 import { createTopicSet, setRouting, touchTopicSet } from './topicsets.ts'
@@ -315,18 +317,26 @@ async function handleApi(
       if (!verdict.ok) return fail(verdict.message)
       const id = newId('mem')
       const now = Date.now()
+      const title = text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText)
+      // The console's "keywords" field is the tags field (R10); auto keywords
+      // fill whatever the operator did not tag, so old flows stay findable.
+      const keywords = mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText))
+      // R22 需求⑤: the console's write path joins the same collection layer as
+      // memory_remember (related collection → append entry; no new collection).
+      const assignment = await resolveCollectionForEntry(store, ws, { title, keywords, text: memText }, { now })
+      if ('error' in assignment) return fail(assignment.error)
       const record: Memory = {
         workspaceKey: ws,
-        title: text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText),
+        title,
         text: memText,
-        // The console's "keywords" field is the tags field (R10); auto keywords
-        // fill whatever the operator did not tag, so old flows stay findable.
-        keywords: mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText)),
+        keywords,
+        ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
         key: text(body.key) || undefined,
         sourceSessionId: text(body.sessionId) || 'webui', sourceSeq: 0,
         status: 'active', createdAt: now, updatedAt: now,
       }
       await store.memories.put(id, record)
+      if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
       logger.info(`supermemory: webui created memory ${id}`)
       return sendJson(res, 200, { ok: true, id })
     }

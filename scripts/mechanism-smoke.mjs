@@ -531,7 +531,23 @@ const fakeCtx = (services) => ({
   }
   const clientIds = PANEL_REMOTE.descriptors.map((d) => d.id)
   assert.deepEqual([...hostIds].sort(), [...clientIds].sort(), 'host and client descriptor id sets must match')
-  ok('E1 面板 typert 注册：ctx.get(typert) 注册一次 + typertRemote 绑定 + 描述符合法 + 合同 parity')
+  // Arity parity, not just id parity. The mounted client api validates the
+  // ARGUMENT COUNT against the CLIENT declaration, so a method the host declares
+  // with parameters but the client declares 0-arity throws at call time
+  // ("client api: supermemoryPanel/listTools expected 0 argument(s), got 1") and
+  // takes the whole panel down with it. Id-set parity alone cannot see that, so
+  // the parameter contract is compared name by name, optionality included.
+  const contractOf = (descriptor) => descriptor.parameters.map((p) => `${p.name}${p.acceptsUndefined ? '?' : ''}`)
+  for (const hostDescriptor of contribution.invocations) {
+    const clientDescriptor = PANEL_REMOTE.descriptors.find((d) => d.id === hostDescriptor.id)
+    assert.ok(clientDescriptor, `the client half must declare ${hostDescriptor.id}`)
+    assert.deepEqual(
+      contractOf(clientDescriptor),
+      contractOf(hostDescriptor),
+      `parameter contract drift on ${hostDescriptor.id}: host [${contractOf(hostDescriptor)}] vs client [${contractOf(clientDescriptor)}]`,
+    )
+  }
+  ok('E1 面板 typert 注册：ctx.get(typert) 注册一次 + typertRemote 绑定 + 描述符合法 + 合同 parity（id 集合 + 逐方法参数契约）')
 }
 
 {
@@ -1021,6 +1037,8 @@ const nodePath = await import('node:path')
   const records = [
     { header: { id: 'hub-new', cwd: WS, createdAt: 2000 }, live: true, persisted: true },
     { header: { id: 'hub-member', cwd: WS, createdAt: 1500 }, live: false, persisted: true },
+    // R22 需求⑧: attached but finished — ONLINE, never a green "running" dot.
+    { header: { id: 'hub-idle', cwd: WS, createdAt: 1200 }, live: true, persisted: true },
     { header: { id: 'hub-old', cwd: WS, createdAt: 1000 }, live: false, persisted: true },
     { header: { id: 'child', cwd: WS, createdAt: 3000, origin: 'subagent' } },
     { header: { id: 'fork', cwd: WS, createdAt: 3000, parentSession: 'hub-new' } },
@@ -1036,8 +1054,9 @@ const nodePath = await import('node:path')
   ]
   let requestedIds
   const ctx = {
-    get: (name) => (name === 'sessionQuery'
-      ? {
+    get: (name) => {
+      if (name === 'sessionQuery') {
+        return {
           listSessions: async () => records,
           readTitleSnapshots: async (ids) => {
             requestedIds = ids
@@ -1047,20 +1066,29 @@ const nodePath = await import('node:path')
             ]
           },
         }
-      : undefined),
+      }
+      // R22 需求⑧: only hub-new is RUNNING; hub-idle exists but finished.
+      if (name === 'agents') return { get: (id) => ({ id, status: id === 'hub-new' ? 'running' : 'idle' }) }
+      return undefined
+    },
   }
   const hubs = await listHubSessions(ctx, store, WS)
-  assert.deepEqual(hubs.map((h) => h.sessionId), ['hub-new', 'hub-member', 'hub-old', 'session-fresh'],
+  assert.deepEqual(hubs.map((h) => h.sessionId), ['hub-new', 'hub-member', 'hub-idle', 'hub-old', 'session-fresh'],
     'subagents, forks, fork members (archived included) and other workspaces are excluded; a ROOT member stays a hub')
   assert.ok(!hubs.some((h) => h.sessionId.startsWith('branch-')), 'every branch- id is excluded, even a root-kind fresh dispatch')
   assert.ok(hubs.some((h) => h.sessionId === 'session-fresh'), 'a session- id outside every topic set stays a hub')
-  assert.deepEqual([...requestedIds].sort(), ['hub-member', 'hub-new', 'hub-old', 'session-fresh'], 'titles are read in ONE batch request')
+  assert.deepEqual([...requestedIds].sort(), ['hub-idle', 'hub-member', 'hub-new', 'hub-old', 'session-fresh'], 'titles are read in ONE batch request')
   assert.equal(hubs[0].title, '新中枢', 'the batch title is used')
   assert.equal(hubs[1].title, '未命名会话 ' + 'hub-member'.slice(-4), 'a rejected/absent title falls back to the id suffix')
-  assert.equal(hubs[2].title, '未命名会话 ' + 'hub-old'.slice(-4), 'a rejected title falls back to the id suffix')
-  assert.equal(hubs[3].title, '未命名会话 ' + 'session-fresh'.slice(-4), 'the surviving session- hub gets a fallback title too')
-  assert.equal(hubs[0].live, true)
-  assert.equal(hubs[1].live, false)
+  assert.equal(hubs[2].title, '未命名会话 ' + 'hub-idle'.slice(-4), 'a rejected/absent title falls back to the id suffix')
+  assert.equal(hubs[3].title, '未命名会话 ' + 'hub-old'.slice(-4), 'a rejected title falls back to the id suffix')
+  assert.equal(hubs[4].title, '未命名会话 ' + 'session-fresh'.slice(-4), 'the surviving session- hub gets a fallback title too')
+  assert.equal(hubs[0].live, true, 'a RUNNING session lights the dot')
+  assert.equal(hubs[0].online, true, 'a running session is also attached/online')
+  assert.equal(hubs[1].live, false, 'a cold/persisted-only session is not running')
+  assert.equal(hubs[1].online, false, 'a cold/persisted-only session is offline')
+  assert.equal(hubs[2].live, false, 'an attached-but-idle session is NOT running (the permanent-green-dot bug)')
+  assert.equal(hubs[2].online, true, '…but it is still online, exposed as a separate field')
   assert.equal(hubs[0].updatedAt, 9000, 'the latest title event orders the rail')
   assert.equal(hubs[0].origin, 'hub')
   assert.equal(hubs[0].cwd, WS, 'rows carry the session cwd (workspace filter is explicit)')
@@ -1080,7 +1108,39 @@ const nodePath = await import('node:path')
   const fallback = await listHubSessions(liveCtx, store, WS)
   assert.deepEqual(fallback.map((h) => h.sessionId), ['live-hub'])
   assert.equal(fallback[0].title, '未命名会话 ' + 'live-hub'.slice(-4))
-  ok('H5 中枢会话列表：过滤规则（父/子代理/fork 成员含归档/他工作区/branch- 前缀）、root 成员保留并带话题集、标题批量读取、排序与上限、降级')
+  assert.equal(fallback[0].online, true, 'the fallback corpus rows are attached')
+  assert.equal(fallback[0].live, false, 'no agent registry -> activity is UNKNOWN -> the dot stays dark')
+  ok('H5 中枢会话列表：过滤规则（父/子代理/fork 成员含归档/他工作区/branch- 前缀）、root 成员保留并带话题集、标题批量读取、排序与上限、降级、活跃判定（只有 running 亮绿点，未知不亮）')
+}
+
+{
+  // R22 需求⑧: the activity probe's own degradation matrix — one `agents.list()`
+  // enumeration is preferred, a throwing list falls back to per-id `get()`, and
+  // every unknown/throwing path must answer false ("unknown stays dark").
+  const WS = nodePath.resolve('ws-live')
+  const store = fakeStore()
+  const record = { header: { id: 'hub-list', cwd: WS, createdAt: 1 }, live: true, persisted: true }
+  const ctxWith = (agents) => ({
+    get: (name) => {
+      if (name === 'sessionQuery') {
+        return { listSessions: async () => [record], readTitleSnapshots: async () => [] }
+      }
+      return name === 'agents' ? agents : undefined
+    },
+  })
+  const run = async (agents) => (await listHubSessions(ctxWith(agents), store, WS))[0]
+  assert.equal((await run({ list: () => [{ id: 'hub-list', status: 'running' }] })).live, true,
+    'agents.list(): a running id lights the dot')
+  assert.equal((await run({ list: () => [{ id: 'hub-list', status: 'idle' }] })).live, false,
+    'agents.list(): an idle agent stays dark')
+  assert.equal((await run({
+    list: () => { throw new Error('registry unavailable') },
+    get: () => ({ status: 'running' }),
+  })).live, true, 'a throwing list falls back to agents.get()')
+  assert.equal((await run({ get: () => { throw new Error('registry unavailable') } })).live, false,
+    'a throwing get() is unknown -> dark')
+  assert.equal((await run(undefined)).live, false, 'no agents service is unknown -> dark')
+  ok('H5b 活跃判定降级：agents.list 枚举优先，list 抛错回退 get；list/get 缺失或抛错都保持不亮')
 }
 
 {
@@ -1792,6 +1852,37 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
 }
 
 {
+  // R2b: 续跑完成（delivered）后原派发必须永久退出清单——旧逻辑只在续跑仍
+  // 「在途」时排除，续跑一交付原派发就重新冒出来，导致 memory_resume 清单与
+  // 每轮中断提醒反复列出已完成任务。另覆盖：只有后继写了 resumeOf 的历史单边
+  // 关联、续跑链、以及续跑自身唤醒失败（resume-wake-failed）时保留原派发可重试。
+  const store = fakeStore({
+    dispatches: [
+      ['dsp-x1', { branchSessionId: 'b-x1', task: '甲', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now, resumedBy: 'dsp-x2' }],
+      ['dsp-x2', { branchSessionId: 'b-x1', task: '甲', hubSessionId: 'hub', startSeq: 0, status: 'delivered', resumeOf: 'dsp-x1', createdAt: now, updatedAt: now }],
+      // Legacy one-sided link: only the successor carries resumeOf.
+      ['dsp-x3', { branchSessionId: 'b-x3', task: '乙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now }],
+      ['dsp-x4', { branchSessionId: 'b-x3', task: '乙', hubSessionId: 'hub', startSeq: 0, status: 'delivered', resumeOf: 'dsp-x3', createdAt: now, updatedAt: now }],
+      // Resume wake failed: the original is still the actionable row.
+      ['dsp-x5', { branchSessionId: 'b-x5', task: '丙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now, resumedBy: 'dsp-x6' }],
+      ['dsp-x6', { branchSessionId: 'b-x5', task: '丙', hubSessionId: 'hub', startSeq: 0, status: 'failed', turnEndReason: 'resume-wake-failed', resumeOf: 'dsp-x5', createdAt: now, updatedAt: now }],
+      // Chain: interrupted -> interrupted -> delivered: nothing should surface.
+      ['dsp-x7', { branchSessionId: 'b-x7', task: '丁', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: now, updatedAt: now, resumedBy: 'dsp-x8' }],
+      ['dsp-x8', { branchSessionId: 'b-x7', task: '丁', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', resumeOf: 'dsp-x7', resumedBy: 'dsp-x9', createdAt: now, updatedAt: now }],
+      ['dsp-x9', { branchSessionId: 'b-x7', task: '丁', hubSessionId: 'hub', startSeq: 0, status: 'delivered', resumeOf: 'dsp-x8', createdAt: now, updatedAt: now }],
+    ],
+  })
+  const views = listInterruptedDispatches(store, { now })
+  assert.deepEqual(views.map((view) => view.dispatchId), ['dsp-x5'],
+    'a delivered successor permanently hides the original (forward/one-sided/chain links); a failed resume keeps it retryable')
+  const deps = { ctx: {}, store, logger }
+  const blocked = await resumeDispatch(deps, 'dsp-x1')
+  assert.equal(blocked.status, 'error')
+  assert.ok(blocked.message.includes('接替'), 'an already-completed successor rejects re-resuming the original')
+  ok('R2b 续跑完成后原派发永久退出中断清单（含历史单边关联与续跑链）；续跑唤醒失败仍保留可重试，已接替的拒绝重复续跑')
+}
+
+{
   // R3: 续跑优先续接被保留的分支会话（live agent 直投，不 resume），
   // 台账双向关联 resumeOf/resumedBy，relay 目标为调用方 hub。
   const store = fakeStore({
@@ -1926,8 +2017,11 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
 // ---- R24: a receipt ends the hub's turn (dispatch / resume never block) ----
 {
   const { DISPATCH_NEXT_ACTION, RESUME_NEXT_ACTION } = await import('../src/round-end.ts')
+  assert.ok(DISPATCH_NEXT_ACTION.startsWith('已派发，结束本轮，等待 relay'), 'the dispatch receipt opens with the mandated wording')
   assert.ok(DISPATCH_NEXT_ACTION.includes('立即结束本轮回复'), 'the dispatch receipt tells the hub to end its turn')
+  assert.ok(DISPATCH_NEXT_ACTION.includes('wait_agent') && DISPATCH_NEXT_ACTION.includes('轮询'), 'the receipt forbids waiting/polling explicitly')
   assert.ok(DISPATCH_NEXT_ACTION.includes('relay'), 'the receipt names the relay that opens the next turn')
+  assert.ok(RESUME_NEXT_ACTION.startsWith('已续跑，结束本轮，等待 relay'), 'the resume receipt opens with the mandated wording')
   assert.ok(RESUME_NEXT_ACTION.includes('立即结束本轮回复'), 'the resume receipt repeats the rule')
   assert.notEqual(DISPATCH_NEXT_ACTION, RESUME_NEXT_ACTION, 'dispatch and resume keep their own wording (已派发 / 已续跑)')
   ok('R24-1 收口文案：派发/续跑回执都要求立即结束本轮，并说明 relay 会在新一轮送达')
@@ -1978,13 +2072,18 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   const index = readFileSync('src/index.ts', 'utf8')
   const route = readFileSync('src/route.ts', 'utf8')
   const tools = readFileSync('src/tools.ts', 'utf8')
+  const dispatchSource = readFileSync('src/dispatch.ts', 'utf8')
   assert.ok(index.includes('立即结束本轮回复'), 'hub role text: end the turn right after the receipt')
   assert.ok(index.includes('subagent 树') && index.includes('wait_agent'), 'hub role text: branches are not subagent-tree members')
   assert.ok(index.includes('派发后即结束本轮回复'), 'the memory prompt block repeats the rule')
   assert.ok(route.includes('立即结束本轮回复'), 'the routing card repeats the rule')
   assert.ok(tools.includes('R24 收口') && tools.includes('wait_agent'), 'both tool descriptions repeat the rule')
   assert.ok(tools.includes('RESUME_NEXT_ACTION'), 'memory_resume receipt is wired to the shared constant')
-  ok('R24-3 中枢/记忆提示/路由卡/两个工具描述与回执同源（文案不再只靠软提示）')
+  // R22 需求①: the receipt path must never sleep/probe the branch while the hub's
+  // tool call (and therefore its turn) is open. The old 300ms setTimeout lived
+  // here; observation/reconciliation own everything after `followup()`.
+  assert.ok(!/setTimeout\s*\(/.test(dispatchSource), 'the dispatch receipt path contains no wait/sleep')
+  ok('R24-3 中枢/记忆提示/路由卡/两个工具描述与回执同源（文案不再只靠软提示）；回执路径无 sleep/轮询')
 }
 
 
@@ -2615,6 +2714,73 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
   assert.deepEqual(outcome.failed, [])
   assert.deepEqual(outcome.skipped, ['branch-r7e'], 'without the agents seam every target is skipped, not failed')
   ok('R7-4 无 agents 缝隙：全部跳过（台账仍可在面板/管理台枚举）')
+}
+
+{
+  // R22 需求④⑤: 记忆集合 + 条目。这里守两件事：
+  //  (a) 工具契约——模型只看得到 parameters/description，模型写 collection、
+  //      读 collectionTitle 的前提是声明存在；
+  //  (b) 数据模型——集合表声明在 store/domain 里、条目的 collectionId 是**可选**字段
+  //      （旧扁平记忆与 panel/webui/maintenance 的写路径不能被破坏）。
+  const toolsSource = readFileSync(new URL('../src/tools.ts', import.meta.url), 'utf8')
+  const rememberStart = toolsSource.indexOf("name: 'memory_remember'")
+  assert.ok(rememberStart > 0, 'memory_remember 定义存在')
+  const rememberOutput = toolsSource.indexOf('output:', rememberStart)
+  const rememberDecl = toolsSource.slice(rememberStart, rememberOutput)
+  assert.match(rememberDecl, /记忆集合/, 'remember 描述说明集合层')
+  assert.match(rememberDecl, /collection:\s*\{\s*type: 'string'/, 'parameters 声明 collection（集合标题）')
+  assert.match(rememberDecl, /collectionId:\s*\{\s*type: 'string'/, 'parameters 声明 collectionId')
+  const rememberOutDecl = toolsSource.slice(rememberOutput, toolsSource.indexOf("name: 'memory_recall'", rememberOutput))
+  assert.match(rememberOutDecl, /collectionTitle:\s*\{\s*type: 'string'/, 'output 回执带 collectionTitle')
+  assert.match(rememberOutDecl, /collectionTier:/, 'output 回执带复用档位')
+  const recallStart = toolsSource.indexOf("name: 'memory_recall'")
+  const recallOutput = toolsSource.indexOf('output:', recallStart)
+  const recallDecl = toolsSource.slice(recallStart, recallOutput)
+  assert.match(recallDecl, /两级检索/, 'recall 描述说明两级检索')
+  const recallOutDecl = toolsSource.slice(recallOutput, recallOutput + 4000)
+  assert.match(recallOutDecl, /collections:\s*\{\s*type: 'array'/, 'recall output 声明 collections')
+  assert.match(recallOutDecl, /collectionTitle:/, 'recall item 带集合标题')
+
+  const schemaSource = readFileSync(new URL('../src/schema.ts', import.meta.url), 'utf8')
+  assert.match(schemaSource, /memory_collections: sd\.domainTable|memory_collections: memoryCollections/, 'schema 返回 memory_collections 表')
+  assert.match(schemaSource, /collectionId: z\.string\(\)\.optional\(\)/, '条目的 collectionId 是可选字段（旧记录/其他写路径兼容）')
+  const storeSource = readFileSync(new URL('../src/store.ts', import.meta.url), 'utf8')
+  assert.match(storeSource, /memoryCollections: Table<MemoryCollection>/, 'store 暴露 memoryCollections 访问器')
+  assert.match(storeSource, /memory_collections: sd\.domainTable/, 'domain 注册记忆集合表')
+  ok('R22-7 记忆集合契约：remember/recall 参数与输出声明 + 集合表注册 + collectionId 可选兼容')
+}
+
+{
+  // R22 需求⑤（写入侧回归）：连续两条同主题结论只应有一个集合——第二条复用第一条
+  // 建出来的集合，而不是每写一条就新开一个。
+  const { resolveCollectionForEntry, listCollections, migrateFlatMemories } = await import('../src/memory-collections.ts')
+  const WS = 'ws'
+  const collectionsTable = table()
+  const memoriesTable = table()
+  const store = { memories: memoriesTable, memoryCollections: collectionsTable }
+  const first = await resolveCollectionForEntry(store, WS,
+    { title: 'git 同步 约定', keywords: ['git', '同步', '推送'], text: '用 pnpm git:sync' }, { now })
+  assert.ok(!('error' in first) && first.created, '第一条结论新建集合')
+  const second = await resolveCollectionForEntry(store, WS,
+    { title: 'git 同步 的凭据', keywords: ['git', '同步', '凭据'], text: '先清 helper 再用 store' }, { now })
+  assert.ok(!('error' in second))
+  assert.equal(second.created, false, '第二条复用已有集合（需求⑤）')
+  assert.equal(second.collectionId, first.collectionId, '两条结论落在同一集合')
+  assert.equal(listCollections(store, WS).length, 1, '同主题连续写入不新开集合')
+
+  // 迁移后写入：旧条目被迁移进集合，新条目命中该集合而不是另开。
+  await memoriesTable.put('legacy', {
+    workspaceKey: WS, title: 'git 推送 要清 helper', text: '旧结论：推送前清 helper', keywords: ['git', '推送'],
+    sourceSessionId: 's', sourceSeq: 1, status: 'active', createdAt: now, updatedAt: now,
+  })
+  const migrated = await migrateFlatMemories(store, WS, now)
+  assert.equal(migrated.entries, 1, '旧条目被迁入集合')
+  const third = await resolveCollectionForEntry(store, WS,
+    { title: 'git 推送 的凭据顺序', keywords: ['git', '推送', 'helper'], text: '先清 helper' }, { now })
+  assert.ok(!('error' in third))
+  assert.equal(third.created, false, '迁移后的旧集合也能被新结论复用')
+  assert.equal(third.collectionId, memoriesTable.get('legacy').collectionId, '新结论进旧条目所在集合')
+  ok('R22-8 集合复用回归：同主题连续写入 + 迁移后的旧集合都可复用（不新开集合）')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

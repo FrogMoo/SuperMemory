@@ -110,6 +110,22 @@ export function isCutOffDispatch(record: Pick<Dispatch, 'status' | 'turnEndReaso
   return false
 }
 
+/**
+ * Whether a resume successor actually replaced the original interruption.
+ *
+ * A still-running, delivered, or itself-cut-off successor owns the work now
+ * (a cut-off successor appears in the list with its own `resumeOf` row). An
+ * honest failure of the resume itself — `resume-wake-failed`, a dispatch error,
+ * max-tokens — is NOT a takeover: the original must stay actionable so the user
+ * can retry it instead of the task silently disappearing from the list.
+ */
+function successorSupersedes(next: Dispatch | undefined): boolean {
+  if (!next) return false
+  if (isOpenDispatch(next)) return true
+  if (next.status === 'delivered') return true
+  return isCutOffDispatch(next)
+}
+
 /** 已完成部分摘要：从中断回执（outbox dlv-<dispatchId>）里摘出。 */
 function partialOfOutbox(store: Store, dispatchId: string): string {
   const payload = store.outbox.get('dlv-' + dispatchId)?.payload ?? ''
@@ -146,21 +162,29 @@ function viewOf(store: Store, dispatchId: string, record: Dispatch): Interrupted
  *
  * 收录两类「可证明被打断」的行：status=interrupted（静默巡检/dispose 兜底标记），
  * 以及 failed 且终态原因是打断签名（重载杀掉在途 turn → aborted、重启后分支消失
- * → branch-died）。已交付、自主失败（max-tokens/派发异常）与已被续跑接续的行
- * （resumedBy 指向一个仍未终态的派发）都不出现——它们不是待决项。
+ * → branch-died）。已交付、自主失败（max-tokens/派发异常）与已被续跑接替的行
+ * 都不出现——它们不是待决项。续跑接替的判定不能只看「续跑仍在途」：续跑完成
+ * （delivered）后原派发必须一直保持隐藏，否则清单和中断提醒会永远重复列出它。
+ * 同时扫描两个方向（原派发的 resumedBy、后继的 resumeOf），历史数据即使只写了
+ * 单边关联也能被正确过滤，无需迁移。
  */
 export function listInterruptedDispatches(store: Store, options: ListInterruptedOptions = {}): InterruptedDispatchView[] {
+  // Reverse-link index: covers ledgers where the original never got resumedBy
+  // (crash between the successor put and the original update) or older data.
+  const superseded = new Set<string>()
+  for (const [, candidate] of store.dispatches.entries()) {
+    if (candidate.resumeOf && successorSupersedes(candidate)) superseded.add(candidate.resumeOf)
+  }
   const out: InterruptedDispatchView[] = []
   for (const [dispatchId, record] of store.dispatches.entries()) {
     if (!record.branchSessionId) continue
     if (!isCutOffDispatch(record)) continue
     const topicSet = record.topicSetId ? store.topicsets.get(record.topicSetId) : undefined
     if (options.workspaceKey && topicSet?.workspaceKey !== options.workspaceKey) continue
-    if (record.resumedBy) {
-      const next = store.dispatches.get(record.resumedBy)
-      // 续跑也已终态（再次被打断）时，续跑行自己会带着 resumeOf 出现在清单里。
-      if (next && isOpenDispatch(next)) continue
-    }
+    // Forward link: the successor took over (running/delivered/again cut off),
+    // so this row is no longer the pending item the user should resume.
+    if (record.resumedBy && successorSupersedes(store.dispatches.get(record.resumedBy))) continue
+    if (superseded.has(dispatchId)) continue
     out.push(viewOf(store, dispatchId, record))
   }
   out.sort((a, b) => b.interruptedAt - a.interruptedAt)
@@ -306,8 +330,14 @@ export async function resumeDispatch(
   }
   if (record.resumedBy) {
     const next = store.dispatches.get(record.resumedBy)
-    if (next && isOpenDispatch(next)) {
-      return { status: 'error', dispatchId, message: '该任务已有续跑在进行（' + record.resumedBy + '）。' }
+    if (next && successorSupersedes(next)) {
+      // Running OR already settled by the successor: resuming the original again
+      // would duplicate finished work. Only an honest resume failure leaves the
+      // original actionable.
+      return {
+        status: 'error', dispatchId,
+        message: '该任务已有续跑' + (isOpenDispatch(next) ? '在进行' : '接替') + '（' + record.resumedBy + '）。',
+      }
     }
   }
   const hubSessionId = String(options.exec?.agent?.id ?? record.hubSessionId)

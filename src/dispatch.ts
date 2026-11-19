@@ -599,21 +599,17 @@ async function dispatchOne(
     if (!handle) throw new Error('分支句柄缺失（acquireBranch 未返回 handle）')
     const seqBefore = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq
     handle.agent.followup(message as UserMessage)
-    await new Promise((r) => setTimeout(r, 300))
-    const seqAfter = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq
-    if (typeof seqBefore === 'number' && typeof seqAfter === 'number' && seqAfter > seqBefore) {
-      // §2.2: the dispatch input landed at seqBefore+1, so the ownership window
-      // must start at that pre-append position — otherwise a later turn/end
-      // would be matched against a stale (often 0) startSeq.
+    // R22 需求①: the receipt must reach the hub IMMEDIATELY. This used to await
+    // a 300ms `setTimeout` probe that re-read the branch log to "confirm the
+    // input landed"; that probe only refined a log line (the startSeq update
+    // below is the same pre-followup position), while keeping the hub's tool
+    // call — and therefore its turn — open. `followup()` durably splices the
+    // input even while a branch is busy, so observation/reconciliation own
+    // everything after the wake: no hub-side wait, no polling, no sleep.
+    if (typeof seqBefore === 'number') {
       await store.dispatches.update(dispatchId, (r) => ({ ...r, startSeq: seqBefore, updatedAt: Date.now() }))
-      logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} input landed (seq ${seqBefore} → ${seqAfter})`)
-    } else {
-      // A busy branch may queue the followup past this 300ms probe. Failing the
-      // dispatch here stranded work that DID land later (observe settled only
-      // open dispatches). Leave it dispatched: observe settles it when the
-      // turn/end arrives, and reconcile path 3 re-follows an untraced input.
-      logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} input not observed yet (seq ${seqBefore} → ${seqAfter}); leaving it to observation/reconciliation`)
     }
+    logger.info(`supermemory: branch ${branchSessionId.slice(0, 20)} followup queued at seq ${String(seqBefore ?? 'unknown')}; observation settles the turn`)
   } catch (error) {
     logger.warn(`supermemory: branch followup threw: ${String(error).slice(0, 300)}`)
     await store.dispatches.update(dispatchId, (r) => ({ ...r, status: 'failed', updatedAt: Date.now() }))

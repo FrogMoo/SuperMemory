@@ -13,7 +13,7 @@
  */
 
 /** memory_dispatch 成功回执的收口提示（单条 / 并行组通用）。 */
-export const DISPATCH_NEXT_ACTION = '已派发。请立即结束本轮回复；分支完成后 relay 会自动开启新一轮对话，届时再汇总转述给用户。'
+export const DISPATCH_NEXT_ACTION = '已派发，结束本轮，等待 relay：请立即结束本轮回复，不要调用 wait_agent、不要轮询分支状态；分支完成后 relay 会自动开启新一轮对话，届时再汇总转述给用户。'
 
 /** memory_resume 续跑回执的收口提示（只查清单时不需要）。 */
-export const RESUME_NEXT_ACTION = '已续跑。请立即结束本轮回复；分支完成后 relay 会自动开启新一轮对话，届时再汇总转述给用户。'
+export const RESUME_NEXT_ACTION = '已续跑，结束本轮，等待 relay：请立即结束本轮回复，不要调用 wait_agent、不要轮询分支状态；分支完成后 relay 会自动开启新一轮对话，届时再汇总转述给用户。'

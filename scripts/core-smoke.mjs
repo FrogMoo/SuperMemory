@@ -8,12 +8,20 @@
 import assert from 'node:assert/strict'
 
 const { buildExport } = await import('../src/export.ts')
+const {
+  collectionRows, findMemoryConflict, listCollections, matchCollections, migrateFlatMemories,
+  recallEntriesWithCollections, resolveCollectionForEntry, shapeScore, tierOfScore,
+} = await import('../src/memory-collections.ts')
 const { topicSetIdsOf } = await import('../src/topicsets.ts')
 const { recallMemories } = await import('../src/recall.ts')
 const { renderRecordLine } = await import('../src/retrieval.ts')
 const { rankMembers } = await import('../src/topicsets.ts')
 const { extractRequirements } = await import('../src/requirements.ts')
 const { extractFacts } = await import('../src/extract.ts')
+// R22 需求④⑤: 记忆集合 + 条目的断言集中在独立模块里（也可单独运行）。
+const { runMemoryCollectionChecks } = await import('./memory-collections-smoke.mjs')
+// R23：记忆整理（集合重排/合并/清占位）的引擎断言（也可单独运行）。
+const { runMemoryOrganizeChecks } = await import('./memory-organize-smoke.mjs')
 
 function table(seed = []) {
   const map = new Map(seed)
@@ -55,6 +63,8 @@ const store = {
   outbox: table(),
   routing: table(),
   hotcache: table(),
+  // R22 需求④: 记忆集合（默认空表；集合相关的断言自己建 fixture）。
+  memoryCollections: table(),
 }
 
 let passed = 0
@@ -244,6 +254,10 @@ ok('rankMembers ranks by task overlap')
     'a subagent/child session is never a hub')
   ok('R19-协同2/3 中枢↔分支关联：状态/共享/所属话题集/工作区隔离 + 中枢判定')
 }
+
+// R22 需求④⑤：记忆集合模型（集合复用 / 旧数据迁移 / 两级检索 / 同 key / 导出分组）
+passed += await runMemoryCollectionChecks({ ok, now })
+passed += await runMemoryOrganizeChecks({ ok, now })
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 process.exit(0)

@@ -2,12 +2,16 @@
 # git-sync-push.sh — 本仓库（SuperMemory）的一站式 git 同步与推送脚本
 #
 # 用途:
-#   一次跑完「工作区检查 -> fetch -> rebase -> push -> 远端 hash 核对」，
-#   并把本机 Git 凭据的坑封装掉：本机全局没有 credential.helper，但
-#   Git Credential Manager(manager) 通过 helperselector 接管了
-#   zrynas.7766.org:8418 的认证且失败，所以必须「先清空 helper 列表，再只用 store」:
-#       GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c credential.helper=store <子命令>
-#   凭据存放于 ~/.git-credentials（host 条目 zrynas.7766.org%3a8418）。
+#   一次跑完「工作区检查 -> fetch -> rebase -> push -> 远端 hash 核对」。
+#
+# Git 凭据（2026-11-19 现状）:
+#   仓库本地 git config 配的是 Git Credential Manager（GCM / manager），凭据由
+#   Windows 凭据存储托管，网络 git 调用直接用仓库配置即可：
+#       credential.helper=!"C:/Users/admin/AppData/Local/Programs/Git/mingw64/bin/git-credential-manager.exe"
+#   旧方案「先清空 helper 列表再用 store 读 ~/.git-credentials」已失效
+#   （~/.git-credentials 不存在），脚本已不再清空 helper。
+#   GIT_TERMINAL_PROMPT=0 保留：凭据缺失时立即失败，而不是卡在用户名/密码提示。
+#   脚本不改全局 git config、不改 remote URL；GCM 也取不到凭据时按原样报错退出。
 #
 # 用法:
 #   bash scripts/git-sync-push.sh [-n|--dry-run] [-r|--remote <name>] [-b|--branch <name>]
@@ -66,10 +70,11 @@ while [ $# -gt 0 ]; do
   shift
 done
 
-# 所有需要网络的 git 调用统一走这个数组：
-# 先用 credential.helper= 清空 helper 列表（避开 GCM/manager），再用 store（读 ~/.git-credentials）。
+# 所有需要网络的 git 调用统一走这个数组（目前就是 git 本身）：
+# 凭据交给仓库本地配置的 GCM（manager）与 Windows 凭据存储处理；
+# GIT_TERMINAL_PROMPT=0 让凭据缺失时立即失败，不弹交互提示卡死脚本。
 export GIT_TERMINAL_PROMPT=0
-GIT=(git -c credential.helper= -c credential.helper=store)
+GIT=(git)
 
 if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
   echo "ERROR: 当前目录不在 git 仓库内。" >&2
