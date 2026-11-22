@@ -1957,3 +1957,69 @@ pnpm typecheck 双端 0 错；pnpm build 宿主 10 文件 603.45 kB + client 110
 
 生效：pnpm build 后跑 scripts/dev-load.sh（lib/dev-<stamp>.js 新 URL + profile patch 原子武装，HMR 监视器重载；同 URL 重建对运行宿主不可见——ESM 按 URL 缓存）。重载实证：tool_memory 两行回填出 workspaceKey/createdAt。**用户需刷新 GUI 页面**拿新客户端产物（lib/client.js）。
 遗留：① profile patch 里的 dev 插入在下次源码变更后需重跑 dev-load.sh，或跑 scripts/install-into-dsh.mjs 清回 bundle 形态并重启 DSH；② 管理台（src/web/**）本轮未加时间戳/集合分组（只做面板）；webui.ts 仅接了写入 deps；③ memory_toolize list 输出未透 createdAt（如需由集成轮补一行）；④ 存量垃圾记忆（R18 大杂烩、派发包装、命令行、疑问句）仍在，需 /memory organize 或手动清理；⑤ when 门禁依赖宿主 register 的 options.when——若将来宿主换旧签名会退化为只有 execute 门禁；⑥ 拆分写入最坏 1+5 次模型调用，慢模型下面板保存可能等秒级。
+
+## 33. R29：「新会话」点击必须立即产出中枢会话（2026-11-23）
+
+### 根因（两个入口都不创建会话，且都「无可见效果」）
+
+R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框删掉，改成「打开 SuperMemory 面板 + 广播 `open-dispatch` 信号切到中枢页签」——**点击不再创建任何会话**：
+
+- shell 侧入口：`src/client/new-session.tsx` 的 capture 监听 → `selectPanel()` → `broadcastOpenDispatch()`；面板本来停在中枢页签时，点击的唯一效果是「切回中枢页签」，视觉上是零变化。
+- 面板侧入口：`src/client/panel-page.tsx` 左栏「＋ 新中枢会话」按钮的 onClick 只有 `setView({kind:'hub'}); setReceipt(undefined)`——同样不创建会话。
+
+即：两个「新会话」入口在 R28 后都退化成「切页签」，用户看到的「点击无效」是这个回归的直接表现（不是按钮没绑定事件）。
+
+### 修法：点击即创建（默认值直接落库），回执就地展示
+
+- `src/client/new-session.tsx`（重写）：capture 命中 shell 的全局「新建会话」控件后 —— 先解析当前工作区，再 `preventDefault + stopPropagation`，`selectPanel()` 打开面板，然后立刻调用宿主 `api.createHubSession(workspace, {}, '')`；成功则把回执 `{id, message, kind:'hub'}` 交给面板（`publishHubReceipt`），面板未打开时直接 `openSession(id)` 兜底；失败则发一条只有文案的回执（`id:''`，面板不渲染「打开会话」）并在面板打不开时 `startSession()` 兜底。
+  - 命中条件：aria-label / title / textContent 匹配「新建会话 / 新会话 / 新对话 / New session…」；**排除**工作区行自己的「在“X”中新建会话」动作（overlay 看不到那一行的 X，拦截会把会话建到当前主视图工作区，语义错误，保留 shell 原行为）。
+  - 无 api / 无工作区 / 标签被上游改名：**不拦截**，shell 自己的新建会话流程照常（永不出现死按钮）。
+- `src/client/open-dispatch.ts`（重写）：`subscribeOpenDispatch/broadcastOpenDispatch` 换成回执通道 `publishHubReceipt / subscribeHubReceipt / takePendingHubReceipt`。面板常常在宿主调用返回后才挂载（`selectPanel` 是异步生效），所以没有监听者时回执进入 `pending`，下一次挂载**恰好消费一次**——这个 pending 槽就是「修复点击无效果」的关键，避免回执丢失。
+- `src/client/panel-page.tsx`：
+  - 订阅回执（并立即 drain 一次 pending，闭合「挂载/发布」竞态）：收到即切中枢页签 + 就地回执卡（文案 + 会话 id + 「打开会话」）+ 刷新左栏。
+  - 左栏「＋ 新中枢会话」按钮改为调用新的 `createHubNow()`：直接 `createHubSession(launchCwd, {}, '')`，成功即回执，失败写错误条；按钮在创建中 disabled（防连点）。
+  - 回执卡：`id` 为空（失败回执）时不渲染「打开会话」。
+- `src/client/index.ts`：恢复 `resolveCwd`（主视图会话 cwd → 第一个工作区），新会话入口 inject 从 `{selectPanel}` 扩为 `{api, cwd, selectPanel}`；`selectSuperPanel` 优先读 `ctx.layout`（shell 自身插件的写法），回退 `ctx.get('layout')`。
+
+### 默认值取舍（需求②：不再提供选项）
+
+| 维度 | 默认 | 理由 |
+|---|---|---|
+| 工作区 | 当前主视图会话的 cwd，回退第一个打开的工作区 | 与面板/派发卡的工作区单一来源一致；解析不到就不拦截，交给 shell 的工作区选择页 |
+| Agent 模式 / 模型 / 权限 | 不传 options → 宿主默认（default preset / 默认路由 / 默认权限） | 「默认」= shell 的默认，不臆造 |
+| 话题集 | 不绑定（纯中枢会话） | 中枢会话按定义不属于任何话题集；派发时派发卡仍按 sticky/自动匹配选集 |
+| 首条消息 | 空 | 「新会话」= 先建会话；打字在会话里进行，不在弹窗里先填 |
+
+中间选择步骤：R3–R27 的「中枢会话 / 话题集会话」对话框在 R28 已删除，本轮不再恢复；`NewSessionChoice` 只做拦截、渲染 null。
+
+### 闸门与测试
+
+- `pnpm typecheck` 双端 0 错；`pnpm build` 宿主 10 文件 603.45 kB、`lib/client.js` 115.14 kB → wrap **112508 bytes**；`pnpm smoke` 全绿：core 25 / mechanism **94** / webui 35 / client-sim OK / capability 12 / workspace-scope 9。
+- 新增回归：`scripts/client-sim-smoke.mjs` 对**构建产物**断言新会话入口必须 inject `api.createHubSession` + `cwd` + `selectPanel`（R28 只注入 selectPanel 正是本 bug）；`scripts/mechanism-smoke.mjs` 新增 R29-1 断言回执通道「无监听者留待下次挂载 / 只消费一次 / 退订后回到 pending」。
+
+### 生效步骤（需中枢执行）
+
+1. 中枢重载插件（`include:supermemory` 禁用→启用，或 `scripts/dev-load.sh` 武装新模块 URL + HMR）；分支内重载会自杀，本轮未做。
+2. 用户刷新 GUI（当前 http://127.0.0.1:51913）。
+3. 验证：点侧栏「新建会话」→ 面板打开并出现回执「已创建中枢会话。」+ 会话 id + 「打开会话」，左栏/侧栏列表立即多一条「新会话 · xxxx」；面板左栏「＋ 新中枢会话」同样立即建会话。
+
+---
+
+## 34. R29 收尾：记忆清理 + 重载机制修正（2026-11-23）
+
+### 34.1 记忆清理（用户需求③）
+
+- 范围：仅 `workspaceKey = F:\10-SuperMemory`；存储 `~/.dsh/storages/supermemory.json`（单文件 JSON，顶层 `{unit,global,tables}`，无校验和）。
+- 删除：requirements 40 条（全是任务提示词碎片/已完成残留/元指令片段）、memories 1 条（派发任务抽取碎片 `mem-mws0s74i`）、topicsets 2 个（`ts-mwl4q67c`/`ts-mwm1r5xl`，`F:\10-Su` 截断路径残根）；清 2 条旧 routing 的 `activeTopicSetId` 悬空引用。
+- 保留：12 条正式记忆、5 个集合、6 个话题集、episodes/signals/dispatches/questions 等历史表；其他工作区（07-WeChatTool/08-ERP/ProductManage/ceshi）未触碰。
+- 备份：`~/.dsh/storages/supermemory-backups/manual-cleanup-r29-2026-11-22T16-05-38-718Z.json`。
+- 脚本与报告：`memory-cleanup-20261122/`（decisions.json / apply-cleanup.mjs dry-run+写入 / patch-insert.mjs / REPORT.md）。
+- 已知来源：`src/maintenance.ts` 的 `extractRequirements` 会把分支任务提示词里的「必须/需要/待办」抽成需求——未来派发仍会产生同类碎片（规则保守、无 LLM 判定，属设计取舍）。
+
+### 34.2 重载机制修正（重要，推翻历来笔记的说法）
+
+- `cordis.patch.yml` 里 dev-load.sh 写的 `- insert: id: supermemory` 会**遮蔽**基础条目 `- id: supermemory / name: dsh-supermemory`（profile 的 node_modules/dsh-supermemory 是指向源码仓库的符号链接）。
+- insert 存在时 `include:supermemory` 报 `unaddressable`，**plugin_manager 禁用/启用会失败**（历来「plugin_manager 禁用→启用重载」的说法只在 insert 被移除后成立）。
+- 原子移除 insert 后：watcher 实时用基础条目重新激活（加载仓库当前构建），条目变为可管理（出现 patchId），此时 plugin_manager `set_plugin include:supermemory enabled=false/true` 才是可靠重载。
+- ESM 按 URL 缓存：同 URL 重建不生效；要加载新构建要么武装新 URL（`scripts/dev-load.sh` 的 `lib/dev-<stamp>.js`），要么让基础包入口重新导入（本次即走这条）。
+- **离线改存储的安全流程**：patch 移除 insert（或 plugin_manager 禁用）→ 插件卸载、存储域关闭 → 编辑 `supermemory.json` → 重新启用/武装 → 自动重读。R29 记忆清理即按此流程执行并验证（memory_topicsets 残根消失、memory_recall 正常）。

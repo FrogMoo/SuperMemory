@@ -88,6 +88,27 @@ for (const want of expected) {
 }
 if (consoleErrors.length > 0) throw new Error('console.error during apply: ' + consoleErrors.join(' | '))
 
+// R29 需求① regression guard: clicking the shell's 新建会话 control must CREATE a
+// hub session, not merely reveal the panel. The entry therefore has to inject
+// the panel api (host createHubSession), a cwd resolver and the panel selector —
+// the shipped 2026-11-22 regression injected only selectPanel, so the click
+// silently did nothing. Checked on the BUILT bundle's registered inject().
+const newSession = registrations.find((row) => row.slot === 'shell.overlay'
+  && row.entry?.options?.id === 'supermemory-new-session')
+if (!newSession) throw new Error('shell.overlay:supermemory-new-session is not registered')
+const injectedNewSession = typeof newSession.entry?.options?.inject === 'function'
+  ? newSession.entry.options.inject()
+  : undefined
+if (typeof injectedNewSession?.api?.createHubSession !== 'function') {
+  throw new Error('new-session entry must inject api.createHubSession: the click has to create a hub session')
+}
+if (typeof injectedNewSession?.cwd !== 'function') {
+  throw new Error('new-session entry must inject a cwd resolver: the hub session needs a workspace')
+}
+if (typeof injectedNewSession?.selectPanel !== 'function') {
+  throw new Error('new-session entry must inject selectPanel: the receipt must become visible')
+}
+
 // The client half only reaches the browser when the package manifest declares
 // it: dsh.client.platform 'web' makes clientModules add the package to
 // window.__DSH_BOOT__, and exports["./client"] names the artifact to serve.

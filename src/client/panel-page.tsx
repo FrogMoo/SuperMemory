@@ -8,7 +8,7 @@
  * @module supermemory/client/panel-page
  */
 import { createElement as h, useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
-import { subscribeOpenDispatch } from './open-dispatch.ts'
+import { subscribeHubReceipt, takePendingHubReceipt, type HubSessionReceipt } from './open-dispatch.ts'
 
 export interface TopicSetView {
   id: string
@@ -859,16 +859,28 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
 
-  // R28 需求①: the shell's 新建会话 control opens this panel (host layout
-  // service) and broadcasts the open-dispatch signal. The panel may be
-  // parked on another tab, so the signal switches back to the hub tab —
-  // where the dispatch card lives — and drops a stale receipt. With no
-  // listener yet (panel not mounted) the signal is a no-op: a fresh mount
-  // defaults to the hub tab anyway.
-  useEffect(() => subscribeOpenDispatch(() => {
-    setView({ kind: 'hub' })
-    setReceipt(undefined)
-  }), [])
+  // 需求①: the shell's 新建会话 click CREATES a hub session and publishes its
+  // receipt here. The panel may be parked on another tab, so a receipt always
+  // switches back to the hub tab and renders in place (message + session id +
+  // 「打开会话」). The rail's 「＋ 新中枢会话」 button produces the same receipt
+  // through createHubNow below, so both entries behave identically.
+  //
+  // Two consumption paths, one effect: (1) live publishes reach the listener,
+  // (2) a receipt published before this panel mounted is drained right after
+  // subscribing — that closes the mount/publish race (selectPanel opens the
+  // panel and the host call resolves a few milliseconds later). Drained once,
+  // so a later remount never shows a stale creation.
+  useEffect(() => {
+    const show = (incoming: HubSessionReceipt): void => {
+      setView({ kind: 'hub' })
+      setReceipt(incoming)
+      void refreshHub()
+    }
+    const unsubscribe = subscribeHubReceipt(show)
+    const pending = takePendingHubReceipt()
+    if (pending) show(pending)
+    return unsubscribe
+  }, [refreshHub])
 
   // R19 需求⑤: read one session's model-visible surface. The panel polls this
   // method (2.5 s) instead of opening the shell session; `sessionQuery` gives
@@ -990,6 +1002,38 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
     }
   }
+
+  /**
+   * 需求②: one click on 「＋ 新中枢会话」 (the panel rail) creates the hub session
+   * immediately — no form, no type picker — and renders the same in-place
+   * receipt as the shell's 新建会话 entry.
+   *
+   * Defaults: the panel's current workspace; host defaults for agent preset /
+   * model / permission (no options passed, so the host applies its own);
+   * NO topic set, because a hub session owns none by definition — the dispatch
+   * card still picks the sticky / automatically matched set when dispatching.
+   */
+  const createHubNow = useCallback(async (): Promise<void> => {
+    if (!launchCwd) { setError(t('launch.needWorkspace')); return }
+    setLaunching(true)
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      const result = await api.createHubSession(launchCwd, {}, '')
+      if (result.status === 'ok' && result.id) {
+        setView({ kind: 'hub' })
+        setReceipt({ id: result.id, message: result.message, kind: 'hub' })
+        setComposerText('')
+        void refreshHub()
+      } else {
+        setError(result.message)
+      }
+    } catch (createError) {
+      setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
+    } finally {
+      setLaunching(false)
+    }
+  }, [api, launchCwd, refreshHub, t])
 
   const startLaunch = async (mode: 'chat' | 'bare' = 'chat'): Promise<void> => {
     if (!launchCwd) { setError(t('launch.needWorkspace')); return }
@@ -1238,7 +1282,11 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         ),
         h('div', { key: 'meta', className: 'sm-sub' }, receipt.id),
         h('div', { key: 'actions', className: 'sm-actions' },
-          h(Button, { key: 'open', label: t('composer.open'), onClick: () => api.openSession(receipt.id) }),
+          // A failure receipt ('' id) has no session to open: show the message
+          // and let the user dismiss it, never a broken 打开会话 button.
+          receipt.id
+            ? h(Button, { key: 'open', label: t('composer.open'), onClick: () => api.openSession(receipt.id) })
+            : null,
           h(Button, { key: 'dismiss', label: t('composer.dismiss'), onClick: () => setReceipt(undefined) }),
         ),
       )
@@ -1768,9 +1816,12 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         ),
     h('div', { key: 'foot', className: 'sm-side-foot' },
       h(Button, {
+        // 需求②: clicking 「＋ 新中枢会话」 creates a hub session right away (no
+        // intermediate form); the receipt appears in the hub tab.
         key: 'new', className: 'sm-newhub', size: 'sm', label: t('side.new'),
         title: t('composer.title'),
-        onClick: () => { setView({ kind: 'hub' }); setReceipt(undefined) },
+        disabled: launching,
+        onClick: () => { void createHubNow() },
       }),
     ),
   )

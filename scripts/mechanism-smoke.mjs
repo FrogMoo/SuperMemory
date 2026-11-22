@@ -2789,6 +2789,31 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
   ok('R22-8 集合复用回归：同主题连续写入 + 迁移后的旧集合都可复用（不新开集合）')
 }
 
+{
+  // R29 需求①: 「新会话」 must not be a dead click. The client entry creates the
+  // hub session and hands the receipt to the panel through this signal module.
+  // The panel is often NOT mounted when the host call resolves (selectPanel
+  // mounts it a beat later), so the pending slot is the contract that makes the
+  // receipt survive that race — and it must be drained exactly once.
+  const { publishHubReceipt, subscribeHubReceipt, takePendingHubReceipt } =
+    await import('../src/client/open-dispatch.ts')
+  assert.equal(takePendingHubReceipt(), undefined, 'nothing pending before the first receipt')
+  publishHubReceipt({ id: 'session-a', message: '已创建中枢会话。', kind: 'hub' })
+  assert.deepEqual(takePendingHubReceipt(), { id: 'session-a', message: '已创建中枢会话。', kind: 'hub' },
+    'a receipt published with no listener is kept for the next panel mount')
+  assert.equal(takePendingHubReceipt(), undefined, 'the pending receipt is drained exactly once')
+
+  const seen = []
+  const unsubscribe = subscribeHubReceipt((receipt) => seen.push(receipt))
+  publishHubReceipt({ id: 'session-b', message: '已创建中枢会话。', kind: 'hub' })
+  unsubscribe()
+  publishHubReceipt({ id: 'session-c', message: '已创建中枢会话。', kind: 'hub' })
+  assert.deepEqual(seen.map((row) => row.id), ['session-b'], 'a live listener sees publishes, an unsubscribed one does not')
+  assert.deepEqual(takePendingHubReceipt(), { id: 'session-c', message: '已创建中枢会话。', kind: 'hub' },
+    'after the last listener unsubscribes a receipt is kept pending again')
+  ok('R29-1 新会话回执信号：无监听时留待下次挂载、只消费一次、退订后回到 pending')
+}
+
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 
 process.exit(0)

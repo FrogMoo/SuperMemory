@@ -3,9 +3,10 @@
  * src/panel.ts), registers the left-sidebar "超级记忆" panel launcher, the
  * main-column panel page (hub session by default; topic sets and their
  * sessions at the second level; memory browsing/management; composite-tool
- * editing), the New-session entry (the shell's 新建会话 control opens this
- * panel's dispatch card — no dialog), and a 「分支」 badge on topic-set sessions
- * in the sidebar (hub vs branch at a glance).
+ * editing), the New-session entry (the shell's 新建会话 control CREATES a hub
+ * session immediately with host defaults and shows the in-place receipt — no
+ * dialog, no choice step; 需求①), and a 「分支」 badge on topic-set sessions in
+ * the sidebar (hub vs branch at a glance).
  * @module supermemory/client
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -93,17 +94,57 @@ function buildApi(ctx: Context): PanelApi | undefined {
 }
 
 /**
- * Open the SuperMemory panel in the shell's main column (派发改回卡片): the same
- * `ctx.get('layout')?.selectPanel(...)` call the plugin-manager launcher makes.
- * Returns false when the layout service is unavailable, so the caller (the
- * New-session entry) leaves the click un-prevented and the shell's own
- * new-session behaviour runs — never a dead button. An asynchronous failure
- * falls back to the shell's plain new session, so a rejected selectPanel is
- * still not a swallowed click.
+ * Resolve the workspace a click-created hub session should live in.
+ *
+ * The MAIN-VIEW session's own cwd wins: with more than one workspace open,
+ * `workspaces.items[0].path` points the session (and every later write) at the
+ * wrong project. Both services are optional seams: an older shell simply
+ * yields '' and the New-session entry then leaves the click to the shell
+ * instead of creating a session in an unknown workspace.
+ */
+function resolveCwd(ctx: Context): string {
+  try {
+    const sessions = ctx.get('sessions') as
+      | { list?: { getSnapshot?: () => { byId?: Record<string, { retainedBy?: { mainView?: number }; cwd?: unknown; header?: { cwd?: unknown } }> } } }
+      | undefined
+    const byId = sessions?.list?.getSnapshot?.()?.byId ?? {}
+    for (const session of Object.values(byId)) {
+      if ((session?.retainedBy?.mainView ?? 0) <= 0) continue
+      const cwd = session.cwd ?? session.header?.cwd
+      if (typeof cwd === 'string' && cwd) return cwd
+    }
+  } catch {
+    // The service is absent on older shells; fall through to the workspace list.
+  }
+  try {
+    const workspaces = ctx.get('workspaces') as
+      | { list?: { getSnapshot?: () => { items?: Array<{ path?: unknown }> } } }
+      | undefined
+    const items = workspaces?.list?.getSnapshot?.()?.items ?? []
+    for (const item of items) {
+      if (typeof item?.path === 'string' && item.path) return item.path
+    }
+  } catch {
+    // The service is absent on older shells; '' makes the entry defer to the shell.
+  }
+  return ''
+}
+
+/**
+ * Open the SuperMemory panel in the shell's main column — the same
+ * `layout.selectPanel(PANEL_ID)` call the shell's plugin-manager makes.
+ *
+ * The shell provides the layout service as a reflected value and its own
+ * plugins read it as `ctx.layout`; `ctx.get('layout')` is the abstracted form.
+ * Both are tried, because the reflected property is the verified one while
+ * `get` keeps this working if the property is renamed. Returns false when
+ * neither is usable, so the caller can fall back to opening the created
+ * session directly — never a dead click.
  */
 function selectSuperPanel(ctx: Context): boolean {
   try {
-    const layout = ctx.get('layout') as { selectPanel?: (id: string) => unknown } | undefined
+    const holder = ctx as unknown as { layout?: { selectPanel?: (id: string) => unknown } }
+    const layout = holder.layout ?? (ctx.get('layout') as { selectPanel?: (id: string) => unknown } | undefined)
     const select = layout?.selectPanel
     if (typeof select !== 'function') return false
     void Promise.resolve(select.call(layout, PANEL_ID)).catch(() => {
@@ -180,22 +221,30 @@ export async function apply(ctx: Context): Promise<void> {
     }, SupermemoryPanelPage as never)), 'supermemory: panel page')
   })
 
-  // 3. the New-session entry (派发改回卡片): the shell's 新建会话 control opens
-  // THIS panel's dispatch card instead of a dialog. Mounted in shell.overlay,
-  // NOT in a sidebar row slot: this shell exposes no "new session action" slot
-  // (the verified sidebar slot vocabulary is sidebar.panellist /
-  // sidebar.session.row.leading / sidebar.workspaces.session.row.action /
-  // sidebar.footer.action), so the component installs its own capture-phase
-  // document listener and matches the control by accessible name. Worst cases
-  // (label renamed upstream, or no layout service) leave the click untouched,
-  // so the shell's default plain new session still runs.
+  // 3. the New-session entry (需求①：点击「新会话」立即创建中枢会话): the click
+  // CREATES the hub session through the panel api with host defaults and hands
+  // the receipt to the panel — no dialog and no intermediate choice step.
+  // Mounted in shell.overlay, NOT in a sidebar row slot: this shell exposes no
+  // "new session action" slot to replace (the sidebar's own 新建会话 row renders
+  // sidebar.session.action, which would ADD a control rather than replace it),
+  // so the component installs a capture-phase document listener and matches the
+  // control by accessible name. Worst cases (label renamed upstream, no api, or
+  // no resolvable workspace) leave the click untouched, so the shell's default
+  // new-session flow still runs.
   contribute('new-session entry', () => {
     ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
       name: 'shell.overlay',
       id: 'supermemory-new-session',
       order: 30,
       locale: NS,
-      inject: () => ({ selectPanel: () => selectSuperPanel(ctx) }),
+      inject: () => ({
+        // 需求①: the click creates the hub session itself (host defaults), then
+        // hands the receipt to the panel; `cwd` resolves the current workspace
+        // and `selectPanel` reveals the panel so the receipt is visible.
+        api,
+        cwd: () => resolveCwd(ctx),
+        selectPanel: () => selectSuperPanel(ctx),
+      }),
     }, NewSessionChoice as never)), 'supermemory: new-session entry')
   })
 

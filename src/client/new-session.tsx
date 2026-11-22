@@ -1,68 +1,101 @@
 /**
- * New-session entry (派发改回卡片, requirement ①): the shell's 新建会话 control
- * now opens THIS plugin's panel on its dispatch card instead of a modal choice
- * layer (the 中枢会话 / 话题集会话 dialog this module used to render).
+ * New-session entry (需求①: 「新会话」 must have an immediate, visible effect).
  *
- * Mounted in `shell.overlay` (a global render slot) because this shell exposes
- * no sidebar "new session action" slot to hook into — the verified sidebar slot
- * vocabulary is sidebar.panellist / sidebar.session.row.leading /
- * sidebar.workspaces.session.row.action / sidebar.footer.action. The component
- * therefore installs a capture-phase document listener and intercepts the click
- * on the shell's 新建会话 control by its accessible name (aria-label / title /
- * text). If that label is renamed upstream the listener never matches, nothing
- * is prevented, and the shell's default plain new session keeps working — the
- * failure mode is a missing interception, never a dead button.
+ * The click on the shell's 新建会话 control (sidebar header / sidebar new-session
+ * row / a workspace row's 新会话 action) now CREATES a hub session right away
+ * with host defaults — current workspace, default agent preset / model /
+ * permission, no topic set (a hub session owns no set; the panel's dispatch
+ * card still picks the sticky/auto set when dispatching) — and hands the
+ * receipt to the panel, which renders it in place (message + session id +
+ * 「打开会话」). No choice dialog, no type picker, no waiting for a form: one
+ * click, one session.
  *
- * Why no dialog: the dispatch card already lives in the panel (composerView:
- * task text, workspace / Agent preset / model / permission, topic-set chips,
- * ＋新话题集, 开始对话 / 仅创建会话, Ctrl/Cmd+Enter, in-place receipt), and a
- * second copy in a modal drifted from it. So the click only (1) asks the host
- * layout service to open the SuperMemory panel in the main column — the same
- * call the plugin-manager launcher makes — and (2) broadcasts the
- * open-dispatch signal, which switches an already-mounted panel page back to
- * the hub tab. Degradation is explicit: without the layout service the click is
- * NOT prevented, so the shell's own new-session behaviour runs untouched; an
- * asynchronous selectPanel failure falls back to uiWorkspace.startSession().
+ * Why an interceptor instead of a slot: this shell exposes no "new session
+ * action" slot to replace (the verified vocabulary is sidebar.panellist /
+ * sidebar.session.row.leading / sidebar.workspaces.session.row.action /
+ * sidebar.footer.action — the sidebar's own 新建会话 row renders
+ * `sidebar.session.action`, which ADDS a control instead of replacing it), so
+ * the entry lives in `shell.overlay` (a global render slot) and installs a
+ * capture-phase document listener that matches the control by accessible name
+ * (aria-label / title / text). Capture runs before the shell's own bubble
+ * handler, so a matched click never creates the shell's plain session behind
+ * the panel.
+ *
+ * Degradation is explicit and never a dead button: without the panel api, a
+ * resolvable workspace, or a matching label, the click is NOT prevented and the
+ * shell's own new-session flow runs untouched. If the session was created but
+ * the panel could not be revealed (no layout service), the created session is
+ * opened directly so the click still has a visible result.
  * @module supermemory/client/new-session
  */
 import { useEffect, type ReactElement } from 'react'
-import { broadcastOpenDispatch } from './open-dispatch.ts'
+import { publishHubReceipt } from './open-dispatch.ts'
+
+/** The slice of the panel api the entry needs (host `createHubSession`). */
+export interface NewSessionApi {
+  createHubSession(
+    cwd: string,
+    options?: Record<string, unknown>,
+    firstMessage?: string,
+  ): Promise<{ status: string; message: string; id?: string }>
+  /** Open a created session in the shell (fallback when the panel cannot open). */
+  openSession?(sessionId: string): void
+  /** Start the shell's own plain new session (last-resort fallback). */
+  startSession?(): void
+}
 
 export interface NewSessionChoiceProps {
-  /** Locale-bound translator injected by the shell slot owner (kept for the slot contract; the layer renders no text). */
+  /** Locale-bound translator injected by the shell slot owner (no text is rendered here). */
   t?: (key: string, params?: Record<string, string | number>) => string
+  /** Panel api (host createHubSession + the two navigation fallbacks). */
+  api?: NewSessionApi
+  /** Current workspace path (main-view session cwd, else the first workspace). */
+  cwd?: () => string
   /**
    * Open the SuperMemory panel in the shell's main column. Returns false when
-   * the host layout service is unavailable, so the caller lets the shell's own
-   * new-session behaviour run instead of swallowing the click.
+   * the host layout service is unavailable, so the caller can fall back to
+   * opening the created session directly.
    */
   selectPanel?: () => boolean
 }
 
 /**
  * The shell's New-session control, in the shipped zh and en dictionaries plus
- * the plausible variants. Matched against aria-label + title + textContent.
+ * the plausible variants (the sidebar uses 新建会话 / New session, a workspace
+ * row uses 在“…”中新建会话).
  */
 const NEW_SESSION_CONTROL = /(新建|新的?)\s*会话|新建对话|新对话|new\s+(session|chat|conversation)/i
 
 /** Whether an accessible name/value describes the shell's New-session control. */
 function isNewSessionControl(value: string): boolean {
   if (!value) return false
+  if (PER_WORKSPACE_ACTION.test(value.trim())) return false
   return NEW_SESSION_CONTROL.test(value)
 }
 
+/**
+ * A workspace ROW's own action ("在“X”中新建会话" / New session in "X"): that
+ * control belongs to one workspace the overlay cannot see, so it keeps the
+ * shell's own behaviour — intercepting it here would create the session in the
+ * MAIN-VIEW workspace instead of the clicked one. Only the global 新建会话
+ * control (sidebar header / new-session row / brand) is ours.
+ */
+const PER_WORKSPACE_ACTION = /^在.*中\s*(新建|新的?)\s*(会话|对话)/
+
 /** The New-session entry: an interceptor that renders nothing. */
 export function NewSessionChoice(props: NewSessionChoiceProps): ReactElement | null {
+  const api = props.api
+  const cwd = props.cwd
   const selectPanel = props.selectPanel
   // Capture-phase interception of the shell's New-session control. Capture runs
-  // before any bubble handler, so stopping propagation here keeps the shell from
-  // creating its plain session behind the panel we are about to open.
+  // before any bubble handler, so a matched click never creates the shell's
+  // plain session behind the panel we are about to open.
   useEffect(() => {
     if (typeof document === 'undefined') return
     const onCapture = (event: MouseEvent): void => {
       const target = event.target
       if (!(target instanceof Element)) return
-      // Our own panel must never re-trigger the layer: its 「＋ 新中枢会话」
+      // Our own panel must never re-trigger the entry: its 「＋ 新中枢会话」
       // button and every in-panel control already act locally.
       if (target.closest('[data-sm-panel]') !== null) return
       const control = target.closest('button, [role="button"], a')
@@ -73,15 +106,42 @@ export function NewSessionChoice(props: NewSessionChoiceProps): ReactElement | n
         control.textContent,
       ].filter((value): value is string => typeof value === 'string').join(' ')
       if (!isNewSessionControl(name)) return
-      // The host layout service decides: unavailable (older shell) means no
-      // preventDefault here, and the shell's default new session keeps working.
-      if (typeof selectPanel !== 'function' || !selectPanel()) return
+      // No api or no workspace: leave the click alone, the shell's own
+      // new-session flow (with its workspace picker) is the honest fallback.
+      if (typeof api?.createHubSession !== 'function') return
+      const workspace = typeof cwd === 'function' ? String(cwd() ?? '') : ''
+      if (!workspace) return
       event.preventDefault()
       event.stopPropagation()
-      broadcastOpenDispatch()
+      // Open the panel FIRST so the receipt has somewhere to render; a false
+      // return (older shell without the layout service) is not fatal — the
+      // created session is opened directly below.
+      const panelOpened = typeof selectPanel === 'function' && selectPanel() === true
+      void api.createHubSession(workspace, {}, '')
+        .then((result) => {
+          if (result && result.status === 'ok' && result.id) {
+            publishHubReceipt({ id: result.id, message: result.message, kind: 'hub' })
+            if (!panelOpened) api.openSession?.(result.id)
+            return
+          }
+          publishHubReceipt({
+            id: '',
+            message: result?.message || '创建中枢会话失败',
+            kind: 'hub',
+          })
+          if (!panelOpened) api.startSession?.()
+        })
+        .catch((error) => {
+          publishHubReceipt({
+            id: '',
+            message: '创建中枢会话失败：' + String(error instanceof Error ? error.message : error),
+            kind: 'hub',
+          })
+          if (!panelOpened) api.startSession?.()
+        })
     }
     document.addEventListener('click', onCapture, true)
     return () => document.removeEventListener('click', onCapture, true)
-  }, [selectPanel])
+  }, [api, cwd, selectPanel])
   return null
 }
