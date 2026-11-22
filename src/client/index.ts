@@ -3,8 +3,9 @@
  * src/panel.ts), registers the left-sidebar "超级记忆" panel launcher, the
  * main-column panel page (hub session by default; topic sets and their
  * sessions at the second level; memory browsing/management; composite-tool
- * editing), the New-session choice layer (中枢会话 / 话题集会话), and a 「分支」 badge
- * on topic-set sessions in the sidebar (hub vs branch at a glance).
+ * editing), the New-session entry (the shell's 新建会话 control opens this
+ * panel's dispatch card — no dialog), and a 「分支」 badge on topic-set sessions
+ * in the sidebar (hub vs branch at a glance).
  * @module supermemory/client
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -92,41 +93,30 @@ function buildApi(ctx: Context): PanelApi | undefined {
 }
 
 /**
- * Resolve the workspace path the New-session dialog should create sessions in.
- *
- * The MAIN-VIEW session own cwd wins: with more than one workspace open,
- * `workspaces.items[0].path` points the dialog — and every write it triggers —
- * at the wrong project (the same trap fixed in panel-page.tsx). The row shape
- * is the client `sessions` list snapshot (`cwd`, or `header.cwd` on rows that
- * only carry a header); `workspaces.list` is the fallback, and '' lets the host
- * resolve its default workspace.
+ * Open the SuperMemory panel in the shell's main column (派发改回卡片): the same
+ * `ctx.get('layout')?.selectPanel(...)` call the plugin-manager launcher makes.
+ * Returns false when the layout service is unavailable, so the caller (the
+ * New-session entry) leaves the click un-prevented and the shell's own
+ * new-session behaviour runs — never a dead button. An asynchronous failure
+ * falls back to the shell's plain new session, so a rejected selectPanel is
+ * still not a swallowed click.
  */
-function resolveCwd(ctx: Context): string {
+function selectSuperPanel(ctx: Context): boolean {
   try {
-    const sessions = ctx.get('sessions') as
-      | { list?: { getSnapshot?: () => { byId?: Record<string, { retainedBy?: { mainView?: number }; cwd?: unknown; header?: { cwd?: unknown } }> } } }
-      | undefined
-    const byId = sessions?.list?.getSnapshot?.()?.byId ?? {}
-    for (const session of Object.values(byId)) {
-      if ((session?.retainedBy?.mainView ?? 0) <= 0) continue
-      const cwd = session.cwd ?? session.header?.cwd
-      if (typeof cwd === 'string' && cwd) return cwd
-    }
+    const layout = ctx.get('layout') as { selectPanel?: (id: string) => unknown } | undefined
+    const select = layout?.selectPanel
+    if (typeof select !== 'function') return false
+    void Promise.resolve(select.call(layout, PANEL_ID)).catch(() => {
+      try {
+        ctx.get('uiWorkspace')?.startSession()
+      } catch {
+        // Older shell: nothing else to fall back to.
+      }
+    })
+    return true
   } catch {
-    // The service is absent on older shells; the dialog still works with ''.
+    return false
   }
-  try {
-    const workspaces = ctx.get('workspaces') as
-      | { list?: { getSnapshot?: () => { items?: Array<{ path?: unknown }> } } }
-      | undefined
-    const items = workspaces?.list?.getSnapshot?.()?.items ?? []
-    for (const item of items) {
-      if (typeof item?.path === 'string' && item.path) return item.path
-    }
-  } catch {
-    // The service is absent on older shells; the dialog still works with ''.
-  }
-  return ''
 }
 
 /**
@@ -190,23 +180,23 @@ export async function apply(ctx: Context): Promise<void> {
     }, SupermemoryPanelPage as never)), 'supermemory: panel page')
   })
 
-  // 3. the New-session choice layer (中枢会话 / 话题集会话).
-  // Mounted in shell.overlay, NOT in a sidebar row slot: this shell exposes no
-  // "new session action" slot (the verified sidebar slot vocabulary is
-  // sidebar.panellist / sidebar.session.row.leading /
-  // sidebar.workspaces.session.row.action / sidebar.footer.action), so the
-  // component installs its own capture-phase document listener and intercepts
-  // the click on the shell's 新建会话 control by accessible name. Worst case
-  // (label renamed upstream) nothing is intercepted and the shell's default
-  // plain new session still runs.
-  contribute('new-session choice', () => {
+  // 3. the New-session entry (派发改回卡片): the shell's 新建会话 control opens
+  // THIS panel's dispatch card instead of a dialog. Mounted in shell.overlay,
+  // NOT in a sidebar row slot: this shell exposes no "new session action" slot
+  // (the verified sidebar slot vocabulary is sidebar.panellist /
+  // sidebar.session.row.leading / sidebar.workspaces.session.row.action /
+  // sidebar.footer.action), so the component installs its own capture-phase
+  // document listener and matches the control by accessible name. Worst cases
+  // (label renamed upstream, or no layout service) leave the click untouched,
+  // so the shell's default plain new session still runs.
+  contribute('new-session entry', () => {
     ctx.effect(() => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
       name: 'shell.overlay',
       id: 'supermemory-new-session',
       order: 30,
       locale: NS,
-      inject: () => ({ api, cwd: () => resolveCwd(ctx) }),
-    }, NewSessionChoice as never)), 'supermemory: new-session choice')
+      inject: () => ({ selectPanel: () => selectSuperPanel(ctx) }),
+    }, NewSessionChoice as never)), 'supermemory: new-session entry')
   })
 
   // 4. the sidebar session-row branch badge (问题③): a 「分支」 mark on every

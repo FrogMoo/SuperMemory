@@ -255,7 +255,12 @@ export async function registerComposite(ctx: Context, store: Store, spec: Compos
     // 定义对象在函数内构造会加宽字面量类型（type: 'object' → string），与序列路径
     // 一样用 as never 交给 defineTool；语义由 output schema 的文字描述保证。
     const capSpec = spec as CapabilitySpec
-    const disposer = ctx.tools.register(tools.defineTool(capabilityToolDef(store, capSpec, workspaceKey) as never))
+    // A3 检索侧门禁：宿主按 step 解析时对每个可见工具调用 when(context)——
+    // 跨工作区的会话在工具列表里就看不到本能力（此前只有 execute 门禁）。
+    const disposer = ctx.tools.register(
+      tools.defineTool(capabilityToolDef(store, capSpec, workspaceKey) as never),
+      { when: compositeWhenGate(spec, workspaceKey) },
+    )
     liveComposites.set(spec.name, disposer)
     liveCompositeSpecs.add(spec.name)
     return disposer
@@ -266,6 +271,8 @@ export async function registerComposite(ctx: Context, store: Store, spec: Compos
   for (const parameter of spec.parameters) {
     properties[parameter.name] = { type: 'string', description: parameter.description }
   }
+  // 序列路径同样带 when 门禁：有行级归属的序列（trigger 推导出的工作区）
+  // 不会泄漏进别的工作区的工具列表；无归属的序列判定为全局，任何工作区可见。
   const disposer = ctx.tools.register(tools.defineTool({
     name: spec.name,
     description: spec.description + '（一次调用完成整个确定性子序列）',
@@ -321,19 +328,35 @@ export async function registerComposite(ctx: Context, store: Store, spec: Compos
       bumpCompositeUse(store, spec.name)
       return { status: 'completed' as const, steps: completed, summary: `${spec.description}：${texts.join('，')}` }
     },
-  }))
+  }), { when: compositeWhenGate(spec, workspaceKey) })
   liveComposites.set(spec.name, disposer)
   liveCompositeSpecs.add(spec.name)
   return disposer
 }
 
 /** Persist a composite spec into tool_memory (durable definition JSON). */
-export async function persistComposite(store: Store, spec: CompositeSpec, signalKey: string, workspaceKey?: string): Promise<string> {
+export async function persistComposite(
+  store: Store,
+  spec: CompositeSpec,
+  signalKey: string,
+  workspaceKey?: string,
+  logger?: { info: (msg: string) => void },
+): Promise<string> {
   const id = newId('tm')
+  // 归属永不缺失：未显式传入时从 signalKey 推导——序列 persist 键形如
+  // `ws/<workspaceKey>/seq/<tools>`（sequenceKey / toolize / 提议接受路径都写这个
+  // 形状），前缀即工作区。此前这些行不落归属：重启重建拿不到行级门禁、回填前
+  // 一直是全局可见。能力行 trigger='capability/<name>' 推导不出归属，由调用方
+  // 显式传参（register 的 scope / 内置播种的 seedWorkspace）决定；两者都没有
+  // 的行留空（全局）并记日志，启动回填会再次如实记录。
+  const own = workspaceKey ?? workspaceKeyFromSignalKey(signalKey)
+  if (!own) {
+    logger?.info('supermemory: persistComposite 未解析到工作区归属（trigger=' + signalKey + '），按全局记录')
+  }
   const record: ToolMemory = {
     kind: 'composite',
-    // 能力按适用范围落到工作区（控制台只在本工作区展示它）；序列记录保持全局。
-    ...(workspaceKey ? { workspaceKey } : {}),
+    // 能力按适用范围落到工作区（控制台只在本工作区展示它）；序列按 trigger 前缀归属。
+    ...(own ? { workspaceKey: own } : {}),
     title: spec.title ?? deriveTitle(spec.description, spec.name),
     tags: normalizeTags(spec.tags ?? spec.name),
     trigger: signalKey,
@@ -341,9 +364,52 @@ export async function persistComposite(store: Store, spec: CompositeSpec, signal
     entry: JSON.stringify(spec),
     useCount: 0,
     status: 'active',
+    // R28: 增加时间落库（面板「固化能力」页签「增加时间」列的数据源；同名
+    // 更新/原地更新走 store.toolMemory.update 的 ...r 展开，原值自然保留）。
+    createdAt: Date.now(),
   }
   await store.toolMemory.put(id, record)
   return id
+}
+
+/**
+ * 启动回填（R28，幂等的一次性迁移）：补齐 R26/R28 之前写入的行。
+ * ① 归属：无 workspaceKey 的行从 trigger 前缀 `ws/<workspaceKey>/seq/` 推导写回
+ *    （宿主工具注册表进程全局 + persist 不落归属 = 跨工作区泄漏的两个根因）；
+ *    推导不到且 spec 无 scope 的行保持全局，info 日志如实记录。
+ * ② createdAt：缺失的行按 `spec.updatedAt ?? Date.now()` 回填（面板「增加时间」
+ *    对旧行也有值），info 日志；已有值的一行不动——第二次启动起不再写、不再记。
+ * 回填写库失败不阻塞启动（try/catch：旧介质/只读场景下降级为下次重启再试）。
+ */
+async function backfillToolMemoryAttribution(
+  store: Store,
+  logger?: { info: (msg: string) => void },
+): Promise<void> {
+  for (const [id, record] of [...store.toolMemory.entries()]) {
+    if (record.kind !== 'composite') continue
+    let spec: CompositeSpec | undefined
+    try {
+      spec = JSON.parse(record.entry) as CompositeSpec
+    } catch { /* 坏定义：只回填行级事实字段，不猜 spec */ }
+    const patch: Partial<ToolMemory> = {}
+    if (!record.workspaceKey) {
+      const derived = record.trigger ? workspaceKeyFromSignalKey(record.trigger) : undefined
+      if (derived) {
+        patch.workspaceKey = derived
+        logger?.info('supermemory: tool_memory ' + id + ' 归属回填为 ' + derived + '（trigger 前缀推导）')
+      } else if (!spec?.scope) {
+        logger?.info('supermemory: tool_memory ' + id + ' 无归属信息（trigger 不可推导且 spec 无 scope），保持全局')
+      }
+    }
+    if (record.createdAt === undefined) {
+      patch.createdAt = Number(spec?.updatedAt) || Date.now()
+      logger?.info('supermemory: tool_memory ' + id + ' 回填 createdAt=' + patch.createdAt)
+    }
+    if (Object.keys(patch).length === 0) continue
+    try {
+      await store.toolMemory.update(id, (r) => ({ ...r, ...patch }))
+    } catch { /* 回填写库失败不阻塞启动 */ }
+  }
 }
 
 /** Rebuild-register every active composite from durable JSON (P3 restart). */
@@ -352,14 +418,20 @@ export async function rebuildComposites(
   store: Store,
   // 注入缝：无宿主注册器（测试/headless）时用假 register 也能验证重建拾取。
   deps?: {
-    register?: (ctx: Context, store: Store, spec: CompositeSpec) => Promise<() => void>
+    // A3: 第 4 参 = 行级工作区归属，注册门禁（when）与 execute 门禁都用它。
+    register?: (ctx: Context, store: Store, spec: CompositeSpec, workspaceKey?: string) => Promise<() => void>
     logger?: { info: (msg: string) => void }
   },
 ): Promise<number> {
   const register = deps?.register ?? registerComposite
+  // R28: 先回填旧行（归属 + createdAt，幂等），再合并/注册——回填出的归属随即
+  // 进入本轮注册的 when 门禁，修补的泄漏当次启动即生效。
+  try {
+    await backfillToolMemoryAttribution(store, deps?.logger)
+  } catch { /* 回填失败不阻塞启动：持久行照常重建 */ }
   // R26: 内置能力先与 store 合并（缺失播种/旧版升级/现场保留），随后统一注册。
   try {
-    const merged = await mergeBuiltinCapabilities(store)
+    const merged = await mergeBuiltinCapabilities(store, { logger: deps?.logger })
     if (merged.seeded.length > 0 || merged.upgraded.length > 0) {
       deps?.logger?.info('supermemory: builtin capabilities merged — seeded ' + merged.seeded.join(',')
         + '; upgraded ' + merged.upgraded.join(','))
@@ -626,6 +698,63 @@ export function capabilityAppliesToWorkspace(
   return own === callerWorkspace
 }
 
+/**
+ * 序列 trigger 里的工作区键：`ws/<workspaceKey>/seq/<tools>` → `<workspaceKey>`
+ * （sequenceKey / toolize 的 persist 键都是这个形状）。不是这个形状（能力行
+ * `capability/<name>`、旧格式、空串）返回 undefined——归属保持缺失，由调用方
+ * 决定是显式传参还是留空（全局）。
+ */
+export function workspaceKeyFromSignalKey(signalKey: string): string | undefined {
+  if (typeof signalKey !== 'string') return undefined
+  const index = signalKey.indexOf('/seq/')
+  if (index <= 0) return undefined
+  const prefix = signalKey.slice(0, index)
+  return prefix.startsWith('ws/') && prefix.length > 3 ? prefix.slice(3) : undefined
+}
+
+/**
+ * 注册门禁 context 里取调用方工作区（宿主 ToolsService.register 的 options.when）。
+ * 宿主按 step 解析：对每个可见工具 await registration.when(context)，context.agent
+ * 是 preparing agent。取不到（宿主未注入/形状不符/抛错）一律 undefined = 放行——
+ * 与 execute 门禁「无工作区事实时放行」语义一致。
+ */
+function registrationWorkspaceKey(context: unknown): string | undefined {
+  try {
+    const agent = (context as { agent?: { session?: { header?: { cwd?: string } } } } | undefined)?.agent
+    const cwd = agent?.session?.header?.cwd
+    if (!cwd || typeof cwd !== 'string') return undefined
+    return workspaceKeyOf(cwd)
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 模型可见性门禁（A3 工作区隔离的检索侧）：注册时随定义交给宿主，宿主在每个
+ * step 解析工具集时调用——返回 false 的工具不进 admitted set（模型不可见，调用
+ * 报 UNKNOWN_TOOL）。此前只有 execute 门禁（挡调用不挡检索）：跨工作区会话仍能
+ * 在工具列表里看到别的工作区固化的能力/序列；本门禁把「检索」也挡住。
+ *
+ * 语义与 execute 门禁一致：调用方工作区不可知时放行（true）；取到则按
+ * capabilityAppliesToWorkspace 判定（行级归属优先，其次 spec.scope，都没有=全局）。
+ * 永不抛出：宿主会把 when 的异常升级为 ToolActivationError 导致整个 step 失败，
+ * 因此整个判定包在 try/catch 里，任何坏形状/坏 spec 都退化为放行。
+ */
+export function compositeWhenGate(
+  spec: Pick<CompositeSpec, 'scope'>,
+  rowWorkspaceKey: string | undefined,
+): (context: unknown) => boolean {
+  return (context: unknown): boolean => {
+    try {
+      const caller = registrationWorkspaceKey(context)
+      if (!caller) return true
+      return capabilityAppliesToWorkspace(spec, caller, rowWorkspaceKey)
+    } catch {
+      return true
+    }
+  }
+}
+
 /** One capability execution result (tool output and the webui endpoint share it). */
 export interface CapabilityRunResult {
   status: 'completed' | 'failed' | 'needs-confirm'
@@ -834,8 +963,10 @@ export function capabilityToolDef(store: Store, spec: CapabilitySpec, workspaceK
 
 /** Seam so tests (and headless hosts) can register a capability without a live tool registry. */
 export interface CapabilityDeps {
-  register: (ctx: Context, store: Store, spec: CompositeSpec) => Promise<() => void>
-  persist: (store: Store, spec: CompositeSpec, key: string, workspaceKey?: string) => Promise<string>
+  // A3: 第 4 参 = 行级工作区归属，注册门禁（when）与 execute 门禁都用它。
+  register: (ctx: Context, store: Store, spec: CompositeSpec, workspaceKey?: string) => Promise<() => void>
+  // R28: 第 5 参 = 归属推导失败时的日志出口（可选）。
+  persist: (store: Store, spec: CompositeSpec, key: string, workspaceKey?: string, logger?: { info: (msg: string) => void }) => Promise<string>
   toolExists: (ctx: Context, name: string) => boolean
 }
 
@@ -915,7 +1046,10 @@ export async function registerCapability(
         ...(previous?.usage ? { usage: previous.usage } : {}),
       }
       disposeComposite(next.name)
-      if (hasRegistry) await seam.register(ctx, store, next)
+      // A3: 行级归属随注册传入（when 门禁 + execute 门禁）。更新路径取本行现有
+      // 归属，缺省回退到调用方传入的 workspaceKey。
+      const ownWorkspace = workspaceKey ?? store.toolMemory.get(existingId)?.workspaceKey
+      if (hasRegistry) await seam.register(ctx, store, next, ownWorkspace)
       await store.toolMemory.update(existingId, (r) => ({
         ...r,
         title: next.title ?? r.title,
@@ -936,7 +1070,8 @@ export async function registerCapability(
       updatedAt: Date.now(),
       changelog: [changeLine],
     }
-    if (hasRegistry) await seam.register(ctx, store, stamped)
+    // A3: 新行注册也带归属（与 persist 的 workspaceKey 同一个值）。
+    if (hasRegistry) await seam.register(ctx, store, stamped, workspaceKey)
     const id = await seam.persist(store, stamped, 'capability/' + stamped.name, workspaceKey)
     return {
       status: 'ok',
@@ -952,8 +1087,8 @@ export async function registerCapability(
 }
 
 /** Every durable capability record (broken JSON skipped) — for list surfaces. */
-export function capabilityRecordsOf(store: Store, workspaceKey?: string): Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string }> {
-  const out: Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string }> = []
+export function capabilityRecordsOf(store: Store, workspaceKey?: string): Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string; createdAt?: number }> {
+  const out: Array<{ id: string; spec: CapabilitySpec; useCount: number; status: string; createdAt?: number }> = []
   for (const [id, record] of store.toolMemory.entries()) {
     if (record.kind !== 'composite' || !record.entry) continue
     try {
@@ -961,7 +1096,8 @@ export function capabilityRecordsOf(store: Store, workspaceKey?: string): Array<
       if (spec?.kind !== 'capability' || !spec.entry) continue
       // A3: 只列出适用于当前工作区的能力（行级归属或 scope 推导；全局能力除外）。
       if (!capabilityAppliesToWorkspace(spec, workspaceKey, record.workspaceKey)) continue
-      out.push({ id, spec: spec as CapabilitySpec, useCount: record.useCount, status: record.status })
+      // R28: 透出增加时间（面板「固化能力」页签；旧行回填前为 undefined）。
+      out.push({ id, spec: spec as CapabilitySpec, useCount: record.useCount, status: record.status, ...(record.createdAt !== undefined ? { createdAt: record.createdAt } : {}) })
     } catch { /* one broken row never blocks a list */ }
   }
   return out
@@ -1009,6 +1145,8 @@ export async function mergeBuiltinCapabilities(
     ctx?: Context
     // A3: register 可带行级工作区归属，供能力工具做跨工作区门禁。
     register?: (ctx: Context, store: Store, spec: CompositeSpec, workspaceKey?: string) => Promise<() => void>
+    // R28: 播种落不到归属时的日志出口（rebuildComposites 传 deps.logger）。
+    logger?: { info: (msg: string) => void }
   },
 ): Promise<BuiltinMergeReport> {
   const report: BuiltinMergeReport = { seeded: [], upgraded: [], current: [], localNewer: [], changed: [] }
@@ -1032,7 +1170,8 @@ export async function mergeBuiltinCapabilities(
         ...(builtin.changelog?.length ? { changelog: [...builtin.changelog] } : {}),
       }
       const seedWorkspace = builtin.scope ? workspaceKeyOf(builtin.scope) : undefined
-      await persistComposite(store, spec, 'capability/' + toolName, seedWorkspace)
+      // 播种即落 createdAt（R28）；无 scope 的内置定义播种不出归属，logger 如实记录。
+      await persistComposite(store, spec, 'capability/' + toolName, seedWorkspace, opts?.logger)
       report.seeded.push(toolName)
       report.changed.push({ spec, workspaceKey: seedWorkspace })
       continue
@@ -1081,6 +1220,9 @@ export async function mergeBuiltinCapabilities(
       entry: JSON.stringify(next),
       // 行级归属只在「继承自旧 scope」时随 scope 迁移（见上）；否则不碰。
       ...(workspaceKey !== r.workspaceKey ? { workspaceKey } : {}),
+      // R28: 旧行缺 createdAt 时（运行时刷新先于启动回填）按同一规则补齐：
+      // spec.updatedAt ?? now；已有值不动——与回填迁移同规则且幂等。
+      ...(r.createdAt === undefined ? { createdAt: Number(spec?.updatedAt) || Date.now() } : {}),
       // status 仍不碰：停用是现场决定。
     }))
     report.upgraded.push(toolName)

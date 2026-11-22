@@ -1,7 +1,7 @@
 /**
- * New-session choice layer (R3): offers 中枢会话 (the shell's plain new session)
- * or 话题集会话 (a fresh session bound to one or more topic sets, created
- * host-side and opened immediately).
+ * New-session entry (派发改回卡片, requirement ①): the shell's 新建会话 control
+ * now opens THIS plugin's panel on its dispatch card instead of a modal choice
+ * layer (the 中枢会话 / 话题集会话 dialog this module used to render).
  *
  * Mounted in `shell.overlay` (a global render slot) because this shell exposes
  * no sidebar "new session action" slot to hook into — the verified sidebar slot
@@ -11,50 +11,32 @@
  * on the shell's 新建会话 control by its accessible name (aria-label / title /
  * text). If that label is renamed upstream the listener never matches, nothing
  * is prevented, and the shell's default plain new session keeps working — the
- * failure mode is a missing dialog, never a dead button.
+ * failure mode is a missing interception, never a dead button.
+ *
+ * Why no dialog: the dispatch card already lives in the panel (composerView:
+ * task text, workspace / Agent preset / model / permission, topic-set chips,
+ * ＋新话题集, 开始对话 / 仅创建会话, Ctrl/Cmd+Enter, in-place receipt), and a
+ * second copy in a modal drifted from it. So the click only (1) asks the host
+ * layout service to open the SuperMemory panel in the main column — the same
+ * call the plugin-manager launcher makes — and (2) broadcasts the
+ * open-dispatch signal, which switches an already-mounted panel page back to
+ * the hub tab. Degradation is explicit: without the layout service the click is
+ * NOT prevented, so the shell's own new-session behaviour runs untouched; an
+ * asynchronous selectPanel failure falls back to uiWorkspace.startSession().
  * @module supermemory/client/new-session
  */
-import { createElement as h, useCallback, useEffect, useState, type ReactElement } from 'react'
-import type { PanelApi, TopicSetView } from './panel-page.tsx'
+import { useEffect, type ReactElement } from 'react'
+import { broadcastOpenDispatch } from './open-dispatch.ts'
 
 export interface NewSessionChoiceProps {
-  /** Locale-bound translator injected by the shell slot owner. */
-  t: (key: string, params?: Record<string, string | number>) => string
-  /** Host panel API (remote namespace wrapper). */
-  api: PanelApi
-  /** Resolve the workspace path the new session should be created in. */
-  cwd?: () => string
-}
-
-const CHOICE_CSS = [
-  '.sm-ns-backdrop{position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.45);display:flex;align-items:flex-start;justify-content:center;padding-top:12vh}',
-  '.sm-ns-card{width:380px;max-width:92vw;max-height:70vh;overflow:auto;border-radius:12px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-1,#232324);color:var(--dsw-alias-label-primary,#f9fafb);padding:16px;font-size:13px;box-shadow:0 12px 40px rgba(0,0,0,.5)}',
-  '.sm-ns-card h2{margin:0 0 12px;font-size:15px}',
-  '.sm-ns-option{display:flex;gap:8px;align-items:flex-start;padding:10px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;margin-bottom:8px;cursor:pointer}',
-  '.sm-ns-option[data-active="true"]{border-color:var(--dsw-alias-link,#7aaaff)}',
-  '.sm-ns-option .sm-ns-name{font-weight:600}',
-  '.sm-ns-option .sm-ns-desc{opacity:.6;font-size:11px;margin-top:2px}',
-  '.sm-ns-list{max-height:180px;overflow:auto;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));border-radius:8px;padding:6px;margin:8px 0}',
-  '.sm-ns-check{display:flex;gap:8px;align-items:center;padding:5px 6px;border-radius:6px;cursor:pointer}',
-  '.sm-ns-check:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.08))}',
-  '.sm-ns-actions{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}',
-  '.sm-ns-btn{padding:6px 14px;border-radius:8px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:inherit;cursor:pointer;font-size:12px}',
-  '.sm-ns-btn:hover{border-color:var(--dsw-alias-link,#7aaaff)}',
-  '.sm-ns-btn[data-variant="primary"]{background:var(--dsw-alias-button-primary-fill,#f9fafb);border-color:transparent;color:var(--dsw-alias-label-primary-foreground,#0f1115)}',
-  '.sm-ns-btn[data-variant="primary"]:hover{border-color:transparent;background:var(--dsw-alias-button-primary-hover,#ebeef2)}',
-  '.sm-ns-btn:disabled{opacity:.45;cursor:default}',
-  '.sm-ns-input{width:100%;padding:6px 8px;border-radius:6px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-specific-input-major,#2c2c2e);color:inherit;font-size:12px;font-family:inherit}',
-  '.sm-ns-error{color:var(--dsw-alias-state-error-primary,#f25a5a);font-size:12px;margin-top:6px}',
-].join('\n')
-
-let cssInstalled = false
-function installCss(): void {
-  if (cssInstalled || typeof document === 'undefined') return
-  cssInstalled = true
-  const style = document.createElement('style')
-  style.setAttribute('data-plugin', 'dsh-supermemory')
-  style.textContent = CHOICE_CSS
-  document.head.append(style)
+  /** Locale-bound translator injected by the shell slot owner (kept for the slot contract; the layer renders no text). */
+  t?: (key: string, params?: Record<string, string | number>) => string
+  /**
+   * Open the SuperMemory panel in the shell's main column. Returns false when
+   * the host layout service is unavailable, so the caller lets the shell's own
+   * new-session behaviour run instead of swallowing the click.
+   */
+  selectPanel?: () => boolean
 }
 
 /**
@@ -69,42 +51,19 @@ function isNewSessionControl(value: string): boolean {
   return NEW_SESSION_CONTROL.test(value)
 }
 
-/** The New-session choice layer. */
+/** The New-session entry: an interceptor that renders nothing. */
 export function NewSessionChoice(props: NewSessionChoiceProps): ReactElement | null {
-  installCss()
-  // Defensive: a slot owner that does not bind the locale dictionary still
-  // renders the layer (keys shown raw) instead of throwing on the first click.
-  const t = typeof props.t === 'function' ? props.t : (key: string): string => key
-  const { api } = props
-  const [open, setOpen] = useState(false)
-  const [choice, setChoice] = useState<'hub' | 'topic'>('hub')
-  const [topicSets, setTopicSets] = useState<TopicSetView[]>([])
-  const [selected, setSelected] = useState<string[]>([])
-  const [newTitle, setNewTitle] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | undefined>()
-  const cwd = typeof props.cwd === 'function' ? props.cwd() : ''
-
-  const openDialog = useCallback(() => {
-    setOpen(true)
-    setError(undefined)
-    setChoice('hub')
-    setSelected([])
-    setNewTitle('')
-    void api.loadTopicSets(cwd).then(setTopicSets, () => setTopicSets([]))
-  }, [api, cwd])
-
+  const selectPanel = props.selectPanel
   // Capture-phase interception of the shell's New-session control. Capture runs
   // before any bubble handler, so stopping propagation here keeps the shell from
-  // creating its plain session behind the dialog.
+  // creating its plain session behind the panel we are about to open.
   useEffect(() => {
-    if (typeof document === 'undefined' || !api) return
+    if (typeof document === 'undefined') return
     const onCapture = (event: MouseEvent): void => {
-      if (open) return
       const target = event.target
       if (!(target instanceof Element)) return
-      // The dialog itself, and our own panel, must never re-trigger the layer.
-      if (target.closest('.sm-ns-backdrop') !== null) return
+      // Our own panel must never re-trigger the layer: its 「＋ 新中枢会话」
+      // button and every in-panel control already act locally.
       if (target.closest('[data-sm-panel]') !== null) return
       const control = target.closest('button, [role="button"], a')
       if (control === null) return
@@ -114,124 +73,15 @@ export function NewSessionChoice(props: NewSessionChoiceProps): ReactElement | n
         control.textContent,
       ].filter((value): value is string => typeof value === 'string').join(' ')
       if (!isNewSessionControl(name)) return
+      // The host layout service decides: unavailable (older shell) means no
+      // preventDefault here, and the shell's default new session keeps working.
+      if (typeof selectPanel !== 'function' || !selectPanel()) return
       event.preventDefault()
       event.stopPropagation()
-      openDialog()
+      broadcastOpenDispatch()
     }
     document.addEventListener('click', onCapture, true)
     return () => document.removeEventListener('click', onCapture, true)
-  }, [api, open, openDialog])
-
-  useEffect(() => {
-    if (!open) return
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') setOpen(false)
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [open])
-
-  const toggle = (id: string): void => {
-    setSelected((current) => current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id])
-  }
-
-  const start = async (): Promise<void> => {
-    setBusy(true)
-    setError(undefined)
-    try {
-      if (choice === 'hub') {
-        api.startSession()
-        setOpen(false)
-        return
-      }
-      let ids = selected
-      if (newTitle.trim()) {
-        const created = await api.createTopicSet(cwd, newTitle.trim())
-        if (created.status !== 'ok' || !created.id) {
-          setError(created.message)
-          return
-        }
-        ids = [...ids, created.id]
-      }
-      if (ids.length === 0) {
-        setError(t('newSession.pick'))
-        return
-      }
-      const result = await api.createTopicSetSession(cwd, ids)
-      if (result.status !== 'ok' || !result.id) {
-        setError(result.message)
-        return
-      }
-      api.openSession(result.id)
-      setOpen(false)
-    } catch (startError) {
-      setError(String(startError instanceof Error ? startError.message : startError))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  if (!open) return null
-
-  return h('div', {
-    key: 'backdrop', className: 'sm-ns-backdrop', 'data-sm-panel': 'true',
-    onClick: (event: { target: EventTarget | null; currentTarget: EventTarget | null }) => {
-      if (event.target === event.currentTarget) setOpen(false)
-    },
-  },
-    h('div', { key: 'card', className: 'sm-ns-card', role: 'dialog', 'aria-modal': true },
-      h('h2', { key: 'title' }, t('newSession.title')),
-      h('div', {
-        key: 'hub', className: 'sm-ns-option', 'data-active': String(choice === 'hub'),
-        onClick: () => setChoice('hub'),
-      },
-        h('input', { key: 'radio', type: 'radio', checked: choice === 'hub', onChange: () => setChoice('hub') }),
-        h('div', { key: 'text' },
-          h('div', { key: 'name', className: 'sm-ns-name' }, t('newSession.hub')),
-          h('div', { key: 'desc', className: 'sm-ns-desc' }, t('newSession.hub.desc')),
-        ),
-      ),
-      h('div', {
-        key: 'topic', className: 'sm-ns-option', 'data-active': String(choice === 'topic'),
-        onClick: () => setChoice('topic'),
-      },
-        h('input', { key: 'radio', type: 'radio', checked: choice === 'topic', onChange: () => setChoice('topic') }),
-        h('div', { key: 'text' },
-          h('div', { key: 'name', className: 'sm-ns-name' }, t('newSession.topic')),
-          h('div', { key: 'desc', className: 'sm-ns-desc' }, t('newSession.topic.desc')),
-        ),
-      ),
-      choice === 'topic'
-        ? h('div', { key: 'picker' },
-            h('div', { key: 'label', className: 'sm-ns-desc' }, t('newSession.pick')),
-            h('div', { key: 'list', className: 'sm-ns-list' },
-              topicSets.length === 0
-                ? h('div', { key: 'empty', className: 'sm-ns-desc' }, t('hub.empty'))
-                : topicSets.map((topicSet) =>
-                    h('label', { key: topicSet.id, className: 'sm-ns-check' },
-                      h('input', {
-                        key: 'box', type: 'checkbox', checked: selected.includes(topicSet.id),
-                        onChange: () => toggle(topicSet.id),
-                      }),
-                      h('span', { key: 'name' }, topicSet.title),
-                    ),
-                  ),
-            ),
-            h('input', {
-              key: 'newTitle', className: 'sm-ns-input', value: newTitle,
-              placeholder: t('newSession.create'),
-              onChange: (event: { target: { value: string } }) => setNewTitle(event.target.value),
-            }),
-          )
-        : null,
-      error ? h('div', { key: 'error', className: 'sm-ns-error' }, error) : null,
-      h('div', { key: 'actions', className: 'sm-ns-actions' },
-        h('button', { key: 'cancel', className: 'sm-ns-btn', onClick: () => setOpen(false) }, t('newSession.cancel')),
-        h('button', {
-          key: 'start', className: 'sm-ns-btn', 'data-variant': 'primary', disabled: busy,
-          onClick: () => void start(),
-        }, t('newSession.start')),
-      ),
-    ),
-  )
+  }, [selectPanel])
+  return null
 }

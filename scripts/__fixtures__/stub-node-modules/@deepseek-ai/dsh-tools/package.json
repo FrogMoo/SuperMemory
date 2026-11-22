@@ -1,0 +1,8 @@
+{
+  "name": "@deepseek-ai/dsh-tools",
+  "version": "0.0.0-smoke-stub",
+  "description": "smoke-only stub of the host tools package: defineTool is identity so capability-smoke can drive registerComposite without a live host. Resolved via NODE_PATH (this directory is an extra node_modules root); the running host always resolves its own bundled copy (loadHostModule anchors on process.argv[1]), so this stub never reaches production.",
+  "type": "module",
+  "main": "index.js",
+  "exports": { ".": "./index.js" }
+}

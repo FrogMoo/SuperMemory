@@ -145,6 +145,10 @@ export async function buildSchemas() {
 
   const toolMemory = z.object({
     workspaceKey: z.string().optional(),
+    // R28: 能力/组合工具的增加时间（面板「固化能力」页签「增加时间」列的数据源）。
+    // 可选：旧介质没有这个字段，读作 undefined，由启动回填一次性补齐
+    // （src/composite.ts backfillToolMemoryAttribution）；域版本保持 v1 兼容。
+    createdAt: z.number().int().optional(),
     kind: z.enum(['composite', 'skill', 'workflow']).default('composite'),
     // Same retrieval shape as memories/topic sets: a human title, tags for
     // matching, and the description as the body.

@@ -27,7 +27,9 @@ import {
 import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
 // R22 需求⑤: 面板新建记忆与 memory_remember 共用同一套集合归属判定。
-import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
+import { collectionTierNote, listCollections, resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
+// R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
+import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
 import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
 import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
@@ -76,6 +78,11 @@ export interface MemoryView {
   sourceSessionId: string
   createdAt: number
   updatedAt: number
+  // R27 需求④: 所属记忆集合（两级模型的条目侧）。未归集时不设这三个字段，
+  // 客户端据此显示「未归集」而不是空串。
+  collectionId?: string
+  collectionTitle?: string
+  collectionTags?: string[]
 }
 
 export interface ToolView {
@@ -89,6 +96,8 @@ export interface ToolView {
   useCount: number
   status: string
   live: boolean
+  /** R27: 行的创建时间（旧行在回填前是 undefined，客户端显示 —）。 */
+  createdAt?: number
   // R22 能力（capability）字段；序列组合工具这些字段为空。
   kind?: 'sequence' | 'capability'
   entry?: string
@@ -463,13 +472,19 @@ export class SupermemoryPanelService {
   hubState(cwd: string, sessionId: string): HubState {
     const workspaceKey = this.wk(cwd)
     const topicSets = listTopicSets(this.store, workspaceKey).map(([id, topicSet]) => this.view(id, topicSet))
+    // R27 需求④: 条目带所属集合（与 listMemories 同一投影）。
+    const collections = new Map(listCollections(this.store, workspaceKey))
     const memories: MemoryView[] = []
     for (const [id, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey) continue
+      const collection = record.collectionId ? collections.get(record.collectionId) : undefined
       memories.push({
         id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
         sourceSessionId: record.sourceSessionId,
         createdAt: record.createdAt, updatedAt: record.updatedAt,
+        ...(collection
+          ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
+          : {}),
       })
     }
     memories.sort((a, b) => b.updatedAt - a.updatedAt)
@@ -514,12 +529,14 @@ export class SupermemoryPanelService {
   listMemories(cwd: string, query?: string, limit?: number): MemoryView[] {
     const workspaceKey = this.wk(cwd)
     const tokens = query ? new Set(tokenize(query)) : new Set<string>()
+    // R27 需求④: 集合上下文一次取齐（未归集/已归档集合的条目不带这三个字段）。
+    const collections = new Map(listCollections(this.store, workspaceKey))
     const rows: Array<{ view: MemoryView; score: number }> = []
     for (const [id, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey) continue
       // R10: title and tags are the index; a hit there counts 4x/3x a body hit,
       // so a title/tag filter never needs the body scan.
-      const titleBag = new Set(tokenize(record.title))
+      const titleBag = new Set(tokenize(record.title ?? ''))
       const tagBag = new Set(tokenize(record.keywords.join(' ')))
       const bodyBag = new Set(tokenize(`${record.text} ${record.key ?? ''}`))
       let score = 0
@@ -529,12 +546,16 @@ export class SupermemoryPanelService {
         else if (bodyBag.has(token)) score += 1
       }
       if (tokens.size > 0 && score === 0) continue
+      const collection = record.collectionId ? collections.get(record.collectionId) : undefined
       rows.push({
         score,
         view: {
           id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
           sourceSessionId: record.sourceSessionId,
           createdAt: record.createdAt, updatedAt: record.updatedAt,
+          ...(collection
+            ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
+            : {}),
         },
       })
     }
@@ -552,6 +573,7 @@ export class SupermemoryPanelService {
     const cleanTags = mergeTags(normalizeTags(tags), tagsOfBody(body))
     const stableKey = key?.trim() || undefined
     const now = Date.now()
+    // 整段重复 / 同 key 冲突：与旧行为一致地直接回报（不拆分、不写入）。
     for (const [memoryId, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey || record.status !== 'active') continue
       if (stableKey && record.key === stableKey) {
@@ -564,34 +586,63 @@ export class SupermemoryPanelService {
         return { status: 'ok', message: '相同记忆已存在。', id: memoryId }
       }
     }
-    // R22 需求⑤: a memory typed in the panel joins the SAME collection layer as
-    // memory_remember (the write path is the closure of the reuse rule: related
-    // collection → append entry, no new collection). Legacy entries stay covered
-    // by the lazy migration in recall/remember.
-    const assignment = await resolveCollectionForEntry(
-      this.store, workspaceKey, { title: cleanTitle, keywords: cleanTags, text: body }, { now },
-    )
-    if ('error' in assignment) return { status: 'error', message: assignment.error }
-    const memoryId = newId('mem')
-    const memory: Memory = {
-      workspaceKey, title: cleanTitle, text: body, key: stableKey,
-      keywords: cleanTags,
-      ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
-      // Typed in the panel: there is no source session to locate.
-      sourceSessionId: '',
-      sourceSeq: 0,
-      status: 'active', createdAt: now, updatedAt: now,
+    // R27 需求④.2: 面板粘贴的长文先整形为 1..N 条原子记忆（有模型才调用一次；
+    // 无模型/预判不通过/失败都保持 1 条，与旧行为一致）。拆分后每条是独立事实，
+    // 调用方的单个 key 无法标识 N 行，因此不沿用。
+    const decisionDeps = { ctx: this.ctx, logger: { warn: (msg: string) => console.warn(msg) } }
+    const drafts = (await splitMemoryEntries(decisionDeps, body, { title: cleanTitle, tags: cleanTags }))
+      ?? [{ title: cleanTitle, tags: cleanTags, text: body }]
+    const atomic = drafts.filter((draft) => draft.text && assessConclusion(draft.text).ok)
+    const entries = atomic.length > 0 ? atomic : [{ title: cleanTitle, tags: cleanTags, text: body }]
+    const split = entries.length > 1
+    const created: Array<{ id: string; collectionTitle: string; note: string | null }> = []
+    const duplicateIds: string[] = []
+    for (const entry of entries) {
+      if (split) {
+        let exists = false
+        for (const [memoryId, record] of this.store.memories.entries()) {
+          if (record.workspaceKey !== workspaceKey || record.status !== 'active') continue
+          if (record.text.trim().toLowerCase() === entry.text.toLowerCase()) {
+            exists = true
+            duplicateIds.push(memoryId)
+            break
+          }
+        }
+        if (exists) continue
+      }
+      const entryTags = mergeTags(entry.tags, cleanTags)
+      // R22 需求⑤ + R27 需求④.3: 与 memory_remember 同一套集合判定（有模型时由模型决定）。
+      const assignment = await resolveCollectionForEntry(
+        this.store, workspaceKey, { title: entry.title, keywords: entryTags, text: entry.text },
+        { now, deps: decisionDeps },
+      )
+      if ('error' in assignment) return { status: 'error', message: assignment.error }
+      const memoryId = newId('mem')
+      const memory: Memory = {
+        workspaceKey, title: entry.title, text: entry.text,
+        ...(split ? {} : (stableKey ? { key: stableKey } : {})),
+        keywords: entryTags,
+        ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+        // Typed in the panel: there is no source session to locate.
+        sourceSessionId: '',
+        sourceSeq: 0,
+        status: 'active', createdAt: now, updatedAt: now,
+      }
+      await this.store.memories.put(memoryId, memory)
+      if (assignment.collectionId) await touchCollection(this.store, assignment.collectionId, now)
+      created.push({ id: memoryId, collectionTitle: assignment.title, note: collectionTierNote(assignment) })
     }
-    await this.store.memories.put(memoryId, memory)
-    if (assignment.collectionId) await touchCollection(this.store, assignment.collectionId, now)
+    if (created.length === 0) {
+      return { status: 'ok', message: '相同记忆已存在，未重复写入。', ...(duplicateIds[0] ? { id: duplicateIds[0] } : {}) }
+    }
+    const first = created[0]
+    const skipped = duplicateIds.length > 0 ? `其中 ${duplicateIds.length} 条已存在，未重复写入。` : ''
     return {
       status: 'ok',
-      message: assignment.title === ''
-        ? '已记住。'
-        : assignment.created
-          ? `已记住（新建记忆集合「${assignment.title}」）。`
-          : `已记住（归入记忆集合「${assignment.title}」）。`,
-      id: memoryId,
+      id: first.id,
+      message: split
+        ? `已拆分为 ${created.length} 条记忆，分别归入：${created.map((row) => row.collectionTitle ? `「${row.collectionTitle}」` : '未归集').join('、')}。${skipped}`
+        : `已记住${first.note ? `（${first.note}）` : ''}。${skipped}`,
     }
   }
 
@@ -1197,6 +1248,8 @@ export class SupermemoryPanelService {
         useCount: record.useCount,
         status: record.status,
         live: liveCompositeSpecs.has(name),
+        // R27: 旧行在 tool_memory.createdAt 回填前是 undefined（客户端显示 —）。
+        createdAt: record.createdAt,
         kind, entry, doc, scope, runnable, dryRunArg, writeConfirm,
         ...(routeNote ? { routeNote } : {}),
         ...(healthRow

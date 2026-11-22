@@ -259,5 +259,137 @@ ok('rankMembers ranks by task overlap')
 passed += await runMemoryCollectionChecks({ ok, now })
 passed += await runMemoryOrganizeChecks({ ok, now })
 
+// ---- R27 需求④.2 原子拆分（记忆整形）+ ④.3 抽取净化 ----
+{
+  const { mayHoldMultipleFacts, normalizeSplitResult, splitMemoryEntries } = await import('../src/memory-split.ts')
+  const { keywordsOf } = await import('../src/extract.ts')
+
+  // 假 llm：拆分类请求（提示词带「待整形材料」）回答拆分答案，集合判定请求按序回答决策。
+  const routingLlm = (splitAnswer, decisions) => {
+    const calls = []
+    let decisionIndex = 0
+    const llm = {
+      listProviders: () => [{ id: 'p', name: 'P' }],
+      listModels: async () => [{ provider: 'p', id: 'm', name: 'M' }],
+      stream(request) {
+        calls.push(request)
+        const asked = (request.messages?.[0]?.content ?? [])
+          .map((block) => (block?.type === 'text' ? String(block.text ?? '') : '')).join('\n')
+        const isSplit = asked.includes('待整形材料')
+        const answer = isSplit ? splitAnswer : decisions[Math.min(decisionIndex, decisions.length - 1)]
+        if (!isSplit) decisionIndex += 1
+        return (async function* () { yield { type: 'text-delta', text: answer } })()
+      },
+    }
+    return { ctx: { get: (name) => (name === 'llm' ? llm : undefined) }, calls }
+  }
+
+  const NL = String.fromCharCode(10)
+  const multiText = [
+    'git 同步用 pnpm git:sync：凭据走仓库本地 GCM（Windows 凭据存储托管），不要再写 -c credential.helper=store。',
+    '推送前先 git fetch 确认无分叉，确认远端没有新提交冲突之后再推送，绝不 force push。',
+    'logs/ 与 *.bak 不提交，已经写入根 .gitignore；带日期后缀的备份要手动排除。',
+    '日常同步跑入口命令 pnpm git:sync，预演加 --dry-run，提交信息写文件后 git commit -F。',
+  ].join(NL)
+
+  // 8.1 预判：明显单条不调用模型，多行正文才可能拆
+  assert.equal(mayHoldMultipleFacts('构建命令是 pnpm build'), false, '短单句不触发拆分（不烧 token）')
+  assert.equal(mayHoldMultipleFacts(multiText), true, '多行长文判定为可能多事实')
+
+  // 8.2 有模型：拆成 2 条 → 各自判重 + 集合归属后落库（两条都带集合）
+  {
+    const store = {
+      memories: table([]),
+      memoryCollections: table([['mc-git', {
+        workspaceKey: WS_A, title: 'git 同步 记忆', keywords: ['git', '同步', '推送'],
+        summary: 'git 同步与推送约定', status: 'active', createdAt: now, updatedAt: now,
+      }]]),
+    }
+    const llm = routingLlm(
+      JSON.stringify({ entries: [
+        { title: 'git 同步用 pnpm git:sync', tags: ['git', '同步'], text: 'git 同步用 pnpm git:sync：凭据走仓库本地 GCM。' },
+        { title: '推送前先 fetch', tags: ['git', '推送'], text: '推送前先 git fetch 确认无分叉，绝不 force push。' },
+      ] }),
+      ['{"collectionId":"mc-git"}', '{"collectionId":"mc-git"}'],
+    )
+    const drafts = await splitMemoryEntries({ ctx: llm.ctx }, multiText, { title: 'git 同步 约定', tags: ['git'] })
+    assert.equal(drafts.length, 2, '模型拆出 2 条原子记忆')
+    assert.equal(drafts[0].title, 'git 同步用 pnpm git:sync')
+    assert.deepEqual(drafts[0].tags, ['git', '同步'])
+    assert.equal(llm.calls.length, 1, '整形只调用一次模型')
+    // 模拟 memory_remember 的写入循环：逐条判重 + 集合归属 + 落库
+    const written = []
+    for (const draft of drafts) {
+      assert.equal(findMemoryConflict(store, WS_A, { text: draft.text }), null, '新片段不误判重复')
+      const assignment = await resolveCollectionForEntry(
+        store, WS_A, { title: draft.title, keywords: draft.tags, text: draft.text },
+        { now, deps: { ctx: llm.ctx } },
+      )
+      assert.ok(!('error' in assignment))
+      await store.memories.put('mem-' + written.length, {
+        workspaceKey: WS_A, title: draft.title, text: draft.text, keywords: draft.tags,
+        ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+        sourceSessionId: 's', sourceSeq: 1, status: 'active', createdAt: now, updatedAt: now,
+      })
+      written.push(assignment)
+    }
+    assert.equal(store.memories.size, 2, '两条原子记忆都落库')
+    assert.equal(written[0].collectionId, 'mc-git', '第一条归入已有集合（模型判定）')
+    assert.equal(written[0].tier, 'llm')
+    assert.equal(written[1].collectionId, 'mc-git', '第二条同样归入该集合')
+    assert.equal(collectionRows(store).length, 1, '同主题两条不新开集合')
+    assert.equal(llm.calls.length, 3, '一次整形 + 两次集合判定（每条一次，token 护栏）')
+  }
+
+  // 8.3 无模型 / 调用失败：保持 1 条（与旧行为一致）
+  assert.equal(await splitMemoryEntries({}, multiText, { title: 't', tags: ['git'] }), undefined, '无 ctx 不拆分')
+  assert.equal(await splitMemoryEntries({ ctx: { get: () => undefined } }, multiText, { title: 't', tags: ['git'] }), undefined,
+    '无 llm 服务不拆分')
+  const broken = { ctx: { get: () => ({ stream: () => { throw new Error('boom') } }) } }
+  assert.equal(await splitMemoryEntries(broken, multiText, { title: 't', tags: ['git'] }), undefined, '模型抛错不拆分')
+
+  // 8.4 答案净化：上限 5 条、组内去重、丢弃步骤日志、标签回退
+  {
+    const many = Array.from({ length: 8 }, (_, i) => ({ title: 'T' + i, tags: ['a'], text: '结论' + i + '：用 pnpm build 构建' }))
+    assert.equal(normalizeSplitResult({ entries: many }, { title: 't', tags: [] }).length, 5, '拆分数上限 5 条')
+    assert.deepEqual(
+      normalizeSplitResult([{ title: 'A', tags: [], text: '同一条结论' }, { title: 'B', tags: [], text: '同一条结论' }], { title: 't', tags: [] })
+        .map((draft) => draft.text),
+      ['同一条结论'],
+      '组内重复只留一条',
+    )
+    assert.equal(normalizeSplitResult({ entries: [{ title: 'A', text: '步骤1 打开终端\n步骤2 运行\n步骤3 复制' }] }, { title: 't', tags: [] }),
+      undefined, '步骤日志片段被丢弃')
+    assert.equal(normalizeSplitResult({ entries: [] }, { title: 't', tags: [] }), undefined, '空答案不可用')
+    assert.equal(normalizeSplitResult('nope', { title: 't', tags: [] }), undefined, '非对象不可用')
+    const fallback = normalizeSplitResult([{ title: 'A', text: '端口是 62590' }], { title: 't', tags: ['部署'] })
+    assert.deepEqual(fallback[0].tags, ['部署'], '模型没给标签时沿用调用方标签')
+  }
+
+  // 8.5 抽取净化：派发包装 / 纯命令行 / 版本行 / 疑问句 / 数字主语不再成记忆
+  assert.deepEqual(extractFacts('记住：1. git --version').map((f) => f.text), [], '纯命令行不成记忆')
+  assert.deepEqual(extractFacts('记住：node -v').map((f) => f.text), [], '命令行不成记忆')
+  assert.deepEqual(extractFacts('记住：v1.2.3').map((f) => f.text), [], '纯版本行不成记忆')
+  assert.deepEqual(extractFacts('本任务是并行组 grp-x 的一员：只负责这一个任务').map((f) => f.text), [], '派发包装文本不成记忆')
+  assert.deepEqual(extractFacts('记住：原派发 dsp-abcd1234 的续跑任务由分支完成').map((f) => f.text), [], '续跑包装文本不成记忆')
+  assert.deepEqual(extractFacts('记住：分支会话 branch-mwryiywu-5uapt9 已交付').map((f) => f.text), [], '分支会话信封不成记忆')
+  assert.deepEqual(extractFacts('记住：这两个项目前端和后端如何分工？').map((f) => f.text), [], '疑问句不成记忆')
+  assert.deepEqual(extractFacts('这两个项目前端和后端是做什么的？').map((f) => f.text), [], '定义式疑问句不成记忆')
+  assert.deepEqual(extractFacts('12 是部署端口配置').map((f) => f.text), [], '纯数字主语不成记忆')
+  assert.deepEqual(extractFacts('记住：构建命令是 pnpm build').map((f) => f.text), ['构建命令是 pnpm build'], '正常结论仍然入库')
+  assert.deepEqual(extractRequirements('这个功能必须支持导出'), ['支持导出'], '正常需求仍然入库')
+  assert.deepEqual(extractRequirements('是否需要导出功能？'), [], '疑问句不成需求')
+
+  // 8.6 关键词不再产出双字滑窗碎片
+  assert.deepEqual(keywordsOf('构建命令是 pnpm build'), ['pnpm', 'build', '构建命令'], 'CJK 按功能字切段取词')
+  const kw = keywordsOf('本任务是并行组的一员，构建命令是 pnpm build，端口是 62590')
+  for (const fragment of ['本任', '务是', '是并', '的一', '行组']) {
+    assert.ok(!kw.includes(fragment), '不再产出跨功能字的双字碎片: ' + fragment)
+  }
+  assert.ok(kw.includes('本任务'), '切段后取到完整词: ' + kw.join(','))
+  assert.ok(kw.length <= 24, '关键词总数受限')
+  ok('R27-2 记忆整形：原子拆分（上限 5 / 去重 / 丢步骤日志 / 无模型不拆）+ 抽取净化（包装/命令行/疑问句/滑窗碎片）')
+}
+
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 process.exit(0)

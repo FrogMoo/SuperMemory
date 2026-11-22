@@ -158,7 +158,7 @@ export function attachMaintenance(
     const reqIds: string[] = []
     for (const user of users) {
       for (const fact of extractFacts(user.text)) {
-        const memoryId = await rememberFact(activeStore, workspaceKey, fact.text, fact.keywords, task.sessionId, user.seq, now)
+        const memoryId = await rememberFact(activeStore, workspaceKey, fact.text, fact.keywords, task.sessionId, user.seq, now, { ctx, logger })
         if (memoryId) {
           createdIds.push(memoryId)
           countSignal(activeStore, workspaceKey, fact.keywords[0] ?? fact.text.slice(0, 12), fact.text, now)
@@ -353,6 +353,8 @@ async function countSequenceSignal(
   sourceSessionId: string,
   sourceSeq: number,
   now: number,
+  // R27 需求④.3: 自动写入同样把集合归属交给大模型判定（无 ctx = 相似度启发式）。
+  deps: { ctx: Context; logger: { warn: (msg: string) => void; info?: (msg: string) => void } },
 ): Promise<string | undefined> {
   const normalized = text.trim().toLowerCase()
   for (const [, record] of store.memories.entries()) {
@@ -367,7 +369,7 @@ async function countSequenceSignal(
   // (the migration in recall/remember folds it later).
   const title = deriveTitle(text)
   const tags = mergeTags([], keywords)
-  const assignment = await resolveCollectionForEntry(store, workspaceKey, { title, keywords: tags, text }, { now })
+  const assignment = await resolveCollectionForEntry(store, workspaceKey, { title, keywords: tags, text }, { now, deps })
   if ('error' in assignment) return undefined
   const memoryId = newId('mem')
   const memory: Memory = {

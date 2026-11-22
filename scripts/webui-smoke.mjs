@@ -54,7 +54,7 @@ const store = {
     members: [{ sessionId: 'sess-1', kind: 'root', title: '根分支', summary: '', status: 'live', modelOverridden: false, lastActiveAt: now }],
     createdAt: now, updatedAt: now, lastActiveAt: now,
   }]]),
-  memories: table([['mem-1', { workspaceKey: ws, text: '旧记忆', keywords: ['old'], status: 'active', sourceSessionId: 'sess-1', sourceSeq: 1, createdAt: now, updatedAt: now }]]),
+  memories: table([['mem-1', { workspaceKey: ws, title: '旧记忆', text: '旧记忆', keywords: ['old'], status: 'active', sourceSessionId: 'sess-1', sourceSeq: 1, createdAt: now, updatedAt: now }]]),
   episodes: table([['ep-1', { topicSetId: 'ts-1', timeStart: now - 1000, timeEnd: now, summary: '一次归档', decisions: ['D1'], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'sess-1', sourceSeqStart: 0, sourceSeqEnd: 1 }]]),
   requirements: table([['req-1', { workspaceKey: ws, topicSetId: 'ts-1', text: '待办一', constraints: [], status: 'open', sourceSessionId: 'sess-1', sourceSeq: 1, createdAt: now }]]),
   filemap: table(),
@@ -461,6 +461,81 @@ ok('404 / 405 / HEAD edges')
     assert.equal(badRow.scopeMissing, true)
     assert.ok(badRow.notes.some((note) => note.includes('适用范围目录不存在')), 'the health note explains the missing scope')
     ok('R22-5 面板 listTools 带出能力详情（入口/文档/适用范围/路由/执行方式/健康信号）')
+
+    // R27 需求④: 面板数据契约——条目带所属集合（未归集不设字段），ToolView 透出 createdAt。
+    {
+      const { SupermemoryPanelService } = await import('../src/panel.ts')
+      await store.memoryCollections.put('mc-panel', {
+        workspaceKey: ws, title: 'git 同步 记忆', keywords: ['git', '同步'], summary: '同步约定',
+        status: 'active', createdAt: now, updatedAt: now,
+      })
+      await store.memories.put('mem-collected', {
+        workspaceKey: ws, title: 'git 同步', text: '用 pnpm git:sync', keywords: ['git'], status: 'active',
+        sourceSessionId: 'sess-1', sourceSeq: 2, collectionId: 'mc-panel', createdAt: now, updatedAt: now,
+      })
+      const rows = new SupermemoryPanelService(store).listMemories(cwd)
+      const collected = rows.find((row) => row.id === 'mem-collected')
+      assert.equal(collected.collectionId, 'mc-panel', '条目带所属集合 id')
+      assert.equal(collected.collectionTitle, 'git 同步 记忆', '条目带所属集合标题')
+      assert.deepEqual(collected.collectionTags, ['git', '同步'], '条目带所属集合标签')
+      const plain = rows.find((row) => row.id === 'mem-1')
+      assert.equal(plain.collectionId, undefined, '未归集条目不设集合字段（客户端显示未归集）')
+      const snapshot = new SupermemoryPanelService(store).hubState(cwd, 'sess-1')
+      assert.equal(snapshot.memories.find((row) => row.id === 'mem-collected').collectionTitle, 'git 同步 记忆',
+        '面板快照同样带集合上下文')
+      // ToolView.createdAt：旧行（未回填）读作 undefined，新行原样透出。
+      const legacy = new SupermemoryPanelService(store).listTools(cwd)
+      const seeded = legacy.find((tool) => tool.id === 'tm-1')
+      assert.equal(seeded.createdAt, undefined,
+        '没有 createdAt 的旧行读作 undefined（客户端显示 —）')
+      await store.toolMemory.put('tm-stamped', {
+        kind: 'composite', workspaceKey: ws, title: '带时间', tags: [], trigger: '', description: 'd',
+        entry: JSON.stringify({ name: 'sm_composite_stamped', kind: 'sequence', steps: [], parameters: [] }),
+        useCount: 0, status: 'active', createdAt: now,
+      })
+      const stamped = new SupermemoryPanelService(store).listTools(cwd).find((tool) => tool.name === 'sm_composite_stamped')
+      assert.equal(stamped.createdAt, now, '有 createdAt 的行原样透出')
+      ok('R27-3 面板数据契约：MemoryView 带集合上下文（未归集不设）+ ToolView 透出 createdAt')
+    }
+    // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（假 llm：拆 2 条 + 各自归入同一集合）。
+    {
+      const { SupermemoryPanelService } = await import('../src/panel.ts')
+      await store.memoryCollections.put('mc-panel', {
+        workspaceKey: ws, title: 'git 同步 记忆', keywords: ['git', '同步', '推送'], summary: '同步约定',
+        status: 'active', createdAt: now, updatedAt: now,
+      })
+      const llm = {
+        listProviders: () => [{ id: 'p', name: 'P' }],
+        listModels: async () => [{ provider: 'p', id: 'm', name: 'M' }],
+        stream(request) {
+          const asked = (request.messages?.[0]?.content ?? [])
+            .map((block) => (block?.type === 'text' ? String(block.text ?? '') : '')).join('\n')
+          const answer = asked.includes('待整形材料')
+            ? JSON.stringify({ entries: [
+                { title: 'git 同步命令', tags: ['git', '同步'], text: 'git 同步用 pnpm git:sync（面板粘贴第一段）。' },
+                { title: '推送前先 fetch', tags: ['git', '推送'], text: '推送前先 git fetch 确认无分叉，绝不 force push（面板粘贴第二段）。' },
+              ] })
+            : '{"collectionId":"mc-panel"}'
+          return (async function* () { yield { type: 'text-delta', text: answer } })()
+        },
+      }
+      const collectionsBefore = store.memoryCollections.size
+      const panel = new SupermemoryPanelService(store, { get: (name) => (name === 'llm' ? llm : undefined) })
+      const pasted = [
+        'git 同步用 pnpm git:sync：凭据走仓库本地 GCM（Windows 凭据存储托管），不要再写 -c credential.helper=store，这是面板粘贴的第一段结论。',
+        '推送前先 git fetch 确认无分叉，确认远端没有新提交冲突之后再推送，绝不 force push，这是面板粘贴的第二段结论。',
+      ].join('\n')
+      const result = await panel.createMemory(cwd, pasted, undefined, 'git 同步 约定', ['git'])
+      assert.equal(result.status, 'ok')
+      assert.match(result.message, /已拆分为 2 条记忆/, '面板回执说明拆分: ' + result.message)
+      assert.match(result.message, /「git 同步 记忆」/, '面板回执列出各自集合: ' + result.message)
+      const created = new SupermemoryPanelService(store).listMemories(cwd)
+        .filter((row) => row.text.includes('面板粘贴'))
+      assert.equal(created.length, 2, '两条原子记忆都写入')
+      assert.ok(created.every((row) => row.collectionId === 'mc-panel'), '两条都归入模型选定的集合')
+      assert.equal(store.memoryCollections.size, collectionsBefore, '同主题两条不另开集合')
+      ok('R27-4 面板 createMemory 整形：粘贴长文拆 2 条、各自归入模型选定的集合、回执同步')
+    }
   }
 }
 // dispose removes the route

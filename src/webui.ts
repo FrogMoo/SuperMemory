@@ -323,7 +323,9 @@ async function handleApi(
       const keywords = mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText))
       // R22 需求⑤: the console's write path joins the same collection layer as
       // memory_remember (related collection → append entry; no new collection).
-      const assignment = await resolveCollectionForEntry(store, ws, { title, keywords, text: memText }, { now })
+      // R27 需求④.3: 与大模型判定同源（无 llm 服务时静默退化为相似度匹配）。
+      const assignment = await resolveCollectionForEntry(store, ws, { title, keywords, text: memText },
+        { now, ...(ctx ? { deps: { ctx, logger } } : {}) })
       if ('error' in assignment) return fail(assignment.error)
       const record: Memory = {
         workspaceKey: ws,

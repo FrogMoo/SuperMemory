@@ -86,6 +86,9 @@ export const zh = {
   'memory.enable': '启用',
   'memory.status': '状态',
   'memory.source': '来源会话',
+  // R28 需求④: 记忆按集合分组（无集合数据时走原来的平铺列表）。
+  'memory.group.ungrouped': '未归集',
+  'memory.group.count': '{count} 条',
   'tool.empty': '（暂无固化能力；可手动注册，重复流程出现 3 次后也会自动提议固化）',
   'tool.empty.hint': '固化能力 = 入口命令 + 文档 + 适用范围，可一键执行（默认预演，写操作需确认）；重复流程也会自动固化为序列。',
   'tool.steps': '步骤',
@@ -106,6 +109,9 @@ export const zh = {
   'tool.detail.kind': '类型',
   'tool.detail.version': '版本',
   'tool.detail.builtin': '内置 v{version}',
+  // R28 需求②: 能力时间戳（增加时间 / 最后使用，缺字段显示 —）。
+  'tool.detail.created': '增加时间',
+  'tool.detail.lastUsed': '最后使用',
   'tool.detail.entry': '入口命令',
   'tool.detail.doc': '文档',
   'tool.detail.scope': '适用范围',
@@ -151,15 +157,9 @@ export const zh = {
   'composer.dismiss': '收起',
   'composer.receipt.hub': '中枢会话',
   'composer.receipt.sets': '话题集会话',
-  'newSession.title': '新建会话',
-  'newSession.hub': '中枢会话',
-  'newSession.hub.desc': '普通新对话（默认行为）',
-  'newSession.topic': '话题集会话',
-  'newSession.topic.desc': '绑定到选定话题集的新对话',
-  'newSession.pick': '选择话题集（可多选）',
+  // R28 需求①: 派发已回到面板卡片（新建会话对话框删除），仅保留面板
+  // 「＋新话题集」输入框仍在使用的占位文案。
   'newSession.create': '新建话题集…',
-  'newSession.start': '开始',
-  'newSession.cancel': '取消',
   'workspace.label': '工作区',
   'side.set': '话题集',
   'topic.root': '中枢',
@@ -273,6 +273,9 @@ export const en: Record<string, string> = {
   'memory.enable': 'Enable',
   'memory.status': 'Status',
   'memory.source': 'Source session',
+  // R28 requirement ④: memories grouped by collection (flat list when no collection data).
+  'memory.group.ungrouped': 'Ungrouped',
+  'memory.group.count': '{count} entries',
   'tool.empty': '(no fixated capabilities; register one manually, or a flow repeated 3 times is proposed automatically)',
   'tool.empty.hint': 'A capability = entry command + doc + scope, one-click runnable (dry-run by default); repeated flows also auto-fixate into sequences.',
   'tool.steps': 'Steps',
@@ -293,6 +296,9 @@ export const en: Record<string, string> = {
   'tool.detail.kind': 'Kind',
   'tool.detail.version': 'Version',
   'tool.detail.builtin': 'builtin v{version}',
+  // R28 requirement ②: capability timestamps (created / last used; '—' when absent).
+  'tool.detail.created': 'Created',
+  'tool.detail.lastUsed': 'Last used',
   'tool.detail.entry': 'Entry',
   'tool.detail.doc': 'Doc',
   'tool.detail.scope': 'Scope',
@@ -338,15 +344,10 @@ export const en: Record<string, string> = {
   'composer.dismiss': 'Dismiss',
   'composer.receipt.hub': 'Hub session',
   'composer.receipt.sets': 'Topic-set session',
-  'newSession.title': 'New session',
-  'newSession.hub': 'Hub session',
-  'newSession.hub.desc': 'Plain new conversation (default)',
-  'newSession.topic': 'Topic-set session',
-  'newSession.topic.desc': 'New conversation bound to the selected topic sets',
-  'newSession.pick': 'Pick topic sets (multi-select)',
+  // R28 requirement ①: dispatch moved back to the panel card and the
+  // new-session dialog is gone; only the placeholder the panel's
+  // 「+ New topic set」 input still uses remains.
   'newSession.create': 'New topic set…',
-  'newSession.start': 'Start',
-  'newSession.cancel': 'Cancel',
   'workspace.label': 'Workspace',
   'side.set': 'topic set',
   'topic.root': 'hub',

@@ -2733,6 +2733,12 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
   const rememberOutDecl = toolsSource.slice(rememberOutput, toolsSource.indexOf("name: 'memory_recall'", rememberOutput))
   assert.match(rememberOutDecl, /collectionTitle:\s*\{\s*type: 'string'/, 'output 回执带 collectionTitle')
   assert.match(rememberOutDecl, /collectionTier:/, 'output 回执带复用档位')
+  // R27 需求④.2/④.3: 一条写入可拆成多条原子记忆；集合归属可由模型判定。
+  assert.match(rememberDecl, /大模型在候选集合中判定/, 'remember 描述说明模型判定集合归属')
+  assert.match(rememberDecl, /整形为多条原子记忆/, 'remember 描述说明原子拆分')
+  assert.match(rememberOutDecl, /split:\s*\{\s*type: 'integer'/, 'output 回执带拆分数')
+  assert.match(rememberOutDecl, /entries:\s*\{\s*type: 'array'/, 'output 回执带逐条 entries')
+  assert.match(rememberOutDecl, /'llm'/, 'collectionTier 枚举含 llm（模型判定档位）')
   const recallStart = toolsSource.indexOf("name: 'memory_recall'")
   const recallOutput = toolsSource.indexOf('output:', recallStart)
   const recallDecl = toolsSource.slice(recallStart, recallOutput)

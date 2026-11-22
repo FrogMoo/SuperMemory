@@ -8,12 +8,15 @@
  *   C5 现场保留：本地版本新于内置时不覆盖、报告 localNewer；
  *   C6 健康报告：连续失败/从未成功/文档缺失/零使用/scope 缺失信号；
  *   C7 路由规则：单一来源文案进入每个能力工具的描述。
+ *   C9 when 门禁（A3 检索侧）：能力/序列两条注册路径都传 { when }；适用工作区
+ *      admitted、跨工作区不 admitted、无 cwd/坏 agent 形状放行、when 对坏 spec
+ *      不抛（驱动 registerComposite，经 NODE_PATH 供 smoke 桩 dsh-tools）。
  * 纯函数 + 假 store + 直接驱动 capabilityToolDef.execute（无需宿主）。
  * Usage: node scripts/capability-smoke.mjs
  */
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { dirname, join } from 'node:path'
+import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 // The health report resolves `doc` relative to `scope` on the REAL filesystem, so
@@ -23,7 +26,15 @@ import { fileURLToPath } from 'node:url'
 const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
 // src/composite.ts 等源码是 TypeScript；Node strip-only 模式不够时整体重放一次。
+// 重放前把 smoke 专用桩根目录（scripts/__fixtures__/stub-node-modules，内含
+// @deepseek-ai/dsh-tools，defineTool 恒等）加进 NODE_PATH：C9 要驱动
+// registerComposite，它经 loadHostModule 解析宿主 @deepseek-ai/dsh-tools——
+// smoke 环境没有宿主包。NODE_PATH 条目按 node_modules 根解析（拼上包名），
+// 所以指到含 @deepseek-ai/ 的上一层。桩只影响本仓库内进程的包解析（宿主运行时
+// 锚定自己的入口解析内置副本，永远拿不到这个桩）。
 if (!process.execArgv.includes('--experimental-transform-types')) {
+  const stubRoot = fileURLToPath(new URL('__fixtures__/stub-node-modules', import.meta.url))
+  process.env.NODE_PATH = [process.env.NODE_PATH, stubRoot].filter(Boolean).join(delimiter)
   const child = spawnSync(
     process.execPath,
     ['--experimental-transform-types', process.argv[1], ...process.argv.slice(2)],
@@ -34,8 +45,8 @@ if (!process.execArgv.includes('--experimental-transform-types')) {
 
 const {
   bumpCompositeUse, buildCapabilitySpec, capabilityToolDef, capabilityToolDescription,
-  capabilityExecEnv, capabilityHealthOf, mergeBuiltinCapabilities, persistComposite, rebuildComposites,
-  registerCapability, runCapability,
+  capabilityExecEnv, capabilityHealthOf, compositeWhenGate, mergeBuiltinCapabilities, persistComposite,
+  rebuildComposites, registerCapability, registerComposite, runCapability,
 } = await import('../src/composite.ts')
 const { BUILTIN_CAPABILITIES } = await import('../src/builtin-capabilities.ts')
 const { CAPABILITY_ROUTING_RULES } = await import('../src/route.ts')
@@ -59,6 +70,11 @@ const fakeStore = (seed = {}) => ({
 })
 const quietExec = { signal: new AbortController().signal }
 const GIT_TOOL = 'sm_composite_git_sync_supermemory'
+// C9 用的两个工作区：A = 本仓库（真实路径，workspaceKeyOf 幂等），B = 虚构路径。
+const WS_A = workspaceKeyOf(REPO_ROOT)
+const WS_B = 'G:\\cap-smoke-b'
+// 注册门禁 context：宿主把 preparing agent 放在 context.agent；缺省/坏形状也要覆盖。
+const whenCtx = (cwd) => (cwd === undefined ? {} : { agent: { session: { header: { cwd } } } })
 
 let passed = 0
 const ok = (label) => { passed += 1; console.log('ok - ' + label) }
@@ -433,6 +449,64 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
     '子进程 PATH 含宿主 node 目录: ' + String(envRun.stdout).slice(0, 200),
   )
   ok('C8 执行环境：PATH 兜底注入宿主 node 目录（stripped PATH 下 node 仍可解析）+ WSL bash 排除')
+}
+
+// ---- C9 when 门禁（A3 检索侧）：适用 admitted / 跨工作区 not admitted / 坏形状放行 ----
+{
+  // registerComposite 两条注册路径都要把 { when } 交给宿主；宿主按 step 对每个
+  // 可见工具调用 when(context)，false = 不进 admitted set（模型不可见）。
+  const captured = []
+  const ctx = {
+    tools: {
+      register: (def, opts) => { captured.push({ def, opts }); return () => {} },
+      get: () => undefined,
+    },
+  }
+  const capSpecWhen = {
+    name: 'sm_composite_cap_when', kind: 'capability', description: 'when 门禁', title: 'when',
+    entry: 'echo when', steps: [], parameters: [], runnable: true, dryRunArg: '--dry-run',
+    scope: WS_A, version: 1,
+  }
+  await registerComposite(ctx, fakeStore(), capSpecWhen, WS_A)
+  const capReg = captured.find((c) => c.def.name === capSpecWhen.name)
+  assert.ok(capReg && capReg.opts && typeof capReg.opts.when === 'function', '能力注册路径传入 { when }')
+  const when = capReg.opts.when
+  assert.equal(when(whenCtx(WS_A)), true, '适用工作区 admitted')
+  assert.equal(when(whenCtx(WS_B)), false, '跨工作区不 admitted')
+  assert.equal(when({}), true, '无 agent 形状放行')
+  assert.equal(when({ agent: undefined }), true, 'agent 缺失放行')
+  assert.equal(when({ agent: { session: { header: {} } } }), true, '无 cwd 放行')
+  assert.equal(when({ agent: { session: { header: { cwd: 123 } } } }), true, 'cwd 非字符串放行')
+  assert.equal(when(null), true, 'null context 放行')
+  // when 对坏 spec 不抛：宿主会把 when 的异常升级为 ToolActivationError（整个 step 失败）。
+  // 坏 spec 只有在「无行级归属」时才会真正触到 spec.scope（短路求值），否则
+  // 行级归属优先、根本不读 spec——两个形状都断言。
+  const badGate = compositeWhenGate(undefined, undefined)
+  assert.equal(badGate(whenCtx(WS_B)), true, '坏 spec（无行级归属）不抛，退化为放行')
+  const badGate2 = compositeWhenGate(null, undefined)
+  assert.equal(badGate2(whenCtx(WS_B)), true, 'null spec 不抛，退化为放行')
+  const badGate3 = compositeWhenGate(undefined, WS_A)
+  assert.equal(badGate3(whenCtx(WS_A)), true, '坏 spec + 行级归属：本工作区仍放行（不读 spec）')
+  const rowGate = compositeWhenGate({ scope: WS_A }, WS_A)
+  assert.equal(rowGate(whenCtx(WS_A)), true, '纯函数门禁：本工作区放行')
+  assert.equal(rowGate(whenCtx(WS_B)), false, '纯函数门禁：跨工作区拦截')
+  // 序列路径同样带 when：有行级归属的序列跨工作区不可见；无归属 = 全局可见。
+  const captured2 = []
+  const ctx2 = {
+    tools: {
+      register: (def, opts) => { captured2.push({ def, opts }); return () => {} },
+      get: () => undefined,
+    },
+  }
+  await registerComposite(ctx2, fakeStore(), { name: 'sm_composite_seq_when', description: '序列 when', steps: [{ tool: 'read', arguments: {} }], parameters: [] }, WS_A)
+  await registerComposite(ctx2, fakeStore(), { name: 'sm_composite_seq_glob', description: '全局序列', steps: [{ tool: 'read', arguments: {} }], parameters: [] })
+  const seqReg = captured2.find((c) => c.def.name === 'sm_composite_seq_when')
+  assert.ok(seqReg && seqReg.opts && typeof seqReg.opts.when === 'function', '序列注册路径也传入 { when }')
+  assert.equal(seqReg.opts.when(whenCtx(WS_A)), true, '本工作区序列 admitted')
+  assert.equal(seqReg.opts.when(whenCtx(WS_B)), false, '跨工作区序列不 admitted')
+  const globReg = captured2.find((c) => c.def.name === 'sm_composite_seq_glob')
+  assert.equal(globReg.opts.when(whenCtx(WS_B)), true, '无归属序列=全局，任何工作区 admitted')
+  ok('C9 when 门禁：适用/跨工作区/坏形状放行/坏 spec 不抛；能力与序列两条注册路径都带门禁')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

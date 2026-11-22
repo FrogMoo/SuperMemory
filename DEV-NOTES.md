@@ -1919,3 +1919,41 @@ fetch 阶段因无凭据失败——属外部凭据配置，不是插件缺陷�
 **生效条件**：宿主改动 → 需中枢在 GUI/hub 对 `include:supermemory` 禁用→启用重载（分支内重载会自杀）；重载时整理自动执行，日志 Info 会打印备份路径与条目数。用户刷新 `http://127.0.0.1:62590` 后，面板里标题/标签已清理、条目数 12；集合层级在 `/memory-organize`、`memory_recall` 输出与 `memory_export` 分节中可见（面板仍为扁平列表，集合分组展示是 R22 遗留的可选后续）。
 
 **回滚**：把备份 JSON 里的 `memories` / `memoryCollections` 两表写回（或 `--apply` 前整文件备份 `supermemory.backup-organize-*.json`）。工作树未 commit/push。
+
+## 32. R28：派发改回卡片 / 能力时间戳与隔离（检索侧）/ 记忆集合写入与展示（2026-11-22）
+
+用户四项需求：① 分支任务派发方式从「执行请求的卡片」被改成对话框，改回卡片；② 「固化能力」页签显示能力的增加时间与最后使用时间；③ 固化能力按工作区隔离——其他工作区的能力不被当前工作区检索和使用；④ 「记忆」页签改为记忆集合（集合=标题+标签+多条记忆；一条记忆只存一条内容，逐条内容以标签+详细内容结构存储；新记忆由大模型判断归入哪个集合还是新建集合）。
+
+**并行三分支（同树、文件范围互斥）**：A=宿主能力（composite/schema/builtin-capabilities）、B=客户端（src/client/**）、C=宿主记忆（panel/tools/memory-collections/extract/maintenance/webui）。集成轮（本机）统一 typecheck → build → smoke，并用 scripts/dev-load.sh 武装新模块 URL 触发 HMR 重载生效。
+
+### 32.1 需求①：派发改回卡片（B）
+
+面板「中枢会话」页签的派发区本来就是卡片（composerView：任务文本/工作区/模式/模型/权限/话题集 chips/＋新话题集/开始对话/仅创建会话/Ctrl+Enter/就地回执）；残留的「对话框」是 shell 侧栏「新建会话」被 src/client/new-session.tsx 拦截后弹出的 sm-ns 选择层。本轮删掉该对话框：拦截命中后经 selectSuperPanel(ctx)（ctx.get('layout')?.selectPanel('supermemory')）打开面板，再经新增 src/client/open-dispatch.ts 的模块级广播信号让已挂载面板 setView({kind:'hub'})+setReceipt(undefined) 显示派发卡片。降级：拿不到 layout 服务/无 selectPanel 时**不** preventDefault——shell 默认新建会话继续，绝无死按钮；selectPanel  promise 拒绝回退 uiWorkspace.startSession()。仅对话框使用的 newSession.* locale 键已删（保留面板在用的 newSession.create）。
+
+### 32.2 需求②：能力增加时间/最后使用时间（A 落库 + B 展示）
+
+tool_memory 增加可选 createdAt（schema.ts，域版本仍 v1）：persistComposite/registerCapability 新建行 stamp，更新/升级经 ...r 展开保留原值，mergeBuiltinCapabilities 升级行缺值时按 spec.updatedAt ?? now 自愈；启动回填 backfillToolMemoryAttribution（rebuildComposites 内、先于合并注册）给旧行补 createdAt 与归属，幂等。最后使用时间本就在 entry JSON 的 spec.usage.lastUsedAt（bumpCompositeUse 持久化）。宿主 panel.ts 的 ToolView 增 createdAt，listTools 填 record.createdAt；客户端 capabilityDetail 与 capmeta 两处显示「增加时间/最后使用」（fmtTime：本地 YYYY-MM-DD HH:mm，缺字段 —）。
+
+### 32.3 需求③：能力工作区隔离（检索侧补强，A）
+
+R26 已有「列表过滤 + execute 门禁」，但宿主工具注册表进程全局——别的工作区的能力/序列对当前工作区的会话仍**可见**（检索得到）。本轮补检索侧门禁：宿主 ToolsService.register(definition, { when })（app.asar dsh-tools 0.2.2-rc.3 已核实：按 step 对每个可见工具调用 when(context)，false 不进 admitted set；抛错升级 ToolActivationError，故必须永不抛）。composite.ts 新增 compositeWhenGate(spec, rowWorkspaceKey)：从 context.agent.session.header.cwd 取调用方工作区，取不到/形状坏/抛错一律放行（与 execute 门禁同语义），取到走 capabilityAppliesToWorkspace；registerComposite 的 capability 与 sequence 两条注册路径都传。归属永不缺失：persistComposite 未显式传 workspaceKey 时从 signalKey 前缀 ws/<workspaceKey>/seq/ 推导（workspaceKeyFromSignalKey）。回填：无 workspaceKey 的行从 trigger 前缀推导写回（实测 tm-mwmbpmgo 回填为 F:\10-SuperMemory），无 createdAt 按 spec.updatedAt ?? now 补；均幂等、try/catch 不阻塞启动。
+
+### 32.4 需求④：记忆集合（C 写入 + B 展示）
+
+- **LLM 判定集合归属**：memory-collections.ts 新增 decideCollectionWithLlm——候选=本工作区 active 集合按相似度预排序（含 0 分行，上限 12、梗概截 200 字）+ 条目标题/标签/正文（截 400/48 字）；模型只返回 JSON {collectionId|createNew,title,tags,reason}，校验 id 必须在候选内、createNew 时 title 非空；任一不满足/解析失败/超时(20s)/无 llm/无 ctx → 静默降级到原启发式（行为与过去逐字一致）。resolveCollectionForEntry 增可选 deps；remember/createMemory/管理台创建/自动抽取四条写路径有 ctx 就传。回执 tier='llm' 时注明「模型判定」。
+- **逐条原子存储**：新增 src/memory-split.ts（mayHoldMultipleFacts 零成本预判：<100 字或单行且子句<3 不调用模型；splitMemoryEntries 上限 5、组内去重、过 assessConclusion、标签回退）。memory_remember 与 panel.createMemory：N>1 时逐条走同 key 判重/冲突 + 各自集合归属，全部写入，回执「已拆分为 N 条…」+ entries[]；拆分后不沿用调用方 key。工具入参 schema 未变。
+- **面板分组**：MemoryView 增 collectionId/collectionTitle/collectionTags（listMemories/hubState 投影，有归属才设）；记忆页签按集合分组（组头=标题+标签 chips+条目数；组序按组内最新 updatedAt 倒序；无归属进「未归集」组；无任何集合数据时退回原平铺）。搜索仍走宿主全量过滤，空组不渲染。
+- **抽取净化**：extract.ts 的 CJK 双字滑窗改功能字切段取词（段 2–4 字、前 120 字内、最多 8 个；拉丁词最多 12 个）；DEFINITION_PATTERNS 主语需 ≥2 汉字或 ≥3 拉丁字符；跳过派发/续跑包装文本（「本任务是并行组」「原派发 dsp-」「branch-」）与纯命令行；requirements.ts 疑问句不再进需求表。存量垃圾记忆未清（防垃圾再生，不回清存量）。
+
+### 32.5 数据契约（跨分支，字段名一字不差）
+
+ToolView.createdAt?: number（listTools 填 record.createdAt）；MemoryView.collectionId?/collectionTitle?/collectionTags?（listMemories/hubState 填）。B 按契约编码并对缺字段兜底（—/平铺）。
+
+### 32.6 闸门（集成轮实测）
+
+pnpm typecheck 双端 0 错；pnpm build 宿主 10 文件 603.45 kB + client 110.67 kB（wrap 108146 bytes）；pnpm smoke 全绿：core 25 / mechanism 93 / webui 35 / client-sim OK / capability 12（+C9 when 门）/ workspace-scope 9（+W7a/b/c）。新增 scripts/__fixtures__/stub-node-modules（NODE_PATH 供 smoke 进程解析 @deepseek-ai/dsh-tools 桩，宿主运行时不经过它，勿删）。
+
+### 32.7 生效方式与遗留
+
+生效：pnpm build 后跑 scripts/dev-load.sh（lib/dev-<stamp>.js 新 URL + profile patch 原子武装，HMR 监视器重载；同 URL 重建对运行宿主不可见——ESM 按 URL 缓存）。重载实证：tool_memory 两行回填出 workspaceKey/createdAt。**用户需刷新 GUI 页面**拿新客户端产物（lib/client.js）。
+遗留：① profile patch 里的 dev 插入在下次源码变更后需重跑 dev-load.sh，或跑 scripts/install-into-dsh.mjs 清回 bundle 形态并重启 DSH；② 管理台（src/web/**）本轮未加时间戳/集合分组（只做面板）；webui.ts 仅接了写入 deps；③ memory_toolize list 输出未透 createdAt（如需由集成轮补一行）；④ 存量垃圾记忆（R18 大杂烩、派发包装、命令行、疑问句）仍在，需 /memory organize 或手动清理；⑤ when 门禁依赖宿主 register 的 options.when——若将来宿主换旧签名会退化为只有 execute 门禁；⑥ 拆分写入最坏 1+5 次模型调用，慢模型下面板保存可能等秒级。

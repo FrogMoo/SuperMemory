@@ -2,11 +2,13 @@
  * SuperMemory main panel (the `main` slot keyed by panel id 'supermemory').
  * Level 1 shows the hub session and the workspace's topic sets; level 2
  * opens one topic set (its branch sessions, reply box and summary); the
- * Memories tab browses/edits memories and locates their source sessions;
- * the Tools tab lists and edits composite tools (R6).
+ * Memories tab browses/edits memories (R28 需求④: grouped by 记忆集合) and
+ * locates their source sessions; the Tools tab lists and edits composite tools
+ * (R6) with their lifecycle timestamps (R28 需求②).
  * @module supermemory/client/panel-page
  */
 import { createElement as h, useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
+import { subscribeOpenDispatch } from './open-dispatch.ts'
 
 export interface TopicSetView {
   id: string
@@ -43,6 +45,13 @@ export interface MemoryView {
   sourceSessionId: string
   createdAt: number
   updatedAt: number
+  /**
+   * R28 需求④: the 记忆集合 this entry belongs to (host listMemories/hubState
+   * 透出；undefined = 未归集). Memories are displayed grouped by collection.
+   */
+  collectionId?: string
+  collectionTitle?: string
+  collectionTags?: string[]
 }
 
 export interface ToolView {
@@ -77,6 +86,8 @@ export interface ToolView {
   notes?: string[]
   /** R26: 能力定义版本与使用明细（面板能力卡片展示）。 */
   version?: number
+  /** R28 需求②: 能力增加时间（ms epoch；宿主 listTools 透出，缺省时面板显示 —）。 */
+  createdAt?: number
   usage?: {
     useCount: number
     successCount: number
@@ -237,6 +248,11 @@ function capabilityDetail(
       + (tool.builtin && tool.builtinVersion !== undefined
         ? ` · ${t('tool.detail.builtin', { version: tool.builtinVersion })}`
         : ''))
+  }
+  // R28 需求②: 生命周期时间戳——增加时间与最后使用时间，缺字段显示 —。
+  if (tool.createdAt !== undefined || tool.usage?.lastUsedAt !== undefined) {
+    row('created', t('tool.detail.created'), fmtTime(tool.createdAt))
+    row('lastUsed', t('tool.detail.lastUsed'), fmtTime(tool.usage?.lastUsedAt))
   }
   if (tool.entry) row('entry', t('tool.detail.entry'), code('code', tool.entry))
   if (tool.doc) {
@@ -563,6 +579,18 @@ function branchAgo(at: number, t: (key: string, params?: Record<string, string |
 }
 
 /**
+ * R28 需求②: local YYYY-MM-DD HH:mm for the capability lifecycle timestamps
+ * (增加时间 / 最后使用). A missing or nonsensical value renders '—' — the host
+ * ships these fields from R28 on, older hosts simply leave them undefined.
+ */
+function fmtTime(at?: number): string {
+  if (at === undefined || !Number.isFinite(at) || at <= 0) return '—'
+  const date = new Date(at)
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+/**
  * R19 协同②: the hub's linked branches. One card, every consumer (hub tab and
  * the in-panel chat of a hub) passes its own rows; a branch row opens that
  * branch's conversation in the panel.
@@ -830,6 +858,17 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   useEffect(() => { void refreshHub() }, [refreshHub])
   useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
+
+  // R28 需求①: the shell's 新建会话 control opens this panel (host layout
+  // service) and broadcasts the open-dispatch signal. The panel may be
+  // parked on another tab, so the signal switches back to the hub tab —
+  // where the dispatch card lives — and drops a stale receipt. With no
+  // listener yet (panel not mounted) the signal is a no-op: a fresh mount
+  // defaults to the hub tab anyway.
+  useEffect(() => subscribeOpenDispatch(() => {
+    setView({ kind: 'hub' })
+    setReceipt(undefined)
+  }), [])
 
   // R19 需求⑤: read one session's model-visible surface. The panel polls this
   // method (2.5 s) instead of opening the shell session; `sessionQuery` gives
@@ -1369,9 +1408,104 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       ]
     : h(EmptyState, { key: 'missing', label: t('hub.empty'), hint: t('hub.empty.hint') })
 
+  // R28 需求④: one memory entry — title, tag chips, body, status, source and
+  // every action (locate / edit / enable-disable / two-step delete). Extracted
+  // so the grouped render and the legacy flat render share exactly one copy.
+  const memoryItem = (memory: MemoryView): ReactNode =>
+    h('div', { key: memory.id, className: 'sm-item' },
+      h('div', { className: 'sm-title' }, memory.title || deriveTitleClient(memory.text)),
+      tagChips(memory.tags, query),
+      h('div', { className: 'sm-body-text' }, memory.text),
+      h('div', { className: 'sm-sub' },
+        h('span', { key: 'st', className: 'sm-badge' }, memory.status),
+        `${t('memory.source')}：${memory.sourceSessionId || '—'}`,
+      ),
+      h('div', { className: 'sm-actions' },
+        memory.sourceSessionId
+          ? h(Button, {
+              key: 'loc', label: t('memory.locate'),
+              onClick: () => api.openSession(memory.sourceSessionId),
+            })
+          : null,
+        h(Button, {
+          key: 'edit', label: t('memory.edit'),
+          onClick: () => setEditingMemory({ id: memory.id, title: memory.title, tags: memory.tags, text: memory.text }),
+        }),
+        h(Button, {
+          key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
+          onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
+        }),
+        // R27: 永久删除先就地问一次（与固化能力的删除确认一致）。
+        confirmDeleteMemory === memory.id
+          ? h(Button, {
+              key: 'delYes', variant: 'danger', label: t('memory.deleteConfirm'),
+              onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => {
+                setConfirmDeleteMemory(undefined)
+                void refreshMemories()
+              }),
+            })
+          : h(Button, {
+              key: 'del', variant: 'danger', label: t('memory.delete'),
+              onClick: () => setConfirmDeleteMemory(memory.id),
+            }),
+        confirmDeleteMemory === memory.id
+          ? h(Button, { key: 'delNo', label: t('memory.cancel'), onClick: () => setConfirmDeleteMemory(undefined) })
+          : null,
+      ),
+    )
+
+  // R28 需求④: group the (already host-filtered) rows by 记忆集合 — the host
+  // 透出 collectionId / collectionTitle / collectionTags. Each group keeps the
+  // host's row order; groups are ordered by their newest updatedAt first. Rows
+  // without a collection land in 未归集; when NO row carries a collection (older
+  // host) the panel keeps the previous flat list — behaviour unchanged.
+  const memoryGroups = useMemo(() => {
+    const groups = new Map<string, { id: string; title: string; tags: string[]; rows: MemoryView[]; latest: number }>()
+    for (const memory of memories) {
+      const id = memory.collectionId ?? ''
+      let group = groups.get(id)
+      if (!group) {
+        group = {
+          id,
+          title: id ? (memory.collectionTitle || id) : t('memory.group.ungrouped'),
+          tags: id ? (memory.collectionTags ?? []) : [],
+          rows: [],
+          latest: 0,
+        }
+        groups.set(id, group)
+      }
+      group.rows.push(memory)
+      if (memory.updatedAt > group.latest) group.latest = memory.updatedAt
+    }
+    return [...groups.values()]
+      .filter((group) => group.rows.length > 0)
+      .sort((left, right) => right.latest - left.latest)
+  }, [memories, t])
+
+  // R28 需求④: 有集合数据时按集合分组（组头 = 标题 + 标签 chips + 条目数），
+  // 否则平铺——与分组上线前的记忆页签完全一致。
+  const hasCollections = memoryGroups.some((group) => group.id !== '')
+  const memoryList: ReactNode = memories.length === 0
+    ? h(EmptyState, { key: 'empty', label: t('memory.empty'), hint: t('memory.empty.hint') })
+    : hasCollections
+      ? h('div', { key: 'groups', className: 'sm-list' },
+          memoryGroups.map((group) =>
+            h('div', { key: group.id || 'ungrouped', className: 'sm-card' },
+              h('div', { key: 'head', className: 'sm-row' },
+                h('h3', { key: 'title' }, group.title),
+                h('span', { key: 'count', className: 'sm-badge' }, t('memory.group.count', { count: group.rows.length })),
+              ),
+              tagChips(group.tags),
+              h('div', { key: 'rows', className: 'sm-list' }, group.rows.map(memoryItem)),
+            ),
+          ),
+        )
+      : h('div', { key: 'list', className: 'sm-list' }, memories.map(memoryItem))
+
   // R10: memories are edited and read as title + tags + body. The search box
   // filters on every field, but the *hit source* is visible: a title/tag match
   // is highlighted, so the user never has to scan the body to find a record.
+  // R28 需求④: the list below is grouped by 记忆集合 (see memoryList).
   const memoriesView: ReactNode = [
     h('div', { key: 'search', className: 'sm-form' },
       h('input', {
@@ -1413,53 +1547,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         h('span', { key: 'hint', className: 'sm-muted' }, t('memory.shape.hint')),
       ),
     ),
-    h('div', { key: 'list', className: 'sm-list' },
-      memories.length === 0
-        ? h(EmptyState, { key: 'empty', label: t('memory.empty'), hint: t('memory.empty.hint') })
-        : memories.map((memory) =>
-            h('div', { key: memory.id, className: 'sm-item' },
-              h('div', { className: 'sm-title' }, memory.title || deriveTitleClient(memory.text)),
-              tagChips(memory.tags, query),
-              h('div', { className: 'sm-body-text' }, memory.text),
-              h('div', { className: 'sm-sub' },
-                h('span', { key: 'st', className: 'sm-badge' }, memory.status),
-                `${t('memory.source')}：${memory.sourceSessionId || '—'}`,
-              ),
-              h('div', { className: 'sm-actions' },
-                memory.sourceSessionId
-                  ? h(Button, {
-                      key: 'loc', label: t('memory.locate'),
-                      onClick: () => api.openSession(memory.sourceSessionId),
-                    })
-                  : null,
-                h(Button, {
-                  key: 'edit', label: t('memory.edit'),
-                  onClick: () => setEditingMemory({ id: memory.id, title: memory.title, tags: memory.tags, text: memory.text }),
-                }),
-                h(Button, {
-                  key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
-                  onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
-                }),
-                // R27: 永久删除先就地问一次（与固化能力的删除确认一致）。
-                confirmDeleteMemory === memory.id
-                  ? h(Button, {
-                      key: 'delYes', variant: 'danger', label: t('memory.deleteConfirm'),
-                      onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => {
-                        setConfirmDeleteMemory(undefined)
-                        void refreshMemories()
-                      }),
-                    })
-                  : h(Button, {
-                      key: 'del', variant: 'danger', label: t('memory.delete'),
-                      onClick: () => setConfirmDeleteMemory(memory.id),
-                    }),
-                confirmDeleteMemory === memory.id
-                  ? h(Button, { key: 'delNo', label: t('memory.cancel'), onClick: () => setConfirmDeleteMemory(undefined) })
-                  : null,
-              ),
-            ),
-          ),
-    ),
+    memoryList,
   ]
 
 
@@ -1554,13 +1642,20 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
               h('div', { className: 'sm-sub' }, `${t('tool.steps')}：${tool.steps.join(' → ') || '—'}`),
               h('div', { className: 'sm-sub' }, `${t('tool.params')}：${tool.parameters.join('、') || '—'} · ${t('tool.uses')}：${tool.useCount}`),
               // R26: 能力卡片显示定义版本与使用明细（成败/连续失败/最近一次执行）。
+              // R28 需求②: 再补上增加时间与最后使用时间（缺字段显示 —）。
               tool.version !== undefined || tool.usage?.lastStatus
+                || tool.createdAt !== undefined || tool.usage?.lastUsedAt !== undefined
                 ? h('div', { key: 'capmeta', className: 'sm-sub' },
                     `${tool.version !== undefined ? `版本 v${tool.version} · ` : ''}`
                     + (tool.usage?.lastStatus
                       ? `最近执行 ${tool.usage.lastStatus === 'completed' ? '成功' : '失败'}${tool.usage.lastDryRun ? '（预演）' : ''}`
                         + ` · 成功 ${tool.usage.successCount}/失败 ${tool.usage.failCount}`
                         + (tool.usage.consecutiveFailures >= 2 ? ` · 连续失败 ${tool.usage.consecutiveFailures}` : '')
+                      : '')
+                    + (tool.createdAt !== undefined || tool.usage?.lastUsedAt !== undefined
+                      ? `${tool.version !== undefined || tool.usage?.lastStatus ? ' · ' : ''}`
+                        + `${t('tool.detail.created')} ${fmtTime(tool.createdAt)}`
+                        + ` · ${t('tool.detail.lastUsed')} ${fmtTime(tool.usage?.lastUsedAt)}`
                       : ''))
                 : null,
             ),

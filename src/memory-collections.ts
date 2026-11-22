@@ -16,11 +16,13 @@
  *   只补 `collectionId` + 新建集合，不删除、不改写任何既有字段。
  * @module supermemory/memory-collections
  */
+import type { Context } from '@deepseek-ai/cordis'
 import { queryWeights, rawScore, tokenize } from './recall.ts'
 import type { RecallOptions } from './recall.ts'
 import { TAG_MAX, TITLE_MAX, deriveTitle, normalizeTags } from './retrieval.ts'
 import type { Memory, MemoryCollection } from './schema.ts'
 import { newId } from './store.ts'
+import { askLlmJson, type LlmJsonDeps } from './llm-json.ts'
 
 /** The fields a collection match reads (entry side or collection side). */
 export interface MemoryShape {
@@ -279,7 +281,11 @@ export function recallEntriesWithCollections(
 export interface CollectionAssignment {
   collectionId: string
   title: string
-  tier: CollectionTier | 'explicit'
+  /**
+   * How the collection was chosen: the similarity tiers, `explicit` (caller
+   * named it), or `llm` (R27 需求④.3: the model picked it — reuse or create).
+   */
+  tier: CollectionTier | 'explicit' | 'llm'
   /** true when this call created the collection. */
   created: boolean
   /** Whether the reuse decision was made from explicit caller input. */
@@ -293,6 +299,173 @@ export interface ResolveCollectionOptions {
   /** Explicit collection title: matched when similar, else created with that title. */
   collection?: string
   now?: number
+  /**
+   * R27 需求④.3: 大模型判定归属的可选依赖。不传（或 ctx 不可用）= 纯相似度
+   * 启发式，行为与本模块早期版本完全一致。
+   */
+  deps?: CollectionDecisionDeps
+}
+
+/** What the LLM collection decision needs (everything optional: no model = heuristic). */
+export interface CollectionDecisionDeps {
+  ctx?: Context
+  logger?: { warn: (msg: string) => void; info?: (msg: string) => void }
+  /** The acting session, so the hub model is preferred over the catalog. */
+  sessionId?: string
+}
+
+/** Candidate cap sent to the model (token guard) and per-candidate body clip. */
+export const COLLECTION_CANDIDATE_LIMIT = 12
+export const COLLECTION_SUMMARY_CLIP = 200
+/** The entry body clip in the prompt (a collection decision needs the gist). */
+export const COLLECTION_ENTRY_CLIP = 400
+
+/** One collection offered to the model as a reuse candidate. */
+export interface CollectionCandidate {
+  collectionId: string
+  title: string
+  keywords: string[]
+  summary: string
+  score: number
+  tier: CollectionTier
+}
+
+/** The model's validated verdict: reuse one candidate, or create a new set. */
+export type CollectionDecision =
+  | { kind: 'reuse'; collectionId: string; score: number; reason: string }
+  | { kind: 'create'; title: string; tags: string[]; reason: string }
+
+/**
+ * Every active collection of the workspace ranked against one entry (best
+ * first, capped at {@link COLLECTION_CANDIDATE_LIMIT}). Zero-similarity rows
+ * stay in the list on purpose: the model may still reuse a collection the
+ * heuristic cannot see (different wording, same project), and it is the one
+ * that decides "new set" — so the candidate list must not pre-decide that.
+ */
+export function rankCollectionsFor(
+  entry: MemoryShape,
+  collections: Array<[string, MemoryCollection]>,
+  limit = COLLECTION_CANDIDATE_LIMIT,
+): CollectionCandidate[] {
+  const ranked: CollectionCandidate[] = []
+  for (const [collectionId, row] of collections) {
+    if (row.status === 'archived') continue
+    const score = shapeScore(entry, { title: row.title, keywords: row.keywords, summary: row.summary })
+    ranked.push({
+      collectionId,
+      title: row.title,
+      keywords: [...(row.keywords ?? [])],
+      summary: clip(row.summary ?? '', COLLECTION_SUMMARY_CLIP),
+      score,
+      tier: tierOfScore(score),
+    })
+  }
+  ranked.sort((a, b) => b.score - a.score)
+  return ranked.slice(0, Math.max(1, limit))
+}
+
+const DECISION_SYSTEM = [
+  '你在维护 SuperMemory 的「记忆集合」归属。只输出一个 JSON 对象，不要代码围栏、不要解释。',
+  '字段：{"collectionId":"复用的候选集合 id（不新建时必填）","createNew":false,"title":"新建时的集合标题（≤48字，必填）","tags":["新建时的 3–8 个检索短词"],"reason":"一句话理由（≤60字）"}',
+  '规则：',
+  '- collectionId 必须是候选清单里的 id，不能编造；无法判断时也要按格式二选一回答。',
+  '- 候选集合主题相近（同一项目/同一类约定/同一命令族）就复用，哪怕标题字面不同。',
+  '- 只有当候选都不相关时才 createNew=true，并给出 title/tags。',
+  '- reason 要短，说明为什么归入该集合或为什么另起一个。',
+].join('\n')
+
+/** The user half of the decision prompt (exported for smoke assertions). */
+export function buildCollectionDecisionPrompt(entry: MemoryShape, candidates: readonly CollectionCandidate[]): string {
+  const lines = candidates.map((candidate, index) => {
+    const tags = candidate.keywords.length ? ` ｜标签: ${candidate.keywords.join('、')}` : ''
+    // Clip again here (rankCollectionsFor already does): the prompt must stay
+    // bounded no matter who built the candidate list.
+    const summary = candidate.summary ? ` ｜梗概: ${clip(candidate.summary, COLLECTION_SUMMARY_CLIP)}` : ''
+    return `${index + 1}. [${candidate.collectionId}] ${candidate.title}${tags}${summary}`
+  })
+  return [
+    `候选记忆集合（按相关度预排序，共 ${candidates.length} 个）：`,
+    ...lines,
+    '',
+    '待写入的记忆：',
+    `标题：${clip(entry.title ?? '', TITLE_MAX) || '（无）'}`,
+    `标签：${(entry.keywords ?? []).join('、') || '（无）'}`,
+    `正文：${clip(entry.summary ?? '', COLLECTION_ENTRY_CLIP) || '（无）'}`,
+    '',
+    '判断这条记忆应归入哪个候选集合，还是新建集合。只返回 JSON。',
+  ].join('\n')
+}
+
+/**
+ * Validate one model answer. An unusable answer (no object, an id outside the
+ * candidate list, createNew without a title, neither branch) yields undefined
+ * so the caller degrades to the similarity heuristic.
+ */
+export function normalizeCollectionDecision(
+  raw: unknown,
+  candidates: readonly CollectionCandidate[],
+): CollectionDecision | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const record = raw as { collectionId?: unknown; createNew?: unknown; title?: unknown; tags?: unknown; reason?: unknown }
+  const reason = typeof record.reason === 'string' ? record.reason.trim().slice(0, 120) : ''
+  const wanted = typeof record.collectionId === 'string' ? record.collectionId.trim() : ''
+  if (wanted) {
+    const hit = candidates.find((candidate) => candidate.collectionId === wanted)
+    if (!hit) return undefined
+    return { kind: 'reuse', collectionId: hit.collectionId, score: hit.score, reason }
+  }
+  if (record.createNew === true) {
+    const title = String(record.title ?? '').trim()
+    if (!title) return undefined
+    return { kind: 'create', title, tags: normalizeTags(record.tags).slice(0, 8), reason }
+  }
+  return undefined
+}
+
+/**
+ * One model call deciding where an entry goes. Returns undefined — caller keeps
+ * the heuristic — when there is no ctx/llm/route, the call fails or times out,
+ * or the answer is not a valid decision.
+ */
+export async function decideCollectionWithLlm(
+  deps: CollectionDecisionDeps | undefined,
+  entry: MemoryShape,
+  candidates: readonly CollectionCandidate[],
+): Promise<CollectionDecision | undefined> {
+  if (!deps?.ctx || candidates.length === 0) return undefined
+  const answer = await askLlmJson(
+    { ctx: deps.ctx, logger: deps.logger, sessionId: deps.sessionId },
+    {
+      system: DECISION_SYSTEM,
+      user: buildCollectionDecisionPrompt(entry, candidates),
+      maxTokens: 400,
+    },
+  )
+  if (answer === undefined) return undefined
+  const decision = normalizeCollectionDecision(answer, candidates)
+  if (!decision) {
+    deps.logger?.warn('supermemory: collection decision answer was unusable; falling back to similarity')
+    return undefined
+  }
+  return decision
+}
+
+/**
+ * 回执里的一句话集合归属说明（tools.ts 的 memory_remember 与 panel.ts 的
+ * createMemory 共用，保证两条写入路径同一套词汇）。title 为空（老存储域没有
+ * 集合表）时返回 null，调用方按「未归集」渲染。
+ */
+export function collectionTierNote(
+  assignment: { title: string; created: boolean; tier: CollectionTier | 'explicit' | 'llm' },
+): string | null {
+  if (!assignment.title) return null
+  if (assignment.created) {
+    return `新建记忆集合并写入：「${assignment.title}」${assignment.tier === 'llm' ? '（模型判定）' : ''}`
+  }
+  if (assignment.tier === 'high') return `归入记忆集合「${assignment.title}」（高相似复用）`
+  if (assignment.tier === 'medium') return `归入相关记忆集合「${assignment.title}」（中等相似复用）`
+  if (assignment.tier === 'llm') return `归入记忆集合「${assignment.title}」（模型判定）`
+  return `已写入指定记忆集合「${assignment.title}」`
 }
 
 function clip(text: string, max: number): string {
@@ -333,8 +506,11 @@ async function putCollection(store: CollectionStore, record: MemoryCollection): 
  * 1. `collectionId` 显式指定：必须已存在，否则报错并列出候选；
  * 2. `collection`（标题）显式指定：同名（忽略大小写/首尾空白）或相似度 ≥ 中等 → 复用，
  *    否则以该标题新建集合；
- * 3. 自动匹配：高/中相似 → 复用（回执里注明相似档位），低相似/无匹配 → 新建集合，
- *    新集合标题 = 条目标题、标签 = 条目标签、正文 = 条目正文（截断），与话题集同形。
+ * 3. 自动匹配（R27 需求④.3 起优先问模型）：
+ *    a. `options.deps.ctx` 可用且存在候选集合 → 让模型在候选里挑一个复用，或判定新建
+ *       （一次调用；校验失败/无模型/超时都静默降级到 b）；
+ *    b. 相似度启发式：高/中相似 → 复用（回执里注明相似档位），低相似/无匹配 → 新建集合，
+ *       新集合标题 = 条目标题、标签 = 条目标签、正文 = 条目正文（截断），与话题集同形。
  */
 export async function resolveCollectionForEntry(
   store: CollectionStore,
@@ -389,6 +565,39 @@ export async function resolveCollectionForEntry(
     const record = newCollectionRecord(workspaceKey, options.collection, shape.keywords ?? [], shape.summary ?? '', now)
     const id = await putCollection(store, record)
     return { collectionId: id, title: record.title, tier: 'explicit', created: true, explicit: true, score: 1 }
+  }
+
+  // R27 需求④.3: 大模型判定「加到某个已有集合，还是新建一个」。候选按现有
+  // 相似度预排序后交给模型；无候选集合时启发式同样只能新建，不必烧 token。
+  const ranked = rankCollectionsFor(shape, collections)
+  if (ranked.length > 0) {
+    const decision = await decideCollectionWithLlm(options.deps, shape, ranked)
+    if (decision?.kind === 'reuse') {
+      const found = collections.find(([id]) => id === decision.collectionId)
+      if (found) {
+        options.deps?.logger?.info?.(
+          `supermemory: memory collection decided by model → ${found[1].title}${decision.reason ? ` (${decision.reason})` : ''}`,
+        )
+        return {
+          collectionId: found[0], title: found[1].title, tier: 'llm',
+          created: false, explicit: false, score: decision.score,
+        }
+      }
+    }
+    if (decision?.kind === 'create') {
+      const record = newCollectionRecord(
+        workspaceKey,
+        decision.title,
+        decision.tags.length > 0 ? decision.tags : (shape.keywords ?? []),
+        shape.summary ?? '',
+        now,
+      )
+      const id = await putCollection(store, record)
+      options.deps?.logger?.info?.(
+        `supermemory: memory collection created by model: ${record.title}${decision.reason ? ` (${decision.reason})` : ''}`,
+      )
+      return { collectionId: id, title: record.title, tier: 'llm', created: true, explicit: false, score: 0 }
+    }
   }
 
   const match = bestCollectionFor(shape, collections)

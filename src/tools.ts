@@ -14,9 +14,12 @@ import { loadHostModule } from './host.ts'
 import { applyModelSelection, askDefaultModel, enumerateModels, type ModelDeps } from './model.ts'
 import { matchTopicSets, recallMemories, type RecallOptions } from './recall.ts'
 import {
-  findMemoryConflict, listCollections, migrateFlatMemories, recallEntriesWithCollections,
+  collectionTierNote, findMemoryConflict, listCollections, migrateFlatMemories, recallEntriesWithCollections,
   resolveCollectionForEntry, touchCollection,
+  type CollectionAssignment, type MemoryConflictFinding,
 } from './memory-collections.ts'
+// R27 需求④.2: 一条写入整形为 1..N 条原子记忆（无模型时保持 1 条）。
+import { splitMemoryEntries } from './memory-split.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, renderRecordLine, tagsOfBody } from './retrieval.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
@@ -78,8 +81,9 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         + '禁止记录过程流水账（先做了什么、执行了哪些命令、第几步、工具调用日志、大段输出），这些留在会话里。'
         + '必须同时给出 title + tags + 正文：标题是一句可扫读的结论（≤48 字），标签是 3–8 个短词（检索索引），正文自包含。'
         + '过长（>1500 字）或明显是步骤/命令日志的内容会被拒绝，请先改写成结论。'
-        + '记忆按「记忆集合 + 条目」组织：写入时会先按标题/标签/正文匹配已有集合，高/中相似直接复用该集合并追加条目（回执注明集合），'
-        + '低相似才新建集合；可用 collection 指定集合标题、collectionId 指定集合 id。'
+        + '记忆按「记忆集合 + 条目」组织：集合归属由大模型在候选集合中判定（加到某个已有集合，还是新建一个；无模型时退化为标题/标签/正文相似度匹配，'
+        + '高/中相似直接复用该集合并追加条目，低相似才新建集合）；可用 collection 指定集合标题、collectionId 指定集合 id。'
+        + '一条写入若含多个事实，会先被整形为多条原子记忆（每条独立标题/标签/正文，最多 5 条，回执的 entries 逐条说明归入哪个集合）。'
         + '同一 key 已存不同文本时返回冲突提示（不覆盖），由你向用户裁决。',
       parameters: {
         text: { type: 'string', required: true, description: '结论正文（自包含、可复用的事实/决策；不要过程流水账）' },
@@ -108,10 +112,32 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
             collectionTitle: { type: 'string', description: '所属记忆集合标题' },
             collectionTier: {
               type: 'string',
-              enum: ['high', 'medium', 'low', 'explicit'],
-              description: '复用档位：high/medium=命中已有集合，low=新建集合，explicit=调用方指定',
+              enum: ['high', 'medium', 'low', 'explicit', 'llm'],
+              description: '复用档位：high/medium=命中已有集合，llm=模型判定，low=新建集合，explicit=调用方指定',
             },
             collectionCreated: { type: 'boolean', description: '本次是否新建了集合' },
+            // R27 需求④.2: 一条写入可被整形为多条原子记忆；entries 逐条回执。
+            split: { type: 'integer', description: '本次写入被拆分为几条原子记忆（1=未拆分）' },
+            entries: {
+              type: 'array',
+              description: '逐条原子记忆的写入结果（各自的内存 id/标题/标签/所属集合）',
+              items: {
+                type: 'object',
+                properties: {
+                  memoryId: { type: 'string' },
+                  title: { type: 'string' },
+                  tags: { type: 'array', items: { type: 'string' } },
+                  collectionId: { type: 'string', description: '所属记忆集合 id' },
+                  collectionTitle: { type: 'string', description: '所属记忆集合标题' },
+                  collectionTier: {
+                    type: 'string',
+                    enum: ['high', 'medium', 'low', 'explicit', 'llm'],
+                    description: '复用档位：high/medium=命中已有集合，llm=模型判定，low=新建集合，explicit=调用方指定',
+                  },
+                },
+                additionalProperties: false,
+              },
+            },
             message: { type: 'string', required: true },
             conflict: {
               type: 'object',
@@ -148,68 +174,132 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         // where this entry goes — a reused collection must include the entries
         // that already exist for the same tags/title.
         await migrateFlatMemories(store, workspaceKey, now)
-        const existing = findMemoryConflict(store, workspaceKey, { text, ...(key ? { key } : {}) })
-        if (existing) {
-          const where = existing.collectionTitle ? `（所属集合「${existing.collectionTitle}」）` : ''
-          const same = existing.kind === 'duplicate'
+
+        // R27 需求④.2: 一条写入先「整形」为 1..N 条原子记忆。有模型时才调用
+        // （一次；无模型/预判不通过/失败都保持 1 条，与旧行为一致）。
+        const decisionDeps = {
+          ctx: deps.ctx,
+          logger: deps.logger,
+          ...(exec.agent?.id ? { sessionId: String(exec.agent.id) } : {}),
+        }
+        const drafts = (await splitMemoryEntries(decisionDeps, text, { title, tags })) ?? [{ title, tags, text }]
+        const atomic = drafts.filter((draft) => draft.text && assessConclusion(draft.text).ok)
+        const entries = atomic.length > 0 ? atomic : [{ title, tags, text }]
+        const split = entries.length > 1
+
+        const stored: Array<{
+          memoryId: string
+          title: string
+          text: string
+          tags: string[]
+          assignment: CollectionAssignment
+        }> = []
+        const duplicates: MemoryConflictFinding[] = []
+        for (const entry of entries) {
+          // 同 key 判重/冲突逐条进行；拆分后每条是独立事实，调用方的单个 key
+          // 无法标识 N 行，因此只按正文判重（避免第二条误判成 key 冲突）。
+          const existing = findMemoryConflict(store, workspaceKey, split
+            ? { text: entry.text }
+            : { text: entry.text, ...(key ? { key } : {}) })
+          if (existing) {
+            if (existing.kind === 'conflict') {
+              return {
+                status: 'conflict' as const,
+                memoryId: existing.memoryId,
+                title: existing.title,
+                tags: existing.tags,
+                ...(existing.collectionId ? { collectionId: existing.collectionId } : {}),
+                ...(existing.collectionTitle ? { collectionTitle: existing.collectionTitle } : {}),
+                message: `key「${key}」已存不同内容：「${renderRecordLine({ title: existing.title, text: existing.text, tags: existing.tags })}」。请与用户裁决后再写入。`,
+                conflict: { memoryId: existing.memoryId, text: existing.text },
+              }
+            }
+            duplicates.push(existing)
+            continue
+          }
+          const entryTags = mergeTags(entry.tags, tags)
+          // R22 需求⑤ + R27 需求④.3: prefer an existing related collection over
+          // opening a new one; with a model available the MODEL decides which
+          // candidate to reuse (or that a new set is warranted).
+          const assignment = await resolveCollectionForEntry(
+            store, workspaceKey, { title: entry.title, keywords: entryTags, text: entry.text }, {
+              ...(args.collectionId ? { collectionId: String(args.collectionId) } : {}),
+              ...(args.collection ? { collection: String(args.collection) } : {}),
+              now,
+              deps: decisionDeps,
+            },
+          )
+          if ('error' in assignment) {
+            return {
+              status: 'conflict' as const,
+              message: assignment.error
+                + (assignment.candidates && assignment.candidates.length > 0
+                  ? `候选集合：${assignment.candidates.map((c) => `「${c.title}」(${c.collectionId})`).join('、')}`
+                  : ''),
+            }
+          }
+          const memoryId = newId('mem')
+          const memory: Memory = {
+            workspaceKey, title: entry.title, text: entry.text,
+            keywords: entryTags,
+            // A split write stores independent facts; the caller's single key
+            // cannot identify N rows, so it is not carried over.
+            ...(!split && key ? { key } : {}),
+            ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+            sourceSessionId: String((exec.agent as { id?: string } | undefined)?.id ?? 'tool'),
+            sourceSeq: 0,
+            status: 'active', createdAt: now, updatedAt: now,
+          }
+          await store.memories.put(memoryId, memory)
+          if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
+          stored.push({ memoryId, title: entry.title, text: entry.text, tags: entryTags, assignment })
+        }
+
+        if (stored.length === 0) {
+          // 拆分后每条都已存在：与旧行为一致地回报 duplicate，不写任何行。
+          const found = duplicates[0]
           return {
-            status: same ? 'duplicate' as const : 'conflict' as const,
-            memoryId: existing.memoryId,
-            title: existing.title,
-            tags: existing.tags,
-            ...(existing.collectionId ? { collectionId: existing.collectionId } : {}),
-            ...(existing.collectionTitle ? { collectionTitle: existing.collectionTitle } : {}),
-            message: same
-              ? (key ? '该 key 已存相同内容，未重复写入。' : '相同记忆已存在，未重复写入。') + where
-              : `key「${key}」已存不同内容：「${renderRecordLine({ title: existing.title, text: existing.text, tags: existing.tags })}」。请与用户裁决后再写入。`,
-            ...(same ? {} : { conflict: { memoryId: existing.memoryId, text: existing.text } }),
+            status: 'duplicate' as const,
+            memoryId: found.memoryId,
+            title: found.title,
+            tags: found.tags,
+            ...(found.collectionId ? { collectionId: found.collectionId } : {}),
+            ...(found.collectionTitle ? { collectionTitle: found.collectionTitle } : {}),
+            ...(split ? { split: entries.length } : {}),
+            message: (key && !split ? '该 key 已存相同内容，未重复写入。' : '相同记忆已存在，未重复写入。')
+              + (!split && found.collectionTitle ? `（所属集合「${found.collectionTitle}」）` : '')
+              + (split ? `（已拆分为 ${entries.length} 条，均已存在）` : ''),
           }
         }
 
-        // R22 需求⑤: prefer an existing related collection over opening a new one.
-        const assignment = await resolveCollectionForEntry(
-          store, workspaceKey, { title, keywords: tags, text }, {
-            ...(args.collectionId ? { collectionId: String(args.collectionId) } : {}),
-            ...(args.collection ? { collection: String(args.collection) } : {}),
-            now,
-          },
-        )
-        if ('error' in assignment) {
-          return {
-            status: 'conflict' as const,
-            message: assignment.error
-              + (assignment.candidates && assignment.candidates.length > 0
-                ? `候选集合：${assignment.candidates.map((c) => `「${c.title}」(${c.collectionId})`).join('、')}`
-                : ''),
-          }
-        }
-        const memoryId = newId('mem')
-        const memory: Memory = {
-          workspaceKey, title, text, key,
-          keywords: tags,
-          ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
-          sourceSessionId: String((exec.agent as { id?: string } | undefined)?.id ?? 'tool'),
-          sourceSeq: 0,
-          status: 'active', createdAt: now, updatedAt: now,
-        }
-        await store.memories.put(memoryId, memory)
-        if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
-        const tierNote = assignment.title === '' ? null : assignment.created
-          ? `新建记忆集合并写入：「${assignment.title}」`
-          : assignment.tier === 'high'
-            ? `归入记忆集合「${assignment.title}」（高相似复用）`
-            : assignment.tier === 'medium'
-              ? `归入相关记忆集合「${assignment.title}」（中等相似复用）`
-              : `已写入指定记忆集合「${assignment.title}」`
+        const first = stored[0]
+        const tierNote = collectionTierNote(first.assignment)
+        const lines = stored.map((row) => renderRecordLine({
+          title: row.title, text: row.text, tags: row.tags, collection: row.assignment.title,
+        }))
+        const skipped = duplicates.length > 0 ? `\n其中 ${duplicates.length} 条已存在，未重复写入。` : ''
+        const keyNote = key && split ? `\n（拆分写入未沿用 key「${key}」：每条原子记忆是独立事实）` : ''
         return {
-          status: 'stored' as const, memoryId, title, tags,
-          ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
-          ...(assignment.title ? { collectionTitle: assignment.title } : {}),
-          collectionTier: assignment.tier,
-          collectionCreated: assignment.created,
-          message: tierNote === null
-            ? `已记住：${renderRecordLine({ title, text, tags })}`
-            : `${tierNote}：${renderRecordLine({ title, text, tags, collection: assignment.title })}`,
+          status: 'stored' as const,
+          memoryId: first.memoryId,
+          title: first.title,
+          tags: first.tags,
+          ...(first.assignment.collectionId ? { collectionId: first.assignment.collectionId } : {}),
+          ...(first.assignment.title ? { collectionTitle: first.assignment.title } : {}),
+          collectionTier: first.assignment.tier,
+          collectionCreated: first.assignment.created,
+          split: entries.length,
+          entries: stored.map((row) => ({
+            memoryId: row.memoryId,
+            title: row.title,
+            tags: row.tags,
+            ...(row.assignment.collectionId ? { collectionId: row.assignment.collectionId } : {}),
+            ...(row.assignment.title ? { collectionTitle: row.assignment.title } : {}),
+            collectionTier: row.assignment.tier,
+          })),
+          message: split
+            ? `已拆分为 ${entries.length} 条原子记忆：\n${lines.map((line, index) => `${index + 1}. ${line}`).join('\n')}${skipped}${keyNote}`
+            : `${tierNote === null ? `已记住：${lines[0]}` : `${tierNote}：${lines[0]}`}${keyNote}`,
         }
       },
     })))

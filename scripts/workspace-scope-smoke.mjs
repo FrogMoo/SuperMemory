@@ -6,6 +6,9 @@
  *   W4 register 同名能力按工作区归属分流（别的工作区的行不被误更新）；
  *   W5 重启重建带行级归属（rebuild 后跨工作区门禁依然生效，内置播种落 scope 工作区）；
  *   W6 适用性判定纯函数语义（行级归属优先 / 全局能力 / 无上下文放行）。
+ *   W7 R28 归属回填与 createdAt：rebuildComposites 启动回填（trigger 前缀推导
+ *      归属 + createdAt 补齐，幂等，日志如实）；persist 未传 workspaceKey 时从
+ *      signalKey 推导；新建行 stamp createdAt、同名更新保留原值、内置升级自愈。
  * 注意：.mjs 自身不做 TS 类型擦除（本脚本保持纯 JS），但 src/panel.ts 用了
  * TypeScript 参数属性，strip-only 模式会拒绝——整体重放一次带 transform 的节点。
  * Usage: node scripts/workspace-scope-smoke.mjs
@@ -26,6 +29,7 @@ if (!process.execArgv.includes('--experimental-transform-types')) {
 const {
   capabilityAppliesToWorkspace, capabilityHealthOf, capabilityRecordsOf, capabilityToolDef,
   mergeBuiltinCapabilities, persistComposite, rebuildComposites, registerCapability,
+  workspaceKeyFromSignalKey,
 } = await import('../src/composite.ts')
 const { listTopicSets } = await import('../src/topicsets.ts')
 const { listWorkspaceBranches } = await import('../src/hub-branches.ts')
@@ -230,6 +234,121 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, undefined), true, '无调用方工作区=不判定')
   assert.equal(workspaceKeyOf(WS_B), WS_B, '虚构路径的键值稳定（resolve 退化）')
   ok('W6 适用性判定：行级归属优先 / scope 推导 / 全局能力 / 无上下文放行')
+}
+
+// ---- W7 R28：归属回填 / signalKey 推导 / createdAt 落库 ----
+{
+  // (a) 启动回填：无 workspaceKey 的旧行从 trigger 前缀 ws/<ws>/seq/ 推导归属并
+  //     写回；回填出的归属当次启动即进入注册（when 门禁不用等下一轮重启）；
+  //     createdAt 一并补齐；保持全局的行记 info 日志；第二次启动不再写（幂等）。
+  const rows = new Map([
+    ['tm-legacy-seq', {
+      kind: 'composite', trigger: 'ws/' + WS_B + '/seq/read>bash',
+      title: '旧序列', tags: [], description: '旧序列',
+      entry: JSON.stringify({ name: 'sm_composite_legacy_seq', steps: [{ tool: 'read', arguments: {} }], parameters: [] }),
+      useCount: 0, status: 'active',
+    }],
+    ['tm-legacy-global', {
+      kind: 'composite', trigger: 'capability/legacy-global',
+      title: '旧全局', tags: [], description: '旧全局',
+      entry: JSON.stringify({ name: 'sm_composite_legacy_glob', kind: 'capability', entry: 'echo g', steps: [], parameters: [] }),
+      useCount: 0, status: 'active',
+    }],
+  ])
+  const updates = []
+  const toolMemory = {
+    get: (k) => rows.get(k),
+    keys: () => rows.keys(),
+    values: () => rows.values(),
+    get size() { return rows.size },
+    entries: () => rows.entries(),
+    put: async (k, v) => { rows.set(k, v) },
+    update: async (k, fn) => { updates.push(k); rows.set(k, fn(rows.get(k))) },
+    delete: async (k) => rows.delete(k),
+  }
+  const store = { ...fakeStore(), toolMemory }
+  const logs = []
+  const seen = []
+  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
+  const count = await rebuildComposites(ctx, store, {
+    register: async (_c, _s, spec, workspaceKey) => { seen.push({ name: spec.name, workspaceKey }); return () => {} },
+    logger: { info: (m) => logs.push(m) },
+  })
+  assert.equal(count, 3, '两条旧行 + 内置播种一条: ' + count)
+  assert.equal(rows.get('tm-legacy-seq').workspaceKey, WS_B, 'trigger 前缀回填归属')
+  const seqSeen = seen.find((s) => s.name === 'sm_composite_legacy_seq')
+  assert.equal(seqSeen && seqSeen.workspaceKey, WS_B, '回填的归属当次启动即随注册传入（门禁立即生效）')
+  assert.ok(typeof rows.get('tm-legacy-seq').createdAt === 'number' && rows.get('tm-legacy-seq').createdAt > 0, '旧行补齐 createdAt')
+  const firstCreatedAt = rows.get('tm-legacy-seq').createdAt
+  assert.equal(rows.get('tm-legacy-global').workspaceKey, undefined, '推导不到且 spec 无 scope = 保持全局')
+  assert.ok(logs.some((m) => m.includes('tm-legacy-seq') && m.includes('归属回填')), '归属回填写 info 日志')
+  assert.ok(logs.some((m) => m.includes('tm-legacy-seq') && m.includes('createdAt')), 'createdAt 回填写 info 日志')
+  assert.ok(logs.some((m) => m.includes('tm-legacy-global') && m.includes('保持全局')), '保持全局的行如实记录')
+  // 幂等：第二次启动不再写任何行、不再记回填日志（保持全局的行每轮启动都
+  // 如实记一条状态说明，不算回填动作——断言把它排除）。
+  updates.length = 0
+  logs.length = 0
+  await rebuildComposites(ctx, store, {
+    register: async () => () => {},
+    logger: { info: (m) => logs.push(m) },
+  })
+  assert.deepEqual(updates, [], '第二次启动零 update（幂等）')
+  assert.equal(logs.filter((m) => m.includes('归属回填') || m.includes('回填 createdAt')).length, 0, '第二次启动不再记回填日志')
+  assert.equal(rows.get('tm-legacy-seq').workspaceKey, WS_B, '归属不被二次改写')
+  assert.equal(rows.get('tm-legacy-seq').createdAt, firstCreatedAt, 'createdAt 不被二次改写')
+  ok('W7a 启动回填：trigger 前缀推导归属 + createdAt 补齐，当次注册生效，幂等不重复写')
+}
+
+{
+  // (b) persist 未显式传 workspaceKey 时从 signalKey 推导；显式传入优先。
+  const store = fakeStore()
+  const seqSpec = { name: 'sm_composite_persist_probe', description: '推导', steps: [{ tool: 'read', arguments: {} }], parameters: [] }
+  const idA = await persistComposite(store, seqSpec, 'ws/' + WS_B + '/seq/read>bash')
+  assert.equal(store.toolMemory.get(idA).workspaceKey, WS_B, '未传 workspaceKey → 从 signalKey 推导')
+  const idB = await persistComposite(store, seqSpec, 'capability/x')
+  assert.equal(store.toolMemory.get(idB).workspaceKey, undefined, 'capability trigger 推导不出归属 = 全局')
+  const idC = await persistComposite(store, seqSpec, 'ws/' + WS_A + '/seq/a>b', WS_B)
+  assert.equal(store.toolMemory.get(idC).workspaceKey, WS_B, '显式传入优先于推导')
+  assert.equal(workspaceKeyFromSignalKey('ws/F:\\10-SuperMemory/seq/a>b'), 'F:\\10-SuperMemory')
+  assert.equal(workspaceKeyFromSignalKey('capability/x'), undefined)
+  assert.equal(workspaceKeyFromSignalKey(''), undefined)
+  assert.equal(workspaceKeyFromSignalKey('ws//seq/a'), undefined, '空前缀不推导')
+  ok('W7b persist 归属推导：signalKey 前缀兜底，显式传入优先，坏形状不瞎猜')
+}
+
+{
+  // (c) createdAt：新建行 stamp；同名更新保留原值；内置升级对旧行自愈。
+  const before = Date.now()
+  const store = fakeStore()
+  const seqSpec = { name: 'sm_composite_created_at', description: 'c', steps: [{ tool: 'read', arguments: {} }], parameters: [] }
+  const id = await persistComposite(store, seqSpec, 'ws/x/seq/a')
+  const created0 = store.toolMemory.get(id).createdAt
+  assert.ok(typeof created0 === 'number' && created0 >= before && created0 <= Date.now(), '新建行 stamp createdAt')
+  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
+  const deps = { register: async () => () => {}, persist: persistComposite, toolExists: () => false }
+  const reg = await registerCapability(ctx, store, { name: 'created-at-cap', description: 'd', entry: 'echo d', scope: WS_A }, WS_A, deps)
+  const rowId = reg.id
+  const created1 = store.toolMemory.get(rowId).createdAt
+  assert.ok(typeof created1 === 'number' && created1 > 0, 'registerCapability 新行落 createdAt')
+  await new Promise((r) => setTimeout(r, 5))
+  const upd = await registerCapability(ctx, store, { name: 'created-at-cap', description: 'd2', entry: 'echo d2', scope: WS_A }, WS_A, deps)
+  assert.equal(upd.id, rowId, '同名更新不建新行')
+  assert.equal(store.toolMemory.get(rowId).createdAt, created1, '同名更新保留原 createdAt')
+  assert.ok(JSON.parse(store.toolMemory.get(rowId).entry).updatedAt > 0, 'updatedAt 照常刷新（与 createdAt 分离）')
+  // 内置升级自愈：缺 createdAt 的旧行被升级时按 spec.updatedAt ?? now 补齐。
+  const legacy = {
+    name: GIT_TOOL, kind: 'capability', entry: 'pnpm git:sync', doc: 'docs/git-sync.md',
+    scope: 'G:\\09 - dsh\\SuperMemory', steps: [], parameters: [], runnable: true,
+    version: 1, updatedAt: 12345,
+  }
+  await store.toolMemory.put('tm-legacy-cap', {
+    kind: 'composite', trigger: 'capability/' + GIT_TOOL, title: 't', tags: [],
+    description: 'd', entry: JSON.stringify(legacy), useCount: 0, status: 'active',
+  })
+  const rep = await mergeBuiltinCapabilities(store)
+  assert.deepEqual(rep.upgraded, [GIT_TOOL])
+  assert.equal(store.toolMemory.get('tm-legacy-cap').createdAt, 12345, '升级行按 spec.updatedAt 补齐 createdAt')
+  ok('W7c createdAt 落库：新建 stamp / 更新保留 / 内置升级按 spec.updatedAt 自愈')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

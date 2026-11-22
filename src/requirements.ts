@@ -31,7 +31,15 @@ export function extractRequirements(text: string): string[] {
   }
   for (const pattern of PATTERNS) {
     const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
-    for (const m of text.matchAll(new RegExp(pattern.source, flags))) push(m[1])
+    for (const m of text.matchAll(new RegExp(pattern.source, flags))) {
+      // R27: 疑问句不是需求——捕获的子句后面紧跟问号（"是否需要导出功能？"），
+      // 或子句本身以疑问词开头。需求与记忆共用 recall 面，疑问句同样污染检索。
+      const tail = text.slice(m.index + m[0].length)
+      const stop = tail.search(/[。！？!?\n]/)
+      if (/^[？?]/.test((stop < 0 ? '' : tail.slice(stop)).trimStart())) continue
+      if (/^(?:是否|能不能|可不可以|怎么|怎样|如何|为什么|为啥|啥|哪些|哪个|有没有|是不是)/.test(m[1].trim())) continue
+      push(m[1])
+    }
   }
   return out
 }
