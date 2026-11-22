@@ -2045,3 +2045,108 @@ R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框�
 - src/builtin-capabilities.ts：git-sync 能力 v3→v4（description 增加双远程推送目标与 Gitee 现状；changelog 记录原因），随后 memory_toolize refresh-builtin 应用。
 - 前置提交：工作区遗留的 R29 改动（9 文件，+931/−550）按 conventional 风格提交为 ea28c78（未跟踪目录 memory-cleanup-20261122/ 为一次性清理脚本，未入仓库）。
 - **离线改存储的安全流程**：patch 移除 insert（或 plugin_manager 禁用）→ 插件卸载、存储域关闭 → 编辑 `supermemory.json` → 重新启用/武装 → 自动重读。R29 记忆清理即按此流程执行并验证（memory_topicsets 残根消失、memory_recall 正常）。
+
+---
+
+## 36. R30-B：中枢-分支协同（会话管理 / 标题标签 / 检索路由 / 回送）（2026-11-23）
+
+### 36.1 需求③：中枢会话不属任何话题集、管理全部话题集、查看全部分支会话
+
+- **③.1 验证（防回归，无代码改动需要）**：`createHubSession`（panel.ts）与 shell「新建会话」（client/new-session.tsx → 同一 api）只建裸会话 + 命名 + 挂工作区，**不写任何话题集成员**（mechanism-smoke 新增 R30-B4 断言 + 临时脚本实测 store.topicsets 成员数不变）；`listHubSessions`/`isHubSession` 恒排除 `branch-*`/`fork-*`（前缀是静态事实，成员行缺失时也能判），root 成员仍是中枢（R19 设计，hub-set 徽章不变）。
+  - **假设（写入汇报）**：「hub-role 会话不出现在任何话题集成员列表中」按「**普通中枢会话不会被任何写路径自动加入话题集**」实现与验证；R19 的 root 成员模型（话题集自己的会话 = 中枢，带「话题集」徽章）是有意设计且被 R19 冒烟锁定，未改。
+- **③.2 全部话题集**：panel 新增 `listAllTopicSets(cwd)`（活跃 + 归档，`TopicSetView.status` 透出生命周期，活跃在前 + lastActiveAt 排序）；面板中枢页签新增「全部话题集」卡（标题/标签/会话数/在线数/模型/归档徽章 + 行内创建入口 + 点击进详情，标签编辑在既有详情页）。`listTopicSets`（话题集页签）保持只看活跃。管理台话题集页早已含归档与增删改，无需改。
+- **③.3 全部分支会话**：panel 新增 `listAllBranches(cwd, topicSetId?, limit?)`（跨话题集，读 `listWorkspaceBranches` 持久台账投影，可按集筛选）；面板中枢页签新增「全部分支会话」卡（筛选下拉 + 标题/标签/状态/共享/组/所属话题集/最后活动/派发次数）；管理台「中枢会话」页新增同一把话题集筛选（`state.branchFilter`，本地过滤）。
+
+### 36.2 需求④：分支会话标题/标签明确化
+
+- **DSH 事实（dsh-doc skill + 源码核实）**：会话**原生支持标题**（`ctx.sessionTitle.rename` → log-only `session/title` 事件，title.ts 已用）；**原生不支持标签**——dsh-session / dsh-session-title 源码无 tags/label/category 字段，会话 header 是不可变创建头。标签因此落在**派发记录**上：`schema.ts` 的 `dispatches` 新增 `title`（默认 ''）与 `tags`（默认 []），v1 介质兼容（R30 前的行读作空）。
+- **新模块 `src/branch-meta.ts`**：`branchTitleFor`（任务首行、去标记、48 字 … 截断）、`branchTagsFor`（话题集标签 + 轮次令牌 `R30`/`R30-B` + 任务性质 `验证` + 能力档位，去重、≤8、每项 ≤24 字）、`roundTokensOf`、`latestBranchMeta`（branchSessionId → 最新派发的标题/标签）。
+- **写入点**：`dispatch.ts` dispatchOne 落 title/tags（含 `kind` 透传）；`recordGroupFailure` 同样落（失败成员也保持同一身份词表）；`resume.ts` 续跑把原行标题/标签带前进（原行没有则按任务重算）。
+- **读模型**：`hub-branches.ts` 的 `HubBranchView` 新增 `tags`；标题取「最新**非空**显式标题 → 成员标题 → 任务摘要」（标题为空的旧行不会擦掉已有标题）；`renderHubBranchesCard` 行内带 `标签 a / b`。三个表面统一：中枢注入卡、面板分支行（hub 卡 / 全部分支卡 / 话题集详情成员行）、管理台（中枢会话分支行 + 话题集成员表新「标签」列）。
+- 宿主会话标题规则不变（`<话题集> · <任务首行>`，title.ts）——GUI 侧栏无回归。
+
+### 36.3 需求⑤：每次对话的检索路由
+
+- **⑤.1** `index.ts` HUB_ROLE_TEXT 增加四步路由：① recall 卡的相关记忆 → ② 列出/匹配话题集 → ③ 按话题集检索其下分支（标题/标签/状态/最后活动，注入卡已带出）→ ④ 才决定复用（continue/auto）或新建（new）；命中话题集时派到该集，不重新检索、不另起炉灶。
+- **⑤.2** `prestep.ts`：注入卡在原有「本会话拉起的分支」之后，追加本轮 recall **命中话题集**的分支段（≤2 个集、每集 ≤4 行，读 store 既有台账，无额外宿主调用）；卡文案改为「标题/标签/状态/话题集/共享」。
+
+### 36.4 需求⑥：分支记录唤醒其中枢会话并完成后回送
+
+- **链路核实（无需改）**：`observe.deliver` 的投递目标是**派发记录里的 `hubSessionId`**（不是「当前中枢」）；组 relay 取 `members[0].hubSessionId`（一个组由一个中枢的一次派发产生，成员同源）；`flushObserve` / `settleInterruptedDispatches` / `reconcile` path2 / resume 通知全部从台账解析 hubSessionId；`resumeDispatch` 用 `exec.agent.id ?? record.hubSessionId`（续跑由中枢发起，回送调用方，缺省回落到记录）。hubSessionId 随派发记录持久化，分支重启后由台账恢复（branch-restore 只 attach 不 dispose），interrupted 成员的组收敛 R19 已处理（本轮未动，防回归）。
+- **补齐点**：`script-delegation.ts` 的派发首条消息新增 `中枢会话：<id>（派发记录与 relay 回送目标都是这个 id…）`（dry-run 不带 id，R18 契约为 `!includes('分支会话：')` 保持）；`resume.ts` 的续跑消息同样点名中枢会话。
+
+### 36.5 闸门与并发
+
+- `pnpm typecheck`（宿主 + 客户端）双 0 错；另跑 `node scripts/mechanism-smoke.mjs`（98 项全绿，含新增 R30-B1/B2/B3/B4）与 `node scripts/webui-smoke.mjs`（35 项全绿）。**未跑** `pnpm build` / `pnpm smoke` / 未重载插件（分支内禁自杀）。
+- 并发：R30-A 同时改 schema.ts 记忆表、panel.ts 记忆方法、panel-page.tsx 记忆页签、store.ts/tools.ts/memory-organize.ts/webui.ts（记忆版本化）；本次只碰派发/会话相关表与 hub/branch/话题集列表方法，双方区域不重叠（typecheck 双 0 即共存证据）。
+
+---
+
+## 37. R30-A：记忆版本控制 + 面板记忆两级页（2026-11-23）
+
+对应六项需求中的 ①记忆版本控制、②面板记忆页签只展示记忆集 + 下钻条目页。与 R30-B（§36）并发：本次只改记忆相关表/方法/页签区域，R30-B 只改派发/会话/话题集列表，双方区域不重叠（`pnpm typecheck` 双 0 错即共存证据）。
+
+### 37.1 需求①：记忆版本控制（就地更新 + 升版 + 历史归档）
+
+- **数据模型（schema.ts）**：`memories` 新增 `version`（默认 1，旧介质读时补齐，域保持 v1）；新表 `memory_versions`（`workspaceKey / memoryId / version / title / text / tags / collectionId? / updatedAt / changeType(create|update|migrate)`）。store.ts 注册 `memory_versions` 域表并暴露 `memoryVersions` 访问器。字段命名假设：历史行标签用 `tags`（任务书字段名）、工作区键用 `workspaceKey`（全仓库 D4 约定，非任务书字面的 `workspaceId`）。
+- **新模块 `src/memory-versions.ts`（唯一读写入口，模式参照 questions.ts）**：
+  - `createMemoryVersioned`：新建 v1 并归档一条 v1 历史（changeType `create`）；
+  - `updateMemoryVersioned`：就地更新 title/text/tags/集合，`version+1`，并把新版本整体归档（changeType `update`）；内容（正文/标题/标签/集合/key）完全相同 → 幂等 `unchanged`，不升版不写历史；记忆不存在/跨工作区返回 undefined；
+  - `memoryHistoryOf`：一条记忆的全部版本（按版本号升序，最后一条即当前版本）；
+  - `findMemoryByKey`：同工作区 active 且 key 相同的行（同 key 更新判定）；
+  - `migrateMemoryVersions`：惰性迁移——给「没有任何历史行」的旧记忆补一条 v1 历史（changeType `migrate`），不改写正文/标题/标签/集合，按 memoryId 判重所以幂等，可像 `migrateFlatMemories` 一样在 recall/remember 前调用；
+  - 兼容：历史表缺失（旧介质/测试替身）时写路径退化为「只改 memories 行」、读路径返回空历史，与 questions.ts 的容错同一套；`memoryVersionsSupported` 供 UI 说明降级原因。
+- **写路径全部收口到版本化入口（不允许绕过）**：tools.ts `memory_remember`、panel.ts `createMemory`/`updateMemory`、webui.ts `memory/create`+`memory/update`、maintenance.ts 自动抽取 `rememberFact`、memory-organize.ts 整理引擎（条目改写 + 集合迁移两处）。
+- **memory_remember 行为变化**：同 key 且内容不同 → 就地更新 + 升版，回执 `status:'updated'` + `version` + 文案「已更新到 vN（旧版本已归档，可用 memory_history 溯源）」；同 key 同内容 → `duplicate` 幂等（不升版）；无 key → 新建 v1（`version:1` 透出）。**取消**旧的「同 key 不同内容返回 conflict 交用户裁决」。集合归属仍按 R22 相似度/R27 模型判定，集合变更记入历史版本。
+- **新工具 `memory_history`**：入参 `key` 或 `memoryId`（二选一）+ 可选 `limit`（默认 20），返回 `memoryId / title / currentVersion / versions[{version,updatedAt,title,tags,text,changeType,collectionId?}] / total` + 人读文案；旧记忆首次查询会先惰性补迁移再读。
+- **memory_recall**：只返回当前版本，输出 items 增补 `version` 字段（仅 memory 类条目），描述里说明历史用 memory_history 溯源。
+- **迁移策略**：不写一次性迁移脚本——`migrateMemoryVersions` 在 recall/remember/memory_history 读取前惰性执行（幂等、按 memoryId 判重），旧数据零丢失（正文/标题/标签/集合原样，只补历史行）。
+
+### 37.2 需求②：面板记忆页签两级页
+
+- **panel.ts 新远程方法（+ PANEL_DESCRIPTORS，client/remote.ts 同步声明，mechanism-smoke 的 id/参数契约 parity 保持）**：
+  - `listMemoryCollections(cwd)`：集合卡片统计（id/title/tags/summary/count/latestUpdatedAt/status/时间戳）；未归集是 id 为 `''` 的虚拟卡片（旧数据不丢），按最近更新倒序；
+  - `listMemoriesByCollection(cwd, collectionId, query?, limit?)`：一个集合内的全部条目（标题×4/标签×3/正文×1 打分过滤），`MemoryView` 增补 `version`；
+  - `getMemoryDetail(cwd, id)`：`{ view, versions[] }`（当前字段 + 历史版本，无历史表时只有当前版本）。
+- **panel-page.tsx**：View  union 新增 `memory-collection` / `memory-detail`；「记忆」页签（第一级）只展示记忆集卡片（标题/标签 chips/条目数/最近更新 + 按标题/标签搜索）与既有的新建记忆表单；点击卡片 → 第二级（面包屑 + 返回 + 集合内条目，行带 `vN` 徽标，点击行进详情）；点击条目 → 第三级详情（完整正文、当前版本徽标、key/来源/集合元信息、编辑/停用/删除、历史版本列表可逐条展开）。tabActive 把两个下钻视图归到「记忆」页签；工作区切换清空两级数据。
+- **locales.ts**：新增 `memory.collection.*` / `memory.detail.open` / `memory.back` / `memory.updated` / `memory.history.*`（zh + en 两套）。
+- **管理台（webui.ts + src/web）**：`buildState` 增补 `memoryCollections`；新路由 `POST /memory/history`（ws + id → versions）；app.js 记忆区改两级导航（集合卡片 → 集合内条目 → 详情），条目行带 `vN` 徽标，详情页可展开历史版本（`state.memHistory` 缓存，编辑保存后作废）；编辑保存 toast 带新版本号。
+- **面板/管理台编辑均走版本化更新**：保存后回执「已更新到 vN」；内容无变化时明确「未升版」。
+
+### 37.3 闸门与并发
+
+- `pnpm typecheck`（宿主 + 客户端）双 0 错。
+- 另跑（不写 dist 的单测脚本）：`core-smoke` 25 项、`mechanism-smoke` 98 项、`webui-smoke` 35 项全绿（webui 日志可见 `webui updated memory … -> v2`）；`memory-collections-smoke` 的 conflict 纯函数断言未动（`findMemoryConflict` 保留原语义，只是 remember 不再走 conflict 分支）。
+- **已知既有失败（非本轮引入，需中枢安排修复）**：`capability-smoke` C3 与 `workspace-scope-smoke` W5 失败——`src/builtin-capabilities.ts` 的 git-sync 能力 v4 `description` 超过 `buildCapabilitySpec` 的 500 字上限，`mergeBuiltinCapabilities` 播种静默跳过（`report.seeded=[]`），导致「内置能力播种/rebuild 注册」计数差 1。该文件本轮未改（R29 遗留）。
+- 未跑 `pnpm build` / `pnpm smoke` / 未重载插件（分支内禁自杀；集成轮统一跑）。
+
+---
+
+## 38. Gitee 恢复：帐号/仓库重建与双远程推送复原（2026-11-23）
+
+用户裁决：由分支代劳重建内网 Gitee 仓库，用新帐号恢复「两方仓库同时提交」。凭据只进 Windows GCM（stdin approve）与一次性临时 curl 配置文件（/tmp，用完即删），不落仓库、不进汇报/记忆。
+
+### 38.1 服务器真相（与上轮判断不同，需修正既有笔记）
+
+- 该内网服务实例是 **Gitea**（`/api/v1/...`；`/api/v5/user` 返回 Not found），不是 Gitee。
+- **帐号是「改名」不是「重建」**：旧 `旧帐号名` 已更名为 **`Zry`**（`GET /api/v1/user`：id 1、is_admin、邮箱 437***@qq.com）；上轮看到的 `旧帐号名 B`（id 8）是服务器切换中间态的短暂帐号，已不复现。
+- **仓库 `Zry/SuperMemory` 已存在且非空**（id 17、`private:true`、默认分支 main；恢复时 `refs/heads/main` = `19032bb`，即 R28 之前的历史快照）——因此**没有建仓**（API 建仓跳过），推送是快进。旧路径 `旧帐号名/SuperMemory` 对 `/info/refs` 返回 307 跳转到新路径（Gitea 改名重定向）。
+- 上轮「仓库 404 / user does not exist」的结论作废：那是切换中间态。
+
+### 38.2 凭据的坑（本轮最有价值的发现）
+
+本机 git 2.55.0.windows.3 的 http 传输向凭据助手发送 **`host=zrynas.7766.org:8418`**（端口嵌在 host 字段、无单独 `port=` 行），而 `git credential approve/fill` 常用 `host=<主机>`+`port=<端口>`——**两者是不同的键**。只按后者写入时 `git credential fill` 显示新帐号，真实 http 请求仍命中旧键的旧帐号（`remote: Repository not found` / `Authentication failed`）。
+修复：嵌入端口键与 host+port 键**各 approve 一次**新凭据，并 reject 掉嵌入键上的旧条目（该键上还清出一个 GCM 占位 `OAUTH_USER`）。排查手法：`GIT_CONFIG_NOSYSTEM=1 HOME=<临时目录> git -c 'credential.helper=!<记录脚本>' ls-remote <url>`（绕开系统级 GCM helper 抢先返回），助手输入输出落临时文件、口令脱敏、用完即删。已写进 docs/git-sync.md §4.4/§4.6。
+
+### 38.3 remote 与推送（实测）
+
+- `origin` fetch URL → `http://zrynas.7766.org:8418/Zry/SuperMemory.git`；push URL 两项：GitHub（首位）+ 新 Gitee URL（旧 `旧帐号名` push URL 已删）。`github` 远程不动。
+- `git push origin main`：GitHub `Everything up-to-date` + Gitee `19032bb..2c4b898 main -> main`，整体 exit 0——**双远程推送恢复**。
+- 三方一致：本地 HEAD = `origin/main` = `github main` = `2c4b898`；`git push --dry-run origin main` 双路 Everything up-to-date。
+
+### 38.4 闸门与未决
+
+- `pnpm git:sync` **未端到端实跑**：工作区有 R30-A/R30-B 的未提交代码改动（归各自轮次，分支不代提交），脚本第 1 步即 exit 2（设计行为：不 stash 不自动提交）。已用 `--dry-run` 与手工 fetch/push/ls-remote 完成等价验证；代码提交后即可正常跑。
+- 另注意：`scripts/git-sync-push.sh` **本身没有 typecheck/smoke 闸门**（只做 工作区检查→fetch→rebase→push→ls-remote 核对），派发单里「会触发 typecheck/smoke 闸门」的说法与实际脚本不符，以脚本为准。
+- **待中枢处理的后续**：`src/builtin-capabilities.ts` 的 git-sync 能力 v4 description 仍写着「Gitee 重建前全部失败」（已过时），且超过 500 字上限导致内置能力播种被静默跳过（capability-smoke C3 / workspace-scope W5 失败的根因）。建议后续一轮：description 改短并更新为「Gitee 已恢复（Zry/SuperMemory）」升 v5 → 中枢 `pnpm build` + 插件重载 + `memory_toolize refresh-builtin`。分支内不重载（禁自杀）。
+- 本轮提交只含文档（`docs/git-sync.md` + 本小节）；DEV-NOTES.md 同时带入 R30-A/R30-B 的文档小节（§36/§37，代码改动仍未提交，归各自轮次）。

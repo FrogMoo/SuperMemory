@@ -2,11 +2,11 @@
 
 > **⚠️ 遇到本仓库的 git 同步、提交、推送类问题，优先使用 `scripts/git-sync-push`，不要手敲 `git fetch` / `git rebase` / `git push`。**
 > 凭据说明（2026-11-19 现状）：网络 git 调用直接用仓库本地配置的 Git Credential Manager（GCM / manager，见 §4.1），凭据由 Windows 凭据存储托管。先 `--dry-run` 看计划，确认后再真跑。
-> 推送说明（2026-11-23 起）：`origin` 配双 push URL——GitHub（`github.com/FrogMoo/SuperMemory.git`，排首位）+ 内网 Gitee；fetch/pull 仍只走 Gitee。Gitee 服务器 2026-11-22 已重置（旧 `旧帐号名/SuperMemory` 仓库 404），恢复前 `pnpm git:sync` 整体 exit 1、但 GitHub 仍能收到提交。详见 §4.6。
+> 推送说明（2026-11-23 起）：`origin` 配双 push URL——GitHub（`github.com/FrogMoo/SuperMemory.git`，排首位）+ 内网 Gitee；fetch/pull 仍只走 Gitee。Gitee 侧 2026-11-23 已恢复：帐号/仓库重建为 `Zry/SuperMemory`（旧 `旧帐号名` 路径 307 跳转到新路径），双远程推送实测恢复（见 §4.6）。
 
 - 适用范围：本仓库（固化能力的 `scope` 由插件位置自动推导，不再硬编码克隆路径；换机器/换目录自动跟随）
-- 远端（2026-11-23 起为双远程推送，详见 §4.6）：
-  - `origin` 的 fetch URL（主远程；pull / rebase / 跟踪分支只走它）= 内网 Gitee `http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git`
+- 远端（2026-11-23 Gitee 恢复后，详见 §4.6）：
+  - `origin` 的 fetch URL（主远程；pull / rebase / 跟踪分支只走它）= 内网 Gitee `http://zrynas.7766.org:8418/Zry/SuperMemory.git`
   - `origin` 的 push URL（两个，按序尝试）= ① GitHub `https://github.com/FrogMoo/SuperMemory.git`（排首位）② 上述 Gitee
   - 独立远程 `github` = `https://github.com/FrogMoo/SuperMemory.git`（fetch/push 同 URL，用于单推 GitHub）
   - 默认分支 `main`
@@ -115,21 +115,22 @@ odejs`
 
 由仓库本地 GCM（manager）托管在 **Windows 凭据存储**（控制面板 → 凭据管理器 → Windows 凭据，目标含 `zrynas.7766.org:8418`）。
 本机 `~/.git-credentials` **不存在**（旧的 store 方案已失效，见 §4.1）。**不要**改全局 git config、**不要**改 remote URL 来解决认证问题。
+**键的坑（2026-11-23 实测）**：Windows 凭据存储里同一个 Gitee 主机可能有**两个键**——`host=zrynas.7766.org`（配 `port=8418`）与 `host=zrynas.7766.org:8418`（端口嵌在 host 里，git http 传输实际用的就是这个）。换帐号/换口令时**两个键都要更新**，否则会出现「`git credential fill` 是新帐号、真实推送却用旧帐号」的怪现象，详见 §4.6。
 
 ### 4.5 行尾（写 .md / 文本文件时）
 
 本仓库无 `.gitattributes`、`core.autocrlf` 未设，行尾混合。新增或修改 `.md` 时保持 **LF、无 BOM、无 CRLF**；写完用 `git diff --stat` 或 `grep -c $'\r' <file>` 自查（应为 0）。
 
-### 4.6 双远程同时推送：GitHub + Gitee（2026-11-23 配置）
+### 4.6 双远程同时推送：GitHub + Gitee（2026-11-23 配置，2026-11-23 Gitee 恢复）
 
-**配置形态**（`git remote -v` 实测）：
+**配置形态**（`git remote -v` 实测，Gitee 恢复后）：
 
 ```text
 github  https://github.com/FrogMoo/SuperMemory.git (fetch)
 github  https://github.com/FrogMoo/SuperMemory.git (push)
-origin  http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git (fetch)
+origin  http://zrynas.7766.org:8418/Zry/SuperMemory.git (fetch)
 origin  https://github.com/FrogMoo/SuperMemory.git (push)
-origin  http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git (push)
+origin  http://zrynas.7766.org:8418/Zry/SuperMemory.git (push)
 ```
 
 - `origin` 仍是主远程：fetch URL 只有 Gitee，pull / rebase / `refs/remotes/origin/main` 跟踪分支全部只走 Gitee；
@@ -138,29 +139,47 @@ origin  http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git (push)
 
 **顺序即韧性（git 2.55.0 实测）**：git 按 push URL 顺序逐个推送，**首个 URL 失败即中止、不再尝试后续 URL**。因此把可用的 GitHub 排在第一位：Gitee 故障期间 `git push origin main` 仍能把提交推上 GitHub（打印 Gitee 报错后整体 exit 非 0），不会出现「Gitee 挂了 → 两个仓库都收不到提交」。Gitee 恢复后顺序无实际影响。
 
-**当前 Gitee 状态（2026-11-23 实测，服务器端已变，不是凭据问题）**：
+**Gitee 服务器事件时间线（2026-11-22 → 2026-11-23）**：
 
-- 主机可达（`curl` 根路径 HTTP 200），但该 Gitee 服务器 2026-11-22 晚被重置：旧账号 `旧帐号名` 与仓库 `旧帐号名/SuperMemory` 均已不存在（仓库 URL 直接 404；`git ls-remote origin` 报 `remote: user does not exist` / `fatal: repository ... not found`，exit 128）。
-- GCM 里同一邮箱（112***@qq.com）的账号已由用户重新注册为 **旧帐号名 B**（`GET /api/v1/user` 实测：id 8、created 2026-11-22T19:18）；仓库搜索 `SuperMemory` 返回空——新服务器上尚未重建本仓库。
-- **影响**：Gitee 重建之前，`git fetch origin` / `git push origin` / `pnpm git:sync` 全部失败（脚本第 2 步 fetch 即 exit 1）；GitHub 推送与 `git push github main` 不受影响。
-- **Gitee 恢复后的处理**：仓库若仍在旧路径（`旧帐号名/SuperMemory`）则无需任何配置改动；若建在新路径（如 `旧帐号名 B/SuperMemory`），更新两处 URL 并保持 GitHub push URL 在前：
+- **2026-11-22 晚（重置期）**：主机可达（`curl` 根路径 HTTP 200），但旧账号 `旧帐号名` 与仓库 `旧帐号名/SuperMemory` 均不存在（仓库 URL 404；`git ls-remote origin` 报 `remote: user does not exist`，exit 128）。同期在 API 侧还曾短暂出现过帐号 `旧帐号名 B`（id 8）——服务器处于切换/重建的中间态。
+- **2026-11-23（恢复态，本轮实测）**：服务器已重建完成，形态是**帐号改名 + 仓库保留**：
+  - 帐号：旧 `旧帐号名` 已更名为 **`Zry`**（`GET /api/v1/user`：id 1、is_admin、邮箱 437***@qq.com）；旧路径 `旧帐号名/SuperMemory` 对 `/info/refs` 返回 **307 跳转**到 `Zry/SuperMemory`（Gitea 的改名重定向）。
+  - 仓库：`Zry/SuperMemory` **已存在且非空**（id 17、`private:true`、默认分支 `main`、恢复时 `refs/heads/main` = `19032bb`，即 R28 之前的历史快照）——因此**无需建仓**，推送是快进。
+  - 该内网服务实例是 **Gitea**（API 为 `/api/v1/...`，响应带 `full_name`/`clone_url`/`empty` 等 Gitea 字段；`/api/v5/user` 返回 Not found）。
 
-  ```bash
-  git remote set-url origin http://zrynas.7766.org:8418/旧帐号名 B/SuperMemory.git              # fetch URL
-  git remote set-url --delete --push origin http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git   # 删旧 Gitee push URL（同名全删）
-  git remote set-url --add --push origin http://zrynas.7766.org:8418/旧帐号名 B/SuperMemory.git       # 加新 Gitee push URL（排在 GitHub 后）
-  ```
+**Gitee 凭据的一个坑（本轮实测，重要）**：本机 git（2.55.0.windows.3）的 http 传输向凭据助手发送的是 **`host=zrynas.7766.org:8418`（端口嵌在 host 字段里，没有单独的 `port=` 行）**，而 `git credential approve/fill` 手工常用 `host=<主机>` + `port=<端口>` 的写法——两者是**不同的键**。只按后者写入新凭据时，`git credential fill` 显示新帐号，但真实 http 请求仍命中旧键上的旧帐号（表现为 `remote: Repository not found` / `Authentication failed`）。**修复**：按 http 实际使用的键各做一次 approve（并 reject 掉该键上的旧条目）：
 
-  注意 `set-url --delete --push` 删除**全部**同名匹配项；`set-url --add --push` 是追加，重复添加会出现重复推送（无害但不整洁）。
+```bash
+# 1) 嵌入端口键（git http 实际使用的键）
+printf 'protocol=http\nhost=zrynas.7766.org:8418\nusername=<邮箱>\npassword=<口令>\n\n' | git credential approve
+printf 'protocol=http\nhost=zrynas.7766.org:8418\n\n' | git credential reject   # 清掉该键上的全部旧条目
+# 2) host+port 分开的键（git credential fill 的常用写法，保持两者一致）
+printf 'protocol=http\nhost=zrynas.7766.org\nport=8418\nusername=<邮箱>\npassword=<口令>\n\n' | git credential approve
+```
 
-**实测记录（2026-11-23）**：
+排查手法：`git -c 'credential.helper=!<记录脚本>' ls-remote <url>` 配 `GIT_CONFIG_NOSYSTEM=1 HOME=<临时目录>`（让系统级 GCM helper 不抢先返回），即可看到助手真实收到的输入行。口令严禁落盘/进日志（记录时脱敏）。
+
+**Gitee 恢复后的处理（本轮实做）**：仓库建在了新帐号路径下，更新两处 URL 并保持 GitHub push URL 在前：
+
+```bash
+git remote set-url origin http://zrynas.7766.org:8418/Zry/SuperMemory.git                      # fetch URL
+git remote set-url --delete --push origin http://zrynas.7766.org:8418/旧帐号名/SuperMemory.git   # 删旧 Gitee push URL（同名全删）
+git remote set-url --add --push origin http://zrynas.7766.org:8418/Zry/SuperMemory.git         # 加新 Gitee push URL（排在 GitHub 后）
+```
+
+注意 `set-url --delete --push` 删除**全部**同名匹配项；`set-url --add --push` 是追加，重复添加会出现重复推送（无害但不整洁）。
+
+**实测记录（2026-11-23，Gitee 恢复轮）**：
 
 | 操作 | 结果 |
 |---|---|
-| `git push github main` | exit 0，`* [new branch] main -> main`，GitHub `refs/heads/main` = `ea28c78` |
-| `git push --dry-run origin main` | GitHub 先打 `Everything up-to-date`，随后 Gitee `fatal: repository ... not found`，整体 exit 128 |
-| `git push origin main`（真实） | 同上：GitHub 收到推送/已最新，Gitee 失败使整体 exit 128 |
-| 首次同步前 GitHub 状态 | `git ls-remote` exit 0 且无任何 ref——空仓库，无历史冲突，无需 force |
+| `GET /api/v1/user`（Basic 认证） | 200，`login=Zry`、id 1、is_admin、邮箱 437***@qq.com |
+| `GET /api/v1/repos/Zry/SuperMemory` | 200，`private:true`、`empty:false`、默认分支 `main` |
+| `git ls-remote origin`（修好凭据键后） | `2c4b898… refs/heads/main`（修复前是 `remote: Repository not found`，exit 128） |
+| `git fetch origin` | exit 0，`refs/remotes/origin/main` = `19032bb`（本地 ahead 3，纯快进） |
+| `git push origin main` | exit 0：GitHub `Everything up-to-date`，Gitee `19032bb..2c4b898 main -> main` |
+| 三方核对 | 本地 HEAD = `origin/main` = `github main` = `2c4b898` |
+| `git push --dry-run origin main` | 双路均 `Everything up-to-date`，exit 0 |
 
 ## 5. 安全约束与退出码
 
@@ -222,7 +241,7 @@ bash scripts/git-sync-push.sh --dry-run -r origin -b main
 
 ### 7.6 push 认证失败时
 
-不要改 git config / remote URL；检查仓库本地 `credential.helper` 是否仍指向 GCM（`git config --get credential.helper`），以及 Windows 凭据管理器里是否还有 `zrynas.7766.org:8418` 的条目（§4.1 / §4.4）。脚本直接用仓库本地 GCM，不再使用 `~/.git-credentials`。GitHub 侧凭据同样由 GCM 托管（Windows 凭据存储中的 `github.com` 条目，实测用户名 FrogMoo），两个远程的凭据相互独立。若报错是 `remote: user does not exist` 或仓库 404（Gitee 服务器 2026-11-22 已重置），那不是凭据问题，见 §4.6。
+不要改 git config / remote URL；检查仓库本地 `credential.helper` 是否仍指向 GCM（`git config --get credential.helper`），以及 Windows 凭据存储里 `zrynas.7766.org:8418` 的条目是否是新帐号（§4.1 / §4.4——注意同一主机有两个键，见 §4.4 的「键的坑」）。脚本直接用仓库本地 GCM，不再使用 `~/.git-credentials`。GitHub 侧凭据同样由 GCM 托管（Windows 凭据存储中的 `github.com` 条目，实测用户名 FrogMoo），两个远程的凭据相互独立。若报错是 `remote: user does not exist` 或仓库 404（Gitee 侧 2026-11-22 曾被重置，2026-11-23 已恢复为 `Zry/SuperMemory`），服务器/路径问题见 §4.6 时间线。
 
 ## 8. 实测记录（2026-11-18）
 
