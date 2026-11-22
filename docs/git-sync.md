@@ -284,3 +284,38 @@ ahead/behind    : 0 / 0
 ## 9. 相关 skill
 
 本流程已固化为本地 skill `git-sync-supermemory`（路由指令：命中「同步 git / 提交推送 / git sync / 检查未提交文件并推送」类请求时，引导走本脚本 + 本文档）。
+
+## 10. 推送帐号切换为 437***@qq.com（2026-11-23，集成准备轮）
+
+用户裁决：推送改用帐号 437***@qq.com（服务器侧登录名 **`Zry`**，即 `Zry/SuperMemory` 的属主，is_admin）。口令只进 Windows GCM，不写入任何文件/记忆/汇报。
+
+### 10.1 API 实测（Basic 认证）
+
+| 端点 | 结果 |
+|---|---|
+| `GET /api/v1/user` | 200：`login=Zry`、id 1、`is_admin=true`、active、prohibit_login=false |
+| `GET /api/v1/repos/Zry/SuperMemory` | 200：id 17、private、非空、默认分支 main；`permissions={admin:true,push:true,pull:true}` |
+
+该帐号对目标仓库有完整权限，**无需**改 origin URL、无需建仓。
+
+### 10.2 凭据键操作要点（承接 §4.4 的「键的坑」）
+
+- 两个键都要 approve 新帐号：`host=zrynas.7766.org:8418`（端口嵌 host，git http 实际使用）+ `host=zrynas.7766.org` 配 `port=8418`（`git credential fill` 常用写法）。
+- **清旧条目必须带旧用户名**（靶向 erase）：`printf 'protocol=http\nhost=zrynas.7766.org:8418\nusername=<旧邮箱>\n\n' | git credential reject`。**不要**用不带用户名的 `git credential reject`——那会erase 该键下全部条目（含刚写入的新帐号），与「先写新的、验证可用再清旧的」相悖。
+- 排查提示：`git credential fill` **带一个不存在的用户名会挂住**（GCM 走交互式查找，无终端时一直等）——探测旧条目别这么干，直接靶向 reject（带超时）即可。
+- 清理后两个键 `fill` 均返回新帐号，旧帐号（112***@qq.com / 旧帐号名 B 期）条目已 reject。
+
+### 10.3 双推验证（2026-11-23 实测）
+
+| 时间 | 操作 | 结果 |
+|---|---|---|
+| 17:49Z | `git push origin main`（双推，当时 HEAD=af768d7） | exit 0，两侧 Everything up-to-date |
+| 18:0xZ | 中枢实推 R30 提交：`git push http://zrynas.7766.org:8418/Zry/SuperMemory.git main` | `af768d7..a0c1b75 main -> main` exit 0——新帐号推送端到端验证通过 |
+| 持续 | GitHub 半边（`git ls-remote/push https://github.com/...`） | git 传输连接被重置（curl 通、git 被 reset，瞬时网络故障）；待恢复后补推 `git push https://github.com/FrogMoo/SuperMemory.git main` |
+
+故障期按侧分别推送（先 Gitea 保底）的原因：git 2.55 首个 push URL 失败即中止、不尝试后续（origin push 排位 GitHub 首位，故 GitHub 故障时会连带看不到 Gitea 结果）。
+
+- `GIT_TERMINAL_PROMPT=0 git push origin main`（GitHub 首位 + Gitea）：**双侧 `Everything up-to-date`，exit 0**（HEAD=af768d7，无新提交可推）。
+- 单侧复验 `git push http://zrynas.7766.org:8418/Zry/SuperMemory.git main`：**`Everything up-to-date`，exit 0** —— 新帐号推送链路（GCM 双键 → 鉴权 → 推送）实测可用。
+- 单侧复验 GitHub：当时 `github.com` 网络不可达（git/curl 均 connect timeout，curl 也曾瞬时成功过一次）——**网络瞬时故障，非凭据/配置问题**；GCM 中 GitHub 凭据（FrogMoo）完好，网络恢复后 GitHub 半边自动恢复。git 2.55 语义下首位 URL 失败即中止，故障期双推会整体 exit 128（韧性设计见 §4.6）。
+- 结论：Gitea 侧帐号切换完成并验证；GitHub 侧待网络恢复（无需任何配置改动）。
