@@ -46,11 +46,18 @@ export const PANEL_REMOTE = Object.freeze({
     method('updateMemory', [param('cwd'), param('id'), param('text'), param('key', true), param('title', true), param('tags', true)]),
     method('deleteMemory', [param('cwd'), param('id')]),
     method('setMemoryStatus', [param('cwd'), param('id'), param('status')]),
+    // R30 需求②: 记忆页签两级页——集合卡片统计 / 集合内条目 / 记忆详情（含历史版本）。
+    method('listMemoryCollections', [param('cwd')]),
+    method('listMemoriesByCollection', [param('cwd'), param('collectionId'), param('query', true), param('limit', true)]),
+    method('getMemoryDetail', [param('cwd'), param('id')]),
     method('createTopicSet', [param('cwd'), param('title'), param('tags', true), param('summary', true)]),
     method('suggestMemoryShape', [param('text')]),
     method('listHubSessions', [param('cwd')]),
     // R19 协同②: hub → branches association (name / state / shared / set).
     method('listHubBranches', [param('cwd'), param('hubSessionId'), param('limit', true)]),
+    // R30 需求③: 中枢管理全部话题集（含归档）+ 查看全部分支会话（跨话题集）。
+    method('listAllTopicSets', [param('cwd')]),
+    method('listAllBranches', [param('cwd'), param('topicSetId', true), param('limit', true)]),
     // R19 需求⑤: in-panel conversation (read surface + send followup).
     method('readSessionMessages', [param('sessionId'), param('limit', true)]),
     method('sendSessionMessage', [param('sessionId'), param('text')]),

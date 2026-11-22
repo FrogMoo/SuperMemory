@@ -18,6 +18,11 @@ import {
   resolveCollectionForEntry, touchCollection,
   type CollectionAssignment, type MemoryConflictFinding,
 } from './memory-collections.ts'
+// R30 需求①: 版本化写路径的唯一入口（就地更新 + 升版 + 历史归档）。
+import {
+  createMemoryVersioned, currentVersionOf, findMemoryByKey, memoryContentUnchanged, memoryHistoryOf,
+  memoryVersionsSupported, migrateMemoryVersions, updateMemoryVersioned,
+} from './memory-versions.ts'
 // R27 需求④.2: 一条写入整形为 1..N 条原子记忆（无模型时保持 1 条）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
@@ -84,7 +89,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         + '记忆按「记忆集合 + 条目」组织：集合归属由大模型在候选集合中判定（加到某个已有集合，还是新建一个；无模型时退化为标题/标签/正文相似度匹配，'
         + '高/中相似直接复用该集合并追加条目，低相似才新建集合）；可用 collection 指定集合标题、collectionId 指定集合 id。'
         + '一条写入若含多个事实，会先被整形为多条原子记忆（每条独立标题/标签/正文，最多 5 条，回执的 entries 逐条说明归入哪个集合）。'
-        + '同一 key 已存不同文本时返回冲突提示（不覆盖），由你向用户裁决。',
+        + '版本控制（R30）：同一 key 且内容不同 → 就地更新该记忆并 version+1（旧版本归档进 memory_versions，可用 memory_history 溯源）；'
+        + '同一 key 且内容相同 → 幂等返回、不升版；无 key → 新建 v1 并写入历史。',
       parameters: {
         text: { type: 'string', required: true, description: '结论正文（自包含、可复用的事实/决策；不要过程流水账）' },
         key: { type: 'string', description: '可选稳定键；同一事实更新时传相同 key' },
@@ -107,6 +113,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
             memoryId: { type: 'string' },
             title: { type: 'string' },
             tags: { type: 'array', items: { type: 'string' } },
+            // R30 需求①: 该记忆的当前版本号（updated=升版后的新版本号）。
+            version: { type: 'integer', description: '当前记忆的版本号（同 key 更新后为升版后的新版本）' },
             // R22 需求④⑤: which memory collection the entry landed in, and how.
             collectionId: { type: 'string', description: '所属记忆集合 id' },
             collectionTitle: { type: 'string', description: '所属记忆集合标题' },
@@ -174,6 +182,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         // where this entry goes — a reused collection must include the entries
         // that already exist for the same tags/title.
         await migrateFlatMemories(store, workspaceKey, now)
+        // R30 需求①: 旧记忆补 v1 历史（幂等；没有历史表时自动跳过）。
+        await migrateMemoryVersions(store, workspaceKey, now)
 
         // R27 需求④.2: 一条写入先「整形」为 1..N 条原子记忆。有模型时才调用
         // （一次；无模型/预判不通过/失败都保持 1 条，与旧行为一致）。
@@ -194,30 +204,86 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           tags: string[]
           assignment: CollectionAssignment
         }> = []
+        // R30 需求①: 同 key 就地更新（version+1，旧版本归档）的结果。
+        const updated: Array<{
+          memoryId: string
+          title: string
+          text: string
+          tags: string[]
+          version: number
+          assignment: CollectionAssignment
+        }> = []
         const duplicates: MemoryConflictFinding[] = []
         for (const entry of entries) {
-          // 同 key 判重/冲突逐条进行；拆分后每条是独立事实，调用方的单个 key
-          // 无法标识 N 行，因此只按正文判重（避免第二条误判成 key 冲突）。
-          const existing = findMemoryConflict(store, workspaceKey, split
-            ? { text: entry.text }
-            : { text: entry.text, ...(key ? { key } : {}) })
-          if (existing) {
-            if (existing.kind === 'conflict') {
+          const entryTags = mergeTags(entry.tags, tags)
+          // R30 需求①: 同 key 且存在 → 就地更新 + 升版（取代旧的「冲突不覆盖」）。
+          // 拆分后每条是独立事实，调用方的单个 key 无法标识 N 行，因此只有
+          // 未拆分写入才走同 key 更新。
+          const sameKey = !split && key ? findMemoryByKey(store, workspaceKey, key) : undefined
+          if (sameKey) {
+            const [memoryId, existing] = sameKey
+            // 幂等快速判定：内容三要素都没变、调用方也没指定集合时，直接回报
+            // 「未重复写入」——先不解析集合归属，避免顺手新建一个空集合。
+            if (!args.collectionId && !args.collection
+              && memoryContentUnchanged(existing, { title: entry.title, text: entry.text, tags: entryTags })) {
               return {
-                status: 'conflict' as const,
-                memoryId: existing.memoryId,
-                title: existing.title,
-                tags: existing.tags,
+                status: 'duplicate' as const,
+                memoryId,
+                title: existing.title ?? '',
+                tags: [...(existing.keywords ?? [])],
+                version: currentVersionOf(existing),
                 ...(existing.collectionId ? { collectionId: existing.collectionId } : {}),
-                ...(existing.collectionTitle ? { collectionTitle: existing.collectionTitle } : {}),
-                message: `key「${key}」已存不同内容：「${renderRecordLine({ title: existing.title, text: existing.text, tags: existing.tags })}」。请与用户裁决后再写入。`,
-                conflict: { memoryId: existing.memoryId, text: existing.text },
+                message: `该 key 已存相同内容，未重复写入（当前 v${currentVersionOf(existing)}）。`,
               }
             }
+            const assignment = await resolveCollectionForEntry(
+              store, workspaceKey, { title: entry.title, keywords: entryTags, text: entry.text }, {
+                ...(args.collectionId ? { collectionId: String(args.collectionId) } : {}),
+                ...(args.collection ? { collection: String(args.collection) } : {}),
+                now,
+                deps: decisionDeps,
+              },
+            )
+            if ('error' in assignment) {
+              return {
+                status: 'conflict' as const,
+                message: assignment.error
+                  + (assignment.candidates && assignment.candidates.length > 0
+                    ? `候选集合：${assignment.candidates.map((c) => `「${c.title}」(${c.collectionId})`).join('、')}`
+                    : ''),
+              }
+            }
+            const result = await updateMemoryVersioned(store, workspaceKey, memoryId, {
+              title: entry.title, text: entry.text, tags: entryTags,
+              ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+            }, now)
+            if (!result) {
+              return { status: 'conflict' as const, message: `key「${key}」对应的记忆不存在或不属于当前工作区。` }
+            }
+            if (result.status === 'unchanged') {
+              // 幂等：同 key 同内容 → 不升版、不写历史。
+              return {
+                status: 'duplicate' as const,
+                memoryId,
+                title: existing.title ?? '',
+                tags: [...(existing.keywords ?? [])],
+                version: result.version,
+                ...(existing.collectionId ? { collectionId: existing.collectionId } : {}),
+                ...(existing.collectionId ? { collectionTitle: assignment.title } : {}),
+                message: `该 key 已存相同内容，未重复写入（当前 v${result.version}）`
+                  + (assignment.title ? `（所属集合「${assignment.title}」）` : ''),
+              }
+            }
+            if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
+            updated.push({ memoryId, title: entry.title, text: entry.text, tags: entryTags, version: result.version, assignment })
+            continue
+          }
+          // 无 key（或拆分写入）：按正文判重，相同内容不重复写入。
+          const existing = findMemoryConflict(store, workspaceKey, { text: entry.text })
+          if (existing) {
             duplicates.push(existing)
             continue
           }
-          const entryTags = mergeTags(entry.tags, tags)
           // R22 需求⑤ + R27 需求④.3: prefer an existing related collection over
           // opening a new one; with a model available the MODEL decides which
           // candidate to reuse (or that a new set is warranted).
@@ -238,25 +304,42 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
                   : ''),
             }
           }
-          const memoryId = newId('mem')
-          const memory: Memory = {
-            workspaceKey, title: entry.title, text: entry.text,
-            keywords: entryTags,
+          const memoryId = await createMemoryVersioned(store, workspaceKey, {
+            title: entry.title, text: entry.text, tags: entryTags,
             // A split write stores independent facts; the caller's single key
             // cannot identify N rows, so it is not carried over.
             ...(!split && key ? { key } : {}),
             ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
             sourceSessionId: String((exec.agent as { id?: string } | undefined)?.id ?? 'tool'),
             sourceSeq: 0,
-            status: 'active', createdAt: now, updatedAt: now,
-          }
-          await store.memories.put(memoryId, memory)
+          }, now)
           if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
           stored.push({ memoryId, title: entry.title, text: entry.text, tags: entryTags, assignment })
         }
 
+        // R30 需求①: 同 key 就地更新 —— 回执报「已更新到 vN」（附集合归属说明）。
+        if (updated.length > 0 && stored.length === 0) {
+          const row = updated[0]
+          const tierNote = collectionTierNote(row.assignment)
+          const line = renderRecordLine({
+            title: row.title, text: row.text, tags: row.tags, collection: row.assignment.title,
+          })
+          return {
+            status: 'updated' as const,
+            memoryId: row.memoryId,
+            title: row.title,
+            tags: row.tags,
+            version: row.version,
+            ...(row.assignment.collectionId ? { collectionId: row.assignment.collectionId } : {}),
+            ...(row.assignment.title ? { collectionTitle: row.assignment.title } : {}),
+            collectionTier: row.assignment.tier,
+            collectionCreated: row.assignment.created,
+            message: `已更新到 v${row.version}（旧版本已归档，可用 memory_history 溯源）：${tierNote === null ? line : `${tierNote} → ${line}`}`,
+          }
+        }
+
         if (stored.length === 0) {
-          // 拆分后每条都已存在：与旧行为一致地回报 duplicate，不写任何行。
+          // 每条都已存在：与旧行为一致地回报 duplicate，不写任何行。
           const found = duplicates[0]
           return {
             status: 'duplicate' as const,
@@ -266,8 +349,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
             ...(found.collectionId ? { collectionId: found.collectionId } : {}),
             ...(found.collectionTitle ? { collectionTitle: found.collectionTitle } : {}),
             ...(split ? { split: entries.length } : {}),
-            message: (key && !split ? '该 key 已存相同内容，未重复写入。' : '相同记忆已存在，未重复写入。')
-              + (!split && found.collectionTitle ? `（所属集合「${found.collectionTitle}」）` : '')
+            message: '相同记忆已存在，未重复写入。'
+              + (found.collectionTitle ? `（所属集合「${found.collectionTitle}」）` : '')
               + (split ? `（已拆分为 ${entries.length} 条，均已存在）` : ''),
           }
         }
@@ -284,6 +367,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           memoryId: first.memoryId,
           title: first.title,
           tags: first.tags,
+          // R30 需求①: 新建记忆的版本号（v1，历史行同步归档）。
+          version: 1,
           ...(first.assignment.collectionId ? { collectionId: first.assignment.collectionId } : {}),
           ...(first.assignment.title ? { collectionTitle: first.assignment.title } : {}),
           collectionTier: first.assignment.tier,
@@ -310,7 +395,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
     description: '检索 SuperMemory：结论性事实记忆（memories）、归档梗概（episodes）、需求（requirements）与项目文件地图（filemap），按当前工作区隔离，'
       + '关键词 + 时间衰减规则评分。回答"之前说过什么/做过什么"类问题前先用本工具检索；记忆只存结论，不是过程日志。'
       + '记忆采用两级检索：先按查询匹配「记忆集合」，再在集合内精选条目（标题×4/标签×3/正文×1 + 集合级上下文），'
-      + '命中的记忆条目会带上所属集合的 id/标题/标签；collections 是命中的记忆集合（按分排序）。'
+      + '命中的记忆条目会带上所属集合的 id/标题/标签与 version（当前版本号；历史版本用 memory_history 溯源）；'
+      + 'collections 是命中的记忆集合（按分排序）。'
       + '返回的 topicSets 是命中的话题集（结论属于哪个集），命中时优先直接回答或把任务派发到该集，不要重复检索。',
     parameters: {
       query: { type: 'string', required: true, description: '检索问题或关键词' },
@@ -331,6 +417,8 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
                 title: { type: 'string', description: '标题：检索命中的索引字段，优先阅读' },
                 tags: { type: 'array', items: { type: 'string' }, description: '标签' },
                 text: { type: 'string', required: true, description: '正文' },
+                // R30 需求①: recall 只返回当前版本；version 供溯源（memory_history）。
+                version: { type: 'integer', description: '当前记忆的版本号（仅 memory 类条目）' },
                 // R22 需求④: the memory collection this entry belongs to.
                 collectionId: { type: 'string', description: '所属记忆集合 id（未归集时为空）' },
                 collectionTitle: { type: 'string', description: '所属记忆集合标题' },
@@ -413,15 +501,22 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         collectionId?: string
         collectionTitle?: string
         collectionTags?: string[]
+        /** R30 需求①: 该记忆的当前版本号（recall 只返回当前版本）。 */
+        version?: number
       }> = []
       // R22 需求④⑤: two-stage retrieval — legacy flat records are folded into
       // collections first, then stage 1 ranks collections and stage 2 ranks the
       // entries (direct title/tag/body score + collection-level context).
       await migrateFlatMemories(store, workspaceKey, options.now)
+      // R30 需求①: 旧记忆补 v1 历史（幂等；没有历史表时自动跳过）。
+      await migrateMemoryVersions(store, workspaceKey, options.now)
       const collections = listCollections(store, workspaceKey)
       const memories: Array<[string, Memory]> = []
+      const versions = new Map<string, number>()
       for (const entry of store.memories.entries()) {
-        if (entry[1].workspaceKey === workspaceKey && entry[1].status === 'active') memories.push(entry)
+        if (entry[1].workspaceKey !== workspaceKey || entry[1].status !== 'active') continue
+        memories.push(entry)
+        versions.set(entry[0], currentVersionOf(entry[1]))
       }
       const collectionRecall = recallEntriesWithCollections(collections, memories, query, options)
       for (const item of collectionRecall.items) {
@@ -431,6 +526,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           collectionId: item.collectionId,
           collectionTitle: item.collectionTitle,
           collectionTags: item.collectionTags,
+          version: versions.get(item.memoryId) ?? 1,
         })
       }
       // Workspace isolation (D4): episodes have no workspaceKey of their own —
@@ -446,7 +542,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       for (const item of recallMemories(
         episodes.map(([id, episode]) => [id, {
           workspaceKey: '', title: '', text: episode.summary, keywords: [], sourceSessionId: episode.sourceSessionId,
-          sourceSeq: episode.sourceSeqStart, status: 'active' as const, createdAt: episode.timeStart, updatedAt: episode.timeEnd,
+          sourceSeq: episode.sourceSeqStart, status: 'active' as const, version: 1, createdAt: episode.timeStart, updatedAt: episode.timeEnd,
         }]),
         query, options,
       )) {
@@ -459,7 +555,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       for (const item of recallMemories(
         requirements.map(([id, req]) => [id, {
           workspaceKey: req.workspaceKey, title: '', text: req.text, keywords: req.constraints, sourceSessionId: req.sourceSessionId,
-          sourceSeq: req.sourceSeq, status: 'active' as const, createdAt: req.createdAt, updatedAt: req.createdAt,
+          sourceSeq: req.sourceSeq, status: 'active' as const, version: 1, createdAt: req.createdAt, updatedAt: req.createdAt,
         }]),
         query, options,
       )) {
@@ -476,7 +572,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           title: entry.path,
           text: `${entry.role ? entry.role + '：' : ''}${entry.summary}`.trim() || entry.path,
           keywords: entry.keywords,
-          sourceSessionId: '', sourceSeq: 0, status: 'active' as const, createdAt: entry.annotatedAt, updatedAt: entry.annotatedAt,
+          sourceSessionId: '', sourceSeq: 0, status: 'active' as const, version: 1, createdAt: entry.annotatedAt, updatedAt: entry.annotatedAt,
         }]),
         query, options,
       )) {
@@ -493,6 +589,103 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
         collections: collectionRecall.collections.map((match) => ({
           id: match.collectionId, title: match.title, tags: match.keywords, score: match.score, tier: match.tier,
         })),
+      }
+    },
+  })))
+
+  // R30 需求①: 记忆版本历史（溯源）。同一 key 的就地更新会把旧版本归档进
+  // memory_versions，本工具按 key 或 memoryId 读出全部版本。
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'memory_history',
+    description: '查看一条记忆的全部历史版本（版本号/时间/标题/标签/正文/changeType），用于溯源「这个结论以前是什么」。'
+      + '入参 key 或 memoryId 二选一（都不传时返回空）。memory_recall 只返回当前版本；本工具返回该记忆的完整版本序列。',
+    parameters: {
+      key: { type: 'string', description: '记忆的稳定键（与 memory_remember 的 key 一致）' },
+      memoryId: { type: 'string', description: '记忆 id（memory_recall 回执里的 id）' },
+      limit: { type: 'integer', description: '返回版本数上限，默认 20' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          memoryId: { type: 'string', required: true },
+          title: { type: 'string', description: '当前标题' },
+          currentVersion: { type: 'integer', required: true },
+          versions: {
+            type: 'array',
+            required: true,
+            description: '全部历史版本（按版本号升序；最后一条即当前版本）',
+            items: {
+              type: 'object',
+              properties: {
+                version: { type: 'integer', required: true },
+                updatedAt: { type: 'integer', required: true },
+                title: { type: 'string' },
+                tags: { type: 'array', items: { type: 'string' } },
+                text: { type: 'string', required: true },
+                changeType: { type: 'string', enum: ['create', 'update', 'migrate'] },
+                collectionId: { type: 'string' },
+              },
+              additionalProperties: false,
+            },
+          },
+          total: { type: 'integer', required: true },
+          message: { type: 'string', required: true },
+        },
+        additionalProperties: false,
+      },
+      render: (_args, value) => [{ type: 'text', text: String((value as { message?: string }).message ?? '') }],
+    },
+    async execute(args: { key?: string; memoryId?: string; limit?: number }, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      if (!cwd) return { memoryId: '', currentVersion: 0, versions: [], total: 0, message: '无法确定当前工作区（agent 会话缺少 cwd）。' }
+      const workspaceKey = workspaceKeyOf(cwd)
+      const key = args.key?.trim() || undefined
+      const memoryId = args.memoryId?.trim() || undefined
+      if (!key && !memoryId) {
+        return { memoryId: '', currentVersion: 0, versions: [], total: 0, message: '请给出 key 或 memoryId（二选一）。' }
+      }
+      let found: [string, Memory] | undefined
+      if (memoryId) {
+        const record = store.memories.get(memoryId)
+        if (record && record.workspaceKey === workspaceKey) found = [memoryId, record]
+      }
+      if (!found && key) found = findMemoryByKey(store, workspaceKey, key)
+      if (!found) {
+        return {
+          memoryId: memoryId ?? '', currentVersion: 0, versions: [], total: 0,
+          message: `没有找到记忆${key ? `（key「${key}」）` : `（id ${memoryId}）`}：它可能不属于当前工作区，或已被删除。`,
+        }
+      }
+      const [id, memory] = found
+      const cap = Math.max(1, Math.min(50, Number(args.limit) || 20))
+      let rows = memoryHistoryOf(store, id)
+      if (rows.length === 0) {
+        // 旧记忆若还没补 v1 历史（例如从未 recall/remember 过），先惰性补齐再读。
+        await migrateMemoryVersions(store, workspaceKey)
+        rows = memoryHistoryOf(store, id)
+      }
+      const current = currentVersionOf(memory)
+      const versions = rows.slice(-cap).map((row) => ({
+        version: row.version,
+        updatedAt: row.updatedAt,
+        title: row.title ?? '',
+        tags: [...(row.tags ?? [])],
+        text: row.text,
+        changeType: row.changeType,
+        ...(row.collectionId ? { collectionId: row.collectionId } : {}),
+      }))
+      const title = memory.title ?? ''
+      const noHistory = memoryVersionsSupported(store) ? '' : '（当前存储域没有 memory_versions 表，无法提供历史）'
+      const lines = versions.map((row) =>
+        `v${row.version}（${new Date(row.updatedAt).toLocaleString('zh-CN', { hour12: false })}，${row.changeType}）${row.title ? ` ${row.title}` : ''}：${row.text.slice(0, 80)}${row.text.length > 80 ? '…' : ''}`)
+      return {
+        memoryId: id,
+        title,
+        currentVersion: current,
+        versions,
+        total: versions.length,
+        message: `「${title || id}」共 ${versions.length} 个版本（当前 v${current}）${noHistory}：\n${lines.join('\n') || '（无历史行）'}`,
       }
     },
   })))

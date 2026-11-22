@@ -16,7 +16,7 @@ import { PANEL_REMOTE } from './remote.ts'
 import { en, NS, zh } from './locales.ts'
 import { SupermemoryIcon } from './icon.tsx'
 import { SupermemoryPanelPage } from './panel-page.tsx'
-import type { HubBranchView, HubSessionView, MemoryShape, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
+import type { HubBranchView, HubSessionView, MemoryCollectionView, MemoryDetailView, MemoryShape, MemoryView, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
 import { NewSessionChoice } from './new-session.tsx'
 import { SupermemorySessionBadge, invalidateBadge } from './session-badge.tsx'
 
@@ -61,10 +61,18 @@ function buildApi(ctx: Context): PanelApi | undefined {
     updateMemory: (cwd, id, text, key, title, tags) => call('updateMemory', cwd, id, text, key, title, tags),
     deleteMemory: (cwd, id) => call('deleteMemory', cwd, id),
     setMemoryStatus: (cwd, id, status) => call('setMemoryStatus', cwd, id, status),
+    // R30 需求②: 记忆页签两级页——集合卡片统计 / 集合内条目 / 记忆详情（含历史版本）。
+    listMemoryCollections: (cwd) => call<MemoryCollectionView[]>('listMemoryCollections', cwd),
+    listMemoriesByCollection: (cwd, collectionId, query) => call<MemoryView[]>('listMemoriesByCollection', cwd, collectionId, query, 200),
+    getMemoryDetail: (cwd, id) => call<MemoryDetailView | undefined>('getMemoryDetail', cwd, id),
     createTopicSet: (cwd, title, tags, summary) => call('createTopicSet', cwd, title, tags, summary),
     listHubSessions: (cwd) => call<HubSessionView[]>('listHubSessions', cwd),
     // R19 协同②: the hub's branch association (read model over dispatches).
     listHubBranches: (cwd, hubSessionId, limit) => call<HubBranchView[]>('listHubBranches', cwd, hubSessionId, limit),
+    // R30 需求③: the hub manages EVERY topic set (archived included) and sees
+    // every branch session across sets (optionally filtered to one set).
+    listAllTopicSets: (cwd) => call<TopicSetView[]>('listAllTopicSets', cwd),
+    listAllBranches: (cwd, topicSetId, limit) => call<HubBranchView[]>('listAllBranches', cwd, topicSetId, limit),
     // R19 需求⑤: in-panel conversation (host reads sessionQuery.readSurface).
     readSessionMessages: (sessionId, limit) => call<SessionChatView>('readSessionMessages', sessionId, limit),
     sendSessionMessage: (sessionId, text) => call<MutationResult>('sendSessionMessage', sessionId, text),

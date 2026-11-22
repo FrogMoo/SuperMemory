@@ -34,8 +34,15 @@ import type { Store } from './store.ts'
 /** One branch as a hub sees it. */
 export interface HubBranchView {
   branchSessionId: string
-  /** The branch's topic-set member title (stable first name), else the task excerpt. */
+  /**
+   * The branch's display title (R30 需求④): the newest dispatch's explicit
+   * title (the task's first line) when recorded, else the topic-set member
+   * title, else the task excerpt. One field, so the hub card, the panel rows
+   * and the web console show the same name.
+   */
   title: string
+  /** R30 需求④: the branch's tags (话题集标签 + 轮次 + 任务性质 + 能力档位). */
+  tags: string[]
   /** The latest task dispatched into the branch. */
   task: string
   /** Hub that owns the row being projected (for a shared branch: one of them). */
@@ -149,10 +156,18 @@ function projectBranch(
     ...rows.map((row) => Math.max(Number(row.updatedAt) || 0, Number(row.lastActivityAt) || 0)),
     Number(member?.lastActiveAt) || 0,
   )
-  const title = (member?.title ?? '').trim() || taskExcerpt(latest.task, BRANCH_CARD_EXCERPT_CHARS)
+  // R30 需求④: the newest dispatch row carries the explicit title/tags
+  // (schema.ts). Newest NON-EMPTY wins: a row without them (pre-R30 media, an
+  // externally written row) must not erase a title the branch already earned.
+  const titled = sorted.find((row) => String(row.title ?? '').trim())
+  const tagged = sorted.find((row) => (row.tags ?? []).length > 0)
+  const explicitTitle = String(titled?.title ?? '').trim()
+  const title = explicitTitle || (member?.title ?? '').trim() || taskExcerpt(latest.task, BRANCH_CARD_EXCERPT_CHARS)
+  const tags = [...(tagged?.tags ?? [])]
   const view: HubBranchView = {
     branchSessionId,
     title,
+    tags,
     task: latest.task,
     hubSessionId: latest.hubSessionId,
     status,
@@ -333,32 +348,59 @@ export function openBranchIds(store: Store | undefined, hubSessionId: string): S
  * 20-branch list would tax every turn. It is omitted entirely when the hub has
  * no associated branch, and it always ends with the dispatch rule that keeps the
  * hub from re-dispatching a branch that is merely idle.
+ *
+ * R30 需求⑤.2: when the round's recall matched topic sets, the card also carries
+ * those sets' branch lists (标题/标签/状态/最后活动) — the "按话题集检索其下分支
+ * 会话" half of the retrieval routing, read from the durable ledger (no host
+ * call). Bounded like the hub section: at most the caller's sections, each
+ * capped at `maxItems` rows.
  */
 export function renderHubBranchesCard(
   rows: HubBranchView[],
-  options: { now?: number; maxItems?: number } = {},
+  options: {
+    now?: number
+    maxItems?: number
+    /** Matched topic sets whose branches ride the same card (R30 需求⑤.2). */
+    topicSets?: Array<{ title: string; rows: HubBranchView[] }>
+  } = {},
 ): string {
-  if (rows.length === 0) return ''
   const now = options.now ?? Date.now()
   const maxItems = Math.max(1, Math.min(HUB_BRANCH_LIMIT, options.maxItems ?? 8))
-  const working = rows.filter((row) => row.status === 'working').length
-  const failed = rows.filter((row) => row.status === 'failed').length
-  const lines: string[] = [
-    '[supermemory 关联分支] 本会话在该话题集拉起的分支：',
-  ]
-  for (const row of rows.slice(0, maxItems)) {
-    const status = row.status === 'working' ? '工作中' : row.status === 'failed' ? '失败待处理' : '空闲'
-    const parts = [
-      `${status}`,
-      row.topicSetTitle ? `话题集「${row.topicSetTitle}」` : '无话题集',
-      relativeAgo(row.lastActivityAt, now),
-    ]
-    if (row.shared) parts.push(`与另外 ${row.hubs.length - 1} 个中枢共享`)
-    lines.push(`- ${row.title}（${parts.join(' · ')}）`)
+  const setSections = (options.topicSets ?? []).filter((section) => section.rows.length > 0)
+  if (rows.length === 0 && setSections.length === 0) return ''
+  const lines: string[] = []
+  if (rows.length > 0) {
+    const working = rows.filter((row) => row.status === 'working').length
+    const failed = rows.filter((row) => row.status === 'failed').length
+    lines.push('[supermemory 关联分支] 本会话在该话题集拉起的分支：')
+    for (const row of rows.slice(0, maxItems)) {
+      const status = row.status === 'working' ? '工作中' : row.status === 'failed' ? '失败待处理' : '空闲'
+      const parts = [
+        `${status}`,
+        row.topicSetTitle ? `话题集「${row.topicSetTitle}」` : '无话题集',
+        relativeAgo(row.lastActivityAt, now),
+      ]
+      // R30 需求④: tags are part of the branch's identity now (标题 + 标签).
+      if (row.tags.length > 0) parts.push(`标签 ${row.tags.join(' / ')}`)
+      if (row.shared) parts.push(`与另外 ${row.hubs.length - 1} 个中枢共享`)
+      lines.push(`- ${row.title}（${parts.join(' · ')}）`)
+    }
+    if (rows.length > maxItems) lines.push(`- …另有 ${rows.length - maxItems} 个分支（面板可查看全部）`)
+    lines.push(`共 ${rows.length} 个分支：${working} 工作中 / ${failed} 失败 / ${rows.length - working - failed} 空闲。`)
+    lines.push('继续同一分支用 mode=continue（忙则排队）；并行新任务用 tasks[]，每个任务独占一个分支并统一汇总。')
   }
-  if (rows.length > maxItems) lines.push(`- …另有 ${rows.length - maxItems} 个分支（面板可查看全部）`)
-  lines.push(`共 ${rows.length} 个分支：${working} 工作中 / ${failed} 失败 / ${rows.length - working - failed} 空闲。`)
-  lines.push('继续同一分支用 mode=continue（忙则排队）；并行新任务用 tasks[]，每个任务独占一个分支并统一汇总。')
+  for (const section of setSections) {
+    lines.push('')
+    lines.push(`话题集「${section.title}」的分支（按话题集检索，可继续/复用）：`)
+    for (const row of section.rows.slice(0, maxItems)) {
+      const status = row.status === 'working' ? '工作中' : row.status === 'failed' ? '失败待处理' : '空闲'
+      const parts = [status, relativeAgo(row.lastActivityAt, now)]
+      if (row.tags.length > 0) parts.push(`标签 ${row.tags.join(' / ')}`)
+      if (row.shared) parts.push(`与另外 ${row.hubs.length - 1} 个中枢共享`)
+      lines.push(`- ${row.title}（${parts.join(' · ')}）`)
+    }
+    if (section.rows.length > maxItems) lines.push(`- …另有 ${section.rows.length - maxItems} 个分支（面板可查看全部）`)
+  }
   return lines.join('\n')
 }
 

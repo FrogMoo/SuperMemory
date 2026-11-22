@@ -1444,6 +1444,125 @@ const { groupRelayText } = await import('../src/group.ts')
   ok('R19-协同2/3 面板投影：中枢分支列表 + 共享计数 + 所属话题集 + 工作区过滤')
 }
 
+// ---- R30 需求③④⑥: 中枢管理视图 / 分支标题+标签 / 派发脚本带中枢会话 id ----
+// DSH sessions carry a native TITLE but no tags (verified in dsh-session-title),
+// so the branch's 标题/标签 live on the dispatch record and are projected by
+// hub-branches.ts into the hub card, the panel rows and the web console.
+{
+  const nodePath3 = await import('node:path')
+  const WS3 = nodePath3.resolve('ws-r30b')
+  const now3 = Date.now()
+  const { branchTitleFor, branchTagsFor, roundTokensOf, latestBranchMeta } = await import('../src/branch-meta.ts')
+  assert.equal(branchTitleFor('## 【R30-B：中枢-分支协同】\n第二行'), 'R30-B：中枢-分支协同', '标题取任务首行（去标记）')
+  assert.ok(Array.from(branchTitleFor('任'.repeat(80))).length <= 48, '标题 48 字预算并以 … 标记截断')
+  assert.deepEqual(roundTokensOf('【R30-B：…】与 R30 相关'), ['R30-B', 'R30'], '轮次令牌含裸轮次')
+  assert.deepEqual(
+    branchTagsFor({ topicTags: ['supermemory'], task: '【R30-B：…】', kind: 'verify', capability: 'full' }),
+    ['supermemory', 'R30-B', 'R30', '验证', 'full'],
+    '标签 = 话题集标签 + 轮次 + 任务性质 + 能力档位',
+  )
+  const metaStore = fakeStore({ dispatches: [
+    ['d-old', { topicSetId: 'ts', branchSessionId: 'b-1', task: '老', hubSessionId: 'hub', startSeq: 0, status: 'delivered', title: '老标题', tags: ['旧'], createdAt: now3 - 5000, updatedAt: now3 - 4000 }],
+    ['d-new', { topicSetId: 'ts', branchSessionId: 'b-1', task: '【R30-B：新】', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', title: '【R30-B：新】', tags: ['R30-B'], createdAt: now3 - 1000, updatedAt: now3 }],
+  ] })
+  assert.deepEqual(latestBranchMeta(metaStore).get('b-1'), { title: '【R30-B：新】', tags: ['R30-B'] }, '最新派发行持有该映射')
+  ok('R30-B1 分支标题/标签：推导规则 + latestBranchMeta 投影')
+}
+
+{
+  // 需求③: the hub's management view — every topic set (archived included) and
+  // every branch across sets, plus the branch row's explicit title/tags.
+  const nodePath4 = await import('node:path')
+  const WS4 = nodePath4.resolve('ws-r30b-panel')
+  const now4 = Date.now()
+  const m = (sessionId, kind = 'fork') => ({ sessionId, kind, title: sessionId, summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now4 })
+  const store = {
+    topicsets: table([
+      ['ts-live', { workspaceKey: WS4, title: '活跃集', summary: '', keywords: ['a'], status: 'active', members: [m('branch-1'), m('hub-root', 'root')], createdAt: now4, updatedAt: now4, lastActiveAt: now4 - 500 }],
+      ['ts-old', { workspaceKey: WS4, title: '归档集', summary: '', keywords: ['b'], status: 'archived', members: [m('branch-2')], createdAt: now4, updatedAt: now4, lastActiveAt: now4 - 9000 }],
+    ]),
+    memories: table(), episodes: table(), requirements: table(), filemap: table(),
+    toolMemory: table(), signals: table(), outbox: table(), routing: table(), hotcache: table(), questions: table(),
+    dispatches: table([
+      ['d-1', { topicSetId: 'ts-live', branchSessionId: 'branch-1', task: '【R30-B：任务一】', hubSessionId: 'hub-1', startSeq: 0, status: 'dispatched', title: '【R30-B：任务一】', tags: ['R30-B', 'full'], createdAt: now4 - 3000, updatedAt: now4 - 2000 }],
+      ['d-2', { topicSetId: 'ts-old', branchSessionId: 'branch-2', task: '旧任务', hubSessionId: 'hub-1', startSeq: 0, status: 'delivered', title: '旧任务', tags: [], createdAt: now4 - 8000, updatedAt: now4 - 7000 }],
+    ]),
+  }
+  const service = new SupermemoryPanelService(store, undefined)
+  const allSets = service.listAllTopicSets(WS4)
+  assert.equal(allSets.length, 2, '全部话题集含归档')
+  assert.equal(allSets[0].id, 'ts-live', '活跃集在前')
+  assert.equal(allSets[1].status, 'archived', '归档集带状态')
+  const row = allSets[0].branches.find((b) => b.sessionId === 'branch-1')
+  assert.equal(row.title, '【R30-B：任务一】', '面板分支行显示显式标题')
+  assert.deepEqual(row.tags, ['R30-B', 'full'], '面板分支行带标签')
+  assert.equal(service.listTopicSets(WS4).length, 1, '话题集页签保持只看活跃')
+  assert.equal(service.listAllBranches(WS4).length, 2, '全部分支跨话题集')
+  assert.equal(service.listAllBranches(WS4, 'ts-live').length, 1, '按话题集筛选')
+  ok('R30-B2 面板：listAllTopicSets/listAllBranches + 分支行标题/标签')
+}
+
+{
+  // 需求⑤.2 + ⑥.1: the hub card carries the matched set's branches; the
+  // dispatch script names the hub session the relay returns to.
+  const { renderHubBranchesCard, listHubBranches } = await import('../src/hub-branches.ts')
+  const now5 = Date.now()
+  const store = fakeStore({
+    topicsets: [['ts-1', { workspaceKey: 'ws', title: '话题集甲', summary: '', keywords: ['supermemory'], status: 'active', members: [{ sessionId: 'b-1', kind: 'fork', title: '成员名', summary: '', status: 'idle', lastActiveAt: now5 - 1000 }], createdAt: now5, updatedAt: now5, lastActiveAt: now5 }]],
+    dispatches: [['d-1', { topicSetId: 'ts-1', branchSessionId: 'b-1', task: '【R30-A：记忆版本控制】全文……', hubSessionId: 'hub-1', startSeq: 0, status: 'dispatched', title: '【R30-A：记忆版本控制】', tags: ['supermemory', 'R30-A', 'full'], createdAt: now5 - 9000, updatedAt: now5 - 8000 }]],
+  })
+  const rows = listHubBranches(store, 'hub-1')
+  assert.equal(rows[0].title, '【R30-A：记忆版本控制】', '显式标题优先于成员标题')
+  assert.deepEqual(rows[0].tags, ['supermemory', 'R30-A', 'full'])
+  const card = renderHubBranchesCard(rows, { now: now5, topicSets: [{ title: '话题集甲', rows }] })
+  assert.match(card, /标签 supermemory \/ R30-A \/ full/, '中枢卡显示标签')
+  assert.match(card, /话题集「话题集甲」的分支（按话题集检索，可继续\/复用）：/, '命中话题集的分支随卡带出')
+  assert.equal(renderHubBranchesCard([], { now: now5 }), '', '无分支无话题集段 → 空卡（行为不回退）')
+  // Pre-R30 rows keep the legacy card shape (no tag segment).
+  const legacy = renderHubBranchesCard([{ ...rows[0], tags: [] }], { now: now5 })
+  assert.ok(!legacy.includes('标签'), '无标签时不出现标签段（向后兼容）')
+
+  const script = buildDispatchScript({ task: '修构建', capabilities: 'full', topicTitle: '发布', branchSessionId: 'branch-9', dispatchId: 'dsp-9', hubSessionId: 'session-abc' })
+  assert.ok(script.includes('中枢会话：session-abc'), '派发首条消息点名中枢会话（⑥）')
+  assert.ok(script.includes('relay 回送目标'), '并说明 relay 回送目标就是它')
+  const dry = buildDispatchScript({ task: '审阅', capabilities: 'read', topicTitle: 'x' })
+  assert.ok(!dry.includes('中枢会话：'), 'dry-run 不带任何 id（R18 契约保持）')
+  ok('R30-B3 注入卡带出命中话题集分支 + 派发脚本带中枢会话 id')
+}
+
+{
+  // 需求③.1 防回归：新建中枢会话不绑定任何话题集（R29 的行为，R30 复核锁定）。
+  const nodePath5 = await import('node:path')
+  const WS5 = nodePath5.resolve('ws-r30b-hub')
+  const now6 = Date.now()
+  const store = fakeStore({
+    topicsets: [['ts-1', { workspaceKey: WS5, title: '甲', summary: '', keywords: [], status: 'active', members: [], createdAt: now6, updatedAt: now6, lastActiveAt: now6 }]],
+  })
+  const created = []
+  const agentsService = {
+    create: async (options) => {
+      created.push(options)
+      return { agent: { followup: () => {} }, dispose: async () => {} }
+    },
+  }
+  const services = { typert: { register: () => () => {} } }
+  const fakeCtx = {
+    agents: agentsService,
+    provide: (k, v) => { services[k] = v },
+    get: (n) => (n === 'typert' ? services.typert : services[n]),
+    effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {} },
+  }
+  attachPanel(fakeCtx, store)
+  const service = services.supermemoryPanel
+  const result = await service.createHubSession(WS5, {}, '')
+  assert.equal(result.status, 'ok', result.message)
+  assert.equal(created.length, 1, 'exactly one host session is created')
+  assert.equal(created[0].meta.cwd, WS5, 'the session carries the workspace')
+  assert.equal(store.topicsets.get('ts-1').members.length, 0, 'createHubSession adds NO topic-set member（③.1）')
+  assert.deepEqual(service.sessionBadge(result.id), { kind: 'hub' }, 'the new hub is badged as a plain hub')
+  ok('R30-B4 新中枢会话不绑定话题集（③.1 防回归）')
+}
+
 // ---- R19 协同①: a parallel group claims distinct branches and never aborts ----
 // This drives the REAL runDispatch group loop with a stubbed agent registry. The
 // branch wake itself fails in a host-free process (no @deepseek-ai/dsh-llm), so

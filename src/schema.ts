@@ -78,6 +78,10 @@ export async function buildSchemas() {
     sourceSeq: z.number().int().nonnegative(),
     status: z.enum(['active', 'superseded']).default('active'),
     supersededBy: z.string().optional(),
+    // R30 需求①: 记忆版本号。同一 key 的更新不再新开一行，而是就地修改并
+    // version+1（旧版本整体归档进 memory_versions）。旧介质没有这个字段，
+    // zod 默认值在读时补齐为 1，并由惰性迁移补一条 v1 历史（域保持 v1 兼容）。
+    version: z.number().int().default(1),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })
@@ -94,6 +98,25 @@ export async function buildSchemas() {
     status: z.enum(['active', 'archived']).default('active'),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
+  })
+
+  // R30 需求①: 记忆历史版本 —— 一条记忆的每一次版本都是一行完整快照（标题/
+  // 标签/正文/集合），与 memories.version 共同构成版本日志：当前版本永远同时
+  // 存在于 memories 行与最后一条历史行，旧版本只增不减地留在本表。
+  // 旧介质没有行即空表，域保持 v1 兼容（同 questions 的新表模式）。
+  const memoryVersions = z.object({
+    workspaceKey: z.string(),
+    memoryId: z.string(),
+    version: z.number().int(),
+    title: z.string().default(''),
+    text: z.string(),
+    /** 该版本的标签（与 memories.keywords 同语义，历史行用 tags 命名）。 */
+    tags: z.array(z.string()).default([]),
+    collectionId: z.string().optional(),
+    /** 该版本生效的时间（创建/更新时刻；迁移行沿用记忆自身的 updatedAt）。 */
+    updatedAt: z.number().int(),
+    /** create=新建 v1；update=就地更新升版；migrate=旧记忆惰性迁移补的 v1。 */
+    changeType: z.enum(['create', 'update', 'migrate']),
   })
 
   const episodes = z.object({
@@ -186,6 +209,13 @@ export async function buildSchemas() {
     status: z.enum(['queued', 'dispatched', 'observed', 'summarized', 'delivered', 'failed', 'interrupted']).default('queued'),
     // D: last heartbeat while the branch was still working (timeout judgement)
     lastActivityAt: z.number().int().optional(),
+    // R30 需求④: 分支会话的显式标题与标签（DSH 会话原生只支持标题、不支持标签，
+    // 见 title.ts 对 dsh-session-title 的核实；标签因此落在派发行上，成为
+    // 「分支会话 → 标题/标签」的持久映射）。标题取任务首行，标签 = 话题集标签 +
+    // 轮次令牌 + 任务性质 + 能力档位（src/branch-meta.ts 推导）。
+    // 带默认值：R30 之前的派发记录读作 ''/[]，存储域保持 v1 兼容（同 D/E 的可选字段）。
+    title: z.string().default(''),
+    tags: z.array(z.string()).default([]),
     // E: 续跑关联（中断任务由用户决定继续）。续跑产生的新派发记录原 dispatchId
     // （resumeOf），原派发回写续跑派发 id（resumedBy）。两个字段都是可选的：
     // 旧记录读作 undefined，存储域保持 v1 兼容（同 D 的 interrupted/lastActivityAt）。
@@ -272,7 +302,8 @@ export async function buildSchemas() {
   })
 
   return {
-    topicsets, memories, memory_collections: memoryCollections, episodes, requirements, filemap,
+    topicsets, memories, memory_collections: memoryCollections, memory_versions: memoryVersions,
+    episodes, requirements, filemap,
     tool_memory: toolMemory, signals, dispatches, questions, outbox, routing, hotcache, meta,
   }
 }
@@ -282,6 +313,8 @@ export type Schemas = Awaited<ReturnType<typeof buildSchemas>>
 export type TopicSet = z.infer<Schemas['topicsets']>
 export type Memory = z.infer<Schemas['memories']>
 export type MemoryCollection = z.infer<Schemas['memory_collections']>
+/** R30 需求①: one historical version of a memory (full snapshot). */
+export type MemoryVersion = z.infer<Schemas['memory_versions']>
 export type Episode = z.infer<Schemas['episodes']>
 export type Requirement = z.infer<Schemas['requirements']>
 export type FileMapEntry = z.infer<Schemas['filemap']>

@@ -2,9 +2,9 @@
  * SuperMemory main panel (the `main` slot keyed by panel id 'supermemory').
  * Level 1 shows the hub session and the workspace's topic sets; level 2
  * opens one topic set (its branch sessions, reply box and summary); the
- * Memories tab browses/edits memories (R28 需求④: grouped by 记忆集合) and
- * locates their source sessions; the Tools tab lists and edits composite tools
- * (R6) with their lifecycle timestamps (R28 需求②).
+ * Memories tab is two levels (R30 需求②): 记忆集卡片 → 集合内条目（带版本
+ * 徽标）→ 记忆详情（完整正文 + 历史版本）；the Tools tab lists and edits
+ * composite tools (R6) with their lifecycle timestamps (R28 需求②).
  * @module supermemory/client/panel-page
  */
 import { createElement as h, useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
@@ -20,6 +20,8 @@ export interface TopicSetView {
   sessions: number
   /** How many of those sessions are live right now. */
   live: number
+  /** R30 需求③: lifecycle (the hub's 全部话题集 view lists archived sets too). */
+  status?: 'active' | 'archived'
   branches: Array<{
     sessionId: string
     kind: 'root' | 'fork'
@@ -31,6 +33,8 @@ export interface TopicSetView {
     hubs?: number
     /** 最新一次派发的任务摘要（重启后仅凭持久台账也能认出分支）。 */
     task?: string
+    /** R30 需求④: 分支标签（来自最新一次派发记录）。 */
+    tags?: string[]
   }>
   model?: string
 }
@@ -52,6 +56,44 @@ export interface MemoryView {
   collectionId?: string
   collectionTitle?: string
   collectionTags?: string[]
+  /**
+   * R30 需求①: 当前版本号（旧记录读作 1）。记忆页签的条目行显示 vN 徽标，
+   * 详情页列出全部历史版本。
+   */
+  version?: number
+}
+
+/**
+ * R30 需求②: 记忆页签第一级——记忆集合卡片。条目数/最近更新由宿主聚合
+ * （未归集是一张 id 为 '' 的虚拟卡片，保证旧数据不丢）。
+ */
+export interface MemoryCollectionView {
+  id: string
+  title: string
+  tags: string[]
+  summary: string
+  count: number
+  latestUpdatedAt: number
+  status: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** R30 需求①: 一条历史版本（完整快照）。 */
+export interface MemoryVersionView {
+  version: number
+  updatedAt: number
+  title: string
+  tags: string[]
+  text: string
+  changeType: 'create' | 'update' | 'migrate'
+  collectionId?: string
+}
+
+/** R30 需求②: 记忆详情（当前字段 + 版本序列，最后一条即当前版本）。 */
+export interface MemoryDetailView {
+  view: MemoryView
+  versions: MemoryVersionView[]
 }
 
 export interface ToolView {
@@ -191,6 +233,8 @@ export interface HubSessionView {
 export interface HubBranchView {
   branchSessionId: string
   title: string
+  /** R30 需求④: 分支标签（话题集标签 + 轮次 + 任务性质 + 能力档位）。 */
+  tags: string[]
   task: string
   hubSessionId: string
   topicSetId?: string
@@ -308,6 +352,10 @@ export interface MemoryShape {
 export interface PanelApi {
   loadHub(cwd: string, sessionId: string): Promise<HubState>
   listMemories(cwd: string, query?: string): Promise<MemoryView[]>
+  // R30 需求②: 记忆页签两级页（集合卡片 → 集合内条目 → 记忆详情/历史）。
+  listMemoryCollections(cwd: string): Promise<MemoryCollectionView[]>
+  listMemoriesByCollection(cwd: string, collectionId: string, query?: string): Promise<MemoryView[]>
+  getMemoryDetail(cwd: string, id: string): Promise<MemoryDetailView | undefined>
   createMemory(cwd: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   updateMemory(cwd: string, id: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   deleteMemory(cwd: string, id: string): Promise<MutationResult>
@@ -325,6 +373,13 @@ export interface PanelApi {
   listHubSessions(cwd: string): Promise<HubSessionView[]>
   /** R19 协同②: the branches one hub started (name / state / set / shared). */
   listHubBranches(cwd: string, hubSessionId: string, limit?: number): Promise<HubBranchView[]>
+  /**
+   * R30 需求③: every topic set of the workspace (archived included) — the hub's
+   * management view — and every branch session across sets (optionally filtered
+   * to one topic set). Both are durable-ledger reads (no live handle needed).
+   */
+  listAllTopicSets(cwd: string): Promise<TopicSetView[]>
+  listAllBranches(cwd: string, topicSetId?: string, limit?: number): Promise<HubBranchView[]>
   readSessionMessages(sessionId: string, limit?: number): Promise<SessionChatView>
   sendSessionMessage(sessionId: string, text: string): Promise<MutationResult>
   suggestMemoryShape(text: string): Promise<MemoryShape>
@@ -350,6 +405,9 @@ type View =
   | { kind: 'sets' }
   | { kind: 'topic'; id: string }
   | { kind: 'memories' }
+  // R30 需求②: 记忆两级页——集合内条目 / 单条记忆详情（含历史版本）。
+  | { kind: 'memory-collection'; id: string }
+  | { kind: 'memory-detail'; id: string }
   | { kind: 'tools' }
   | { kind: 'chat'; id: string }
 
@@ -631,6 +689,8 @@ function BranchList(props: {
                 `${row.topicSetTitle ? t('branches.set', { title: row.topicSetTitle }) : t('branches.noSet')} · `
                 + `${branchAgo(row.lastActivityAt, t)} · ${t('branches.dispatches', { count: row.dispatches })}`,
               ),
+              // R30 需求④: 分支标签（话题集标签 + 轮次 + 任务性质 + 能力档位）。
+              row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
               h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
             ),
           ),
@@ -674,12 +734,19 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const { t, api } = props
   const [view, setView] = useState<View>({ kind: 'hub' })
   const [hub, setHub] = useState<HubState | undefined>()
-  const [memories, setMemories] = useState<MemoryView[]>([])
+  // R30 需求②: 记忆两级页的状态——第一级集合卡片、第二级集合内条目、
+  // 第三级单条记忆详情（当前版本 + 历史版本）。
+  const [memoryCollections, setMemoryCollections] = useState<MemoryCollectionView[]>([])
+  const [collectionMemories, setCollectionMemories] = useState<MemoryView[]>([])
+  const [memoryDetail, setMemoryDetail] = useState<MemoryDetailView | undefined>()
   const [tools, setTools] = useState<ToolView[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | undefined>()
   const [notice, setNotice] = useState<string | undefined>()
   const [query, setQuery] = useState('')
+  // R30 需求②: 第一级的集合搜索（与第二级的条目搜索分开：前者在本地过滤卡片，
+  // 后者由宿主按标题/标签/正文打分过滤）。
+  const [memoryQuery, setMemoryQuery] = useState('')
   // R11: the 话题集 tab filters on title + tags (never on every body), so a
   // workspace with many topic sets stays searchable by index.
   const [setsQuery, setSetsQuery] = useState('')
@@ -689,7 +756,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [reply, setReply] = useState('')
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
   const [summaryTagsDraft, setSummaryTagsDraft] = useState<string[] | undefined>()
-  const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string } | undefined>()
+  const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string; key?: string } | undefined>()
   const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string } | undefined>()
   const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
   // R22 需求③: 固化能力可展开看完整定义（入口/文档/适用范围/路由/执行方式/健康度）。
@@ -697,6 +764,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // R27: 记忆删除不可恢复，和固化能力一样先就地问一次（内联两段确认），
   // 不再一点就永久删除。
   const [confirmDeleteMemory, setConfirmDeleteMemory] = useState<string | undefined>()
+  // R30 需求②: 详情页里展开的历史版本（key = `<memoryId>:<version>`）。
+  const [expandedVersion, setExpandedVersion] = useState<string | undefined>()
   // R7 quick launcher (中枢会话页签): the new-session-page choices — workspace,
   // agent preset, model, permission — beside the topic-set selection.
   const [presets, setPresets] = useState<AgentPresetView[]>([])
@@ -728,6 +797,14 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // surfaces answer "which branches did this hub start?".
   const [hubBranches, setHubBranches] = useState<HubBranchView[]>([])
   const [chatBranches, setChatBranches] = useState<HubBranchView[]>([])
+  // R30 需求③: the hub manages EVERY topic set (archived included) and views
+  // every branch across sets (filterable by set). Same refresh path as the rail.
+  const [allSets, setAllSets] = useState<TopicSetView[]>([])
+  const [allBranches, setAllBranches] = useState<HubBranchView[]>([])
+  const [branchFilter, setBranchFilter] = useState('')
+  // R30 需求③: 「全部话题集」卡内联创建入口（与快速启动区的新建互不干扰）。
+  const [allSetForm, setAllSetForm] = useState(false)
+  const [allSetTitle, setAllSetTitle] = useState('')
   // R18 需求②: the topic set just created (title + auto tags must be visible).
   const [createdSet, setCreatedSet] = useState<{ title: string; tags: string[] } | undefined>()
   // Whether the memory editor auto-filled title/tags from the body.
@@ -796,12 +873,19 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     setHubs([])
     setHubBranches([])
     setChatBranches([])
+    setAllSets([])
+    setAllBranches([])
+    setBranchFilter('')
     setLaunchSelected([])
     setLaunchSets([])
     setReceipt(undefined)
     setCreatedSet(undefined)
     // A3/A4: 工具列表也是工作区视图——切换时清空，由 refreshTools 按新 cwd 重拉。
     setTools([])
+    // R30 需求②: 记忆两级页的数据同样是工作区视图，切换时清空重拉。
+    setMemoryCollections([])
+    setCollectionMemories([])
+    setMemoryDetail(undefined)
     setChatData(undefined)
     setChatDraft('')
     setChatError(undefined)
@@ -816,17 +900,21 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       // R18 需求①: the rail rides the same refresh — hub sessions are created by
       // this very page, so a stale rail would hide the session just started.
       // R19 协同②: the current hub's branch list rides it too.
-      const [state, hubRows, branchRows] = await Promise.all([
+      // R30 需求③: 全部话题集 + 全部分支会话（中枢的管理视图）同路刷新。
+      const [state, hubRows, branchRows, setRows, allBranchRows] = await Promise.all([
         api.loadHub(cwd, sessionId),
         api.listHubSessions(cwd).then((rows) => rows, () => [] as HubSessionView[]),
         sessionId
           ? api.listHubBranches(cwd, sessionId).then((rows) => rows, () => [] as HubBranchView[])
           : Promise.resolve([] as HubBranchView[]),
+        api.listAllTopicSets(cwd).then((rows) => rows, () => [] as TopicSetView[]),
+        api.listAllBranches(cwd).then((rows) => rows, () => [] as HubBranchView[]),
       ])
       setHub(state)
-      setMemories(state.memories)
       setHubs(hubRows)
       setHubBranches(branchRows)
+      setAllSets(setRows)
+      setAllBranches(allBranchRows)
       // R18 需求③: a refresh is exactly when membership may have changed.
       api.invalidateBadges()
     } catch (loadError) {
@@ -836,14 +924,56 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }, [api, cwd, sessionId, t])
 
-  const refreshMemories = useCallback(async () => {
+  // R30 需求②: 第一级——集合卡片（含条目数/最近更新，宿主聚合）。
+  const refreshMemoryCollections = useCallback(async () => {
     if (!cwd) return
     try {
-      setMemories(await api.listMemories(cwd, query.trim() || undefined))
+      setMemoryCollections(await api.listMemoryCollections(cwd))
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  // R30 需求②: 第二级——一个集合内的条目（'' = 未归集）。
+  const refreshCollectionMemories = useCallback(async (collectionId: string) => {
+    if (!cwd) return
+    try {
+      setCollectionMemories(await api.listMemoriesByCollection(cwd, collectionId, query.trim() || undefined))
     } catch (loadError) {
       setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
     }
   }, [api, cwd, query, t])
+
+  // R30 需求②: 第三级——记忆详情（当前版本 + 历史版本）。
+  const refreshMemoryDetail = useCallback(async (id: string) => {
+    if (!cwd) return
+    try {
+      setMemoryDetail(await api.getMemoryDetail(cwd, id))
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  // R30 需求②: 一次写操作后按当前所在层级刷新（集合卡片 / 集合内条目 / 详情），
+  // 顺带刷新中枢计数，让「记忆 N」徽标即时跟上。
+  const refreshMemoryViews = useCallback((): void => {
+    if (view.kind === 'memory-collection') void refreshCollectionMemories(view.id)
+    else if (view.kind === 'memory-detail') void refreshMemoryDetail(view.id)
+    else void refreshMemoryCollections()
+    void refreshHub()
+  }, [view, refreshCollectionMemories, refreshMemoryDetail, refreshMemoryCollections, refreshHub])
+
+  // R30 需求②: 打开记忆详情（记住来自哪个集合，返回时回到该集合的条目页）。
+  const openMemoryDetail = useCallback((id: string): void => {
+    setExpandedVersion(undefined)
+    setMemoryDetail(undefined)
+    setView({ kind: 'memory-detail', id })
+  }, [])
+
+  const backFromMemoryDetail = useCallback((): void => {
+    setExpandedVersion(undefined)
+    setView({ kind: 'memory-collection', id: memoryDetail?.view.collectionId ?? '' })
+  }, [memoryDetail])
 
   // A3: 工具列表按当前工作区拉取（cwd 变化即重新过滤，不停留在旧工作区数据）。
   const refreshTools = useCallback(async () => {
@@ -856,7 +986,16 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   }, [api, cwd, t])
 
   useEffect(() => { void refreshHub() }, [refreshHub])
-  useEffect(() => { if (view.kind === 'memories') void refreshMemories() }, [view, refreshMemories])
+  // R30 需求②: 两级页各自按视图拉取（集合卡片 / 集合内条目 / 记忆详情）。
+  useEffect(() => {
+    if (view.kind === 'memories') void refreshMemoryCollections()
+  }, [view, refreshMemoryCollections])
+  useEffect(() => {
+    if (view.kind === 'memory-collection') void refreshCollectionMemories(view.id)
+  }, [view, refreshCollectionMemories])
+  useEffect(() => {
+    if (view.kind === 'memory-detail') void refreshMemoryDetail(view.id)
+  }, [view, refreshMemoryDetail])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
 
   // 需求①: the shell's 新建会话 click CREATES a hub session and publishes its
@@ -1035,6 +1174,31 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }, [api, launchCwd, refreshHub, t])
 
+  /**
+   * R30 需求③: 「全部话题集」卡的内联创建入口（同一 host 路径，与快速启动区
+   * 的新建话题集等价）；创建后刷新管理列表并保持表单打开以便连续新建。
+   */
+  const createAllSet = async (): Promise<void> => {
+    const title = allSetTitle.trim()
+    if (!title || !launchCwd) return
+    setError(undefined)
+    try {
+      const created = await api.createTopicSet(launchCwd, title)
+      if (created.status !== 'ok' || !created.id) { setError(created.message); return }
+      setAllSetTitle('')
+      const [rows, branchRows] = await Promise.all([
+        api.listAllTopicSets(launchCwd),
+        api.listAllBranches(launchCwd).then((list) => list, () => [] as HubBranchView[]),
+      ])
+      setAllSets(rows)
+      setAllBranches(branchRows)
+      setCreatedSet({ title: created.message, tags: [] })
+      void refreshHub()
+    } catch (createError) {
+      setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
+    }
+  }
+
   const startLaunch = async (mode: 'chat' | 'bare' = 'chat'): Promise<void> => {
     if (!launchCwd) { setError(t('launch.needWorkspace')); return }
     const text = composerText.trim()
@@ -1070,6 +1234,13 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       setLaunching(false)
     }
   }
+
+  // R30 需求③: 全部分支会话（跨话题集）按话题集筛选——筛选在本地做，切换即
+  // 生效（宿主 listAllBranches 也支持按集过滤，这里保留即时体验）。
+  const filteredAllBranches = useMemo(() => {
+    if (!branchFilter) return allBranches
+    return allBranches.filter((row) => row.topicSetId === branchFilter)
+  }, [allBranches, branchFilter])
 
   const filteredSets = useMemo(() => {
     const needle = setsQuery.trim().toLowerCase()
@@ -1109,10 +1280,12 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
 
   // R27: 会话视图（chat）属于「中枢会话」，话题集详情（topic）属于「话题集」——
   // 否则在这两个二级视图里四个页签全都不高亮，用户看不出自己在哪一层。
+  // R30 需求②: 记忆的两级下钻（集合内条目 / 记忆详情）同属「记忆」页签。
   const tabActive = (kind: View['kind']): boolean => {
     if (view.kind === kind) return true
     if (kind === 'hub') return view.kind === 'chat'
     if (kind === 'sets') return view.kind === 'topic'
+    if (kind === 'memories') return view.kind === 'memory-collection' || view.kind === 'memory-detail'
     return false
   }
 
@@ -1297,6 +1470,105 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     receiptView,
     // R19 协同②: the current hub's own delegates, with state / set / sharing.
     BranchList({ rows: hubBranches, t, onOpen: openChat }),
+    // R30 需求③: 全部话题集（含归档）——中枢在这里管理工作区的每一个话题集：
+    // 标题/标签/会话数/在线数一览，点进行内详情（标签编辑在那里），行内即建入口。
+    h('div', { key: 'allSets', className: 'sm-card' },
+      h('div', { key: 'head', className: 'sm-row' },
+        h('h3', { key: 'title' }, t('hub.allSets')),
+        h('span', { key: 'count', className: 'sm-badge' }, String(allSets.length)),
+        h(Button, {
+          key: 'new', size: 'sm', label: t('hub.allSets.new'),
+          disabled: !launchCwd,
+          onClick: () => setAllSetForm((value) => !value),
+        }),
+      ),
+      allSetForm
+        ? h('div', { key: 'newForm', className: 'sm-form', style: { marginTop: 8, marginBottom: 0 } },
+            h('input', {
+              key: 'input', className: 'sm-input', value: allSetTitle,
+              placeholder: t('newSession.create'),
+              onChange: (event: { target: { value: string } }) => setAllSetTitle(event.target.value),
+            }),
+            h(Button, {
+              key: 'add', label: t('topic.create'), disabled: !allSetTitle.trim() || !launchCwd,
+              onClick: () => void createAllSet(),
+            }),
+          )
+        : null,
+      allSets.length === 0
+        ? h(EmptyState, { key: 'empty', label: t('sets.empty'), hint: t('hub.allSets.hint') })
+        : h('div', { key: 'list', className: 'sm-list' },
+            allSets.map((topicSet) =>
+              h('div', {
+                key: topicSet.id, className: 'sm-item', 'data-clickable': 'true',
+                title: `${topicSet.title} · ${topicSet.id}`,
+                onClick: () => {
+                  setView({ kind: 'topic', id: topicSet.id })
+                  setSummaryDraft(undefined)
+                  setSummaryTagsDraft(undefined)
+                  setReply('')
+                },
+              },
+                h('div', { key: 'row', className: 'sm-row' },
+                  h('span', { key: 'title', className: 'sm-title' }, topicSet.title),
+                  hub?.activeTopicSetId === topicSet.id ? h('span', { key: 'a', className: 'sm-badge' }, t('hub.active')) : null,
+                  topicSet.status === 'archived' ? h('span', { key: 'arch', className: 'sm-badge' }, t('sets.archived')) : null,
+                  h('span', { key: 'n', className: 'sm-badge' }, t('sets.sessions', { count: topicSet.sessions })),
+                  topicSet.live > 0 ? h('span', { key: 'l', className: 'sm-badge' }, t('sets.live', { count: topicSet.live })) : null,
+                  topicSet.model ? h('span', { key: 'm', className: 'sm-badge' }, topicSet.model) : null,
+                ),
+                tagChips(topicSet.tags),
+                h('div', { key: 'summary', className: 'sm-body-text' }, topicSet.summary || t('sets.noBody')),
+              ),
+            ),
+          ),
+    ),
+    // R30 需求③: 全部分支会话（跨话题集）——按话题集筛选，行内打开任一分支。
+    h('div', { key: 'allBranches', className: 'sm-card' },
+      h('div', { key: 'head', className: 'sm-row' },
+        h('h3', { key: 'title' }, t('hub.allBranches')),
+        h('span', { key: 'count', className: 'sm-badge' }, String(filteredAllBranches.length)),
+      ),
+      h('div', { key: 'filter', className: 'sm-form' },
+        h('label', { key: 'label', className: 'sm-opt' },
+          h('span', { key: 'text', className: 'sm-opt-label' }, t('hub.allBranches.filter')),
+          h('select', {
+            key: 'select', className: 'sm-opt-select', value: branchFilter,
+            onChange: (event: { target: { value: string } }) => setBranchFilter(event.target.value),
+          },
+            h('option', { key: 'all', value: '' }, t('hub.allBranches.allSets')),
+            allSets.map((topicSet) =>
+              h('option', { key: topicSet.id, value: topicSet.id }, topicSet.title)),
+          ),
+        ),
+      ),
+      filteredAllBranches.length === 0
+        ? h(EmptyState, { key: 'empty', label: t('hub.allBranches.empty'), hint: t('hub.allBranches.hint') })
+        : h('div', { key: 'list', className: 'sm-list' },
+            filteredAllBranches.map((row) =>
+              h('div', {
+                key: row.branchSessionId, className: 'sm-item', 'data-clickable': 'true',
+                title: `${row.title} · ${row.branchSessionId}`,
+                onClick: () => openChat(row.branchSessionId),
+              },
+                h('div', { key: 'row', className: 'sm-row' },
+                  h('span', { key: 'title', className: 'sm-title' }, row.title),
+                  h('span', { key: 'state', className: 'sm-badge', 'data-state': row.status }, t(`branches.${row.status}`)),
+                  row.shared
+                    ? h('span', { key: 'shared', className: 'sm-badge', title: row.hubs.join('、') }, t('branches.shared', { count: row.hubs.length - 1 }))
+                    : null,
+                  row.groupId ? h('span', { key: 'grp', className: 'sm-badge' }, t('branches.group')) : null,
+                ),
+                h('div', { key: 'meta', className: 'sm-sub' },
+                  `${row.topicSetTitle ? t('branches.set', { title: row.topicSetTitle }) : t('branches.noSet')} · `
+                  + `${branchAgo(row.lastActivityAt, t)} · ${t('branches.dispatches', { count: row.dispatches })}`,
+                ),
+                row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
+                h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
+              ),
+            ),
+          ),
+    ),
     // R22 需求⑦: 中枢会话页签只留「派发 + 回执 + 本中枢的分支 + 当前会话」。
     // 话题集列表、激活话题集、会话数/在线数统计都属于话题集页签，这里不再
     // 重复展示——用户已明确「这部分都在话题集页签里看」。
@@ -1405,6 +1677,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                     h('div', { className: 'sm-sub' }, branch.sessionId),
                     // B3: 分支卡片带最新一次派发的任务摘要（无则仅显示会话 id）。
                     branch.task ? h('div', { key: 'task', className: 'sm-sub' }, `任务：${branch.task}`) : null,
+                    // R30 需求④: 分支标签（与中枢卡/管理台同一份映射）。
+                    branch.tags && branch.tags.length > 0 ? tagChips(branch.tags) : null,
                   ),
                 ),
               ),
@@ -1456,17 +1730,28 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       ]
     : h(EmptyState, { key: 'missing', label: t('hub.empty'), hint: t('hub.empty.hint') })
 
-  // R28 需求④: one memory entry — title, tag chips, body, status, source and
-  // every action (locate / edit / enable-disable / two-step delete). Extracted
-  // so the grouped render and the legacy flat render share exactly one copy.
-  const memoryItem = (memory: MemoryView): ReactNode =>
+  // R28 需求④ / R30 需求②: one memory entry row inside a collection — title
+  // (+ version badge), tag chips, body, status, source and every action (open
+  // detail / edit / enable-disable / two-step delete). The title row opens the
+  // detail page (level 3); the actions stay inline so nothing is lost from the
+  // old flat list.
+  const memoryEntryRow = (memory: MemoryView): ReactNode =>
     h('div', { key: memory.id, className: 'sm-item' },
-      h('div', { className: 'sm-title' }, memory.title || deriveTitleClient(memory.text)),
+      h('div', {
+        key: 'head', className: 'sm-row', 'data-clickable': 'true',
+        title: t('memory.detail.open'),
+        style: { cursor: 'pointer' },
+        onClick: () => openMemoryDetail(memory.id),
+      },
+        h('span', { key: 'title', className: 'sm-title' }, memory.title || deriveTitleClient(memory.text)),
+        h('span', { key: 'ver', className: 'sm-badge' }, `v${memory.version ?? 1}`),
+        h('span', { key: 'st', className: 'sm-badge' }, memory.status),
+      ),
       tagChips(memory.tags, query),
       h('div', { className: 'sm-body-text' }, memory.text),
       h('div', { className: 'sm-sub' },
-        h('span', { key: 'st', className: 'sm-badge' }, memory.status),
-        `${t('memory.source')}：${memory.sourceSessionId || '—'}`,
+        `${t('memory.updated')}：${fmtTime(memory.updatedAt)}`,
+        ` · ${t('memory.source')}：${memory.sourceSessionId || '—'}`,
       ),
       h('div', { className: 'sm-actions' },
         memory.sourceSessionId
@@ -1477,11 +1762,11 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
           : null,
         h(Button, {
           key: 'edit', label: t('memory.edit'),
-          onClick: () => setEditingMemory({ id: memory.id, title: memory.title, tags: memory.tags, text: memory.text }),
+          onClick: () => setEditingMemory({ id: memory.id, title: memory.title, tags: memory.tags, text: memory.text, key: memory.key }),
         }),
         h(Button, {
           key: 'toggle', label: memory.status === 'active' ? t('memory.disable') : t('memory.enable'),
-          onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemories()),
+          onClick: () => void run(async () => api.setMemoryStatus(cwd, memory.id, memory.status === 'active' ? 'superseded' : 'active'), () => void refreshMemoryViews()),
         }),
         // R27: 永久删除先就地问一次（与固化能力的删除确认一致）。
         confirmDeleteMemory === memory.id
@@ -1489,7 +1774,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
               key: 'delYes', variant: 'danger', label: t('memory.deleteConfirm'),
               onClick: () => void run(async () => api.deleteMemory(cwd, memory.id), () => {
                 setConfirmDeleteMemory(undefined)
-                void refreshMemories()
+                void refreshMemoryViews()
               }),
             })
           : h(Button, {
@@ -1502,65 +1787,156 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       ),
     )
 
-  // R28 需求④: group the (already host-filtered) rows by 记忆集合 — the host
-  // 透出 collectionId / collectionTitle / collectionTags. Each group keeps the
-  // host's row order; groups are ordered by their newest updatedAt first. Rows
-  // without a collection land in 未归集; when NO row carries a collection (older
-  // host) the panel keeps the previous flat list — behaviour unchanged.
-  const memoryGroups = useMemo(() => {
-    const groups = new Map<string, { id: string; title: string; tags: string[]; rows: MemoryView[]; latest: number }>()
-    for (const memory of memories) {
-      const id = memory.collectionId ?? ''
-      let group = groups.get(id)
-      if (!group) {
-        group = {
-          id,
-          title: id ? (memory.collectionTitle || id) : t('memory.group.ungrouped'),
-          tags: id ? (memory.collectionTags ?? []) : [],
-          rows: [],
-          latest: 0,
-        }
-        groups.set(id, group)
-      }
-      group.rows.push(memory)
-      if (memory.updatedAt > group.latest) group.latest = memory.updatedAt
-    }
-    return [...groups.values()]
-      .filter((group) => group.rows.length > 0)
-      .sort((left, right) => right.latest - left.latest)
-  }, [memories, t])
+  // R30 需求②: 第一级只展示记忆集卡片（标题/标签/条目数/最近更新），按标题/标签
+  // 搜索；点击卡片下钻到该集合的条目页。未归集是一张 id 为 '' 的虚拟卡片。
+  const filteredCollections = useMemo(() => {
+    const needle = memoryQuery.trim().toLowerCase()
+    if (!needle) return memoryCollections
+    return memoryCollections.filter((collection) =>
+      collection.title.toLowerCase().includes(needle)
+      || collection.tags.some((tag) => tag.toLowerCase().includes(needle)))
+  }, [memoryCollections, memoryQuery])
 
-  // R28 需求④: 有集合数据时按集合分组（组头 = 标题 + 标签 chips + 条目数），
-  // 否则平铺——与分组上线前的记忆页签完全一致。
-  const hasCollections = memoryGroups.some((group) => group.id !== '')
-  const memoryList: ReactNode = memories.length === 0
-    ? h(EmptyState, { key: 'empty', label: t('memory.empty'), hint: t('memory.empty.hint') })
-    : hasCollections
-      ? h('div', { key: 'groups', className: 'sm-list' },
-          memoryGroups.map((group) =>
-            h('div', { key: group.id || 'ungrouped', className: 'sm-card' },
-              h('div', { key: 'head', className: 'sm-row' },
-                h('h3', { key: 'title' }, group.title),
-                h('span', { key: 'count', className: 'sm-badge' }, t('memory.group.count', { count: group.rows.length })),
-              ),
-              tagChips(group.tags),
-              h('div', { key: 'rows', className: 'sm-list' }, group.rows.map(memoryItem)),
-            ),
-          ),
-        )
-      : h('div', { key: 'list', className: 'sm-list' }, memories.map(memoryItem))
+  const collectionCard = (collection: MemoryCollectionView): ReactNode =>
+    h('div', {
+      key: collection.id || 'ungrouped', className: 'sm-card',
+      'data-clickable': 'true',
+      title: t('memory.collection.open'),
+      style: { cursor: 'pointer' },
+      onClick: () => setView({ kind: 'memory-collection', id: collection.id }),
+    },
+      h('div', { key: 'head', className: 'sm-row' },
+        h('h3', { key: 'title' }, collection.title),
+        h('span', { key: 'count', className: 'sm-badge' }, t('memory.group.count', { count: collection.count })),
+      ),
+      tagChips(collection.tags),
+      h('div', { key: 'meta', className: 'sm-sub' }, `${t('memory.updated')}：${fmtTime(collection.latestUpdatedAt)}`),
+    )
 
-  // R10: memories are edited and read as title + tags + body. The search box
-  // filters on every field, but the *hit source* is visible: a title/tag match
-  // is highlighted, so the user never has to scan the body to find a record.
-  // R28 需求④: the list below is grouped by 记忆集合 (see memoryList).
-  const memoriesView: ReactNode = [
+  const collectionList: ReactNode = filteredCollections.length === 0
+    ? h(EmptyState, { key: 'empty', label: t('memory.collection.empty'), hint: t('memory.collection.empty.hint') })
+    : h('div', { key: 'cards', className: 'sm-list' }, filteredCollections.map(collectionCard))
+
+  // R30 需求②: 第二级——一个集合内的全部条目（标题/标签/版本徽标/更新时间），
+  // 点击条目进入详情页。搜索框按标题/标签/正文过滤（宿主侧打分）。
+  const currentCollection = view.kind === 'memory-collection'
+    ? memoryCollections.find((collection) => collection.id === view.id)
+    : undefined
+
+  const memoryCollectionView: ReactNode = h('div', { key: 'mc' },
+    h('div', { key: 'crumb', className: 'sm-row' },
+      h(Button, { key: 'back', label: t('memory.back'), onClick: () => setView({ kind: 'memories' }) }),
+      h('span', { key: 'path', className: 'sm-muted' },
+        `${t('tab.memories')} / ${currentCollection?.title ?? (view.kind === 'memory-collection' ? view.id : '')}`),
+    ),
     h('div', { key: 'search', className: 'sm-form' },
       h('input', {
         key: 'input', className: 'sm-input', value: query, placeholder: t('memory.search'),
         onChange: (event: { target: { value: string } }) => setQuery(event.target.value),
       }),
-      h(Button, { key: 'go', label: t('hub.refresh'), onClick: () => void refreshMemories() }),
+      h(Button, {
+        key: 'go', label: t('hub.refresh'),
+        onClick: () => { if (view.kind === 'memory-collection') void refreshCollectionMemories(view.id) },
+      }),
+    ),
+    collectionMemories.length === 0
+      ? h(EmptyState, { key: 'empty', label: t('memory.empty'), hint: t('memory.empty.hint') })
+      : h('div', { key: 'list', className: 'sm-list' }, collectionMemories.map(memoryEntryRow)),
+  )
+
+  // R30 需求②: 第三级——记忆详情：完整正文、当前版本、历史版本列表（可展开），
+  // 以及编辑/停用/删除动作。历史里最后一条即当前版本。
+  const detail = memoryDetail
+  const detailVersions = detail?.versions ?? []
+  const expandedVersionKey = expandedVersion
+  const memoryDetailView: ReactNode = detail
+    ? h('div', { key: 'md' },
+        h('div', { key: 'crumb', className: 'sm-row' },
+          h(Button, { key: 'back', label: t('memory.back'), onClick: () => backFromMemoryDetail() }),
+          h('span', { key: 'path', className: 'sm-muted' },
+            `${t('tab.memories')} / ${detail.view.collectionTitle || t('memory.group.ungrouped')} / ${detail.view.title || deriveTitleClient(detail.view.text)}`),
+        ),
+        h('div', { key: 'head', className: 'sm-row' },
+          h('span', { key: 'title', className: 'sm-title' }, detail.view.title || deriveTitleClient(detail.view.text)),
+          h('span', { key: 'ver', className: 'sm-badge' }, `v${detail.view.version ?? 1}`),
+          h('span', { key: 'st', className: 'sm-badge' }, detail.view.status),
+        ),
+        tagChips(detail.view.tags, query),
+        h('div', { key: 'body', className: 'sm-body-text' }, detail.view.text),
+        h('div', { key: 'meta', className: 'sm-sub' },
+          `${t('memory.updated')}：${fmtTime(detail.view.updatedAt)}`,
+          detail.view.key ? ` · key ${detail.view.key}` : '',
+          detail.view.sourceSessionId ? ` · ${t('memory.source')}：${detail.view.sourceSessionId}` : '',
+        ),
+        h('div', { key: 'actions', className: 'sm-actions' },
+          h(Button, {
+            key: 'edit', label: t('memory.edit'),
+            onClick: () => setEditingMemory({
+              id: detail.view.id, title: detail.view.title, tags: detail.view.tags, text: detail.view.text, key: detail.view.key,
+            }),
+          }),
+          h(Button, {
+            key: 'toggle', label: detail.view.status === 'active' ? t('memory.disable') : t('memory.enable'),
+            onClick: () => void run(async () => api.setMemoryStatus(cwd, detail.view.id, detail.view.status === 'active' ? 'superseded' : 'active'), () => void refreshMemoryViews()),
+          }),
+          confirmDeleteMemory === detail.view.id
+            ? h(Button, {
+                key: 'delYes', variant: 'danger', label: t('memory.deleteConfirm'),
+                onClick: () => void run(async () => api.deleteMemory(cwd, detail.view.id), () => {
+                  setConfirmDeleteMemory(undefined)
+                  setView({ kind: 'memory-collection', id: detail.view.collectionId ?? '' })
+                }),
+              })
+            : h(Button, {
+                key: 'del', variant: 'danger', label: t('memory.delete'),
+                onClick: () => setConfirmDeleteMemory(detail.view.id),
+              }),
+          confirmDeleteMemory === detail.view.id
+            ? h(Button, { key: 'delNo', label: t('memory.cancel'), onClick: () => setConfirmDeleteMemory(undefined) })
+            : null,
+        ),
+        h('div', { key: 'history', className: 'sm-form-col' },
+          h('div', { key: 'label', className: 'sm-form-label' },
+            `${t('memory.history')}（${detailVersions.length}）`),
+          detailVersions.length === 0
+            ? h('div', { key: 'none', className: 'sm-muted' }, t('memory.history.none'))
+            : h('div', { key: 'rows', className: 'sm-list' },
+                detailVersions.map((row) => {
+                  const rowKey = `${detail.view.id}:${row.version}`
+                  const open = expandedVersionKey === rowKey
+                  return h('div', { key: rowKey, className: 'sm-item' },
+                    h('div', {
+                      key: 'head', className: 'sm-row', 'data-clickable': 'true',
+                      title: t('memory.history.toggle'),
+                      style: { cursor: 'pointer' },
+                      onClick: () => setExpandedVersion(open ? undefined : rowKey),
+                    },
+                      h('span', { key: 'caret', className: 'sm-caret' }, open ? '▾' : '▸'),
+                      h('span', { key: 'ver', className: 'sm-badge' }, `v${row.version}`),
+                      h('span', { key: 'type', className: 'sm-badge' }, t(`memory.history.${row.changeType}`)),
+                      h('span', { key: 'title', className: 'sm-title' }, row.title || '—'),
+                      h('span', { key: 'at', className: 'sm-sub' }, fmtTime(row.updatedAt)),
+                    ),
+                    tagChips(row.tags),
+                    open ? h('div', { key: 'text', className: 'sm-body-text' }, row.text) : null,
+                  )
+                }),
+              ),
+        ),
+      )
+    : h(EmptyState, { key: 'missing', label: t('memory.empty'), hint: t('memory.empty.hint') })
+
+  // R10: memories are edited and read as title + tags + body. The search box
+  // filters on every field, but the *hit source* is visible: a title/tag match
+  // is highlighted, so the user never has to scan the body to find a record.
+  // R30 需求②: 第一级只列记忆集卡片（见 collectionList），条目在下钻页里。
+  const memoriesView: ReactNode = [
+    h('div', { key: 'search', className: 'sm-form' },
+      h('input', {
+        key: 'input', className: 'sm-input', value: memoryQuery, placeholder: t('memory.collection.search'),
+        onChange: (event: { target: { value: string } }) => setMemoryQuery(event.target.value),
+      }),
+      h(Button, { key: 'go', label: t('hub.refresh'), onClick: () => void refreshMemoryCollections() }),
     ),
     h('div', { key: 'new', className: 'sm-form-col' },
       h('div', { key: 'title', className: 'sm-form-row' },
@@ -1589,13 +1965,14 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
             setNewMemoryTitle('')
             setNewMemoryTags('')
             setShapeAuto(false)
-            void refreshMemories()
+            void refreshMemoryViews()
+            void refreshHub()
           }),
         }),
         h('span', { key: 'hint', className: 'sm-muted' }, t('memory.shape.hint')),
       ),
     ),
-    memoryList,
+    collectionList,
   ]
 
 
@@ -1771,8 +2148,10 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     : view.kind === 'sets' ? setsView
       : view.kind === 'topic' ? topicView
         : view.kind === 'memories' ? memoriesView
-          : view.kind === 'chat' ? chatView
-            : toolsView
+          : view.kind === 'memory-collection' ? memoryCollectionView
+            : view.kind === 'memory-detail' ? memoryDetailView
+              : view.kind === 'chat' ? chatView
+                : toolsView
 
   // R18 需求①: the panel is a two-column shell — a hub-session rail on the
   // left and the active view on the right. Under 760px the rail folds into a
@@ -1877,10 +2256,10 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                 cwd,
                 editingMemory.id,
                 editingMemory.text,
-                memories.find((memory) => memory.id === editingMemory.id)?.key,
+                editingMemory.key,
                 editingMemory.title,
                 editingMemory.tags,
-              ), () => { setEditingMemory(undefined); void refreshMemories() }),
+              ), () => { setEditingMemory(undefined); void refreshMemoryViews() }),
             }),
             h(Button, { key: 'cancel', label: t('memory.cancel'), onClick: () => setEditingMemory(undefined) }),
           ),

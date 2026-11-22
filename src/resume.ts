@@ -24,6 +24,7 @@ import { branchHandles, compositionSetup, hubComposition, runDispatch } from './
 import { deliverRelay, type ObserveConfig, type ObserveDeps } from './observe.ts'
 import { resolveCapabilities, type CapabilityProfile } from './capabilities.ts'
 import { isOpenDispatch, relativeAgo, taskExcerpt } from './hub-branches.ts'
+import { branchTagsFor, branchTitleFor } from './branch-meta.ts'
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId } from './store.ts'
@@ -264,12 +265,18 @@ async function partialOfBranch(deps: ResumeDeps, dispatchId: string, record: Dis
 }
 
 /** The wake message of a same-session continuation. */
-function resumeMessage(originalId: string, record: Dispatch, partial: string): string {
+function resumeMessage(originalId: string, record: Dispatch, partial: string, hubSessionId: string): string {
   const group = record.groupId
     ? '\n原任务来自并行组 ' + record.groupId + '（组汇总已另行交付），本次为单独续跑。'
     : ''
+  // R30 需求⑥: 续跑消息同样点名中枢会话——relay 回送目标就是它（派发记录
+  // hubSessionId 与调用方 agent id 一致时才续跑，见 resumeDispatch）。
+  const hub = hubSessionId
+    ? '\n中枢会话：' + hubSessionId + '（完成后结果经既有 relay 通道送回该会话）。'
+    : ''
   return '[supermemory-resume ' + originalId + ']'
     + '\n本消息是被中断任务的续跑（原派发 ' + originalId + '，原分支 ' + record.branchSessionId + '）。' + group
+    + hub
     + '\n原始任务：' + record.task
     + '\n已完成部分：' + (partial || '（无记录）')
     + '\n请先核对以上已完成部分与分支日志中已有的工作，再继续未完成的事项；不要从头重复已完成的工作。'
@@ -377,6 +384,15 @@ export async function resumeDispatch(
       startSeq: seqBefore,
       status: 'dispatched',
       resumeOf: dispatchId,
+      // R30 需求④: 续跑把标题/标签映射带前进（同一分支、同一身份词表）。
+      title: record.title || branchTitleFor(record.task),
+      tags: record.tags && record.tags.length > 0
+        ? [...record.tags]
+        : branchTagsFor({
+            topicTags: record.topicSetId ? store.topicsets.get(record.topicSetId)?.keywords : undefined,
+            task: record.task,
+            capability: capabilities.profile,
+          }),
       createdAt: now,
       updatedAt: now,
     })
@@ -389,7 +405,7 @@ export async function resumeDispatch(
     try {
       const factory = options.createMessage ?? (await messageFactory())
       agent.followup(factory({
-        content: [{ type: 'text', text: resumeMessage(dispatchId, record, partial) }],
+        content: [{ type: 'text', text: resumeMessage(dispatchId, record, partial, hubSessionId) }],
         // R25: 续跑消息也以人类提示形态落账（kind 'user'，不再用 form
         // 'instructions'）：宿主会话列表的 recency 只认 kind 'user'，续跑一条
         // 已存在的分支才能回到列表顶部。归属由 kind 'user' + observe 的首个

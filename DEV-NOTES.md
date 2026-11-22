@@ -2150,3 +2150,25 @@ R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框�
 - 另注意：`scripts/git-sync-push.sh` **本身没有 typecheck/smoke 闸门**（只做 工作区检查→fetch→rebase→push→ls-remote 核对），派发单里「会触发 typecheck/smoke 闸门」的说法与实际脚本不符，以脚本为准。
 - **待中枢处理的后续**：`src/builtin-capabilities.ts` 的 git-sync 能力 v4 description 仍写着「Gitee 重建前全部失败」（已过时），且超过 500 字上限导致内置能力播种被静默跳过（capability-smoke C3 / workspace-scope W5 失败的根因）。建议后续一轮：description 改短并更新为「Gitee 已恢复（Zry/SuperMemory）」升 v5 → 中枢 `pnpm build` + 插件重载 + `memory_toolize refresh-builtin`。分支内不重载（禁自杀）。
 - 本轮提交只含文档（`docs/git-sync.md` + 本小节）；DEV-NOTES.md 同时带入 R30-A/R30-B 的文档小节（§36/§37，代码改动仍未提交，归各自轮次）。
+
+---
+
+## 39. R30 集成轮：全量闸门 + git-sync 能力 v5 修复 + 一次性提交（2026-11-23）
+
+### 需求与结果
+
+- R30-A（§37 记忆版本控制 + 面板记忆两级页）与 R30-B（§36 中枢-分支协同③-⑥）终态后，本轮把全部改动合并收口：一次提交（含 `lib/` 重建产物——插件经 profile 符号链接从仓库加载，宿主入口 `lib/supermemory.js` URL 稳定、按内容哈希重新导入新 chunk，重载后生效），**未推送、未重载**（中枢负责）。
+- `memory-cleanup-20261122/`（R29 遗留本地清理报告）按约定留作未跟踪，未入库。
+
+### 既有失败根因修复：git-sync 内置能力 v4→v5（§38.4 待办的兑现）
+
+- 根因：v4 描述 **725 字**超过 `buildCapabilitySpec`（src/composite.ts）的 **500 字**上限 → `mergeBuiltinCapabilities` 静默跳过播种（`report.seeded=[]`）→ capability-smoke **C3** 与 workspace-scope **W5** 失败、内置能力计数差 1。该文件 R30 两分支都未改（R29 遗留）。
+- 修法：version 4→5；描述压回 **499 字**并更新为现状——双远程推送（origin push = GitHub 首位 + Gitee `Zry/SuperMemory`，fetch/pull 只走 Gitee）、凭据走仓库本地 GCM（helper=manager）、`GIT_TERMINAL_PROMPT=0`、Gitea 2026-11-22 晚重置后已恢复（帐号改名 `旧帐号名→Zry`，非重建）、凭据键坑与恢复流程指向 `docs/git-sync.md`；changelog 记录 v5 原因（超限被静默跳过 → 压缩 + 更新现状）。
+- 修复前后实测：C3 `AssertionError: actual [] expected ['sm_composite_git_sync_supermemory']` → `ok - C3 内置播种：空库播种+落工作区+重启重建拾取+幂等`；W5 `rebuild 注册全部活跃行（含播种的内置能力）: 3` → `ok - W5 重启重建带行级归属；内置播种落 scope 工作区且幂等`。
+
+### 闸门（全绿，按序）
+
+- `pnpm typecheck`：宿主 + 客户端双 0 错。
+- `pnpm build`：宿主 10 文件 642.91 kB（含新 `lib/memory-versions-*.js` chunk）+ client 134.12 kB（wrapped 130818 bytes）；`INEFFECTIVE_DYNAMIC_IMPORT` 为既有提示非错误。
+- `pnpm smoke` 六套件：core 25 / mechanism 98（含 R30-B1–B4）/ webui 35 / client-sim `SIM SMOKE OK` / capability 12（C3 转绿）/ workspace-scope 9（W5 转绿）。
+- 提交后待中枢：`pnpm build` 已生成新 `lib/`，重载插件 + `memory_toolize refresh-builtin` 后 store 里的能力行才升到 v5（分支内禁重载）。

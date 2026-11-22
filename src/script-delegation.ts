@@ -7,6 +7,12 @@
  * host additionally restricts the branch's tools (src/capabilities.ts), but a
  * host without that seam still gets the explicit contract.
  *
+ * R30 需求⑥: the script also names the hub session that dispatched this task
+ * (`hubSessionId`). The dispatch record carries the same id, and the relay
+ * channel (observe.ts `deliver`) targets THAT record — so the branch knows
+ * which conversation its result returns to without maintaining its own map.
+ * Omitted for a dry run, which then stays id-free.
+ *
  * Pure on purpose: scripts/mechanism-smoke.mjs asserts the exact text without a
  * DSH host.
  * @module supermemory/script-delegation
@@ -24,6 +30,12 @@ export interface DispatchScriptInput {
   branchSessionId?: string
   /** The dispatch id (kept in the header for traceability). */
   dispatchId?: string
+  /**
+   * R30 需求⑥: the hub session this dispatch was recorded against. The branch's
+   * result is relayed back to exactly this session (the dispatch record's
+   * `hubSessionId` is the delivery target), so the script names it.
+   */
+  hubSessionId?: string
 }
 
 /**
@@ -38,6 +50,10 @@ export function buildDispatchScript(input: DispatchScriptInput): string {
     '[supermemory-dispatch' + (input.dispatchId ? ` ${input.dispatchId}` : '') + ']',
     `话题集：${input.topicTitle}`,
     ...(input.branchSessionId ? [`分支会话：${input.branchSessionId}`] : []),
+    // R30 需求⑥: 唤醒你的中枢会话 id —— 派发记录已写入它，relay 也按它回送。
+    ...(input.hubSessionId
+      ? [`中枢会话：${input.hubSessionId}（派发记录与 relay 回送目标都是这个 id；完成后结果会自动送回该会话）`]
+      : []),
     `任务：${input.task}`,
     '',
     `本轮能力边界：${capability.label}（${capability.description}）；越界请汇报而不是硬做——做不到就说清楚缺什么，不要假装完成。`,

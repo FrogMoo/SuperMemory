@@ -38,6 +38,9 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { bestCollectionFor, collectionRows } from './memory-collections.ts'
+// R30 需求①: 整理引擎的条目改写同样走版本化更新（就地修改 + 升版 + 归档），
+// 不与 memory_remember/面板/管理台/自动抽取各走一套写路径。
+import { updateMemoryVersioned } from './memory-versions.ts'
 import { TITLE_MAX } from './retrieval.ts'
 import type { Memory, MemoryCollection, Meta } from './schema.ts'
 import { newId } from './store.ts'
@@ -829,7 +832,10 @@ export async function applyMemoryOrganize(
     const titleChanged = next.title !== (memory.title ?? '')
     const tagsChanged = !sameTags(memory.keywords ?? [], item.keywords)
     if (textChanged || titleChanged || tagsChanged || memory.collectionId !== collectionId) {
-      await store.memories.update(item.memoryId, () => next)
+      // R30 需求①: 同一套版本化更新——旧版本整体归档进 memory_versions。
+      await updateMemoryVersioned(store, workspaceKey, item.memoryId, {
+        title: next.title, text: next.text, tags: next.keywords, collectionId,
+      }, now)
     }
     mappings.push({
       memoryId: item.memoryId,
@@ -873,7 +879,8 @@ export async function applyMemoryOrganize(
     }
     if (!targetId) { targetId = await ensureFallback(); targetTitle = ORGANIZE_FALLBACK.title }
     if (memory.collectionId !== targetId) {
-      await store.memories.update(row.memoryId, (value) => ({ ...value, collectionId: targetId, updatedAt: now }))
+      // R30 需求①: 集合迁移同样是一次内容变更，走版本化更新并归档。
+      await updateMemoryVersioned(store, workspaceKey, row.memoryId, { collectionId: targetId }, now)
     }
     unknownAssignments.push({ memoryId: row.memoryId, title: row.title, collection: targetTitle })
   }

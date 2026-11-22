@@ -14,11 +14,13 @@ import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { extractFacts } from './extract.ts'
 import { extractRequirements, rememberRequirements } from './requirements.ts'
 import { deriveTitle, mergeTags } from './retrieval.ts'
-import type { Memory, Signal } from './schema.ts'
+import type { Signal } from './schema.ts'
 import type { Store } from './store.ts'
-import { newId, workspaceKeyOf } from './store.ts'
+import { workspaceKeyOf } from './store.ts'
 // R22 需求⑤: 自动抽取的事实记忆与 memory_remember 共用集合归属判定。
 import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
+// R30 需求①: 自动抽取与其他写路径共用同一套版本化创建（不允许绕过）。
+import { createMemoryVersioned } from './memory-versions.ts'
 import './services.ts'
 
 
@@ -371,14 +373,13 @@ async function countSequenceSignal(
   const tags = mergeTags([], keywords)
   const assignment = await resolveCollectionForEntry(store, workspaceKey, { title, keywords: tags, text }, { now, deps })
   if ('error' in assignment) return undefined
-  const memoryId = newId('mem')
-  const memory: Memory = {
-    workspaceKey, title, text,
-    keywords: tags, sourceSessionId, sourceSeq,
+  // R30 需求①: 自动抽取也走版本化创建（v1 + 归档 v1 历史），不绕过版本化写入。
+  const memoryId = await createMemoryVersioned(store, workspaceKey, {
+    title, text,
+    tags,
     ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
-    status: 'active', createdAt: now, updatedAt: now,
-  }
-  await store.memories.put(memoryId, memory)
+    sourceSessionId, sourceSeq,
+  }, now)
   if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
   return memoryId
 }

@@ -22,6 +22,7 @@ import {
   TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine,
 } from './title.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
+import { branchTagsFor, branchTitleFor } from './branch-meta.ts'
 import { groupComplete, groupEpisodeSummaries, groupRelayExists, groupRelayText, newGroupId } from './group.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { noteTopicSetActivated } from './topic-shape.ts'
@@ -402,7 +403,7 @@ export async function runDispatch(
       try {
         result = await dispatchOne(deps, {
           topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities,
-          mode: groupMode, groupId, excludeBranches: claimed,
+          mode: groupMode, kind: args.kind, groupId, excludeBranches: claimed,
         })
       } catch (error) {
         // One task must not abort the group: record it as a failed member so
@@ -444,7 +445,7 @@ export async function runDispatch(
 
   const task = firstTask
   if (!task) return { status: 'error', message: 'task 不能为空。' }
-  const one = await dispatchOne(deps, { topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities, mode })
+  const one = await dispatchOne(deps, { topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities, mode, kind: args.kind })
   if (one.status === 'dispatched' && topicSetSource !== 'explicit' && topicSetSource !== 'sticky') {
     // R23: the receipt names the set it landed in, so the hub can relay it.
     const how = topicSetSource === 'reused' ? '复用'
@@ -466,6 +467,9 @@ async function recordGroupFailure(
 ): Promise<string> {
   const dispatchId = newId('dsp')
   const now = Date.now()
+  // R30 需求④: even a failed member carries the branch title/tags mapping, so a
+  // retry (or the panel's branch rows) keeps one identity vocabulary.
+  const topicSet = deps.store.topicsets.get(input.topicSetId)
   try {
     await deps.store.dispatches.put(dispatchId, {
       topicSetId: input.topicSetId,
@@ -476,6 +480,8 @@ async function recordGroupFailure(
       startSeq: 0,
       status: 'failed',
       turnEndReason: `dispatch-error: ${String(input.error).slice(0, 120)}`,
+      title: branchTitleFor(input.task),
+      tags: branchTagsFor({ topicTags: topicSet?.keywords, task: input.task }),
       createdAt: now,
       updatedAt: now,
     })
@@ -499,13 +505,17 @@ async function dispatchOne(
     /** R18: capability profile enforced on the branch scope + written into the script. */
     capabilities: ResolvedCapability
     mode: 'auto' | 'continue' | 'fork' | 'new'
+    /** R23: the dispatch's nature ('verify' rides the branch tags). */
+    kind?: 'verify'
     groupId?: string
     /** R19 协同①: branches already claimed by this group (never reuse them). */
     excludeBranches?: Set<string>
   },
 ): Promise<DispatchResult> {
   const { ctx, store, logger } = deps
-  const { topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities, mode, groupId, excludeBranches } = input
+  // `kind: taskKind` — the function's own `kind` below is the acquisition kind
+  // ('root' | 'fork'); the input's is the dispatch nature ('verify').
+  const { topicSetId, topicSet, task, cwd, hubSessionId, hubModel, composition, capabilities, mode, kind: taskKind, groupId, excludeBranches } = input
 
   const dispatchId = newId('dsp')
   const now = Date.now()
@@ -518,6 +528,11 @@ async function dispatchOne(
     // filled after acquisition: the branch log position this dispatch starts from
     startSeq: 0,
     status: 'queued',
+    // R30 需求④: the explicit branch title/tags are recorded WITH the dispatch
+    // (DSH has no native session tags — see branch-meta.ts), so every surface
+    // reads one durable mapping instead of re-deriving it per view.
+    title: branchTitleFor(task),
+    tags: branchTagsFor({ topicTags: topicSet.keywords, task, kind: taskKind, capability: capabilities.profile }),
     createdAt: now,
     updatedAt: now,
   }
@@ -583,6 +598,9 @@ async function dispatchOne(
       topicTitle: topicSet.title,
       branchSessionId,
       dispatchId,
+      // R30 需求⑥: the branch's first message names the hub session its result
+      // is relayed back to (the dispatch record's hubSessionId is the target).
+      hubSessionId,
     })
     const message = factory({
       content: [{

@@ -34,7 +34,7 @@ import './services.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
 import { activeComposites, catalogFor, renderCatalog } from './toolize.ts'
-import { isHubSession, listHubBranches, renderHubBranchesCard } from './hub-branches.ts'
+import { isHubSession, listHubBranches, listTopicSetBranches, renderHubBranchesCard } from './hub-branches.ts'
 
 export interface PreStepConfig {
   enabled: boolean
@@ -128,10 +128,23 @@ export function attachPreStep(
         // started (title / state / owning set / shared-with-N-hubs), so "which
         // branches do I have?" is answerable from context instead of guesswork.
         // Branches never receive this card (isHubSession is false for them).
+        // R30 需求⑤.2: the card ALSO carries the matched topic sets' own branch
+        // lists (标题/标签/状态/最后活动) — the 「按话题集检索其下分支会话」 step
+        // of the routing, read from the durable ledger with no extra host call.
         let branchesCard = ''
         if (isHubSession(activeStore, agent)) {
           try {
-            branchesCard = renderHubBranchesCard(listHubBranches(activeStore, sessionId), { now: Date.now() })
+            const setSections = topicSets
+              .slice(0, 2)
+              .map((set) => ({
+                title: set.title,
+                rows: listTopicSetBranches(activeStore, set.id, 4),
+              }))
+              .filter((section) => section.rows.length > 0)
+            branchesCard = renderHubBranchesCard(
+              listHubBranches(activeStore, sessionId),
+              { now: Date.now(), ...(setSections.length > 0 ? { topicSets: setSections } : {}) },
+            )
           } catch (error) {
             logger.warn('supermemory: hub branch card skipped: ' + String(error).slice(0, 160))
           }

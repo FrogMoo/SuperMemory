@@ -26,8 +26,13 @@ import { scanWorkspace } from './filemap.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
 // R22 需求⑤: 管理台新建记忆与 memory_remember 共用集合归属判定。
 import { resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
+// R30 需求①: 管理台写路径与 memory_remember 共用同一套版本化更新（不允许绕过）。
+import {
+  createMemoryVersioned, findMemoryByKey, memoryContentUnchanged, memoryHistoryOf,
+  updateMemoryVersioned,
+} from './memory-versions.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
-import type { Dispatch, Episode, FileMapEntry, Memory, OutboxItem, Requirement, Routing, Signal, ToolMemory, TopicSet } from './schema.ts'
+import type { Dispatch, Episode, FileMapEntry, Memory, MemoryCollection, OutboxItem, Requirement, Routing, Signal, ToolMemory, TopicSet } from './schema.ts'
 import { createTopicSet, setRouting, touchTopicSet } from './topicsets.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { newId, workspaceKeyOf, type Store } from './store.ts'
@@ -315,29 +320,54 @@ async function handleApi(
       // R19 需求⑧: every write path stores conclusions, not transcripts.
       const verdict = assessConclusion(memText)
       if (!verdict.ok) return fail(verdict.message)
-      const id = newId('mem')
       const now = Date.now()
       const title = text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText)
       // The console's "keywords" field is the tags field (R10); auto keywords
       // fill whatever the operator did not tag, so old flows stay findable.
       const keywords = mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText))
+      const stableKey = text(body.key) || undefined
+      // R30 需求①: 同 key → 就地更新 + 升版（与 memory_remember / 面板同一套版本化
+      // 语义，不再「冲突不覆盖」）；内容相同 → 幂等回报、不升版。
+      if (stableKey) {
+        const sameKey = findMemoryByKey(store, ws, stableKey)
+        if (sameKey) {
+          // 幂等快速判定：内容没变时不解析集合归属（避免顺手新建空集合）。
+          if (memoryContentUnchanged(sameKey[1], { title, text: memText, tags: keywords })) {
+            return sendJson(res, 200, {
+              ok: true, id: sameKey[0],
+              message: `该 key 已存相同内容，未重复写入（当前 v${sameKey[1].version ?? 1}）。`,
+            })
+          }
+          const assignment = await resolveCollectionForEntry(store, ws, { title, keywords, text: memText },
+            { now, ...(ctx ? { deps: { ctx, logger } } : {}) })
+          if ('error' in assignment) return fail(assignment.error)
+          const result = await updateMemoryVersioned(store, ws, sameKey[0], {
+            title, text: memText, tags: keywords,
+            ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+          }, now)
+          if (!result) return fail('key 对应的记忆不存在')
+          if (result.status === 'unchanged') {
+            return sendJson(res, 200, { ok: true, id: sameKey[0], message: `该 key 已存相同内容，未重复写入（当前 v${result.version}）。` })
+          }
+          if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
+          return sendJson(res, 200, { ok: true, id: sameKey[0], message: `已更新到 v${result.version}（旧版本已归档）。` })
+        }
+      }
       // R22 需求⑤: the console's write path joins the same collection layer as
       // memory_remember (related collection → append entry; no new collection).
       // R27 需求④.3: 与大模型判定同源（无 llm 服务时静默退化为相似度匹配）。
       const assignment = await resolveCollectionForEntry(store, ws, { title, keywords, text: memText },
         { now, ...(ctx ? { deps: { ctx, logger } } : {}) })
       if ('error' in assignment) return fail(assignment.error)
-      const record: Memory = {
-        workspaceKey: ws,
+      // R30 需求①: 新建 v1 + 归档 v1 历史（版本化创建的唯一入口）。
+      const id = await createMemoryVersioned(store, ws, {
         title,
         text: memText,
-        keywords,
+        tags: keywords,
+        ...(stableKey ? { key: stableKey } : {}),
         ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
-        key: text(body.key) || undefined,
         sourceSessionId: text(body.sessionId) || 'webui', sourceSeq: 0,
-        status: 'active', createdAt: now, updatedAt: now,
-      }
-      await store.memories.put(id, record)
+      }, now)
       if (assignment.collectionId) await touchCollection(store, assignment.collectionId, now)
       logger.info(`supermemory: webui created memory ${id}`)
       return sendJson(res, 200, { ok: true, id })
@@ -351,20 +381,36 @@ async function handleApi(
         const verdict = assessConclusion(memText)
         if (!verdict.ok) return fail(verdict.message)
       }
-      await store.memories.update(id, (r) => ({
-        ...r,
+      // R30 需求①: 编辑走同一套版本化更新（就地修改 + version+1 + 归档）。
+      const result = await updateMemoryVersioned(store, ws, id, {
         ...(memText ? { text: memText } : {}),
         ...(body.title !== undefined
-          ? { title: text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText || r.text) }
+          ? { title: text(body.title).slice(0, TITLE_MAX) || deriveTitle(memText || existing.text) }
           : {}),
         ...(body.keywords !== undefined
-          ? { keywords: mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText || r.text)) }
+          ? { tags: mergeTags(normalizeTags(list(body.keywords)), tagsOfBody(memText || existing.text)) }
           : {}),
         ...(body.key !== undefined ? { key: text(body.key) || undefined } : {}),
-        updatedAt: Date.now(),
+      })
+      if (!result) return fail('记忆不存在')
+      logger.info(`supermemory: webui updated memory ${id} -> v${result.version}`)
+      return sendJson(res, 200, { ok: true, version: result.version })
+    }
+    case 'memory/history': {
+      // R30 需求②: 管理台记忆详情的历史版本列表（最后一条即当前版本）。
+      const id = text(body.id)
+      const existing = store.memories.get(id)
+      if (!existing || existing.workspaceKey !== ws) return fail('记忆不存在')
+      const versions = memoryHistoryOf(store, id).map((row) => ({
+        version: row.version,
+        updatedAt: row.updatedAt,
+        title: row.title ?? '',
+        tags: [...(row.tags ?? [])],
+        text: row.text,
+        changeType: row.changeType,
+        ...(row.collectionId ? { collectionId: row.collectionId } : {}),
       }))
-      logger.info(`supermemory: webui updated memory ${id}`)
-      return sendJson(res, 200, { ok: true })
+      return sendJson(res, 200, { ok: true, id, versions })
     }
     case 'memory/status': {
       const id = text(body.id)
@@ -700,6 +746,15 @@ function buildState(store: Store, ws: string) {
   for (const [id, m] of store.memories.entries()) if (m.workspaceKey === ws) memories.push({ id, ...m })
   memories.sort((a, b) => b.updatedAt - a.updatedAt)
 
+  // R30 需求②: 记忆集合（两级导航第一级）。旧介质没有集合表时为空数组，
+  // 前端退化为平铺（与集合上线前的管理台一致）。
+  const memoryCollections: Array<{ id: string } & MemoryCollection> = []
+  for (const [id, c] of store.memoryCollections?.entries() ?? []) {
+    if (c.workspaceKey !== ws) continue
+    memoryCollections.push({ id, ...c })
+  }
+  memoryCollections.sort((a, b) => b.updatedAt - a.updatedAt)
+
   const requirements: Array<{ id: string } & Requirement> = []
   for (const [id, r] of store.requirements.entries()) if (r.workspaceKey === ws) requirements.push({ id, ...r })
   requirements.sort((a, b) => b.createdAt - a.createdAt)
@@ -750,7 +805,7 @@ function buildState(store: Store, ws: string) {
   for (const [sessionId, r] of store.routing.entries()) routing.push({ sessionId, ...r })
   routing.sort((a, b) => b.updatedAt - a.updatedAt)
 
-  return { generatedAt: Date.now(), workspace: ws, topicsets, memories, episodes, requirements, dispatches, outbox, signals, toolMemory, filemap, routing }
+  return { generatedAt: Date.now(), workspace: ws, topicsets, memories, memoryCollections, episodes, requirements, dispatches, outbox, signals, toolMemory, filemap, routing }
 }
 
 // ---------- small helpers ----------

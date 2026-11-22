@@ -31,8 +31,17 @@ const state = {
   auto: localStorage.getItem('sm-auto') !== '0',
   memQuery: '',
   memFilter: 'all',
+  // R30 需求②: 记忆两级页——memCollection=null 在第一级（集合卡片），
+  // 为字符串（含 '' 未归集）时在第二级（集合内条目）；memDetail 为记忆 id
+  // 时在第三级（详情 + 历史版本）。memHistory 缓存已拉取的历史版本。
+  memCollection: null,
+  memDetail: null,
+  memHistory: {},
+  memVersionOpen: null,
   // R11: 话题集按标题/标签过滤（索引检索，不扫正文）
   tsQuery: '',
+  // R30 需求③: 中枢会话页按话题集筛选分支行（'' = 全部话题集）。
+  branchFilter: '',
   editing: new Set(),
   // R19 需求⑦: memory editing is a modal, exactly like the in-app panel.
   editMem: null,
@@ -56,6 +65,22 @@ const short = (id) => {
   return esc(s.slice(0, 8) + '…' + s.slice(-6))
 }
 const kwHtml = (kws) => (kws || []).map((k) => `<span class="kw">${esc(k)}</span>`).join(' ')
+
+/**
+ * R30 需求④: branchSessionId → 最新一次派发的显式标题/标签（管理台本地投影，
+ * 与宿主 hub-branches 的 newest-row-wins 同一规则；旧派发无这两个字段时为空）。
+ */
+function branchMeta(d) {
+  const map = new Map()
+  for (const x of d.dispatches || []) {
+    if (!x.branchSessionId) continue
+    const at = Math.max(x.updatedAt || 0, x.createdAt || 0)
+    const cur = map.get(x.branchSessionId)
+    if (cur && at < cur.at) continue
+    map.set(x.branchSessionId, { title: x.title || '', tags: x.tags || [], at })
+  }
+  return map
+}
 const badge = (s) => `<span class="badge ${esc(s)}">${esc(s)}</span>`
 
 async function api(path, options = {}) {
@@ -214,23 +239,50 @@ function topicSetCard(t, d, defaultSession) {
         <button class="btn small" type="button" data-action="ts-activate" data-id="${t.id}">激活到该会话</button>
       </div>
       ${t.members && t.members.length
-        ? `<table><tr><th>分支</th><th>类型</th><th>标题</th><th>状态</th><th>模型</th><th>最后活跃</th></tr>${t.members.map((m) => `<tr><td>${short(m.sessionId)}</td><td>${m.kind}</td><td>${esc(m.title || '—')}</td><td>${badge(m.status)}</td><td>${esc(m.model || '默认')}${m.modelOverridden ? '（覆盖）' : ''}</td><td>${fmtTime(m.lastActiveAt)}</td></tr>`).join('')}</table>`
+        ? `<table><tr><th>分支</th><th>类型</th><th>标题</th><th>标签</th><th>状态</th><th>模型</th><th>最后活跃</th></tr>${t.members.map((m) => {
+            // R30 需求④: 分支标签取自最新一次派发记录（与面板/中枢卡同一映射）。
+            const meta = branchMeta(d).get(m.sessionId)
+            return `<tr><td>${short(m.sessionId)}</td><td>${m.kind}</td><td>${esc((meta && meta.title) || m.title || '—')}</td><td>${meta && meta.tags.length ? kwHtml(meta.tags) : '<span class="muted">—</span>'}</td><td>${badge(m.status)}</td><td>${esc(m.model || '默认')}${m.modelOverridden ? '（覆盖）' : ''}</td><td>${fmtTime(m.lastActiveAt)}</td></tr>`
+          }).join('')}</table>`
         : '<div class="muted" style="padding:6px 0">无分支</div>'}
       <div class="row-meta">创建 ${fmtTime(t.createdAt)} · 更新 ${fmtTime(t.updatedAt)} · 活跃 ${fmtTime(t.lastActiveAt)} · id ${short(t.id)}</div>
     </div>
   </div>`
 }
 
+function memGroups(d) {
+  // R30 需求②: 集合 → 条目。未归集（无 collectionId）归到 id 为 '' 的虚拟集合，
+  // 保证旧数据在两级导航里仍然可见，不丢条目。
+  const groups = new Map()
+  for (const m of d.memories || []) {
+    const id = m.collectionId || ''
+    if (!groups.has(id)) groups.set(id, [])
+    groups.get(id).push(m)
+  }
+  return groups
+}
+
+function latestOf(rows) {
+  return (rows || []).reduce((max, m) => (m.updatedAt > max ? m.updatedAt : max), 0)
+}
+
+/** R30 需求②: 第一级——只展示记忆集卡片（标题/标签/条目数/最近更新）。 */
 function renderMemories(d) {
+  if (state.memDetail) return renderMemoryDetail(d)
+  if (state.memCollection !== null) return renderMemoryCollection(d)
   const q = state.memQuery.trim().toLowerCase()
-  // 标题/标签是索引：先按索引匹配；索引无命中时才扫正文（正文匹配仍会展示标题）。
-  const indexHit = (m) => !q
-    || String(m.title || '').toLowerCase().includes(q)
-    || (m.keywords || []).some((k) => String(k).toLowerCase().includes(q))
-    || String(m.key || '').toLowerCase().includes(q)
-  const bodyHit = (m) => !q || String(m.text || '').toLowerCase().includes(q)
-  const list = d.memories.filter((m) =>
-    (state.memFilter === 'all' || m.status === state.memFilter) && (indexHit(m) || bodyHit(m)))
+  const groups = memGroups(d)
+  const specs = []
+  for (const c of d.memoryCollections || []) {
+    const rows = groups.get(c.id) || []
+    specs.push({ id: c.id, title: c.title, tags: c.keywords || [], summary: c.summary || '', rows, latest: latestOf(rows) })
+  }
+  const loose = groups.get('') || []
+  if (loose.length > 0) specs.push({ id: '', title: '未归集', tags: [], summary: '', rows: loose, latest: latestOf(loose) })
+  specs.sort((a, b) => b.latest - a.latest)
+  const list = q
+    ? specs.filter((s) => s.title.toLowerCase().includes(q) || s.tags.some((t) => String(t).toLowerCase().includes(q)))
+    : specs
   const head = `
   <div class="panel"><header>新建记忆</header><div class="body">
     <form data-form="mem-create">
@@ -244,16 +296,116 @@ function renderMemories(d) {
     </form>
   </div></div>
   <div class="toolbar">
-    <input type="text" id="mem-q" placeholder="搜索记忆…" value="${esc(state.memQuery)}">
+    <input type="text" id="mem-q" placeholder="按标题或标签搜索记忆集合…" value="${esc(state.memQuery)}">
+    <span class="muted">${list.length} 个集合</span>
+  </div>`
+  const rows = list.length ? list.map((s) => `
+  <div class="row" data-id="${esc(s.id)}">
+    <div class="row-main">
+      <div class="row-text">
+        <div class="row-title"><a href="javascript:void(0)" data-action="mem-collection" data-id="${esc(s.id)}" title="打开这个记忆集合的条目">${esc(s.title)}</a></div>
+        <div class="row-meta">
+          ${kwHtml(s.tags)}
+          <span>${s.rows.length} 条</span>
+          <span>更新 ${fmtTime(s.latest)}</span>
+          ${s.summary ? `<span class="clamp">${esc(s.summary)}</span>` : ''}
+        </div>
+      </div>
+    </div>
+  </div>`).join('') : '<div class="empty">没有匹配的记忆集合</div>'
+  return head + `<div class="panel"><div class="body">${rows}</div></div>`
+}
+
+/** R30 需求②: 第二级——一个集合内的全部条目（标题/标签/版本徽标/更新时间）。 */
+function renderMemoryCollection(d) {
+  const cid = state.memCollection
+  const groups = memGroups(d)
+  const all = groups.get(cid) || []
+  const title = cid
+    ? ((d.memoryCollections || []).find((c) => c.id === cid) || {}).title || cid
+    : '未归集'
+  const q = state.memQuery.trim().toLowerCase()
+  const indexHit = (m) => !q
+    || String(m.title || '').toLowerCase().includes(q)
+    || (m.keywords || []).some((k) => String(k).toLowerCase().includes(q))
+    || String(m.key || '').toLowerCase().includes(q)
+  const bodyHit = (m) => !q || String(m.text || '').toLowerCase().includes(q)
+  const list = all.filter((m) =>
+    (state.memFilter === 'all' || m.status === state.memFilter) && (indexHit(m) || bodyHit(m)))
+  const head = `
+  <div class="toolbar">
+    <button class="btn" type="button" data-action="mem-back">← 返回记忆集合</button>
+    <span class="muted">记忆 / ${esc(title)}</span>
+  </div>
+  <div class="toolbar">
+    <input type="text" id="mem-q" placeholder="搜索该集合内的记忆…" value="${esc(state.memQuery)}">
     <select id="mem-filter">
-      <option value="all"${state.memFilter === 'all' ? ' selected' : ''}>全部 ${d.memories.length}</option>
+      <option value="all"${state.memFilter === 'all' ? ' selected' : ''}>全部 ${all.length}</option>
       <option value="active"${state.memFilter === 'active' ? ' selected' : ''}>生效</option>
       <option value="superseded"${state.memFilter === 'superseded' ? ' selected' : ''}>已软删</option>
     </select>
     <span class="muted">显示 ${list.length} 条</span>
   </div>`
-  const rows = list.length ? list.map((m) => memoryRow(m)).join('') : '<div class="empty">没有匹配的记忆</div>'
+  const rows = list.length ? list.map((m) => memoryRow(m)).join('') : '<div class="empty">这个集合里没有匹配的记忆</div>'
   return head + `<div class="panel"><div class="body">${rows}</div></div>`
+}
+
+/** R30 需求②: 第三级——记忆详情：完整正文、当前版本、历史版本列表（可展开）。 */
+function renderMemoryDetail(d) {
+  const id = state.memDetail
+  const m = (d.memories || []).find((row) => row.id === id)
+  if (!m) {
+    return `<div class="toolbar"><button class="btn" type="button" data-action="mem-detail-back">← 返回</button></div>
+    <div class="empty">这条记忆已不存在（可能被删除）。</div>`
+  }
+  const collectionRow = m.collectionId ? (d.memoryCollections || []).find((c) => c.id === m.collectionId) : undefined
+  const collectionTitle = (collectionRow && collectionRow.title) || '未归集'
+  const versions = state.memHistory[id] || []
+  const head = `
+  <div class="toolbar">
+    <button class="btn" type="button" data-action="mem-detail-back">← 返回${esc(collectionTitle)}</button>
+    <span class="muted">记忆 / ${esc(collectionTitle)} / ${esc(m.title || (m.text || '').slice(0, 48))}</span>
+  </div>`
+  const detail = `
+  <div class="panel"><header>${esc(m.title || (m.text || '').slice(0, 48))}</header><div class="body">
+    <div class="row-meta" style="margin-bottom:8px">
+      ${badge(m.status)}
+      <span class="badge">v${m.version == null ? 1 : m.version}</span>
+      ${kwHtml(m.keywords)}
+      <span>来源 ${short(m.sourceSessionId)} #${m.sourceSeq}</span>
+      <span>更新 ${fmtTime(m.updatedAt)}</span>
+      ${m.key ? `<span>key ${esc(m.key)}</span>` : ''}
+    </div>
+    <div style="white-space:pre-wrap;word-break:break-word">${esc(m.text)}</div>
+    <div class="toolbar" style="margin-top:10px">
+      <button class="btn small" type="button" data-action="mem-edit" data-id="${m.id}">编辑</button>
+      ${m.status === 'active'
+        ? `<button class="btn small danger" type="button" data-action="mem-soft" data-id="${m.id}">软删</button>`
+        : `<button class="btn small" type="button" data-action="mem-restore" data-id="${m.id}">恢复</button>`}
+      <button class="btn small danger" type="button" data-action="mem-del" data-id="${m.id}">彻底删除</button>
+    </div>
+  </div></div>`
+  const history = versions.length === 0
+    ? `<div class="panel"><header>历史版本</header><div class="body"><div class="empty">正在加载历史版本…（若始终为空，说明该记忆还没有版本历史）</div></div></div>`
+    : `<div class="panel"><header>历史版本（${versions.length}）</header><div class="body">${versions.map((v) => {
+        const open = state.memVersionOpen === `${m.id}:${v.version}`
+        const typeLabel = v.changeType === 'create' ? '新建' : v.changeType === 'update' ? '更新' : '迁移'
+        return `
+        <div class="row" data-id="${m.id}:${v.version}">
+          <div class="row-main">
+            <div class="row-text">
+              <div class="row-title">
+                <a href="javascript:void(0)" data-action="mem-version" data-id="${m.id}:${v.version}" title="展开/收起这个版本的完整内容">${open ? '▾' : '▸'} v${v.version}</a>
+                <span class="badge">${typeLabel}</span>
+                <span class="muted">${esc(v.title || '—')} · ${fmtTime(v.updatedAt)}</span>
+              </div>
+              ${open ? `<div class="clamp" style="white-space:pre-wrap;word-break:break-word">${esc(v.text)}</div>` : ''}
+              <div class="row-meta">${kwHtml(v.tags)}</div>
+            </div>
+          </div>
+        </div>`
+      }).join('')}</div></div>`
+  return head + detail + history
 }
 
 function memoryRow(m) {
@@ -261,7 +413,9 @@ function memoryRow(m) {
   <div class="row" data-id="${m.id}">
     <div class="row-main">
       <div class="row-text">
-        <div class="row-title">${esc(m.title || (m.text || '').slice(0, 48))}</div>
+          <div class="row-title"><a href="javascript:void(0)" data-action="mem-open" data-id="${m.id}" title="打开详情与历史版本">${esc(m.title || (m.text || '').slice(0, 48))}</a>
+            <span class="badge">v${m.version == null ? 1 : m.version}</span>
+          </div>
         <div class="clamp" title="点击展开/收起">${esc(m.text)}</div>
         <div class="row-meta">
           ${badge(m.status)} ${kwHtml(m.keywords)}
@@ -426,8 +580,13 @@ function renderHubs(d) {
     byHub.get(b.hubSessionId).push(b)
   }
   const stateText = (s) => s === 'working' ? '工作中' : s === 'failed' ? '失败待处理' : '空闲'
+  // R30 需求③: 按话题集筛选（本地过滤，切换即生效）；被筛掉的分支不计入计数。
+  const filter = state.branchFilter || ''
+  const setsOf = (b) => (filter && b.topicSetId !== filter ? [] : [b])
   const cards = hubs.map((h) => {
-    const rows = byHub.get(h.sessionId) || []
+    const all = byHub.get(h.sessionId) || []
+    const rows = all.flatMap(setsOf)
+    if (filter && rows.length === 0) return ''
     const working = rows.filter((b) => b.status === 'working').length
     const branchHtml = rows.length === 0
       ? '<div class="row-meta"><span class="muted">尚未拉起分支</span></div>'
@@ -446,6 +605,7 @@ function renderHubs(d) {
                 <span>派发 ${b.dispatches}</span>
                 <span>会话 ${short(b.branchSessionId)}</span>
               </div>
+              ${b.tags && b.tags.length ? `<div class="row-meta">${kwHtml(b.tags)}</div>` : ''}
               ${b.task ? `<div class="row-meta"><span class="muted">任务</span> ${esc(b.task)}</div>` : ''}
             </div>`).join('')}</div>`
     return `
@@ -468,8 +628,19 @@ function renderHubs(d) {
       ${branchHtml}
     </div>`
   }).join('')
+  // R30 需求③: 按话题集筛选分支（管理台与面板同一份 ledger 投影）。
+  const setOptions = (d.topicsets || []).map((t) =>
+    `<option value="${esc(t.id)}"${state.branchFilter === t.id ? ' selected' : ''}>${esc(t.title)}${t.status === 'archived' ? '（归档）' : ''}</option>`).join('')
+  const filterBar = (d.topicsets || []).length > 0
+    ? `<div class="toolbar"><select data-role="branch-filter"><option value="">全部话题集</option>${setOptions}</select>
+       <span class="muted">${filter ? '已按话题集筛选分支行' : `共 ${branches.length} 个分支`}</span></div>`
+    : ''
+  const visible = cards.join('')
+  const body = visible
+    ? `${filterBar}<div class="card-list">${visible}</div>`
+    : `<div class="empty">${filter ? '该话题集下没有分支会话' : '当前工作区还没有中枢会话（无父会话、非子代理、且不属于任何话题集）'}</div>`
   return `<div class="panel"><header>中枢会话 <span class="badge info">${hubs.length}</span><span class="muted">当前工作区 ${esc(d.workspace || '')}</span></header>`
-    + `<div class="body"><div class="card-list">${cards}</div></div></div>`
+    + `<div class="body">${body}</div></div>`
 }
 
 /** R22: 解析一条 toolMemory 记录的能力定义；非能力返回 null。 */
@@ -676,6 +847,31 @@ document.addEventListener('click', async (ev) => {
       render()
       return
     }
+    // R30 需求②: 两级导航——进入集合 / 返回集合 / 打开记忆详情 / 返回详情 /
+    // 展开或收起某个历史版本。
+    case 'mem-collection': state.memCollection = id; state.memQuery = ''; render(); return
+    case 'mem-back': state.memCollection = null; state.memQuery = ''; render(); return
+    case 'mem-detail-back': state.memDetail = null; state.memVersionOpen = null; render(); return
+    case 'mem-version':
+      state.memVersionOpen = state.memVersionOpen === id ? null : id
+      render()
+      return
+    case 'mem-open': {
+      state.memDetail = id
+      state.memVersionOpen = null
+      render()
+      if (!state.memHistory[id]) {
+        try {
+          const r = await api('/memory/history', { method: 'POST', body: { ws: state.ws, id } })
+          state.memHistory[id] = r.versions || []
+        } catch (e) {
+          state.memHistory[id] = []
+          showError(e)
+        }
+        render()
+      }
+      return
+    }
     case 'modal-close': state.editMem = null; state.capRun = null; state.capConfirm = null; render(); return
     case 'mem-save-modal': await run(async () => {
       const modal = document.querySelector('.modal')
@@ -683,9 +879,11 @@ document.addEventListener('click', async (ev) => {
       const title = modal.querySelector('[data-role="edit-title"]').value
       const keywords = modal.querySelector('[data-role="edit-kw"]').value
       const text = modal.querySelector('[data-role="edit-text"]').value
-      await post('/memory/update', { ws: state.ws, id, title, keywords, text })
+      const r = await post('/memory/update', { ws: state.ws, id, title, keywords, text })
       state.editMem = null
-      toast('记忆已保存')
+      // R30 需求①: 编辑会就地升版——历史缓存作废，下次打开详情重新拉取。
+      delete state.memHistory[id]
+      toast(r && r.version ? `记忆已保存（v${r.version}）` : '记忆已保存')
     }); return
     case 'edit-cancel': state.editing.delete(id); render(); return
     case 'mem-soft':
@@ -858,6 +1056,11 @@ document.addEventListener('change', async (ev) => {
     render()
     const q = $('#ts-q')
     if (q) { q.focus(); q.setSelectionRange(pos, pos) }
+  } else if (t.matches('[data-role="branch-filter"]')) {
+    // R30 需求③: 中枢会话页按话题集筛选分支行（本地过滤，无需重新拉取）。
+    if (state.branchFilter === t.value) return
+    state.branchFilter = t.value
+    render()
   }
 })
 

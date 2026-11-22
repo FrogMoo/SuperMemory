@@ -10,7 +10,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { UserMessage, createUserMessage as CreateUserMessage } from '@deepseek-ai/dsh-llm'
 import { loadHostModule } from './host.ts'
-import type { Memory, ToolMemory } from './schema.ts'
+import type { ToolMemory } from './schema.ts'
 import type { Store } from './store.ts'
 import { newId, workspaceKeyOf } from './store.ts'
 import {
@@ -28,11 +28,17 @@ import { enumerateModels } from './model.ts'
 import { tokenize } from './recall.ts'
 // R22 需求⑤: 面板新建记忆与 memory_remember 共用同一套集合归属判定。
 import { collectionTierNote, listCollections, resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
+// R30 需求①: 面板写路径与 memory_remember 共用同一套版本化更新（不允许绕过）。
+import {
+  createMemoryVersioned, currentVersionOf, findMemoryByKey, memoryContentUnchanged, memoryHistoryOf,
+  updateMemoryVersioned,
+} from './memory-versions.ts'
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
 import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
-import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
+import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, listWorkspaceBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
+import { latestBranchMeta } from './branch-meta.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 
 export interface TopicSetView {
@@ -46,6 +52,11 @@ export interface TopicSetView {
   sessions: number
   /** How many of those sessions are currently live. */
   live: number
+  /**
+   * R30 需求③: the set's lifecycle (listTopicSets only lists active ones;
+   * listAllTopicSets — the hub's management view — carries archived sets too).
+   */
+  status?: 'active' | 'archived'
   branches: Array<{
     sessionId: string
     kind: 'root' | 'fork'
@@ -63,6 +74,8 @@ export interface TopicSetView {
      * title + owning set + task summary, without needing a live handle.
      */
     task?: string
+    /** R30 需求④: the branch's tags (from its newest dispatch record). */
+    tags?: string[]
   }>
   model?: string
 }
@@ -83,6 +96,43 @@ export interface MemoryView {
   collectionId?: string
   collectionTitle?: string
   collectionTags?: string[]
+  // R30 需求①: 当前版本号（旧记录读作 1；历史版本见 getMemoryDetail）。
+  version?: number
+}
+
+/**
+ * R30 需求②: 记忆页签第一级——记忆集合卡片（标题/标签/条目数/最近更新）。
+ * 条目仍在 `memories` 表里，这里只给统计投影。
+ */
+export interface MemoryCollectionView {
+  id: string
+  title: string
+  tags: string[]
+  summary: string
+  /** 该集合的条目数（active + superseded 全算，与 hubState 的 memories 计数一致）。 */
+  count: number
+  /** 集合内最近一次更新的时间戳。 */
+  latestUpdatedAt: number
+  status: string
+  createdAt: number
+  updatedAt: number
+}
+
+/** R30 需求②: 记忆详情页——当前版本 + 全部历史版本（可展开）。 */
+export interface MemoryVersionView {
+  version: number
+  updatedAt: number
+  title: string
+  tags: string[]
+  text: string
+  changeType: 'create' | 'update' | 'migrate'
+  collectionId?: string
+}
+
+/** R30 需求②: 一条记忆的详情（当前字段 + 版本序列，最后一条即当前版本）。 */
+export interface MemoryDetailView {
+  view: MemoryView
+  versions: MemoryVersionView[]
 }
 
 export interface ToolView {
@@ -269,6 +319,9 @@ interface ChatAgentsLike {
  */
 const resumedChatHandles = new Map<string, { agent: { followup(message: UserMessage): unknown } }>()
 
+/** R30 需求②: 「未归集」虚拟集合的标题（id 为空串；与面板 locales 同一词汇）。 */
+const UNGROUPED_TITLE = '未归集'
+
 let createMessage: typeof CreateUserMessage | undefined
 async function messageFactory(): Promise<typeof CreateUserMessage> {
   if (!createMessage) {
@@ -404,6 +457,9 @@ export class SupermemoryPanelService {
     // truthful projection; `undefined` means the branch has no dispatch yet.
     const hubCounts = hubsByBranch(this.store)
     const latestTasks = latestTaskByBranch(this.store)
+    // R30 需求④: 分支的显式标题/标签来自最新一次派发记录（DSH 无原生会话标签，
+    // 见 branch-meta.ts）。一次读全表投影，行内直接取用。
+    const branchMeta = latestBranchMeta(this.store)
     return {
       id,
       title: topicSet.title,
@@ -411,15 +467,18 @@ export class SupermemoryPanelService {
       summary: topicSet.summary,
       sessions: topicSet.members.length,
       live: topicSet.members.filter((member) => member.status === 'live').length,
+      status: topicSet.status,
       branches: topicSet.members.map((m) => {
         // A fresh dispatch is recorded as kind 'root' but is a `branch-*` work
         // branch; the UI label must follow the id, not the raw member kind.
         const isBranch = m.kind === 'fork' || isPluginBranchId(m.sessionId)
         const hubCount = isBranch ? hubCounts.get(m.sessionId)?.length : undefined
+        const meta = branchMeta.get(m.sessionId)
         return {
           sessionId: m.sessionId,
           kind: (isBranch ? 'fork' : 'root') as 'root' | 'fork',
-          title: m.title,
+          // R30 需求④: 显式标题（任务首行）优先，成员标题（话题集 · 任务）兜底。
+          title: (isBranch ? meta?.title : '') || m.title,
           status: m.status,
           ...(m.model ? { model: m.model } : {}),
           // R19 协同③ fix: a branch belongs to this set; carry the set so the
@@ -430,6 +489,7 @@ export class SupermemoryPanelService {
           ...(isBranch && latestTasks.get(m.sessionId)
             ? { task: taskExcerpt(latestTasks.get(m.sessionId)!, BRANCH_CARD_EXCERPT_CHARS) }
             : {}),
+          ...(isBranch && meta && meta.tags.length > 0 ? { tags: [...meta.tags] } : {}),
         }
       }),
       ...(topicSet.defaultModel ? { model: `${topicSet.defaultModel.provider}/${topicSet.defaultModel.model}` } : {}),
@@ -482,6 +542,8 @@ export class SupermemoryPanelService {
         id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
         sourceSessionId: record.sourceSessionId,
         createdAt: record.createdAt, updatedAt: record.updatedAt,
+        // R30 需求①: 当前版本号（旧记录读作 1）。
+        version: currentVersionOf(record),
         ...(collection
           ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
           : {}),
@@ -553,6 +615,8 @@ export class SupermemoryPanelService {
           id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
           sourceSessionId: record.sourceSessionId,
           createdAt: record.createdAt, updatedAt: record.updatedAt,
+          // R30 需求①: 当前版本号（旧记录读作 1）。
+          version: currentVersionOf(record),
           ...(collection
             ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
             : {}),
@@ -573,16 +637,44 @@ export class SupermemoryPanelService {
     const cleanTags = mergeTags(normalizeTags(tags), tagsOfBody(body))
     const stableKey = key?.trim() || undefined
     const now = Date.now()
-    // 整段重复 / 同 key 冲突：与旧行为一致地直接回报（不拆分、不写入）。
+    // R30 需求①: 同 key → 就地更新 + 升版（与 memory_remember 同一套版本化语义，
+    // 不再「冲突不覆盖」）。内容完全相同 → 幂等回报、不升版。
+    const sameKey = stableKey ? findMemoryByKey(this.store, workspaceKey, stableKey) : undefined
+    if (sameKey) {
+      const [memoryId, existing] = sameKey
+      // 幂等快速判定：内容没变时不解析集合归属（避免顺手新建空集合）。
+      if (memoryContentUnchanged(existing, { title: cleanTitle, text: body, tags: cleanTags })) {
+        return {
+          status: 'ok',
+          id: memoryId,
+          message: `该 key 已存相同内容，未重复写入（当前 v${currentVersionOf(existing)}）。`,
+        }
+      }
+      const decisionDeps = { ctx: this.ctx, logger: { warn: (msg: string) => console.warn(msg) } }
+      const assignment = await resolveCollectionForEntry(
+        this.store, workspaceKey, { title: cleanTitle, keywords: cleanTags, text: body },
+        { now, deps: decisionDeps },
+      )
+      if ('error' in assignment) return { status: 'error', message: assignment.error }
+      const result = await updateMemoryVersioned(this.store, workspaceKey, memoryId, {
+        title: cleanTitle, text: body, tags: cleanTags,
+        ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
+      }, now)
+      if (!result) return { status: 'error', message: 'key 对应的记忆不存在或不属于当前工作区。' }
+      if (result.status === 'unchanged') {
+        return { status: 'ok', message: `该 key 已存相同内容，未重复写入（当前 v${result.version}）。`, id: memoryId }
+      }
+      if (assignment.collectionId) await touchCollection(this.store, assignment.collectionId, now)
+      return {
+        status: 'ok',
+        id: memoryId,
+        message: `已更新到 v${result.version}（旧版本已归档，可在详情里查看历史）${assignment.title ? `，归入记忆集合「${assignment.title}」` : ''}。`,
+      }
+    }
+    // 整段重复（无 key）：与旧行为一致地直接回报（不拆分、不写入）。
     for (const [memoryId, record] of this.store.memories.entries()) {
       if (record.workspaceKey !== workspaceKey || record.status !== 'active') continue
-      if (stableKey && record.key === stableKey) {
-        if (record.text.trim().toLowerCase() === body.toLowerCase()) {
-          return { status: 'ok', message: '该 key 已存相同内容，未重复写入。', id: memoryId }
-        }
-        return { status: 'error', message: `key「${stableKey}」已存不同内容，请先修改或删除原记忆。`, id: memoryId }
-      }
-      if (!stableKey && record.text.trim().toLowerCase() === body.toLowerCase()) {
+      if (record.text.trim().toLowerCase() === body.toLowerCase()) {
         return { status: 'ok', message: '相同记忆已存在。', id: memoryId }
       }
     }
@@ -617,18 +709,15 @@ export class SupermemoryPanelService {
         { now, deps: decisionDeps },
       )
       if ('error' in assignment) return { status: 'error', message: assignment.error }
-      const memoryId = newId('mem')
-      const memory: Memory = {
-        workspaceKey, title: entry.title, text: entry.text,
+      // R30 需求①: 新建 v1 + 归档 v1 历史（版本化创建的唯一入口）。
+      const memoryId = await createMemoryVersioned(this.store, workspaceKey, {
+        title: entry.title, text: entry.text, tags: entryTags,
         ...(split ? {} : (stableKey ? { key: stableKey } : {})),
-        keywords: entryTags,
         ...(assignment.collectionId ? { collectionId: assignment.collectionId } : {}),
         // Typed in the panel: there is no source session to locate.
         sourceSessionId: '',
         sourceSeq: 0,
-        status: 'active', createdAt: now, updatedAt: now,
-      }
-      await this.store.memories.put(memoryId, memory)
+      }, now)
       if (assignment.collectionId) await touchCollection(this.store, assignment.collectionId, now)
       created.push({ id: memoryId, collectionTitle: assignment.title, note: collectionTierNote(assignment) })
     }
@@ -642,7 +731,7 @@ export class SupermemoryPanelService {
       id: first.id,
       message: split
         ? `已拆分为 ${created.length} 条记忆，分别归入：${created.map((row) => row.collectionTitle ? `「${row.collectionTitle}」` : '未归集').join('、')}。${skipped}`
-        : `已记住${first.note ? `（${first.note}）` : ''}。${skipped}`,
+        : `已记住（v1）${first.note ? `（${first.note}）` : ''}。${skipped}`,
     }
   }
 
@@ -663,21 +752,24 @@ export class SupermemoryPanelService {
     // R19 需求⑧: editing is still a write — keep the conclusion rule here too.
     const verdict = assessConclusion(body)
     if (!verdict.ok) return { status: 'error', message: verdict.message }
-    await this.store.memories.update(id, (r) => ({
-      ...r,
+    // R30 需求①: 编辑走同一套版本化更新（就地修改 + version+1 + 归档）。
+    // An omitted title/tags keeps what the record had (the row is edited
+    // field by field); an explicit empty value re-derives it from the body.
+    const result = await updateMemoryVersioned(this.store, workspaceKey, id, {
       text: body,
       ...(key !== undefined ? { key: key.trim() || undefined } : {}),
-      // An omitted title/tags keeps what the record had (the row is edited
-      // field by field); an explicit empty value re-derives it from the body.
       ...(title !== undefined
         ? { title: String(title).trim().slice(0, TITLE_MAX) || deriveTitle(body) }
         : {}),
       ...(tags !== undefined
-        ? { keywords: mergeTags(normalizeTags(tags), tagsOfBody(body)) }
+        ? { tags: mergeTags(normalizeTags(tags), tagsOfBody(body)) }
         : {}),
-      updatedAt: Date.now(),
-    }))
-    return { status: 'ok', message: '已更新。', id }
+    })
+    if (!result) return { status: 'error', message: '记忆不存在或不属于当前工作区。' }
+    if (result.status === 'unchanged') {
+      return { status: 'ok', message: `内容没有变化，未升版（当前 v${result.version}）。`, id }
+    }
+    return { status: 'ok', message: `已更新到 v${result.version}（旧版本已归档）。`, id }
   }
 
   /** Delete one memory. */
@@ -697,6 +789,129 @@ export class SupermemoryPanelService {
     if (status !== 'active' && status !== 'superseded') return { status: 'error', message: 'status 仅支持 active / superseded。' }
     await this.store.memories.update(id, (r) => ({ ...r, status, updatedAt: Date.now() }))
     return { status: 'ok', message: status === 'active' ? '已启用。' : '已停用。', id }
+  }
+
+  /**
+   * R30 需求②: 记忆页签第一级——本工作区的记忆集合卡片（标题/标签/条目数/
+   * 最近更新）。条目数按集合聚合（含未归集：id 为空串的虚拟集合，让旧数据
+   * 与「没归集」的新数据在面板里仍然可见，不丢条目）。
+   */
+  listMemoryCollections(cwd: string): MemoryCollectionView[] {
+    const workspaceKey = this.wk(cwd)
+    const stats = new Map<string, { count: number; latest: number }>()
+    for (const [, record] of this.store.memories.entries()) {
+      if (record.workspaceKey !== workspaceKey) continue
+      const id = record.collectionId ?? ''
+      const row = stats.get(id) ?? { count: 0, latest: 0 }
+      row.count += 1
+      if (record.updatedAt > row.latest) row.latest = record.updatedAt
+      stats.set(id, row)
+    }
+    const rows: MemoryCollectionView[] = []
+    for (const [id, collection] of listCollections(this.store, workspaceKey)) {
+      const row = stats.get(id) ?? { count: 0, latest: collection.updatedAt }
+      rows.push({
+        id,
+        title: collection.title,
+        tags: [...collection.keywords],
+        summary: collection.summary,
+        count: row.count,
+        latestUpdatedAt: row.latest,
+        status: collection.status,
+        createdAt: collection.createdAt,
+        updatedAt: collection.updatedAt,
+      })
+    }
+    const loose = stats.get('')
+    if (loose && loose.count > 0) {
+      rows.push({
+        id: '',
+        title: UNGROUPED_TITLE,
+        tags: [],
+        summary: '',
+        count: loose.count,
+        latestUpdatedAt: loose.latest,
+        status: 'active',
+        createdAt: 0,
+        updatedAt: loose.latest,
+      })
+    }
+    rows.sort((a, b) => b.latestUpdatedAt - a.latestUpdatedAt || a.title.localeCompare(b.title))
+    return rows
+  }
+
+  /**
+   * R30 需求②: 记忆页签第二级——一个集合（collectionId；'' = 未归集）里的全部
+   * 条目，按更新时间倒序。`query` 命中标题/标签/正文/key 时只返回匹配行。
+   */
+  listMemoriesByCollection(cwd: string, collectionId: string, query?: string, limit?: number): MemoryView[] {
+    const workspaceKey = this.wk(cwd)
+    const wanted = collectionId ?? ''
+    const tokens = query ? new Set(tokenize(query)) : new Set<string>()
+    const collections = new Map(listCollections(this.store, workspaceKey))
+    const rows: Array<{ view: MemoryView; score: number }> = []
+    for (const [id, record] of this.store.memories.entries()) {
+      if (record.workspaceKey !== workspaceKey) continue
+      if ((record.collectionId ?? '') !== wanted) continue
+      // 与 listMemories 同一套索引打分：标题×4 / 标签×3 / 正文×1。
+      const titleBag = new Set(tokenize(record.title ?? ''))
+      const tagBag = new Set(tokenize(record.keywords.join(' ')))
+      const bodyBag = new Set(tokenize(`${record.text} ${record.key ?? ''}`))
+      let score = 0
+      for (const token of tokens) {
+        if (titleBag.has(token)) score += 4
+        else if (tagBag.has(token)) score += 3
+        else if (bodyBag.has(token)) score += 1
+      }
+      if (tokens.size > 0 && score === 0) continue
+      const collection = record.collectionId ? collections.get(record.collectionId) : undefined
+      rows.push({
+        score,
+        view: {
+          id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
+          sourceSessionId: record.sourceSessionId,
+          createdAt: record.createdAt, updatedAt: record.updatedAt,
+          version: currentVersionOf(record),
+          ...(collection
+            ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
+            : {}),
+        },
+      })
+    }
+    rows.sort((a, b) => b.score - a.score || b.view.updatedAt - a.view.updatedAt)
+    const cap = Math.max(1, Math.min(200, Number(limit) || 100))
+    return rows.slice(0, cap).map((row) => row.view)
+  }
+
+  /**
+   * R30 需求②: 记忆详情——当前字段 + 全部历史版本（最后一条即当前版本；
+   * 旧存储域没有历史表时只有当前版本，可正常打开详情）。
+   */
+  getMemoryDetail(cwd: string, id: string): MemoryDetailView | undefined {
+    const workspaceKey = this.wk(cwd)
+    const record = this.store.memories.get(id)
+    if (!record || record.workspaceKey !== workspaceKey) return undefined
+    const collections = new Map(listCollections(this.store, workspaceKey))
+    const collection = record.collectionId ? collections.get(record.collectionId) : undefined
+    const view: MemoryView = {
+      id, title: record.title, tags: record.keywords, text: record.text, key: record.key, status: record.status,
+      sourceSessionId: record.sourceSessionId,
+      createdAt: record.createdAt, updatedAt: record.updatedAt,
+      version: currentVersionOf(record),
+      ...(collection
+        ? { collectionId: record.collectionId, collectionTitle: collection.title, collectionTags: [...collection.keywords] }
+        : {}),
+    }
+    const versions: MemoryVersionView[] = memoryHistoryOf(this.store, id).map((row) => ({
+      version: row.version,
+      updatedAt: row.updatedAt,
+      title: row.title ?? '',
+      tags: [...(row.tags ?? [])],
+      text: row.text,
+      changeType: row.changeType,
+      ...(row.collectionId ? { collectionId: row.collectionId } : {}),
+    }))
+    return { view, versions }
   }
 
   /**
@@ -727,6 +942,43 @@ export class SupermemoryPanelService {
       const topicSet = this.store.topicsets.get(row.topicSetId)
       return !topicSet || topicSet.workspaceKey === workspaceKey
     })
+  }
+
+  /**
+   * R30 需求③: EVERY topic set of the workspace — the hub's management view.
+   * `listTopicSets` above stays active-only (the 话题集 tab); this one adds the
+   * archived sets (each row carries `status`) so a hub can still inspect, tag or
+   * re-activate history instead of losing it from every list.
+   */
+  listAllTopicSets(cwd: string): TopicSetView[] {
+    const workspaceKey = this.wk(cwd)
+    const rows: TopicSetView[] = []
+    const ordered: Array<[string, NonNullable<ReturnType<typeof getTopicSet>>]> = []
+    for (const [id, topicSet] of this.store.topicsets.entries()) {
+      if (topicSet.workspaceKey !== workspaceKey) continue
+      ordered.push([id, topicSet])
+    }
+    // Active first (a management list still leads with live work), then by the
+    // set's own recency — the same order the 话题集 tab uses inside each group.
+    ordered.sort((a, b) =>
+      (a[1].status === 'archived' ? 1 : 0) - (b[1].status === 'archived' ? 1 : 0)
+      || b[1].lastActiveAt - a[1].lastActiveAt)
+    for (const [id, topicSet] of ordered) rows.push(this.view(id, topicSet))
+    return rows
+  }
+
+  /**
+   * R30 需求③: every BRANCH session of the workspace, across topic sets — the
+   * hub's cross-set view (title / tags / owning set / status / last activity),
+   * optionally filtered to one topic set. Projected from the durable dispatch
+   * ledger (`listWorkspaceBranches`), so a preserved branch survives restarts
+   * without a live handle; `cwd` scopes it to the panel's workspace.
+   */
+  listAllBranches(cwd: string, topicSetId?: string, limit = 100): HubBranchView[] {
+    const workspaceKey = this.wk(cwd)
+    const setId = String(topicSetId ?? '').trim()
+    const rows = listWorkspaceBranches(this.store, workspaceKey, limit)
+    return setId ? rows.filter((row) => row.topicSetId === setId) : rows
   }
 
   /**
@@ -1467,6 +1719,40 @@ const PANEL_DESCRIPTORS = Object.freeze([
     ],
   },
   {
+    // R30 需求②: 记忆页签第一级（集合卡片统计）。
+    id: 'dsh-supermemory#supermemoryPanel/listMemoryCollections',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listMemoryCollections',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MemoryCollectionViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R30 需求②: 记忆页签第二级（一个集合内的条目，带版本徽标）。
+    id: 'dsh-supermemory#supermemoryPanel/listMemoriesByCollection',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listMemoriesByCollection',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MemoryViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'collectionId', wire: 'collectionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#CollectionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'query', wire: 'query', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Query', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'limit', wire: 'limit', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Limit', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R30 需求②: 记忆详情（当前版本 + 历史版本列表）。
+    id: 'dsh-supermemory#supermemoryPanel/getMemoryDetail',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'getMemoryDetail',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MemoryDetail', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
     id: 'dsh-supermemory#supermemoryPanel/createTopicSet',
     service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'createTopicSet',
     invocation: { kind: 'direct' },
@@ -1604,6 +1890,28 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'hubSessionId', wire: 'hubSessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'limit', wire: 'limit', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Limit', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R30 需求③: 中枢管理全部话题集（含归档）——标题/标签/会话数/在线数。
+    id: 'dsh-supermemory#supermemoryPanel/listAllTopicSets',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listAllTopicSets',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#TopicSetViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R30 需求③: 中枢查看全部分支会话（跨话题集，可按话题集筛选）。
+    id: 'dsh-supermemory#supermemoryPanel/listAllBranches',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listAllBranches',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubBranchViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'topicSetId', wire: 'topicSetId', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#TopicSetId', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'limit', wire: 'limit', source: 'json', acceptsUndefined: true, codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Limit', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
