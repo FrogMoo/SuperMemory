@@ -2022,4 +2022,26 @@ R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框�
 - insert 存在时 `include:supermemory` 报 `unaddressable`，**plugin_manager 禁用/启用会失败**（历来「plugin_manager 禁用→启用重载」的说法只在 insert 被移除后成立）。
 - 原子移除 insert 后：watcher 实时用基础条目重新激活（加载仓库当前构建），条目变为可管理（出现 patchId），此时 plugin_manager `set_plugin include:supermemory enabled=false/true` 才是可靠重载。
 - ESM 按 URL 缓存：同 URL 重建不生效；要加载新构建要么武装新 URL（`scripts/dev-load.sh` 的 `lib/dev-<stamp>.js`），要么让基础包入口重新导入（本次即走这条）。
+
+---
+
+## 35. GitHub 同步与双远程同时推送配置（2026-11-23）
+
+### 需求与结果
+
+- 新增远程 `github = https://github.com/FrogMoo/SuperMemory.git`；`git push github main` 成功（exit 0）。GitHub 原为空仓库（`git ls-remote` exit 0 且无任何 ref，无历史冲突、**未使用 force**），推送后 `refs/heads/main` = ea28c78（R29 提交）。
+- `origin` 保持 Gitee 为唯一 fetch URL（pull / rebase / 跟踪分支不变），新增两个 push URL：**GitHub（首位）+ Gitee**。`pnpm git:sync` 里的 `git push origin main` 一条命令自动双推，**scripts/ 零改动**（.sh 用 `git push "$REMOTE" "$BRANCH"`，不硬编码推送目标；.mjs 只是 bash 启动器）。
+- 顺序取舍（git 2.55.0 实测）：多 push URL 时**首个失败即中止、不尝试后续 URL**。若 Gitee 排首位，「Gitee 故障 → GitHub 也收不到提交」；故 GitHub 排首位——Gitee 故障期 push 仍落 GitHub（整体 exit 非 0、Gitee 报错可见）。
+
+### 环境突变（需用户后续处理，已上交中枢）
+
+- 内网 Gitee 服务器 2026-11-22 晚被重置：主机可达（curl 根路径 HTTP 200），但旧账号 `旧帐号名` 与仓库 `旧帐号名/SuperMemory` 均不存在（仓库 URL 404；`git ls-remote origin` 报 `remote: user does not exist`）。GCM 中同邮箱（112***@qq.com）账号已由用户重新注册为 **旧帐号名 B**（API `/api/v1/user` 实测 id 8、created 2026-11-22T19:18），仓库搜索 `SuperMemory` 返回空。
+- 影响：Gitee 重建前 `git fetch/push origin`、`pnpm git:sync` 全部失败（脚本第 2 步 fetch 即 exit 1）；GitHub 侧不受影响。
+- 处置：按任务约束保留 origin 主远程与 URL 不变、**未在 Gitee 侧自动建仓**（外部服务变更，交用户裁决）；恢复方法与完整命令写进 docs/git-sync.md §4.6。
+
+### 同步改动
+
+- docs/git-sync.md：新增 §4.6（双远程配置形态、顺序即韧性、Gitee 现状与恢复命令、实测记录表）；头部推送说明、§3 步骤 6、§7.6 同步补充。
+- src/builtin-capabilities.ts：git-sync 能力 v3→v4（description 增加双远程推送目标与 Gitee 现状；changelog 记录原因），随后 memory_toolize refresh-builtin 应用。
+- 前置提交：工作区遗留的 R29 改动（9 文件，+931/−550）按 conventional 风格提交为 ea28c78（未跟踪目录 memory-cleanup-20261122/ 为一次性清理脚本，未入仓库）。
 - **离线改存储的安全流程**：patch 移除 insert（或 plugin_manager 禁用）→ 插件卸载、存储域关闭 → 编辑 `supermemory.json` → 重新启用/武装 → 自动重读。R29 记忆清理即按此流程执行并验证（memory_topicsets 残根消失、memory_recall 正常）。

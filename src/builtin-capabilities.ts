@@ -89,9 +89,9 @@ export interface BuiltinCapability extends Omit<CapabilityInput, 'changelog'> {
 export const BUILTIN_CAPABILITIES: readonly BuiltinCapability[] = Object.freeze([
   {
     name: 'git-sync-supermemory',
-    version: 3,
+    version: 4,
     title: 'git 同步/提交/推送（SuperMemory 仓库）',
-    description: 'SuperMemory 仓库的 git 同步/提交/推送固化流程。先判断工作区是否本仓库（存在 scripts/git-sync-push.sh），不是本仓库不要触发。优先执行入口命令 pnpm git:sync，不要手敲 git fetch/rebase/push。凭据（2026-11-19 起）：仓库本地 git config 指向 GCM（manager，Windows 凭据存储托管），脚本直接用；旧「清空 helper + store 读 ~/.git-credentials」已失效（文件不存在），不要再写 -c credential.helper=store；GIT_TERMINAL_PROMPT=0 防交互卡死，GCM 失败时找用户、不改全局 config / remote URL。日常=跑入口；预演=加 --dry-run；提交前闸门 pnpm typecheck + pnpm smoke，提交信息写文件后 git commit -F。坑见 docs/git-sync.md。',
+    description: 'SuperMemory 仓库的 git 同步/提交/推送固化流程。先判断工作区是否本仓库（存在 scripts/git-sync-push.sh），不是本仓库不要触发。优先执行入口命令 pnpm git:sync，不要手敲 git fetch/rebase/push。凭据（2026-11-19 起）：仓库本地 git config 指向 GCM（manager，Windows 凭据存储托管），脚本直接用；旧「清空 helper + store 读 ~/.git-credentials」已失效（文件不存在），不要再写 -c credential.helper=store；GIT_TERMINAL_PROMPT=0 防交互卡死，GCM 失败时找用户、不改全局 config / remote URL。推送目标（2026-11-23 起双远程）：origin 的 push URL = GitHub（github.com/FrogMoo/SuperMemory.git，排首位）+ 内网 Gitee，fetch/pull 仍只走 Gitee；git 首个 push URL 失败即中止后续推送，故可用远程排最前——Gitee 服务器 2026-11-22 已重置（旧 旧帐号名 仓 404），恢复前 pnpm git:sync 整体 exit 1 但 GitHub 仍收到提交；另可 git push github main 单推 GitHub。日常=跑入口；预演=加 --dry-run；提交前闸门 pnpm typecheck + pnpm smoke，提交信息写文件后 git commit -F。坑见 docs/git-sync.md。',
     entry: 'pnpm git:sync',
     doc: 'docs/git-sync.md',
     // v2: 自动推导，不再硬编码克隆路径（换机器/换目录自动跟随）。
@@ -102,6 +102,7 @@ export const BUILTIN_CAPABILITIES: readonly BuiltinCapability[] = Object.freeze(
     tags: ['git', '同步', '推送', '流程固化'],
     routeNote: '在本仓库范围内遇到 git 同步/提交/推送类事务时优先用本能力：先默认预演（--dry-run）看计划，确认后 confirm=true 真实执行；不要手敲 git fetch/rebase/push。',
     changelog: [
+      'v4: 双远程同时推送（origin push URL = GitHub 优先 + Gitee，fetch 仍只走 Gitee；git 2.55 首个 push URL 失败即中止后续推送，故 GitHub 排首位保障 Gitee 故障期推送不落空）；记录 Gitee 服务器 2026-11-22 重置、旧 旧帐号名 仓 404 的现状与恢复后 URL 更新方法。',
       'v3: 凭据改为走仓库本地 GCM（manager + Windows 凭据存储）；旧 store 方案（~/.git-credentials）已失效（文件不存在，fetch 必报 could not read Username），脚本与 docs 同步更新。',
       'v2: scope 改为从插件位置自动推导（原硬编码 G:\\09 - dsh\\SuperMemory），修复仓库迁移后「适用范围目录不存在」导致能力对当前工作区失效；升级时由旧 scope 继承的行级归属一并迁移。',
       'v1: 能力内置化（原由 memory_toolize register 手工录入）：随插件分发，清库/全新安装后自动播种；附带使用统计（成败分列/连续失败/最近一次结果）与刷新入口 memory_toolize refresh-builtin。',
