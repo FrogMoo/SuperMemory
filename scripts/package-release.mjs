@@ -4,7 +4,7 @@
 // 产物：release/dsh-supermemory-<version>.zip
 //   内含：lib/（预构建产物）+ node_modules/（hoisted 生产依赖，解压即用、无需外网）
 //         + package.json / cordis.patch.yml / scripts/install-into-dsh.mjs
-//         + README.md / CHANGELOG.md / INSTALL.md / .npmrc
+//         + README.md / CHANGELOG.md / INSTALL.md / LICENSE / .npmrc
 //
 // 用法：
 //   node scripts/package-release.mjs            # 按 package.json version 打包
@@ -33,7 +33,7 @@ const log = (...a) => console.log('[package-release]', ...a)
 const fail = (...a) => { console.error('[package-release] ERROR:', ...a); process.exit(1) }
 
 // ---------- 1. 前置检查 ----------
-for (const f of ['lib/supermemory.js', 'lib/client.js', 'cordis.patch.yml', 'scripts/install-into-dsh.mjs', 'README.md', 'CHANGELOG.md', 'INSTALL.md']) {
+for (const f of ['lib/supermemory.js', 'lib/client.js', 'cordis.patch.yml', 'scripts/install-into-dsh.mjs', 'README.md', 'CHANGELOG.md', 'INSTALL.md', 'LICENSE']) {
   if (!existsSync(join(root, f))) fail('缺少文件: ' + f + '（先 pnpm build？）')
 }
 if (existsSync(join(stageDir, 'node_modules')) && !skipInstall) {
@@ -49,7 +49,7 @@ cpSync(join(root, 'cordis.patch.yml'), join(stageDir, 'cordis.patch.yml'))
 cpSync(join(root, 'lib'), join(stageDir, 'lib'), { recursive: true })
 mkdirSync(join(stageDir, 'scripts'), { recursive: true })
 cpSync(join(root, 'scripts/install-into-dsh.mjs'), join(stageDir, 'scripts/install-into-dsh.mjs'))
-for (const doc of ['README.md', 'CHANGELOG.md', 'INSTALL.md']) {
+for (const doc of ['README.md', 'CHANGELOG.md', 'INSTALL.md', 'LICENSE']) {
   cpSync(join(root, doc), join(stageDir, doc))
 }
 // staging 专用 .npmrc：hoisted 平铺 + 不自动装 peer（宿主包由 DSH profile 提供，公共 registry 上没有）

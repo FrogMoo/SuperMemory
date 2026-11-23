@@ -1,8 +1,9 @@
 {
   "name": "dsh-supermemory",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与组合工具自动固化。",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "main": "lib/supermemory.js",
   "exports": {

@@ -15,15 +15,15 @@
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.0.0.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.0.1.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.0.0`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.0.0`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.0.1`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.0.1`
 
-解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、本文件。
+解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
 ### 2. 挂载到 DSH profile
 

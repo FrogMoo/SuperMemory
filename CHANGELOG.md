@@ -2,6 +2,27 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.0.1] - 2026-11-23
+
+补全发布元数据的维护版：新增专有 LICENSE 文件、登记 v1.0.0 发布轮记录，重新打包发布。无功能与行为变更，v1.0.0 用户可按 INSTALL.md「升级」一节平滑升级（亦可停留在 v1.0.0，两者功能等价）。
+
+### 新增
+
+- **LICENSE 文件**：专有许可（All Rights Reserved，`package.json` 增 `license: "UNLICENSED"`）——允许个人自用、阅读源码与提 issue/PR，不允许再分发或基于本软件提供商业服务。了结 v1.0.0「已知限制：仓库暂无 LICENSE 文件」。
+
+### 工程
+
+- `DEV-NOTES.md` §41：v1.0.0 发布轮实测记录（三端一致性、双远程各自账号推送、GitHub API 补推路径）归档。
+- 发布包重新打包：`release/dsh-supermemory-1.0.1.zip`（预构建产物 + 生产依赖，随仓库跟踪）。
+
+### 兼容性
+
+- 与 v1.0.0 完全兼容：宿主要求 DSH `>=0.2.0 <0.3.0`；存储域 `supermemory` version 1 不变，无需迁移。
+
+### 已知限制
+
+- 全新空中枢会话在产生首条消息前不显示徽标（宿主 blank 行门控，与既有行为一致）。
+
 ## [1.0.0] - 2026-11-23
 
 首个正式 Release：DSH 跨会话记忆插件「话题集记忆 + 派发归档 + 过程内再召回 + 组合工具自动固化」能力集齐，全量闸门（typecheck + 6 套冒烟）通过。
@@ -38,4 +59,5 @@
 - 仓库暂无 LICENSE 文件。
 - 全新空中枢会话在产生首条消息前不显示徽标（宿主 blank 行门控，与既有行为一致）。
 
+[1.0.1]: https://github.com/FrogMoo/SuperMemory/releases/tag/v1.0.1
 [1.0.0]: https://github.com/FrogMoo/SuperMemory/releases/tag/v1.0.0

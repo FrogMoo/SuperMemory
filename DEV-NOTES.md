@@ -2205,3 +2205,40 @@ R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框�
 - `pnpm typecheck` 双 0 错；`pnpm build` exit 0（宿主 10 文件 + client 136.32 kB）；`pnpm smoke` 六套件全绿：core 25 / **mechanism 99**（新增 R31-1 中枢标题迁移用例 + E2 按新 kind 规则改写）/ webui 35 / client-sim（slot 断言改 trailing）/ capability 12 / workspace-scope 9。
 - **实时数据验收**：用 `~/.dsh/storages/supermemory.json`（只读）驱动真实 `SupermemoryPanelService`，7/7 通过——R30 话题集的 branch-* root 成员→`branch`、session-* root 成员→`hub-set`、派发记录里的两个真实中枢会话→`hub`、派发过但未入集的真实 branch-*→`none`、合成未入集分支与未知 id→`none`。
 - 管理台 HTTP 验收未做：控制台令牌只经 `/memory ui` 下发（本分支无该工具），页面 token 已被剥离，API 401；改以「实时存储 + 真实服务」等价验证。
+---
+
+## 41. v1.0.0 发布轮补记 + v1.0.1 发布轮：LICENSE 补全、双远程各自账号推送（2026-11-23）
+
+v1.0.0（提交 1f549a1）之后仓库无任何代码/文档改动：三端 main 一致、工作区干净、无 stash。按发布预案 defaultPlan 出维护版 v1.0.1：补 LICENSE、补发布轮记录、重新打包；无功能与行为变更。
+
+### 41.1 v1.0.0 发布轮补记（该轮未在 DEV-NOTES 留节，据 git-sync.md §11 与实测归档）
+
+- 提交 4509e3c（release: v1.0.0）+ 1f549a1（docs §11 GitHub 半边阻断与 API 补推方法），附注 tag v1.0.0（tag 对象 50f1b5d9）。
+- 推送期 github.com:443 被网络阻断（git 传输 connect timeout，api.github.com / uploads.github.com 可达）：Gitea 侧正常推送，GitHub 侧经 `scripts/github-api-release.mjs` 走 git data API 补推——blob/tree/commit/tag SHA 逐级与本地一致、只快进（force:false），保证零分叉；Release 与资产 `dsh-supermemory-1.0.0.zip` 一并经 API 创建/上传。
+- 终态：本地 / Gitea（Zry/SuperMemory）/ GitHub（FrogMoo/SuperMemory）三端 main 一致于 1f549a1，tag v1.0.0 两端在线。
+
+### 41.2 v1.0.1 发布轮（本轮）
+
+**改动清单**：
+
+- 新增 `LICENSE`：专有许可 All Rights Reserved；`package.json` 补 `license: "UNLICENSED"`（private 包的 SPDX 惯用标记，使许可类型可发现）。允许个人自用、阅读源码、提 issue/PR；不允许再分发、基于本软件提供商业服务、移除声明。了结 v1.0.0「已知限制：仓库暂无 LICENSE 文件」。
+- `CHANGELOG.md`：[1.0.1] 条目（新增/工程/兼容性/已知限制，格式照 v1.0.0）+ 底部版本链接。
+- `README.md` 版本行、`INSTALL.md` 三处示例版本号 + 「解压后应包含」清单同步到 1.0.1。
+- `scripts/package-release.mjs`：发布包纳入 LICENSE（专有许可条款随分发走）；`INSTALL.md` 清单同步。
+- 本小节（§41）。
+
+**闸门与打包**：
+
+- 闸门三连全绿后才提交：`pnpm typecheck`（双配置 0 错）→ `pnpm build` → `pnpm smoke`（六套件 core / mechanism / webui / client-sim / capability / workspace-scope）。
+- 打包 `node scripts/package-release.mjs` → `release/dsh-supermemory-1.0.1.zip`（随仓库跟踪；staging 目录 `release/dsh-supermemory-*/` 按 .gitignore 忽略）。
+- 自检：临时目录解压 + `node scripts/install-into-dsh.mjs --dry-run`（只预演，不触碰真实 DSH profile）。
+
+**双远程各自账号推送**（本任务核心红线：两端必须各自账号，严禁同一凭据打两边）：
+
+- 推送前 `git credential fill` 探测（口令脱敏，不落盘）：github.com → **FrogMoo**；zrynas.7766.org:8418 → 437***@qq.com（服务器登录名 **Zry**，Gitea 侧属主）。
+- 本轮 github.com:443 已恢复可达（curl 200），走正常 git 推送路径，未动用 API 补推。
+- Gitea：单推 URL `git push http://zrynas.7766.org:8418/Zry/SuperMemory.git main` + 同 URL 推 `v1.0.1`；GitHub：`git push github main` + `git push github v1.0.1`。两端分别独立推送，不依赖 origin 双 push URL（git 2.55 首个 push URL 失败即中止，见 git-sync.md §4.6/§11.1）。
+- 账号留证：GitHub 侧以 FrogMoo 凭据调 `GET https://api.github.com/user`；Gitea 侧以 Zry 凭据调 `GET http://zrynas.7766.org:8418/api/v1/user`（login=Zry）。
+- 推后 `git ls-remote` 两端核对 refs/heads/main 与 tag SHA 与本地一致（三端零分叉，标准同 v1.0.0 轮）。
+
+**Release 页**：GitHub 建 v1.0.1 Release 并上传 `dsh-supermemory-1.0.1.zip`；Gitea 侧同建 Release（用 Zry 凭据；失败不阻塞主流程）。
