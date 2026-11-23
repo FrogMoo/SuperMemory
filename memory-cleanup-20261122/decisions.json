@@ -1,0 +1,64 @@
+{
+  "workspaceKey": "F:\\10-SuperMemory",
+  "note": "R29 记忆清理（2026-11-22，中枢执行）。仅限本工作区；其他工作区（07-WeChatTool/08-ERP/ProductManage/ceshi）数据不碰。",
+  "deleteRequirements": {
+    "reason": "全部为任务提示词碎片/已完成轮次残留/元指令片段，无一条是真实待办需求",
+    "ids": [
+      "req-mwkvq456-rt5p75",
+      "req-mwkwqovu-897wzs",
+      "req-mwkxxtz5-ogviu9",
+      "req-mwm3hbjj-ui3xkc",
+      "req-mwm3hblb-7x7f5b",
+      "req-mwm3hbll-s6bvzt",
+      "req-mwm3nb90-quyoaq",
+      "req-mwm4kgjt-hhv80q",
+      "req-mwm4kgk4-xuxbpp",
+      "req-mwm4rjzq-qet158",
+      "req-mwm4rk01-yb41v1",
+      "req-mwm4wh6o-aluqfh",
+      "req-mwm4wh7c-tfxrfd",
+      "req-mwm4wh7y-pgr4o6",
+      "req-mwm54zpb-hq02do",
+      "req-mwmbx5tu-rfp22c",
+      "req-mwmbx5w8-591wsh",
+      "req-mwmc4i8k-e5xvef",
+      "req-mwmc68ff-mi287a",
+      "req-mwmc68j4-pliwxe",
+      "req-mwmc68jh-ixjv1w",
+      "req-mwmc68kq-blajku",
+      "req-mwmceuqh-k3t070",
+      "req-mwmceuum-5nn8h7",
+      "req-mwmcmp0h-zhwse0",
+      "req-mwmcmp0y-7ltuk1",
+      "req-mwmcmp47-mtjd6s",
+      "req-mwmcmp4n-zncpm2",
+      "req-mwmdxzl4-buqrxs",
+      "req-mwmdxzlo-qw6968",
+      "req-mwmdxznw-70pky4",
+      "req-mwmdxzoi-97qsgj",
+      "req-mwmui242-ezg62o",
+      "req-mwmui24q-m4jmhc",
+      "req-mws0j7m2-8zxg3d",
+      "req-mws0j7p0-0480lq",
+      "req-mws0s768-rcu411",
+      "req-mws0s78h-3aeaq4",
+      "req-mws0s79a-vl4y5s",
+      "req-mws0s7a3-pugzng"
+    ]
+  },
+  "deleteMemories": {
+    "reason": "mem-mws0s74i 是今天派发任务文本的自动抽取碎片（非结论）",
+    "ids": ["mem-mws0s74i-9h1lt4"]
+  },
+  "deleteTopicSets": {
+    "reason": "截断路径残根（F:\\10-Su），正文自述空/暂无结论，成员为 11-17 的旧分支；引用方只有已终态 dispatch、2 条旧 routing、4 条历史 episode",
+    "ids": ["ts-mwl4q67c-wyg5pi", "ts-mwm1r5xl-itf4rn"]
+  },
+  "clearRoutingActiveTopicSet": {
+    "reason": "这 2 个旧会话的 activeTopicSetId 指向被删话题集，清掉悬空引用",
+    "sessionIds": [
+      "session-3e471e1b-5647-4f59-bf25-e838ddb7695e",
+      "session-348ec3c9-3591-412a-9850-6ffac0421d1d"
+    ]
+  }
+}
