@@ -319,3 +319,47 @@ ahead/behind    : 0 / 0
 - 单侧复验 `git push http://zrynas.7766.org:8418/Zry/SuperMemory.git main`：**`Everything up-to-date`，exit 0** —— 新帐号推送链路（GCM 双键 → 鉴权 → 推送）实测可用。
 - 单侧复验 GitHub：当时 `github.com` 网络不可达（git/curl 均 connect timeout，curl 也曾瞬时成功过一次）——**网络瞬时故障，非凭据/配置问题**；GCM 中 GitHub 凭据（FrogMoo）完好，网络恢复后 GitHub 半边自动恢复。git 2.55 语义下首位 URL 失败即中止，故障期双推会整体 exit 128（韧性设计见 §4.6）。
 - 结论：Gitea 侧帐号切换完成并验证；GitHub 侧待网络恢复（无需任何配置改动）。
+
+## 11. GitHub 半边阻断与 API 补推（2026-11-23，v1.0.0 Release 轮）
+
+### 11.1 故障形态（实测）
+
+| 探测 | 结果 |
+|---|---|
+| `pnpm git:sync`（origin push URL：GitHub 首位 + Gitee） | GitHub 半边连接失败，脚本整体 exit 1（符合「失败原样退出不重试」）。**Gitee 是否被推到取决于失败形态**（本次两种都遇到了）：① 连接后中段掉线（`send-pack: unexpected disconnect` / `remote end hung up`）→ 后续 URL 仍会尝试，Gitee 推送成功（`c5fb0bf..4509e3c`，v1.0.0 分支推送时实测）；② 起点即连接失败（`unable to access ... Failed to connect ... after 21092 ms`）→ **首个 URL 失败即中止，Gitee 根本不会被推送**（§4.6 语义，文档提交 `9fec6d5` 推送时复现）。**故障期要保底推 Gitee，直接单推 URL：`git push <gitee-url> main`（tag 同理），不要指望双推** |
+| `curl -v https://github.com` | TCP 20.247.166.64:443 connect timeout（持续 10+ 分钟，非瞬时） |
+| `curl -sI https://api.github.com` | **200**（API 面可达） |
+| `ssh -T git@github.com`（22 端口通、host key 已 accept-new） | `Permission denied (publickey)`——本机 `~/.ssh/id_ed25519` **未注册**到 FrogMoo 账号 |
+| `curl -sI https://uploads.github.com` | 302（资产上传面可达） |
+
+结论：github.com 的 git/网页面被网络阻断，`api.github.com` 与 `uploads.github.com` 可达；GCM 里的 GitHub 凭据（FrogMoo）完好，**不是凭据/配置问题**，网络恢复后自动回归正常路径。
+
+### 11.2 API 补推方法（scripts/github-api-release.mjs）
+
+git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一个提交**（SHA 与本地逐级一致，不会分叉）：
+
+1. 变更文件逐个 `POST /git/blobs`（base64），blob SHA 与本地 `sha1("blob <len>\0" + 内容)` 比对；
+2. `POST /git/trees`（`base_tree` = GitHub 侧父提交的 tree），tree SHA 与本地比对；
+3. `POST /git/commits`（message / author / committer 全部取自行对象原文），**commit SHA 与本地一致才继续**；
+4. `PATCH /git/refs/heads/main`（`force:false`，仅快进）；
+5. 需要时 `POST /git/tags` + `POST /git/refs`（tag 对象 SHA 与本地比对）、`POST /releases` + 上传发布包资产。
+
+要点与坑（全部实测）：
+
+- **时区格式**：git 原始时间是 `+0800`（无冒号），GitHub API 只认 `+08:00`（带冒号），不转换直接 422 `is not a valid date-time`；
+- **`%ai`/`%ci` 日期格式在本机不可靠**：经 node `execSync`（Windows 下走 cmd.exe）跑 `git log --format=%ai` 拿到的是**空格分隔格式**（`2026-11-23 11:15:56 +0800`），按 ISO 切时区会切错（实测错切出 `+80 分钟` 偏移）；脚本因此改为从 `git cat-file commit/tag` **原文**解析 author/committer/tagger 行（epoch + tz 原样）；
+- **SHA 逐级校验是防分叉的唯一手段**：任一级不一致立即中止，且校验通过前不写任何 ref——保证 GitHub 与本地永不产生分叉；
+- **只支持单提交快进**：GitHub main 必须恰好等于该提交的父提交；落后多个提交时逐个跑本脚本，或等网络恢复走 `pnpm git:sync`；
+- tag 必须用 `POST /git/tags` 建**附注 tag 对象**（与本地 annotated tag 同 SHA）；不要图省事用 Release 自动创建的轻量标签——否则以后本地推同名 tag 会冲突；
+- `execSync` 在 Windows 走 cmd.exe：`^` 是 cmd 转义符，`git rev-parse X^{tree}` 会被吃成 `X{tree}` 报 ambiguous argument；脚本用 `git rev-parse X:` 取 tree、`git log --format=%T/%P` 取 tree/parent，全程不用 `^` 与 `%a*`/`%c*` 日期格式。
+
+### 11.3 v1.0.0 实测记录（2026-11-23）
+
+| 步骤 | 命令 / 操作 | 结果 |
+|---|---|---|
+| 正常推送 | `pnpm git:sync` | Gitee `c5fb0bf..4509e3c main -> main`；GitHub 连接失败（脚本 exit 1） |
+| tag 推送 | `git push <gitee-url> v1.0.0` | `* [new tag] v1.0.0 -> v1.0.0` exit 0 |
+| API 补推 | blobs×7 → tree → commit → refs（scripts/github-api-release.mjs） | tree `fd03e69c` / commit `4509e3c` / tag object `50f1b5d9` **与本地逐级一致**；main 快进成功 |
+| Release | `POST /releases` + 资产上传 | https://github.com/FrogMoo/SuperMemory/releases/tag/v1.0.0 ，资产 `dsh-supermemory-1.0.0.zip`（1.83 MB，1917704 B）state=uploaded |
+
+网络恢复后 GitHub 半边自动回归 `pnpm git:sync` 正常路径，无需任何配置改动；本机 `~/.ssh/id_ed25519` 如需启用 SSH 备用通道，需先在 GitHub 账号 Settings → SSH keys 注册。
