@@ -299,6 +299,11 @@ export async function buildSchemas() {
     organizeWorkspace: z.string().optional(),
     organizeBackup: z.string().optional(),
     organizeSummary: z.string().optional(),
+    // R31 需求① marker (meta row 'hub-titles'): the one-time rename of hub
+    // sessions created by the legacy '新会话 · <id4>' title format. Same
+    // reason as above: an undeclared marker key would be stripped on load.
+    hubTitlesMigrationVersion: z.number().int().optional(),
+    hubTitlesMigratedAt: z.number().int().optional(),
   })
 
   return {

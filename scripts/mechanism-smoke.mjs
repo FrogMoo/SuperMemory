@@ -556,15 +556,96 @@ const fakeCtx = (services) => ({
   const service = services.supermemoryPanel
   assert.deepEqual(service.sessionBadge('branch-1'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'live' }, 'two hits resolve to the newest lastActiveAt')
   assert.deepEqual(service.sessionBadge('branch-2'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'idle' })
-  assert.deepEqual(service.sessionBadge('branch-3'), { kind: 'hub' }, 'an archived topic set never marks a branch')
+  // R31 需求②: an archived set never marks a branch — and the id shape decides
+  // the non-member case, so a plugin branch is `none` (no badge), never a hub.
+  assert.deepEqual(service.sessionBadge('branch-3'), { kind: 'none' }, 'an archived topic set never marks a branch (and a branch-* id is not a hub)')
   // R19 需求③④：root member = the set's own hub conversation. It must NOT be
   // labelled a branch (the R18 bug) and must carry its topic-set name instead.
   assert.deepEqual(service.sessionBadge('hub-root'), { kind: 'hub-set', topicSetId: 'ts-live', topicSetTitle: 'ts-live' })
   // A fresh dispatch records kind 'root' (its own session root) but its id is
   // `branch-*`: it must stay a branch, never become a hub-set.
   assert.deepEqual(service.sessionBadge('branch-fresh'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'live' })
-  assert.deepEqual(service.sessionBadge('hub-session'), { kind: 'hub' })
-  ok('E2 sessionBadge：fork→分支（最新 lastActiveAt），root→hub-set（不再错标分支），归档/未知→中枢')
+  // R31 需求②: the non-member rule is by id shape — a host-native `session-*`
+  // id is a plugin hub (badged 「中枢」), everything else is explicitly `none`.
+  assert.deepEqual(service.sessionBadge('session-plain'), { kind: 'hub' }, 'a host-native session-* id in no set is a hub')
+  assert.deepEqual(service.sessionBadge('hub-session'), { kind: 'none' }, 'an id this plugin cannot classify is not a hub')
+  assert.deepEqual(service.sessionBadge('branch-lonely'), { kind: 'none' }, 'a plugin branch with no set yet gets no badge')
+  ok('E2 sessionBadge：fork→分支（最新 lastActiveAt），root→hub-set（不再错标分支），非成员按 id 形状（session-*→hub，其余→none）')
+}
+
+// ---- R31 需求①: hub session title generation + one-time legacy rename ----
+{
+  const { migrateHubSessionTitles, hubTitleFor, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
+  const { hubSessionTitle, HUB_TITLE_PREFIX } = await import('../src/hub-sessions.ts')
+
+  // 1) generation: the flavour prefix plus the 4-char id suffix.
+  assert.equal(hubSessionTitle('session-abcd1234'), 'SuperMemory 中枢 · 1234')
+  assert.equal(HUB_TITLE_PREFIX, 'SuperMemory 中枢')
+  assert.equal(hubTitleFor('session-abcd1234', '新会话 · 1234'), 'SuperMemory 中枢 · 1234')
+
+  // 2) rename pass: a fake host seam. Only a plausible plugin hub whose LIVE
+  //    title still matches the legacy pattern is renamed; a branch id, a
+  //    parented child, a subagent and a user-renamed title are all left alone.
+  const titles = new Map([
+    ['session-legacy1', '新会话 · legacy'],   // the rename target
+    ['session-useredit', '我自己起的名字'],     // user rename → never touched
+    ['branch-lonely2', '新会话 · nely2'],      // plugin branch → never a hub
+    ['session-child3', '新会话 · hild3'],      // parented → not a hub
+    ['session-agent4', '新会话 · gent4'],      // subagent → not a hub
+    ['session-fresh5', 'SuperMemory 中枢 · esh5'], // already new format
+  ])
+  const records = [
+    { header: { id: 'session-legacy1', cwd: 'ws' } },
+    { header: { id: 'session-useredit', cwd: 'ws' } },
+    { header: { id: 'branch-lonely2', cwd: 'ws' } },
+    { header: { id: 'session-child3', cwd: 'ws', parentSession: 'session-parent' } },
+    { header: { id: 'session-agent4', cwd: 'ws', origin: 'subagent' } },
+    { header: { id: 'session-fresh5', cwd: 'ws' } },
+  ]
+  const writes = []
+  const titleService = {
+    get: (session) => ({ title: titles.get(session.id) ?? '' }),
+    rename: (session, text) => { writes.push([session.id, text]); titles.set(session.id, text) },
+  }
+  const ctx = {
+    sessions: { get: (id) => (titles.has(id) ? { id, append: () => {} } : undefined) },
+    get: (name) => (name === 'sessionTitle' ? titleService : undefined),
+  }
+  const seam = {
+    listSessions: async () => records,
+    readTitleSnapshots: async (ids) => ids.map((id) => ({ sessionId: id, status: 'fulfilled', value: { title: { title: titles.get(id) ?? '' } } })),
+  }
+  const ctxWithSeam = { ...ctx, get: (name) => (name === 'sessionQuery' ? seam : name === 'sessionTitle' ? titleService : undefined) }
+  const quiet = { warn: () => {}, info: () => {} }
+
+  const dry = await migrateHubSessionTitles({ ctx: ctxWithSeam, store: undefined, logger: quiet }, { dryRun: true, ignoreMarker: true })
+  assert.equal(dry.status, 'planned')
+  assert.equal(dry.scanned, 3, 'plugin branch, parented child and subagent are all excluded from the candidate scan')
+  assert.deepEqual(dry.plan, [{ sessionId: 'session-legacy1', from: '新会话 · legacy', to: 'SuperMemory 中枢 · legacy' }], 'dry-run plans exactly the legacy hub')
+  assert.equal(writes.length, 0, 'dry-run writes nothing')
+
+  const applied = await migrateHubSessionTitles({ ctx: ctxWithSeam, store: undefined, logger: quiet }, { ignoreMarker: true })
+  assert.equal(applied.status, 'applied')
+  assert.equal(applied.renamed, 1)
+  assert.deepEqual(writes, [['session-legacy1', 'SuperMemory 中枢 · legacy']])
+  assert.equal(titles.get('session-useredit'), '我自己起的名字', 'a user-renamed title is never overwritten')
+  assert.equal(titles.get('branch-lonely2'), '新会话 · nely2', 'a plugin branch is never renamed as a hub')
+
+  // 3) marker guard: a store whose meta row is current short-circuits, and a
+  //    missing ctx (no host seam) degrades to no-host without writing.
+  const store = { meta: table([['hub-titles', { hubTitlesMigrationVersion: HUB_TITLES_MIGRATION_VERSION, hubTitlesMigratedAt: 1 }]]) }
+  const again = await migrateHubSessionTitles({ ctx: ctxWithSeam, store, logger: quiet })
+  assert.equal(again.status, 'already-done')
+  assert.equal(again.renamed, 0)
+  const noHost = await migrateHubSessionTitles({ ctx: undefined, store: { meta: table() }, logger: quiet }, { ignoreMarker: true })
+  assert.equal(noHost.status, 'no-host')
+
+  // 4) a real store records the marker after a clean pass (nothing pending).
+  const metaTable = table()
+  const liveStore = { meta: metaTable }
+  await migrateHubSessionTitles({ ctx: ctxWithSeam, store: liveStore, logger: quiet }, { ignoreMarker: true })
+  assert.equal(metaTable.get('hub-titles')?.hubTitlesMigrationVersion, HUB_TITLES_MIGRATION_VERSION, 'a clean pass writes the marker')
+  ok('R31-1 中枢标题：生成格式 SuperMemory 中枢 · <id4>；一次性迁移只改旧格式的插件中枢（用户改名/分支/子代理不碰），标记守卫 + 无宿主降级')
 }
 
 {

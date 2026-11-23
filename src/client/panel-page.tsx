@@ -194,13 +194,19 @@ export interface MutationResult {
 
 /**
  * Sidebar badge projection for one session (mirrors the host SessionBadge):
- * a topic-set branch with the set it belongs to, or a plain hub session.
+ * a topic-set branch with the set it belongs to, a topic-set hub, a plugin hub
+ * session, or an explicit "no badge".
  */
 export type SessionBadge =
   | { kind: 'hub' }
   /** R19 需求③: hub conversation that is the root member of a topic set. */
   | { kind: 'hub-set'; topicSetId: string; topicSetTitle: string }
   | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+  /**
+   * R31 需求②: no badge — a plugin branch that has not joined a topic set yet,
+   * or an id the plugin cannot classify. The sidebar renders nothing.
+   */
+  | { kind: 'none' }
 
 /**
  * R18 需求①: one row of the panel's left rail. A hub session is a top-level

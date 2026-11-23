@@ -23,6 +23,7 @@ import { isPluginBranchId } from './hub-sessions.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
+import { migrateHubSessionTitles } from './hub-title-migration.ts'
 import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
@@ -505,6 +506,14 @@ export async function apply(ctx: Context, config: Config) {
     // restart never repeats the work; a manual re-scan is /memory titles.
     void migrateTruncatedTitles({ ctx, store, logger }).catch((error) => {
       logger.warn('supermemory: title migration failed: ' + String(error).slice(0, 160))
+    })
+    // R31 需求①: one-time rename of hub sessions still carrying the legacy
+    // '新会话 · <id4>' title to 'SuperMemory 中枢 · <id4>'. Marker-guarded
+    // (meta row 'hub-titles'), reads the live host title so a session somebody
+    // renamed by hand is never overwritten, and leaves the marker unwritten
+    // while a candidate is still unattached so the next startup retries it.
+    void migrateHubSessionTitles({ ctx, store, logger }).catch((error) => {
+      logger.warn('supermemory: hub title migration failed: ' + String(error).slice(0, 160))
     })
     // R23: one-time memory re-layout into the R22 collection model. Marker-
     // guarded (meta row `organize-<digest>`), only targets this plugin

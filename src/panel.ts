@@ -36,7 +36,7 @@ import {
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
-import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
+import { isPluginBranchId, listHubSessions, hubSessionTitle, HUB_ID_PREFIX, type HubSessionView } from './hub-sessions.ts'
 import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, listWorkspaceBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
 import { latestBranchMeta } from './branch-meta.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
@@ -231,6 +231,13 @@ export type SessionBadge =
    */
   | { kind: 'hub-set'; topicSetId: string; topicSetTitle: string }
   | { kind: 'branch'; topicSetId: string; topicSetTitle: string; status: string }
+  /**
+   * R31 需求②: deliberately unbadged — a plugin branch that has not joined a
+   * topic set yet, or an id this plugin cannot classify. The client renders
+   * nothing; the kind exists so "no badge" is an explicit answer instead of
+   * the old catch-all `hub`.
+   */
+  | { kind: 'none' }
 
 /**
  * R18: the hub-session rail of the panel. Same shape as the host module's view
@@ -1205,8 +1212,9 @@ export class SupermemoryPanelService {
     const created = await this.createSessionWithOptions(cwd, options)
     if ('error' in created) return { status: 'error', message: created.error }
     // A short id suffix keeps several hub sessions distinguishable in the
-    // sidebar list (requirement C naming, hub flavour).
-    const title = '新会话 · ' + created.sessionId.slice(-4)
+    // sidebar list (requirement C naming, hub flavour). R31 需求①: the prefix
+    // names the flavour explicitly instead of the generic 「新会话」.
+    const title = hubSessionTitle(created.sessionId)
     await this.finishSession(created.sessionId, cwd, title)
     const delivered = await this.deliverFirstMessage(created.handle, firstMessage)
     if (delivered === true) return { status: 'ok', message: '已创建中枢会话并发送首条消息。', id: created.sessionId }
@@ -1619,7 +1627,19 @@ export class SupermemoryPanelService {
     if (bestRoot) {
       return { kind: 'hub-set', topicSetId: bestRoot.topicSetId, topicSetTitle: bestRoot.title }
     }
-    return { kind: 'hub' }
+    // R31 需求②: a session in NO topic set is badged by its id shape, because
+    // the old catch-all `{kind:'hub'}` marked every foreign id (a branch that
+    // has not joined a set yet, a subagent, a shell session) as a hub:
+    // - a plugin-minted `branch-*`/`fork-*` id is a work branch that simply
+    //   has no member row yet → no badge (`none`), never a hub;
+    // - a host-native `session-*` id is a plugin hub conversation → `hub`
+    //   (every hub the plugin creates carries that prefix; the sidebar badge
+    //   now renders it, so a hub is no longer an invisible row);
+    // - anything else (unknown minting) stays unbadged (`none`) rather than
+    //   being optimistically labelled a hub.
+    if (isPluginBranchId(sessionId)) return { kind: 'none' }
+    if (sessionId.startsWith(HUB_ID_PREFIX)) return { kind: 'hub' }
+    return { kind: 'none' }
   }
 }
 

@@ -80,8 +80,12 @@ const expected = [
   'sidebar.panellist:supermemory',
   'main:supermemory',
   'shell.overlay:supermemory-new-session',
-  // GUI 问题③: the branch badge on topic-set sessions in the sidebar rows.
-  'sidebar.session.row.leading:supermemory-branch',
+  // GUI 问题③ / R31 需求②: the session badge on sidebar rows. It moved from
+  // `leading` to `trailing` because the host gates the leading cell by
+  // `showStatus ? dots : slot` (a running row lost the badge to its status
+  // dot); the trailing cell is gated by `!row.blank` only, so the badge stays
+  // visible while running and in approval states.
+  'sidebar.session.row.trailing:supermemory-branch',
 ]
 for (const want of expected) {
   if (!slots.includes(want)) throw new Error('missing registration: ' + want + ' (got ' + slots.join(', ') + ')')

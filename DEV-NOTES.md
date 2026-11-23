@@ -2172,3 +2172,36 @@ R28（`b7a88d5`）把 shell「新建会话」拦截后弹出的选择对话框�
 - `pnpm build`：宿主 10 文件 642.91 kB（含新 `lib/memory-versions-*.js` chunk）+ client 134.12 kB（wrapped 130818 bytes）；`INEFFECTIVE_DYNAMIC_IMPORT` 为既有提示非错误。
 - `pnpm smoke` 六套件：core 25 / mechanism 98（含 R30-B1–B4）/ webui 35 / client-sim `SIM SMOKE OK` / capability 12（C3 转绿）/ workspace-scope 9（W5 转绿）。
 - 提交后待中枢：`pnpm build` 已生成新 `lib/`，重载插件 + `memory_toolize refresh-builtin` 后 store 里的能力行才升到 v5（分支内禁重载）。
+
+---
+
+## 40. R31：中枢会话具体标题 + 分支/中枢徽标常显（2026-11-23）
+
+对应用户三项 GUI 需求（①中枢会话名称 ②③徽标常显 + 中枢徽标），与 R30 同批文件串行做完。
+
+### 40.1 需求①：中枢会话名称从「新会话」变成具体标题
+
+- **生成路径**：`src/panel.ts` `createHubSession` 的标题由 `'新会话 · ' + id4` 改为 **`'SuperMemory 中枢 · ' + id4`**（后缀保留：多个中枢会话在侧栏要靠它区分）。标题生成函数 `hubSessionTitle(sessionId)` 与新前缀常量 `HUB_TITLE_PREFIX` 落在 `src/hub-sessions.ts`（与 `HUB_ID_PREFIX`/`isPluginBranchId` 同处，生成与迁移共用一份）。
+- **一次性迁移**（新模块 `src/hub-title-migration.ts`，模式参照 title-migration.ts）：
+  - 枚举走宿主 `sessionQuery.listSessions()`（缺失时退 `ctx.sessions.list()`；两者都没有 → `no-host` 且**不写标记**，下次启动重试）；
+  - 候选 = 无 `parentSession`、`origin !== 'subagent'`、非插件 `branch-*`/`fork-*` id（分支永远不当中枢改名）；
+  - 标题先批量读（`readTitleSnapshots`，退逐条 `currentSessionTitle`），只对**仍匹配 `^新会话 · `** 的落计划；apply 前再用 `currentSessionTitle` 复核一遍——**用户手动改过的一律不覆盖**；
+  - 改名走 `applySessionTitle(..., { force: true })`（与生成路径同一宿主写入）；
+  - 标记：`meta` 行 `hub-titles`（schema 的 meta 增 `hubTitlesMigrationVersion`/`hubTitlesMigratedAt`——meta schema 会剥掉未声明键）。**有 pending（会话尚未 attach，outcome `none`）时不写标记**，下次启动自愈续跑，不做成一锤子丢失。
+- `index.ts` 启动处在 `migrateTruncatedTitles` 之后调用（best-effort，失败只 warn）。
+- 未动 `title.ts` 的 `TITLE_FALLBACK`（话题集成员命名回退）与 `hub-sessions.ts` 的 `fallbackTitle`（面板降级回退）——前者是无后缀的裸「新会话」，与旧中枢标题的 ` · id4` 不撞。
+
+### 40.2 需求②③：徽标常显 + 中枢徽标
+
+- **根因（宿主 app.asar 源码核实）**：徽标原挂 `sidebar.session.row.leading`，宿主 Rows.tsx 对该 cell 的门控是 `!row.archived && !row.blank && (showStatus ? <SessionStatusDots/> : renderSlot(...))`，`showStatus = 主状态非 idle`——会话一运行徽标就被状态点挤掉（用户说的「运行中隐藏」）。
+- **改法（纯插件侧）**：`src/client/index.ts` 的 slot 从 `leading` 改为 **`sidebar.session.row.trailing`**（order 30 不变）。trailing cell 只受 `!row.blank` 门控（时间戳 + slot + pin 指示都在 `{!row.blank && …}` 里），运行/审批态都渲染；asar 内无其他包注册该 slot。
+- **kind 规则**（`src/panel.ts` `sessionBadge()`）：成员（fork 或 branch-* id）→ `branch`；root 成员 → `hub-set`；**非成员按 id 形状**——插件 `branch-*`/`fork-*` → `none`（刚从 mint 出来还没入集的分支不徽标，避免误徽成中枢）；宿主 `session-*` → `hub`（新增渲染）；其余 → `none`（新增 kind，显式「无徽标」而非旧的兜底 hub）。
+- **组件侧**（`src/client/session-badge.tsx`）：`hub` 用辐射状小图标（中心点 + 8 射线，与分支「一线两圆」/话题集「储物袋」区分）+ 文案「中枢」；`none` 渲染 null；配色用主题 `--dsw-alias-state-done-primary`（亮 violet-600 / 暗 violet-400，与 hub-set 的 link 蓝区分，双主题可读）；负向缓存 TTL 从仅 `hub` 扩到 **`hub` + `none`**（都是「尚未入集」的观测，8s 过期，避免 R18 同类 race）；模块头注释重写为 trailing/!row.blank 的事实与理由。
+- **locales**：`badge.hub`（zh「中枢」/en 'Hub'）、`badge.hub.tip`（zh「SuperMemory 中枢会话」/en 'SuperMemory hub session'）。
+- **已知限制（非回归）**：blank 行（还没有首条消息）leading/trailing 都不渲染，全新空中枢会话在有消息前不显徽标——与改前同门控。
+
+### 40.3 闸门与验收
+
+- `pnpm typecheck` 双 0 错；`pnpm build` exit 0（宿主 10 文件 + client 136.32 kB）；`pnpm smoke` 六套件全绿：core 25 / **mechanism 99**（新增 R31-1 中枢标题迁移用例 + E2 按新 kind 规则改写）/ webui 35 / client-sim（slot 断言改 trailing）/ capability 12 / workspace-scope 9。
+- **实时数据验收**：用 `~/.dsh/storages/supermemory.json`（只读）驱动真实 `SupermemoryPanelService`，7/7 通过——R30 话题集的 branch-* root 成员→`branch`、session-* root 成员→`hub-set`、派发记录里的两个真实中枢会话→`hub`、派发过但未入集的真实 branch-*→`none`、合成未入集分支与未知 id→`none`。
+- 管理台 HTTP 验收未做：控制台令牌只经 `/memory ui` 下发（本分支无该工具），页面 token 已被剥离，API 401；改以「实时存储 + 真实服务」等价验证。

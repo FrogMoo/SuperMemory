@@ -1,25 +1,38 @@
 /**
- * Sidebar session-row branch badge (GUI 问题③): marks the sessions that belong to
- * a SuperMemory topic set, so a hub session and the branch sessions it dispatched
- * to are visually distinguishable in the left sidebar.
+ * Sidebar session-row badge (GUI 问题③, R31 需求②): marks the sessions this
+ * plugin knows about, so a hub session, the branches it dispatched to and a
+ * topic-set hub stay distinguishable in the left sidebar.
  *
- * Seated in `sidebar.session.row.leading` — the same slot the host package
- * dsh-client-ui-schedule uses for its clock mark (id 'schedule-mark', order 10).
- * The shell renders that cell only for a non-archived, non-blank row whose primary
- * status is idle; a busy/approval row keeps its own status dot in the same cell
- * (upstream gating in dsh-client-ui-workspace's Rows component, verified
- * 2026-11-18: `!row.archived && !row.blank && (showStatus ? dots : renderSlot(...))`).
+ * Seated in `sidebar.session.row.trailing`. The host gates that cell by
+ * `!row.blank` only (upstream in dsh-client-ui-workspace's Rows component:
+ * the trailing `rowResting` span wraps the time label, the slot render and the
+ * pin mark, all inside `{!row.blank && …}`), so the badge stays visible while
+ * the session runs and in approval states. It USED to sit in
+ * `sidebar.session.row.leading`, whose gate is
+ * `!row.archived && !row.blank && (showStatus ? <SessionStatusDots/> : renderSlot(...))`
+ * with `showStatus = primary status is not idle` — a busy row kept its status
+ * dot in that cell and the badge disappeared (the 「运行中隐藏」 report). The
+ * trailing slot has no other registrant in the host bundle (verified in
+ * app.asar). Known limitation, unchanged by the move: a blank row (no first
+ * message) renders neither cell, so a brand-new empty hub session shows no
+ * badge until it has a message.
  *
- * R19 需求③④: two kinds are rendered —
+ * R19 需求③④ + R31 需求②: four kinds are projected by the host
+ * `sessionBadge()` and rendered here —
  * - `branch` (a plugin-minted `branch-*`/`fork-*` session, or a fork member):
  *   the work branch badge. A fresh dispatch is recorded as `kind:'root'`, so
  *   the id prefix — not the member kind — decides this case;
  * - `hub-set` (a HOST session that is the set's root member, e.g. the session
  *   `createTopicSetSession` created): a 「话题集」 badge carrying the set name,
  *   so a topic-set hub is no longer mislabelled as a branch (the R18
- *   conflation) and is not left unmarked.
- * A plain hub session renders nothing. The badge is a pure projection of host
- * membership and never fabricates one when the read fails.
+ *   conflation) and is not left unmarked;
+ * - `hub` (R31 需求②: a host-native `session-*` id in no topic set): a
+ *   「中枢」 badge — a plugin hub conversation is now visible in the sidebar
+ *   instead of being an unmarked row;
+ * - `none` (R31 需求②: a plugin branch that has not joined a set yet, or an
+ *   id the plugin cannot classify): renders nothing.
+ * The badge is a pure projection of host membership and id shape; it never
+ * fabricates one when the read fails.
  * @module supermemory/client/session-badge
  */
 import { createElement as h, useEffect, useState, type ReactElement } from 'react'
@@ -39,6 +52,9 @@ const BADGE_CSS = [
   '.sm-sb-badge{display:inline-flex;align-items:center;gap:3px;flex:none;box-sizing:border-box;height:16px;padding:0 6px 0 4px;border-radius:99px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);color:var(--dsw-alias-label-secondary,#cfd3d6);font-size:10px;line-height:14px;opacity:.8;cursor:default;user-select:none;vertical-align:middle}',
   '.sm-sb-badge:hover{opacity:1}',
   '.sm-sb-badge[data-kind="hub-set"]{color:var(--dsw-alias-link,#7aaaff);border-color:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 45%,transparent)}',
+  // R31 需求②: 「中枢」用主题的 done/violet 色（亮 violet-600 / 暗 violet-400），
+  // 与 hub-set 的 link 蓝明显区分，两种主题下都看得清。
+  '.sm-sb-badge[data-kind="hub"]{color:var(--dsw-alias-state-done-primary,#8b5cf6);border-color:color-mix(in srgb,var(--dsw-alias-state-done-primary,#8b5cf6) 45%,transparent)}',
   '.sm-sb-badge svg{display:block;flex:none}',
 ].join('\n')
 
@@ -64,15 +80,19 @@ function installCss(): void {
  * is asymmetric on purpose:
  * - `branch` is durable: membership is already true and only a real archive
  *   changes it (and a reload/re-scan re-reads it anyway);
- * - `hub` is a NEGATIVE observation with an 8 s TTL, so a newly joined branch
- *   shows up on the next row mount/refresh instead of staying invisible.
+ * - every NEGATIVE observation expires with a short TTL — R31 需求② widened
+ *   that set from `hub` to `hub` AND `none`, because both are "not a member
+ *   YET": a `hub` becomes the set's root member (「话题集」 badge) moments
+ *   after its set is created, and a `none` branch-* id gets its member row
+ *   seconds after its dispatch. A cached negative must not outlive that race,
+ *   or the badge stays missing/invisible until a page refresh.
  */
 interface BadgeCacheEntry {
   badge: SessionBadge
   at: number
 }
 const badgeCache = new Map<string, BadgeCacheEntry>()
-/** Negative (`hub`) answers expire fast; a later dispatch may add the member. */
+/** Negative (`hub`/`none`) answers expire fast; a later dispatch may add the member. */
 const HUB_BADGE_TTL_MS = 8000
 /** Mounted rows subscribe here so invalidateBadge() updates them immediately. */
 const listeners = new Set<() => void>()
@@ -102,8 +122,9 @@ export function invalidateBadge(sessionId?: string): void {
 }
 
 /**
- * Render the branch badge for one session row.
- * @returns the badge for a topic-set branch, null for a hub session.
+ * Render the badge for one session row.
+ * @returns the badge for a topic-set branch / topic-set hub / plugin hub,
+ * null for an unclassified session (`none`) or an unreadable row.
  */
 export function SupermemorySessionBadge(props: SupermemorySessionBadgeProps): ReactElement | null {
   installCss()
@@ -142,8 +163,11 @@ export function SupermemorySessionBadge(props: SupermemorySessionBadgeProps): Re
     }
     return () => { alive = false }
   }, [api, sessionId, revision])
-  if (!badge || (badge.kind !== 'branch' && badge.kind !== 'hub-set')) return null
+  // R31 需求②: `none` (a branch with no set yet, an unclassifiable id) and a
+  // failed read render nothing — an explicit "no badge", not a hub.
+  if (!badge || badge.kind === 'none') return null
   const isBranch = badge.kind === 'branch'
+  const isHub = badge.kind === 'hub'
   // A press on the badge must not activate the session through the row own
   // click target; the host clock mark does the same.
   const stop = (event: { stopPropagation: () => void }): void => { event.stopPropagation() }
@@ -158,24 +182,44 @@ export function SupermemorySessionBadge(props: SupermemorySessionBadgeProps): Re
         h('circle', { key: 'c', cx: 6, cy: 18, r: 3 }),
         h('path', { key: 'd', d: 'M18 9a9 9 0 0 1-9 9' }),
       )
-    : h('svg', {
-        key: 'glyph', width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none',
-        stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round',
-        'aria-hidden': true, focusable: false,
-      },
-        h('path', { key: 'a', d: 'M4 7a8 5 0 1 0 16 0 8 5 0 1 0-16 0' }),
-        h('path', { key: 'b', d: 'M4 7v6a8 5 0 0 0 16 0V7' }),
-      )
+    : isHub
+      // R31 需求②: 「中枢」——辐射状小图标（中心点 + 向外射线），与分支的
+      // 「一线两圆」和话题集的「储物袋」形状明确区分。
+      ? h('svg', {
+          key: 'glyph', width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round',
+          'aria-hidden': true, focusable: false,
+        },
+          h('circle', { key: 'a', cx: 12, cy: 12, r: 2.4 }),
+          h('path', { key: 'b', d: 'M12 3.2v2.6' }),
+          h('path', { key: 'c', d: 'M12 18.2v2.6' }),
+          h('path', { key: 'd', d: 'M3.2 12h2.6' }),
+          h('path', { key: 'e', d: 'M18.2 12h2.6' }),
+          h('path', { key: 'f', d: 'M5.8 5.8l1.9 1.9' }),
+          h('path', { key: 'g', d: 'M16.3 16.3l1.9 1.9' }),
+          h('path', { key: 'h', d: 'M18.2 5.8l-1.9 1.9' }),
+          h('path', { key: 'i', d: 'M7.7 16.3l-1.9 1.9' }),
+        )
+      : h('svg', {
+          key: 'glyph', width: 12, height: 12, viewBox: '0 0 24 24', fill: 'none',
+          stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round',
+          'aria-hidden': true, focusable: false,
+        },
+          h('path', { key: 'a', d: 'M4 7a8 5 0 1 0 16 0 8 5 0 1 0-16 0' }),
+          h('path', { key: 'b', d: 'M4 7v6a8 5 0 0 0 16 0V7' }),
+        )
   return h('span', {
     key: 'badge',
     className: 'sm-sb-badge',
     'data-kind': badge.kind,
     title: isBranch
       ? t('badge.tip', { title: badge.topicSetTitle })
-      : t('badge.hubSet.tip', { title: badge.topicSetTitle }),
+      : isHub
+        ? t('badge.hub.tip')
+        : t('badge.hubSet.tip', { title: badge.topicSetTitle }),
     onClick: stop,
   },
     glyph,
-    h('span', { key: 'text' }, isBranch ? t('badge.branch') : t('badge.hubSet')),
+    h('span', { key: 'text' }, isBranch ? t('badge.branch') : isHub ? t('badge.hub') : t('badge.hubSet')),
   )
 }

@@ -256,14 +256,23 @@ export async function apply(ctx: Context): Promise<void> {
     }, NewSessionChoice as never)), 'supermemory: new-session entry')
   })
 
-  // 4. the sidebar session-row branch badge (问题③): a 「分支」 mark on every
-  //    session that belongs to a SuperMemory topic set, so hub sessions and
-  //    the branches they dispatched to are distinguishable in the sidebar.
-  //    Same slot, order band and inject shape the host dsh-client-ui-schedule
-  //    uses for its clock mark (id 'schedule-mark', order 10).
+  // 4. the sidebar session-row badge (问题③, R31 需求②): a 「分支」/「话题集」/
+  //    「中枢」 mark on the sessions this plugin knows about, so hub sessions,
+  //    the branches they dispatched to and topic-set hubs stay distinguishable
+  //    in the left sidebar.
+  //    R31 需求② moved the slot from `leading` to `trailing`: the host gates
+  //    the leading cell by `!row.archived && !row.blank && (showStatus ?
+  //    <SessionStatusDots/> : renderSlot(...))`, so a RUNNING row lost the
+  //    badge to its own status dot (the 「运行中隐藏」 report). The trailing
+  //    cell is gated by `!row.blank` only — it renders while running and in
+  //    approval states, and no other package registers that slot (verified in
+  //    the host app.asar, Rows.tsx trailing cell: time label, slot, pin mark).
+  //    Known limitation (same as before, not a regression): a blank row — no
+  //    first message yet — renders neither cell, so a brand-new empty hub
+  //    session shows no badge until it has a message.
   contribute('session badge', () => {
-    ctx.effect(() => ctx.slots.inject('sidebar.session.row.leading', () => ctx.slots.register({
-      name: 'sidebar.session.row.leading',
+    ctx.effect(() => ctx.slots.inject('sidebar.session.row.trailing', () => ctx.slots.register({
+      name: 'sidebar.session.row.trailing',
       id: 'supermemory-branch',
       order: 30,
       locale: NS,

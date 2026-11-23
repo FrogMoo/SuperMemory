@@ -98,6 +98,22 @@ export const FORK_ID_PREFIX = 'fork-'
 export const HUB_ID_PREFIX = 'session-'
 
 /**
+ * R31 需求①: the title a plugin-created hub session gets. The prefix names the
+ * flavour (「SuperMemory 中枢」) so a hub is recognizable in the sidebar at a
+ * glance; the 4-char id suffix keeps several hub sessions distinguishable
+ * (the same reason the pre-R31 format carried one).
+ */
+export const HUB_TITLE_PREFIX = 'SuperMemory 中枢'
+
+/** The pre-R31 hub title prefix ('新会话 · <id4>'); hub-title-migration renames it. */
+export const LEGACY_HUB_TITLE_PREFIX = '新会话'
+
+/** The title {@link createHubSession} gives a new hub session. */
+export function hubSessionTitle(sessionId: string): string {
+  return `${HUB_TITLE_PREFIX} · ${sessionId.slice(-4)}`
+}
+
+/**
  * Is this id minted by the plugin as a WORK BRANCH? Fresh dispatches use
  * `branch-*` and forks `fork-*`. This is the static half of the hub/branch
  * rule: dispatch records a fresh branch with `kind:'root'` (it is a root of its

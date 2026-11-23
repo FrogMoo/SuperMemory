@@ -208,6 +208,9 @@ export const zh = {
   'badge.hubSet.tip': '中枢会话属于话题集 · {title}',
   'badge.branch': '分支',
   'badge.tip': '话题集分支 · {title}',
+  // R31 需求②: 插件中枢会话徽标（trailing 槽常显）。
+  'badge.hub': '中枢',
+  'badge.hub.tip': 'SuperMemory 中枢会话',
   'error.load': '加载失败',
   'error.retry': '重试',
   'error.generic': '操作失败',
@@ -419,6 +422,9 @@ export const en: Record<string, string> = {
   'badge.hubSet.tip': 'Hub session of a topic set · {title}',
   'badge.branch': 'Branch',
   'badge.tip': 'Topic-set branch · {title}',
+  // R31 需求②: plugin hub-session badge (always visible in the trailing slot).
+  'badge.hub': 'Hub',
+  'badge.hub.tip': 'SuperMemory hub session',
   'error.load': 'Load failed',
   'error.retry': 'Retry',
   'error.generic': 'Operation failed',
