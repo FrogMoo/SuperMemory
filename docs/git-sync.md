@@ -363,3 +363,4 @@ git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一�
 | Release | `POST /releases` + 资产上传 | https://github.com/FrogMoo/SuperMemory/releases/tag/v1.0.0 ，资产 `dsh-supermemory-1.0.0.zip`（1.83 MB，1917704 B）state=uploaded |
 
 网络恢复后 GitHub 半边自动回归 `pnpm git:sync` 正常路径，无需任何配置改动；本机 `~/.ssh/id_ed25519` 如需启用 SSH 备用通道，需先在 GitHub 账号 Settings → SSH keys 注册。
+
