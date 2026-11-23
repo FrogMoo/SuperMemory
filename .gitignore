@@ -26,3 +26,6 @@ Backup/
 # transient dev-iteration builds (scripts/dev-load.sh)
 lib/dev-*.js
 .probe/
+
+# release staging dirs (only release/*.zip is committed; scripts/package-release.mjs)
+release/dsh-supermemory-*/

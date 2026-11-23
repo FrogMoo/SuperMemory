@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的跨会话记忆插件：把「结论性事实、话题集、派发归档、固化能力」持久化到存储域，让中枢/分支会话协同工作跨会话可续、可追溯、可召回。
 
-- **包名**：`dsh-supermemory`　**版本**：`0.1.0`　**许可**：仓库内暂无 LICENSE 文件
+- **包名**：`dsh-supermemory`　**版本**：`1.0.0`（首个正式 Release，tag `v1.0.0`）　**许可**：仓库内暂无 LICENSE 文件
 - **宿主要求**：DSH `>=0.2.0 <0.3.0`（见 `package.json` 的 `engines.dsh`）
 - **产物形态**：ESM。宿主半边 `lib/supermemory.js`，浏览器半边 `lib/client.js`（DSH 侧边栏/主区面板）
 - **存储**：DSH `storageDomain` 域 `supermemory`（version 1），表定义集中在 `src/schema.ts`；所有业务表按工作区隔离（`workspaceKey`，决策 D4）
@@ -117,6 +117,12 @@ pnpm smoke          # 6 套冒烟一次跑完（见下）
 | `workspace-scope` | 工作区隔离：话题集/分支/能力按工作区过滤与门禁 |
 
 ## 5. 在 DSH 中安装与重载
+
+### 5.1 用户安装（从 Release，推荐）
+
+普通用户**不需要克隆仓库、不需要构建**：到 [GitHub Releases](https://github.com/FrogMoo/SuperMemory/releases)（或仓库 `release/` 目录）下载 `dsh-supermemory-<版本>.zip`，解压后进入目录执行 `node scripts/install-into-dsh.mjs`，重启 DSH Desktop 即可。发布包已内置预构建产物 `lib/` 与生产依赖 `node_modules/`，全程无需外网。完整步骤、升级与卸载见 [INSTALL.md](INSTALL.md)。
+
+### 5.2 开发期安装（源码工作区）
 
 ```bash
 pnpm install:dsh        # 等价于 node scripts/install-into-dsh.mjs
