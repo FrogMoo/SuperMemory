@@ -2242,3 +2242,458 @@ v1.0.0（提交 1f549a1）之后仓库无任何代码/文档改动：三端 main
 - 推后 `git ls-remote` 两端核对 refs/heads/main 与 tag SHA 与本地一致（三端零分叉，标准同 v1.0.0 轮）。
 
 **Release 页**：GitHub 建 v1.0.1 Release 并上传 `dsh-supermemory-1.0.1.zip`；Gitea 侧同建 Release（用 Zry 凭据；失败不阻塞主流程）。
+
+---
+
+## 42. R32：中枢-分支协同三条规则硬化进插件运行时（2026-11-24）
+
+R30/R31 把「分支不重载」「中枢只派发」「双向卡片」写进了提示词与 SOP，但提示词不是闸门：分支一旦在会话里调用插件重载入口，宿主 enable 与 agent 被杀在同一毫秒（R31 实证）。本轮把三条规则落到**插件代码/运行时拦截**，不修改 DSH 本体 checkout，也不在分支内执行重载。
+
+### 42.1 需求①：分支不可重载插件（只留中枢/GUI）
+
+- **宿主实际入口**：agent 侧是 DSH 的 plugin_manager 工具（dsh-plugin-manager/src/tools.ts），R29 §34.2 已核实 set_plugin include:supermemory enabled=false/true 是可靠重载路径；GUI 插件页走同一 pluginManager 服务，但不经过 agent 工具管线。MCP 工具同样经过 ctx.tools 管线，因此统一在同一处拦截。
+- **落点**：src/role-guard.ts 的纯函数 roleGuardDecision() + src/index.ts 注册的 ctx.tools.guard()。tools.guard 是 DSH 的**单调**执行闸：在每个 tools/pre-execute 与审批之后、工具体之前运行，返回字符串即终局拒绝，其他监听器无法把它改回允许。
+- **判定**：isBranchSession() 覆盖三种分支形态——插件铸造的 branch-*/fork-*、话题集 fork 成员（含归档集）、以及任意 dispatches.branchSessionId 命中（宿主会话被 mode: continue 复用为分支）。分支 + plugin_manager 的**任何非只读 action**（set_plugin/set_bundle/install_bundle/remove_bundle/set_version_exemption）→「分支会话不能重载插件，请由中枢会话执行（plugin_manager 的禁用/启用会终止当前分支）。」
+- **边界**：非中枢的子代理会话同样拒绝（「只有中枢会话可以重载插件…」），避免「不是中枢也能重载」的旁路；中枢会话与 GUI 插件页保持可用。**GUI 侧的禁用/启用无法归属到某个分支会话**（它是全局操作，不经 agent 工具），这是宿主限制，不伪装成已拦截。
+
+### 42.2 需求②：中枢只派发与汇总，不亲自执行
+
+- **落点**：同一个 roleGuardDecision()。isHubSession() 为真的会话调用执行类工具时返回引导错误：「中枢会话只做派发，请用 memory_dispatch 派发给分支（不要直接执行工具「<name>」）；分支完成后 relay 会自动送回本会话。」
+- **拒绝清单**：bash、write、edit、apply_patch、multi_edit、create_file/delete_file/move_file、gitbash_native、terminal_*、job_kill、office_render/convert/recalculate、subagent/subagent_fork/workflow，以及 sm_composite_*（固化能力会执行冻结命令）。读/检索/记忆/提问/发送/面板/present/read/glob/grep/web_* 等轻量工具保持可用，relay 链路（memory_*、send_message、ask_user_question）不受影响；分支的 full 能力照旧可执行（分支不是 hub，不命中该规则）。
+- **PTC 取舍（重要限制）**：当前部署里中枢唯一模型直连工具是 run_code，memory_dispatch 等都在程序内通过 tools.* 调用。若禁 run_code，中枢连派发都做不了，所以保留它作为传输层；嵌套的 tools.bash/tools.write 等**仍然被 guard 拦截**（PTC 的每个 sub-call 都走 executor.prepare → pre-execute/guards）。残留旁路：run_code 程序里直接 import('node:fs') 写文件是宿主级能力，无法在不切断派发传输的前提下拆分——这是宿主限制，已在回报中说明，不静默降级成提示词。
+- **审批顺序提示**：guard 在审批之后运行，所以中枢/分支先尝试高危工具时可能先看到审批提示再收到拒绝；这是 DSH 管线顺序，不影响拒绝的终局性。
+
+### 42.3 需求③：双向沟通卡片化 + 动态标题
+
+- **现状定位**：中枢收到的 relay 是 user/message 且 source.kind='supermemory'，唤醒型消息被 DSH 投影为 turn-trigger 节点，宿主卡片标题只从 source.kind 取「收到执行请求」；分支首条派发消息是 source.kind='user'（R25：会话列表 recency 只认 kind user），宿主按普通用户消息渲染。两侧都无法知道发送方是谁。
+- **来源标记（宿主）**：src/chat-card.ts 提供纯函数 relaySource() / dispatchSource()。
+  - 分支→中枢 relay：kind:'supermemory', form:'relay', fromSessionId, fromTitle, fromKind, dispatchId/groupId, status；
+  - 中枢→分支派发/续跑/重发：kind:'user', form:'supermemory-dispatch', fromSessionId, fromTitle, task, topicSetTitle, capability, dispatchId, status——kind 仍是 user，**R25 recency 不变**，只是多了卡片标记。
+  - src/observe.ts 的 deliver() 在发送时解析来源标题（sessionTitleOf()：宿主 sessionTitle.get 优先，回退插件持久的分支标题）并把 from* 一起写进 outbox 行；flushObserve / reconcile 重启重投沿用持久字段。src/schema.ts 的 outbox 新增可选 fromSessionId/fromTitle/fromKind（旧行保持兼容）。dispatch.ts、resume.ts、reconcile.ts 的派发/续跑/重发路径统一改用 dispatchSource()；失败投递与恢复通知也带来源（系统通知用 fromKind:'system', fromTitle:'SuperMemory 中断巡检'）。
+- **客户端渲染**：新增 src/client/chat-card.tsx，在 conversation.chat.node 的 user / steering / turn-trigger / context 四个 keyed cell 上以 priority:-100 遮蔽宿主渲染器；只有带上述 marker 的消息渲染插件卡片，其他消息通过 ctx.slots.entries() 找到宿主原组件并原样委托（普通用户消息、goal/subagent/schedule 触发卡、skill/instructions 上下文一律不受影响）。卡片与面板同一套视觉语言：可收起头部（默认收起）+ 来源/种类/时间 + 展开后的任务、话题集、能力档位、派发回执、来源会话字段 + 完整正文（pre 保留换行）。
+- **标题规则**：「来自 <来源会话标题> 的执行请求」；标题缺失回退来源会话 ID 后 4 位（cardSourceLabel/idTail）。zh/en 字典都补齐 chat.card.*。
+- **降级**：若 shell 不暴露 ctx.slots.entries()（无法委托），插件**不遮蔽任何 cell**并 console.warn，绝不把普通用户消息吞成空白——这是显式降级，不是静默。
+
+### 42.4 改动文件清单
+
+- 新增：src/role-guard.ts（角色判定 + 纯 guard 决策）、src/chat-card.ts（双向来源标记 + 标题/回退纯函数）、src/client/chat-card.tsx（四 cell 卡片渲染 + 委托 + CSS）。
+- 修改：src/index.ts（注册 ctx.tools.guard）、src/title.ts（sessionTitleOf）、src/dispatch.ts/src/resume.ts/src/reconcile.ts/src/observe.ts（来源标记与 outbox 持久化）、src/schema.ts（outbox 可选来源字段）、src/client/index.ts（挂载卡片，且在 panel API 检查之前）、src/client/shell.d.ts（slots.entries 声明）、src/client/locales.ts（卡片字典）。
+- 测试：scripts/core-smoke.mjs 新增 R32 用例（分支重载拒绝 / 中枢执行类拒绝与引导文案 / 轻量工具放行 / 动态标题与 ID 回退 / 卡内字段 / 普通消息不误伤）；scripts/client-sim-smoke.mjs 新增真实渲染断言（两种方向卡片、标题回退、普通 user 消息委托、四个 cell 注册）；scripts/mechanism-smoke.mjs 的 R25 派发/续跑 source 断言改为「kind 仍 user + 新增 form 标记」。
+
+### 42.5 闸门与未做的事
+
+- pnpm typecheck：宿主 + 客户端双 0 错。
+- pnpm build：宿主 10 文件（660.67 kB）+ lib/client.js 148.22 kB（wrap 后 144700 bytes）。
+- pnpm smoke：core **26** / mechanism **99** / webui **35** / client-sim OK / capability **12** / workspace-scope **9** 全绿。
+- **未做**：分支内插件重载（本轮规则本身禁止，且会自杀）；未 commit/push；未修改 DSH 本体 checkout。GUI 现网视觉验收留待中枢重载后执行（见回报的验收步骤）。
+- **已知宿主限制**：① GUI 插件页的禁用/启用是全局操作，插件无法按会话归属拦截；② PTC run_code 作为派发传输必须保留，程序内直接 Node 文件写入无法与派发能力拆分；③ guard 在审批之后运行，危险工具可能先弹审批再被拒。
+
+
+---
+
+## 43. R33：只读复核 P0/P1 修复（2026-11-24）
+
+R32 把三条规则写进了代码并声称闸门全绿，但独立只读复核发现重载后会坏：卡片读错节点层级、hub 判定过宽导致所有顶层会话被拒绝执行、卡片遮蔽后的委托缺 props、角色判定自相矛盾、guard 非 total、lib 产物与 git index 不一致。本轮逐条修复，并补上「删掉就变红」的真实断言。**分支内未重载插件、未 commit/push、未修改 DSH 本体 checkout。**
+
+### 43.1 P0 修复
+
+1. **卡片节点层级**（`src/client/chat-card.tsx`）：宿主 ChatNode 的载荷在 `node.data`（`kind` + `data.source/content/time`，见宿主 `contract/snapshot.ts` 与 `MessageItem.tsx` 的 `const data = node.data`），R32 却读 `node.content/source/time`，`cardMetaOf(undefined)` 恒为 null → 双向卡片从未渲染。现统一读 `node.data.*`；client-sim 的 fixture 改成宿主真实形状，改回 `node.source` 会立即红（卡片断言失败）。
+2. **hub 判定过宽**（`src/hub-branches.ts` + `src/role-guard.ts` → 新 `src/role.ts`）：R32 用「顶层且无 parentSession」推断 hub，于是任何普通对话都被判中枢，bash/write/edit/subagent 全被拒。现由唯一入口 `resolveRole()` 判定，hub 只认**正标记**且**限定本工作区**：① `hub_sessions` 记录（新表）；② 话题集 `kind:'root'` 成员（集合 workspaceKey 必须匹配）；③ `dispatches.hubSessionId` 引用（派发本身就是中枢行为，集合工作区须匹配）。顶层无父不再推断中枢。
+3. **卡片委托缺 props**（`src/client/chat-card.tsx`）：宿主的 `UserMessageNodeView({node, renderFactorySlot, loadImage, renderSlotChain, t})` 需要 `t` 与 `renderSlotChain`，`TurnTriggerNodeView/ContextMessageNodeView` 需要 `t`。R32 的注册项既没有 `locale` 也没有 `children`/`inject`，每条非卡片消息都走 slot 崩溃兜底。现四个 cell 都声明 `locale: 'chat'`（宿主 chat 命名空间）注入 `t`；`user/steering` 用 `inject: () => ({ renderSlotChain: () => null })`（与宿主 `steering` 注册完全同一手法）；委托时再用 `delegationProps()` 兜底补 `t`/no-op `renderSlotChain`。`conversation.chat.user.before` 的声明已被宿主 `user` 项占有，重复声明会在激活期报错，因此只能注入 no-op——**代价：被委托的普通用户消息不渲染 user.before 装饰链**（宿主限制，不是静默降级：代码注释 + 本节 + 回报均单列）。goal/subagent/schedule 触发卡与 context 注入照常委托。
+4. **角色判定自相矛盾**（`src/dispatch.ts` + `src/role-guard.ts` + `src/role.ts`）：mode:auto/continue 会把话题集 root 成员当分支复用，同一会话同时 `isBranchSession/hub`。现统一 `resolveRole()`：**branch 优先**（`branch-*`/`fork-*` id、fork 成员、`dispatches.branchSessionId`），hub 只认正标记；`branchCandidates` 由生产调用方传入 `resolveRole(..., {id}).role === 'hub'` 的谓词排除 hub 成员（面板创建的 `branch-*` root 成员仍可复用）。`isBranchSession/isHubSession` 都退化为该入口的薄投影。
+5. **guard 非 total**（`src/role-guard.ts` + `src/role.ts`）：`resolveRole` 内所有 store 读取都 try/catch（关闭/重载竞态 → `other / resolution-error`）；`roleGuardDecision` 整体 try/catch，异常时 `plugin_manager` 继续拒绝、其它工具放行，并通过 `warn` sink + `resolution-error` 记录告警。分支判定不再「异常 fail-open 到普通会话」式含糊——任何失败都收敛为 other，重载闸保持关闭。
+6. **lib 产物与 index 不一致**（P1）：清空 `lib/` 后 `pnpm build` 重建，旧 chunk（store-DZJW6hvc.js 等）由构建删除，`git add -A lib` 暂存新增/删除（不 commit）。清单见回报与本节 43.5。
+
+### 43.2 P1/P2 顺带修复
+
+7. **relay→中枢 卡片字段补全**：`relaySource()` 新增 `task/topicSetTitle/capability`；`observe.deliver()` 用新的 `relayCardFields()` 解析并把字段持久化到 outbox 行；**组回送的来源会话改为首个成员分支**（groupId 仍单列），不再把 groupId 当 fromSessionId；`flushObserve` 对 pre-R33 行补 `fromSessionId/fromTitle/task/topicSetTitle/capability` 并回写；`reconcile` 重投保留/重建同样的字段。`dispatches` 新增 `capability` 字段（续跑沿用，失败成员为空）。
+8. **guard 注册失败显式告警 + meta 标记**：失败写 `meta['role-guard'].roleGuardFailedAt/roleGuardVersion/roleGuardError` 并用 `[ALERT]` 前缀 logger.warn；成功写 `roleGuardInstalledAt`。拒绝结果从裸字符串升级为 `ToolGuardDenial`（`{ reason, info: { name: 'supermemory:role-guard', code } }`），code ∈ `BRANCH_RELOAD_DENIED / NON_HUB_RELOAD_DENIED / HUB_EXECUTION_DENIED`。
+9. **断言真实性**：
+   - client-sim：fixture 改为 `{ node: { kind, data: { content, source, time } } }`；宿主假组件按真实契约在缺 `t` / 缺 `renderSlotChain` 时**抛错**（并有负向控制用例证明假组件真的会抛）；四个 cell 断言 `locale==='chat'`、`inject().renderSlotChain`；普通 user/steering/trigger/context 委托都调用一次假宿主组件验证不崩；`entries()` 缺失时断言**零** `conversation.chat.node` 注册且有告警。
+   - core：角色正标记/工作区/branch 优先/普通顶层不再误判；拒绝清单 20 项**逐项**断言（`HUB_DENIED_TOOLS.size === 20` + 每项 has + 每项拒绝 code + 每项分支/普通会话放行），删任一项必红；缺 action 的 plugin_manager 对 branch/普通会话 fail-closed、对 hub 放行；异常 store 下 plugin_manager 拒绝 + 普通工具放行 + 两次告警。`priority:-100` 的源码字符串断言已删除（client-sim 用注册行为断言替代）；`tools.guard(` 的源码接线断言保留（宿主 seam 无法 headless 构造），并新增行为断言。
+   - mechanism：单条/失败/组回送的 outbox 行断言 `fromSessionId/fromTitle/fromKind/task/capability`；组回送来源=首个成员分支、groupId 单列；`flushObserve` 对 pre-R33 pending 行补齐字段并固化（通过新增的 `createMessage` 注入缝在宿主外驱动）。
+   - 说明：任务书写「19 项」拒绝清单，代码实际为 20 项（R32 起含 `workflow`）；按代码事实逐条断言 20，删任一项都会红。
+
+### 43.3 角色统一表（唯一权威：`src/role.ts`）
+
+| 角色 | 判据（按优先级） | 执行工具 | plugin_manager 变更 |
+|---|---|---|---|
+| branch | `branch-*`/`fork-*` id → fork 成员 → `dispatches.branchSessionId` | 允许 | 拒绝（BRANCH_RELOAD_DENIED） |
+| hub | `hub_sessions` 记录 → 本工作区 root 成员 → 本工作区派发中枢引用（正标记） | 拒绝执行类（HUB_EXECUTION_DENIED） | 允许 |
+| other | 其余（普通顶层对话、subagent 子会话、别的工作区标记、解析失败） | 允许 | 拒绝（NON_HUB_RELOAD_DENIED） |
+
+- **branch 优先**：同时带分支事实与 hub 标记 → branch。
+- **工作区**：标记的 workspaceKey 与 agent cwd 的 `workspaceKeyOf` 已知且不一致 → 不认该标记；未知不当作不一致。
+- **hub_sessions 表**：面板新建中枢（panel）、话题集会话（topicset-root）、派发（dispatch）写入；启动 `backfillHubRecords` 从 root 成员 + 派发引用幂等回填（跳过已解析为 branch 的会话）。
+- **面板左栏的「中枢会话」列表仍是发现视图**（顶层非分支会话），不是角色权威；角色只看 `resolveRole`。两者刻意分开，避免再次把「无父会话」当角色事实。
+
+### 43.4 剩余限制
+
+- 被委托的普通用户消息丢失 `conversation.chat.user.before` 装饰链（声明归属在宿主 user 注册项，重复声明会激活失败；只能 no-op）。
+- GUI 插件页的禁用/启用是全局操作，不经 agent 工具管线，无法按会话归属拦截（R32 已记录）。
+- PTC `run_code` 必须保留为派发传输；程序内直接 Node 文件写入无法与派发能力拆分（宿主级）。
+- guard 在审批之后运行：危险工具可能先弹审批再被拒。
+- 普通顶层会话不再被认定为 hub：新会话若既非面板创建、也未派发、也不在话题集 root 中，则不会注入 hub 角色提示（这是「正标记」口径的必然代价；面板创建时会立刻写记录）。
+
+### 43.5 闸门与 lib
+
+- `pnpm typecheck`：宿主 + 客户端双 0 错。
+- `pnpm build`：干净重建 `lib/`（清单见本轮回报）。
+- `pnpm smoke`：core **29** / mechanism **101** / webui **35** / client-sim OK / capability **12** / workspace-scope **9**（exit 0）。
+- **「删掉会变红」负向实证**：临时移除 `HUB_DENIED_TOOLS` 的 `workflow` → core 报 `19 !== 20`（exit 1），恢复后绿；把 `cardMetaOf(node?.data?.source)` 改回 `node?.source` → client-sim 报「did not render as a hub card」（exit 1），恢复并重建后绿。两次改动均已用备份 `cmp` 验证还原。
+- **lib 干净重建**（已 `git add -A lib`，未 commit）：`store-CL8aIbHA.js` 新增、`store-DZJW6hvc.js` 删除；其余 chunk 以 R 记录重命名（composite/export/filemap/group/memory-collections/memory-versions/model/topicsets），`supermemory.js`/client.js 更新。最终 10 个宿主文件（672.72 kB）+ `lib/client.js` 145946 bytes。
+- 分支内未重载插件、未 commit/push。
+
+
+## 44. R35：重载后收尾——暂存源码 + 统一残留角色推断 + 老中枢迁移（2026-11-24）
+
+R33 运行时代码已在插件重载后生效；本轮只做「发布一致 + P1/P2 收尾 + 迁移缺口」，不重载插件、不 commit/push、不改 DSH 本体。
+
+### 44.1 发版 P1：git index 与工作树一致
+
+- 前一轮只有 `lib/` 与 `package.json` 在 index 内是 R33 版本，`src`（22 个旧版 + 4 个未跟踪新文件）、`scripts`、`DEV-NOTES.md` 仍是旧版。
+- 本轮执行 `git add -A`（含 `src`、`scripts`、`DEV-NOTES.md`、`lib`、`package.json`），用 `git status --porcelain` + `git diff --cached --stat` 核对后**不 commit**。发布包不会再把旧源码与新 `lib` 拼在一起。
+
+### 44.2 P2：角色入口统一（不再有第二套判定）
+
+唯一权威仍是 `src/role.ts` 的 `resolveRole`（branch 优先 → hub 正标记 → other）。本轮删掉三处残留推断：
+
+1. **`src/route.ts`**：本地 `isBranchSession` 原来只看 `branch-*`/`fork-*` 与 fork 成员，漏了 `dispatches.branchSessionId`（mode:continue 复用非 branch-* id 时会被当成中枢并注入话题提示）。现直接 `resolveRole(store,{id}).role === 'branch'`。行为断言 R35-3：普通会话仍得到静默提示卡；只被 `dispatches.branchSessionId` 命中的会话返回 `{}`（把实现改回`return false` 立即红）。
+2. **`src/panel.ts` sessionBadge**：原来任何无话题集的 `session-*` 都被标 `{kind:'hub'}`。现查 `store.hubs` 正记录，无记录 → `none`（守卫读，store 关闭不抛）。行为断言：`session-*` 有 hub 记录 → hub；无记录 → none（把判定改回 id 前缀立即红）。
+3. **`src/hub-sessions.ts` 面板左栏**：保留为**发现视图**（回答「本工作区哪些顶层会话可以打开」），不改用角色过滤——因为它是启动器，隐藏会话会让用户打不开老对话；代价是它给出的行可能解析为 `other`。边界用三层写明：模块头「DISCOVERY VIEW, NOT ROLE AUTHORITY」、`listHubSessions` JSDoc、面板文案 `side.title=中枢会话（发现视图）` + `side.authority` tooltip（中英双份）。**它绝不作为 guard/prompt/dispatch 的输入**。
+4. **`src/role-guard.ts`**：删除导出的 `isBranchSession`（生产无调用方，但导出本身就是第二入口的邀请）。core 断言该模块**不再导出**这个名字。
+5. **`src/index.ts`**：修正 hub-role systemPrompt 注释（原文说「topic-set 会话不注入 hub 提示」，与 `resolveRole` 相反）。事实：话题集 **root** 成员是正标记之一，会拿到 hub 提示；分支、subagent 不会。
+
+### 44.3 迁移：R33 之前面板创建的老中枢补正证据
+
+- 缺口：R33 之前面板创建、既未派发、也不是话题集 root 的中枢没有 `hub_sessions` 行；重载后 `resolveRole` 判 other——能执行工具，但不能重载插件。
+- 新增 `src/hub-records-migration.ts`（`migrateHubSessionRecords`），**一次性 + 幂等**，只接受窄证据链：
+  - id 以 `session-` 开头（插件铸造的中枢 id）；
+  - 顶层会话：无 `parentSession`、`origin !== 'subagent'`；
+  - 宿主标题以 `SuperMemory 中枢` 开头；
+  - 会话自身 cwd 的 workspaceKey 在 `knownWorkspaceKeys(store)`（从 store 里所有带 workspaceKey 的表推导）白名单内；记录按会话自己的 workspaceKey 写入，绝不猜工作区。
+- 不写的情况：已有 hub 记录（`already-recorded`）、`resolveRole` 判为 branch（`branch-fact`，不写会被覆盖的假审计行）、标题读不到（`title-unreadable`，计入 pending 且**不写 marker**，下次启动重试）、普通标题（`skippedNonHub`）。
+- marker：store.meta 行 `hub-records`（`hubRecordsMigrationVersion/hubRecordsMigratedAt`，已加入 meta schema 防止被剥离）；dryRun 不写任何东西；marker 存在即 `already-done`。
+- **运行时机**：启动期，在 `migrateHubSessionTitles` 之后链式执行（先改名后按新前缀认会话）。因此**需要中枢再做一次重载**才会真正落库；本轮只交付代码 + 只读盘点，不代跑启动迁移。
+- `schema.ts`：`hub_sessions.source` 增加 `'title-migration'`（旧行 'panel'/'topicset-root'/'dispatch'/'migration' 不受影响，域保持 v1 兼容）。
+
+### 44.4 验证
+
+- `pnpm typecheck`：宿主 + 客户端双 0 错。
+- `pnpm build`：宿主 10 文件 680.29 kB，客户端 `lib/client.js` 146267 bytes（wrap-client）。
+- `pnpm smoke`：core **30** / mechanism **102** / webui **35** / client-sim OK / capability **12** / workspace-scope **9**，exit 0。
+- 断言真实性（临时改坏 → 红 → 还原 → 绿）：
+  - route 本地分支判定改回`return false` → mechanism 报「a dispatch branch ... is not routed like a hub」；
+  - sessionBadge 改回 `session-` 前缀 → mechanism 报「a session-* id WITHOUT a hub record gets no badge」；
+  - 迁移去掉 already-recorded 跳过 → core 报「exactly the unrecorded hub-titled session is planned」。
+
+### 44.5 剩余限制
+
+- 老中枢迁移只在**启动期**跑：不重载 = 不生效；未 attach 或标题暂不可读的会话保持 pending，下次启动自愈。
+- 发现视图按形状列会话，可能与角色不一致（有意为之；文案已声明非权威）。
+- 迁移不猜工作区：store 里完全没有数据的工作区（无话题集/记忆/集合/filemap/需求/hub 行）不会被迁移，即使该处有 hub 标题的会话。
+- 仍未解决：GUI 插件页禁用/启用全局操作无法按会话拦截；PTC `run_code` 必须保留为派发传输；被委托普通用户消息的 `user.before` 装饰链缺失（§43.4）。
+
+
+---
+
+## 45. R36：中枢权限改白名单（默认拒绝）+ 面板「中枢权限」设置页签（2026-11-24）
+
+对应用户两项需求：①中枢会话权限从『黑名单默认放行』改为『白名单默认拦截』；②面板新增「中枢权限」设置页签，可查看全部中枢可做事项、勾选白名单、恢复默认、保存即生效。与 R35 收尾改动同树（未提交），只新增/改写本 round 自己的区域。
+
+### 45.1 数据落点与默认值
+
+- **新表 `hub_policies`**（schema.ts/store.ts 注册，v1 域兼容：旧介质无行即空表）：一行一个工作区，`{ workspaceKey, tools[], prefixes[], updatedAt }`。选它而不是 meta 行，因为白名单是**有工作区归属的数据**（meta 行是进程事实，per-workspace 的 meta 行得靠 digest 拼键，如 organize-<digest>），且 guard 每次调用都要同步读。
+- **内置默认白名单** `DEFAULT_HUB_TOOLS`（24 项）= R33 放行集：memory_dispatch / memory_questions / memory_resume / memory_recall / memory_remember / memory_history / memory_topicsets / memory_new_topicset / memory_export / memory_scan / memory_set_model / memory_toolize / ask_user_question / send_message / wait_agent / list_agents / read / glob / grep / skill / todo_write / present / run_code / plugin_manager；前缀 `DEFAULT_HUB_PREFIXES` = [`schedule_`]（即任务书的 schedule_*）。
+- **核心锁定项** `LOCKED_HUB_TOOLS`（6 项，永远放行、面板不可取消）：memory_dispatch / memory_questions / memory_recall / ask_user_question / send_message / run_code。理由：派发/收线/提问/运行码传输是中枢的饭碗，去掉任何一项中枢就派发不了；存储行写入时会把锁定项合并回去（用户侧再怎么存也去不掉），guard 判定时锁定项直接放行（双保险）。
+- `plugin_manager` 默认放行但可关：关掉后中枢也不能重载插件（面板该项带后果说明），需在宿主插件页操作。
+
+### 45.2 guard 判定逻辑与错误 code
+
+- `src/hub-policy.ts`（新模块，纯逻辑）：`isHubAllowedTool(name, policy)` = 锁定项 ∨ tools 精确命中 ∨ prefixes 前缀命中；`readHubPolicy(store, workspaceKey, warn)` **从不抛异常**——旧库无行 / 表不可用 / 行两份列表皆空 → 回退内置默认，其中「读失败」与「空行」会告警；不回退到全放行（fail-open），也不回退到全拒（fail-closed 会断派发链路）。
+- `src/role-guard.ts`：`isHubDeniedTool` / `HUB_DENIED_TOOLS` / `HUB_DENIED_PREFIXES` / `HUB_EXECUTION_DENIED` 全部移除，改为 hub 角色下 `!isHubAllowedTool(toolName, readHubPolicy(...))` → `guardDenial(hubToolNotAllowed(name), 'HUB_TOOL_NOT_IN_ALLOWLIST')`。**未知/未来新增工具默认拒绝**（本次需求核心：黑名单时代它们被静默放行）。
+- `ROLE_GUARD_VERSION` 2 → 3（宿主可据此分辨 R33 与 R36 两代规则；旧 code `HUB_EXECUTION_DENIED` 不再产生，新旧 code 在持久诊断里可区分）。
+- plugin_manager 的顺序修正：hub 通过 reload 规则后**不再提前 return**，而是继续走白名单判定——否则「关掉 plugin_manager」这个开关对 hub 无效（会被 reload 分支直接放行）。
+- total 化保留：resolveRole 抛异常时 plugin_manager 仍拒、其它工具仍放行（未知角色按非 hub 处理，即不受白名单约束）；分支角色、普通会话角色行为完全不变；plugin_manager 的分支/非中枢拒绝规则原样保留。
+- 拒绝文案：『该工具「X」不在中枢白名单中：可在超级记忆面板「中枢权限」页签勾选启用（中枢默认拒绝白名单以外的工具，未来新增工具同样默认拒绝）。中枢只做派发与收线，执行请用 memory_dispatch 派发给分支。』
+- 中枢角色 prompt（HUB_ROLE_TEXT）补一条白名单说明，避免模型把轮次烧在必被拒的工具上，并告知开关位置。
+
+### 45.3 面板页签与远程方法契约
+
+- 新页签「中枢权限」（`View` 增 `hub-policy`，页签按钮 `tab.hubPolicy`）：
+  - 顶部一句话：『白名单 N 项 · 默认拒绝白名单以外的工具』+ 来源徽标（工作区自定义 / 内置默认）+「恢复默认」「保存」；
+  - 分组列出全部事项（记忆 / 派发收线 / 沟通 / 只读查看 / 调度 / 其它·AI 传输），每项一个开关；锁定项禁用并带「锁定」徽标 + 原因 tip；实操执行类带「实操」徽标 + 风险 tip；plugin_manager 带后果说明；
+  - 自定义工具名输入框（未知工具默认拒绝，可在此放行）；保存后就地回执『下一个工具调用即生效』。
+- catalog 由插件侧汇总：`BUILTIN_HUB_CATALOG`（74 项内置已知清单，6 组）+ 宿主 `ctx.tools.definitions()` 实时工具名（`mergeHostToolsIntoCatalog`：未知名并入「其它」组、默认拒绝、不标实操；已知名不重复）。宿主枚举失败时只用内置清单，目录永远可用。
+- 远程方法（panel.ts + client/remote.ts 两端严格一致，mechanism-smoke E1 的 arity parity 自动把关）：
+  - `getHubPolicy(cwd): HubPolicyView` —— { workspaceKey, tools, prefixes, source, locked, defaults, catalog }；
+  - `setHubPolicy(cwd, patch: { tools?, prefixes?, reset? }): MutationResult` —— 整份替换或 reset；tools/prefixes 缺一即报错（不接受半份保存），reset 删行回落默认。
+- 面板/管理台样式沿用既有 8px 栅格与 sm-card/sm-item/sm-badge 组件，未新建视觉体系；管理台（webui）本轮未加同款页签（任务范围是面板；如后续要同步，路由可直接复用 getHubPolicy 的投影）。
+
+### 45.4 断言与闸门
+
+- core-smoke R36-1（新增，R33-5 的 20 项黑名单断言按新模型**改写而非删除**）：默认名单逐条（24 项 + 前缀）、20 项实操工具改判「名单外拒绝」且文案点名面板页签、**伪造未知工具名必须被拒**、前缀项生效、plugin_manager 可关、锁定项不可去（isHubAllowedTool + writeHubPolicy 合并双断言）、存取往返（write→stored→reset→default）、读失败回退默认且告警（不断派发也不 fail-open）、空行同等对待、catalog 六组 + 锁定/风险标记 + 未知宿主工具并入。
+- `pnpm typecheck` 双 0；`pnpm build` exit 0（宿主 + client 155154 字节）；`pnpm smoke` 六套件全绿：core **31** / mechanism **102**（E1 描述符 parity 含两个新方法）/ webui **35** / client-sim（通过，徽标仍在 trailing 槽）/ capability **12** / workspace-scope **9**。
+- 另用存储替身驱动真实 panel 服务实测：默认 24 项 + schedule_ 前缀 + 6 锁定；catalog 74 项（6 锁定 / 29 实操）；保存（去 plugin_manager、加 bash）→ stored 且锁定项被合并保留；reset → default；坏入参（只给 tools）→ 明确报错。
+- 未重载、未 commit/push（按任务约束，由中枢/GUI 负责）。
+
+### 45.5 迁移/回退策略
+
+- **无需数据迁移**：旧库没有 hub_policies 行 → 读即内置默认（与 R33 放行集一致），行为对老工作区无缝。
+- 回退 = 「恢复默认」删行；guard 侧回退 = 删行后下一轮自动用内置默认。锁定项写死在代码里，任何存储行都去不掉。
+- 若未来要收窄默认（比如默认不放 plugin_manager）：改 DEFAULT_HUB_TOOLS + 升 HUB_POLICY_VERSION 即可，已存行不受影响（显式自定义优先），需要统一收敛时再发一次性重置。
+
+---
+
+## 46. R37：R35 × R36 并行合并核对 + 补齐暂存 + 最终闸门（2026-11-24）
+
+R35（收尾：暂存/唯一角色入口/面板徽标/老中枢迁移/§44）与 R36（白名单 + 面板「中枢权限」/§45）由两个会话**几乎同时改同一工作树**，存在互相覆盖风险。本轮只做核对、修复、防回归与暂存，**未重载插件、未 commit/push、未改 DSH 本体**。
+
+### 46.1 核对方法
+
+- R35 的改动已经在 git index（暂存快照）里；R36 并行完成、未暂存。于是以 `git diff`（工作树 vs index）作为「R36 相对 R35 的增量」审阅，而不是看工作树绝对状态——否则分不清谁写了谁。
+- 结论先行：**两份改动真实共存，无覆盖回退**。R35 专属文件（`src/route.ts`、`src/role.ts`、`src/hub-records-migration.ts`、`src/hub-sessions.ts`、`src/title.ts`、`src/client/session-badge.tsx`）在工作树 vs index 的差异列表里**一个都没有**，说明 R36 没有把它们改回旧版；R36 的增量只落在自己的区域（新增 `src/hub-policy.ts`、schema/store 的 `hub_policies`、role-guard 白名单判定、panel 的 get/setHubPolicy、client 远程声明与页签、locales、core-smoke、本文件 §45）。
+- `lib/` 的 RD/AD/?? 噪声是 R36 并行构建产生的 chunk 内容哈希变化（旧 chunk 被删、新 chunk 未跟踪），与本轮源码无关；R37 重新构建后由 `git add -A` 一次性收敛。
+
+### 46.2 逐项结果（R35）
+
+| 项 | 结果 | 证据 |
+| --- | --- | --- |
+| a) `hub-records-migration.ts` 存在且启动期调用 | 是 | 文件在树；`src/index.ts` 在标题迁移 `.then()` 后调用 `migrateHubSessionRecords({..., workspaceKeys: knownWorkspaceKeys(store)})`，marker `meta 'hub-records'`（core R35-2 断言版本号与幂等） |
+| b) route 分支判定走 `resolveRole(...).role === 'branch'` | 是 | `src/route.ts` 本地 helper 只有一行 `resolveRole(store, { id: sessionId }).role === 'branch'`；无 `startsWith('branch-')` |
+| c) role-guard 不再导出 `isBranchSession` | 是 | 模块仅注释说明已移除；core R33-2 用 `hasOwnProperty === false` 断言 |
+| d) sessionBadge 无话题集时只认 hub 记录，无记录 → none | 是 | `src/panel.ts`：plugin branch → none；`hubRecordOf(sessionId)` → hub；否则 none |
+| e) hub-sessions「发现视图非角色权威」声明 + 面板文案/tooltip | 是 | 模块头 `R35 boundary — DISCOVERY VIEW, NOT ROLE AUTHORITY`；`side.authority` 中英双语在 locales |
+| f) DEV-NOTES 含 §44 与 §45 | 是 | §44（2348 行）与 §45（2400 行）均在，本轮追加 §46 |
+
+R36 清单（`hub-policy.ts` / schema `hub_policies` / store 访问器 / guard 白名单 + `HUB_TOOL_NOT_IN_ALLOWLIST` / panel get·setHubPolicy / client remote 声明与「中枢权限」页签 / locales）逐项在工作树可读且有一条以上断言覆盖；`pnpm typecheck`、六套件通过即为实证。
+
+### 46.3 合并后的正确性
+
+- guard 仍是唯一角色入口：`resolveRole` 定角色 → hub 才走 `readHubPolicy` 白名单；branch/普通会话不受白名单影响；`plugin_manager` 的分支/非中枢拒绝保留，hub 通过 reload 规则后**继续**走白名单（可被面板关掉）。
+- 迁移仍只在启动期跑、marker 幂等、只标「SuperMemory 中枢」前缀 + `session-*` + 本工作区；分支/已记录/普通/外部/未读标题各有断言。
+- 面板两个改动共存：会话列表仍标注「发现视图」；「中枢权限」页签可加载（stored/default 徽标）、保存（整份替换、锁定项合并）、恢复默认（删行回落）。
+
+### 46.4 新防回归断言（R37 共存锚）
+
+core-smoke 新增一条 `ok('R37 共存锚…')`，同时断言：route 的 `resolveRole(...).role === 'branch'` 正则命中且无 `startsWith('branch-')`；role-guard 无 `isBranchSession` 自有导出；`migrateHubSessionRecords` 仍是可调用函数；默认白名单允许 `memory_dispatch`、拒绝 `bash`；`schema.ts` 仍声明 `hub_policies:`。任一侧被改回旧版，这条断言会先失败。
+
+### 46.5 闸门与暂存
+
+- `pnpm typecheck`：两个 tsconfig 均 exit 0。
+- `pnpm build`：exit 0；宿主 10 files / 692.77 kB，client 包装后 155559 bytes。
+- `pnpm smoke` 六套件：core **32**（R36 的 31 + R37 共存锚）/ mechanism **102** / webui **35** / client-sim SIM SMOKE OK / capability **12** / workspace-scope **9**；全部 exit 0。
+- `git add -A` 后无未跟踪文件；不 commit/push、不重载（由中枢/GUI 负责）。
+
+### 46.6 重载后验收清单
+
+1. 面板出现「中枢权限」页签：默认 24 项 + `schedule_` 前缀 + 6 锁定项；勾选 `bash` 保存 → 来源徽标变「工作区自定义」；「恢复默认」→ 回落默认。
+2. 老中枢（R33 前由面板创建、标题为「SuperMemory 中枢 · xxxx」且无记录）在重载后获得 hub 记录：徽标显示「中枢」，`resolveRole` 不再落 other；marker `hub-records` 写入后重启不重复。
+3. 双向卡片：中枢派发卡片带任务/话题集/能力；分支完成后 relay 卡片同字段带回；普通消息不被卡片化。
+4. 白名单生效：中枢调用未勾选的实操工具（如 `write`）被拒且文案点名「中枢权限」页签；分支/普通会话不受影响。
+
+---
+
+## 47. R39：「中枢权限」页签改为动态目录 + 按工具来源分组（2026-11-24）
+
+对应需求：①「中枢权限」页签的工具清单必须每次从运行时真实注册的工具里取（不再用固定 74 项内置 catalog）；②工具按**来源**分组，而不是固定的 6 组（记忆/派发收线/沟通/只读/调度/其它）。本轮未重载插件、未 commit/push、未改 DSH 本体（宿主源码只读查证）。
+
+### 47.1 宿主工具定义与来源字段调研结论（只读查证）
+
+查证对象（app.asar 内，dsh 包）：
+
+- `@deepseek-ai/dsh-tools/src/index.ts`：`ToolsService.definitions(scope?, toolSet?): readonly ToolDefinition[]`，`schemas()` 只投影 `name/description/parameters`；注册按 Cordis scope（agent）分层，**不记录插件归属**。
+- `@deepseek-ai/dsh-tools/src/contracts.ts`：`ToolDefinition extends ToolSchema`，额外字段是 `output/execute/projectContent?/finalizeContent?/timeoutMs?/isConcurrencySafe?/presentCall?/presentResult?`。
+- `@deepseek-ai/dsh-llm/src/types.ts`：`ToolSchema = { deferLoading?: true; name; description; parameters }`。
+- `@deepseek-ai/dsh-mcp-client/src/tools.ts`：MCP 工具的公开名是 `mcp__<serverName>__<rawName>`（确定性纯函数，超 64 字符/非法字符时加 12 位哈希），由 `ctx.tools.register` 全局注册；文档明确“public name 从不用于反解 raw name”。
+
+结论：
+
+- **拿得到**：全部可见工具的 `name`、`description`、`parameters`（panel 侧用 `ctx.tools.definitions()`，无 scope = 全局视图）；每次调用实时读取，新增/卸载即时反映。
+- **拿不到**：owner / plugin / package / MCP server 等**归属字段**——当前契约没有任何来源元数据；`definitions()` 也不提供按插件枚举。因此来源只能**推断**。
+- **限制**：①panel 服务不在 agent scope，`definitions()` 不传 scope = 全局视图，agent 级 scoped 工具（若有）不在目录内；②`run_code` 是宿主保留的 PTC 传输名（`ToolsService.register` 直接拒绝该名字），永远不会出现在 `definitions()` 里，但中枢可用——本轮把它作为**合成项**显示，避免误报失效；③`mcp__<server>__` 前缀解析在 server 名本身含 `__` 时可能取短名（best-effort，UI 标注推断）。
+
+### 47.2 目录生成算法与分组规则
+
+实现集中在 `src/hub-policy.ts`（纯函数，便于断言），panel 只负责取数据与回退：
+
+1. `runtimeHubTools()`：读 `ctx.tools.definitions()`，投影 `{name, description, source?}`；无 seam / 抛错 / 返回空数组**都视为失败**（空清单不当作“没有工具”）。
+2. `buildHubCatalog({tools, allowTools, prefixes, now})`：
+   - 每个工具先归属来源：`declaredHubToolSource(def)` 命中定义自带字段（`source/sourceName/owner/plugin/pluginName/pluginId/packageName/serverName/mcpServer`，当前宿主都没有）→ 该来源且 `inferred=false`；否则依次 `mcp__<server>__` → `memory_*` → `sm_composite_*` → `schedule_*` → 宿主内置/未归属，全部 `inferred=true`，并带一行 `hint` 说明规则。
+   - 生成组：`source:supermemory` / `source:composite` / `source:mcp:<server>`（每个 server 独立组）/ `source:schedule` / `source:declared:<slug>` / `source:host`；排序 = SuperMemory → 固化能力 → MCP（按名）→ 调度 → 声明来源 → 宿主/未归属，失效组永远最后。
+   - 每项带 `enabled`（白名单精确/前缀命中）、`locked`（`LOCKED_HUB_TOOLS`）、`risk`（`HUB_EXECUTION_TOOLS`）、`description`（首行、≤140 字）、`available`、`source`。
+   - 前缀项（如 `schedule_`）不是工具而是规则：渲染在它当前匹配的工具所属组里（匹配跨来源时按前缀名推断），带 `prefix:true` 与“当前匹配 N 个”。
+   - 白名单有、运行时无的精确名/前缀 → 移入 `stale` 组（`available:false, stale:true`），**不静默丢弃**；锁定项缺失也列出（带锁定徽标，清理时保留）。
+3. `buildFallbackHubCatalog`：内置清单按同一来源规则分组，**未知白名单条目补进宿主组**（不丢），不伪造 `available`、不伪造失效组，返回 `mode:'fallback'` + warning。
+4. `cleanStaleHubPolicy`：移除运行时不存在且非锁定的精确项；前缀仅在没有运行时工具匹配时移除；返回 removed/removedNames。
+5. `getHubPolicy` 每次调用即时生成（`catalogMeta.generatedAt` = 调用时间）；宿主枚举失败时 `console.warn` + `mode:'fallback'` + `warning`，但默认路径永远是动态目录。
+
+### 47.3 UI 结构与远程契约
+
+- 页签顶部：白名单计数 + 来源徽标（工作区自定义/内置默认）+ 模式徽标（动态目录/内置回退）+「运行时工具 N 项 / M 组 · 上次刷新 <时间>」；回退时红色告警条显示具体失败原因。
+- 工具条：搜索框（跨来源组匹配工具名/描述/组名，空组隐藏）+「刷新目录」按钮（只重读目录，**保留当前勾选草稿**）+ 自定义工具名 +「保存/恢复默认」。
+- 分组卡片：来源名 +「来源为推断」徽标（可 hover 看规则）+ 数量 + 已启用数（按当前草稿实时算）+ 折叠按钮（▸/▾）+ 规则 hint；失效组额外有「一键清理（N）」按钮（先保存当前草稿，再由宿主按运行时清理；锁定项不可清理，按钮在全是锁定项时禁用）。
+- 组内每项：复选框（是否白名单）、名称、锁定/实操/失效徽标、前缀规则说明、描述摘要。被前缀覆盖的工具显示「前缀放行」且开关禁用（要移出请取消同组前缀项），勾选态由草稿精确反映 —— 不再出现“取消勾选但仍被前缀放行”的假状态。
+- 远程契约：`getHubPolicy(cwd)` 返回新增 `catalogMeta: HubCatalogMeta` 与 `stale: HubCatalogItem[]`（`catalog` 结构改为来源组）；新增 `cleanupStaleHubPolicy(cwd): MutationResult`。两端同时声明（`panel.ts` / `client/remote.ts`），E1 的 id 集合 + 逐方法参数契约 parity 自动把关；宿主/客户端类型同步修改。
+
+### 47.4 失效条目与回退策略
+
+- 失效判定基于**当前存储白名单**（stored 或内置默认）与**本次运行时清单**的差集；前缀按“是否有任何工具以它开头”判定。锁定项缺失只展示、不清理（guard 始终放行，写回也会合并）。
+- 「一键清理」是显式动作：客户端先保存当前草稿（不丢未保存勾选），再调用宿主清理；宿主动态枚举失败时**拒绝清理**（返回 error），不拿内置清单猜。
+- 回退只发生在动态路径失败（无 `ctx.tools`、抛错、空清单）：页面仍可渲染、仍可勾选/保存、所有白名单条目仍可见，但徽标与告警条明示「内置回退」，且不生成无法核验的失效判定。
+- 老数据无需迁移：`hub_policies` 行格式未变；新字段全部是实时计算的投影。
+
+### 47.5 断言与闸门（实测）
+
+- core-smoke 新增 `R39-1`（R36-1 保留白名单/锁定/回退覆盖，catalog 部分按新模型改写而非删除）：假 definitions 覆盖两个来源（memory_* / mcp__rea__）+ 未知工具 + 失效白名单条目；断言来源分组与顺序、推断标注、未知工具默认拒绝且未锁定可勾选、`run_code` 合成不误报失效、失效精确名/空前缀单列、刷新后新增 `schedule_create` 建组且前缀失效消失/时间戳前进、宿主声明来源不标推断、清理规则（锁定保留/前缀保留）、fallback 覆盖全部默认项 + 不丢未知白名单条目 + 不伪造失效。
+- mechanism-smoke 新增 `R39-1`：用真实 `SupermemoryPanelService` + 假 `ctx.tools.definitions()` 驱动 `getHubPolicy`（动态模式/分组顺序/描述单行投影/失效清单/未知工具默认拒绝/刷新看到新增工具）、`setHubPolicy` 后刷新保持勾选与锁定合并、`cleanupStaleHubPolicy` 实际改行、枚举抛错时 fallback + warning + 清理拒绝、无 `ctx.tools` 时也 fallback 不抛。
+- `pnpm typecheck`：`tsc -p tsconfig.json` 与 `tsc -p tsconfig.client.json` 均 exit 0。
+- `pnpm build`：exit 0；宿主 10 files / 708.63 kB（`lib/supermemory.js` 500.89 kB）、client 169.57 kB、wrap-client 164542 bytes。
+- `pnpm smoke` 六套件全绿：core **33** / mechanism **103** / webui **35** / client-sim SIM SMOKE OK / capability **12** / workspace-scope **9**。
+- `git add -A` 暂存；不 commit/push、不重载（由中枢/GUI 负责）。
+
+### 47.6 重载后验收步骤
+
+1. 打开面板「中枢权限」：应看到「动态目录」徽标 + 运行时工具总数/组数 + 上次刷新时间；分组至少包含 SuperMemory 插件、固化能力（如有）、MCP · rea（或其他已挂 server）、调度（若有 schedule_* 工具）、宿主内置/未归属；每组标「来源为推断」。
+2. 搜索框输入 `mcp__rea__` 或某工具名：只剩匹配组/项；点组头 ▸/▾ 可折叠展开。
+3. 找一个未勾选的未知/宿主工具（如 `bash`、`web_fetch`）勾选并保存 → 来源徽标变「工作区自定义」；再打开/刷新 → 勾选保持、组内「已启用」计数 +1。
+4. 若页面上出现「已失效条目」组（例如默认白名单里的 `plugin_manager` 在当前宿主未注册、或旧白名单含已改名工具）：点「一键清理」→ 回执给出清理数量，失效组消失/只剩锁定项；锁定项即使失效也不会被清掉。
+5. 模拟回退（可选）：在无 `ctx.tools` 的宿主里打开页签 → 应显示「内置回退」徽标 + 告警条 + 内置清单，页面不白屏；此时不出现失效组。
+6. 白名单生效：中枢调用未勾选的工具被拒（`HUB_TOOL_NOT_IN_ALLOWLIST`），文案点名「中枢权限」页签；分支/普通会话不受影响。
+
+### 47.7 假设与已知限制
+
+- 假设 panel 服务的 `ctx.tools.definitions()` 是运行时权威清单（全局视图）；agent-scoped 工具与 preset/session 级 `tools.restrict` 不在该视图里，因此“某中枢会话实际可见集合”可能小于目录（白名单本身是工作区级，目录按注册面展示）。
+- 来源是推断：规则可解释、UI 明示，不假装精确；宿主未来若在定义里声明来源字段，分组自动切到“声明来源”。
+- MCP server 名含 `__` 时前缀解析可能取短名；仅影响分组显示，不影响白名单判定（按完整工具名/前缀精确匹配）。
+- 失效判定依赖当前运行时视图；工具在某会话因 preset/权限未启用（而非卸载）也可能被判失效——清理是显式动作且可恢复默认，接受该误差。
+
+
+---
+
+## 48. R40：会话级/宿主保留工具合成项——修掉「已失效」误判（2026-11-24）
+
+对应需求：面板「中枢权限」的「已失效条目」组误把 `plugin_manager` 判为失效。它不在 `ctx.tools.definitions()` 的全局注册面，但中枢会话实际能调；一旦点「一键清理」会从白名单移除，中枢再也调不到（只能去 GUI 插件页重载），且页面显示为失效，误导用户。本轮未重载插件、未 commit/push，只读查证 DSH 本体（app.asar 0.2.2-rc.5，非仓库内旧的 0.2.2-rc.3 副本）。
+
+### 48.1 只读查证结论（DSH 0.2.2-rc.5 安装体）
+
+查证对象：`resources/app.asar` 内 `dsh/node_modules/@deepseek-ai/*` 的 `src`/`lib` 与 `dsh-base`、`dsh-web-app` 的 `cordis.patch.yml`、`presets/*.patch.yml`。
+
+1. `dsh-tools/src/index.ts`：`ToolsService.definitions(scope?, toolSet?)`；不传 scope = **全局视图**，只含 `layers.global` 的注册。panel 服务挂在 profile 根，没有 agent scope，所以它拿到的永远不是「某个中枢会话实际可见工具」。
+2. `dsh-web-app/cordis.patch.yml`：Web 面把宿主层的普通工具行全部 `disabled: true`（`tool-fs`、`tool-fs-search`、`tool-jobs`、`tool-skill`、`tool-todo`、`tool-web`、`tool-subagent-control`、`tool-subagent`、`tool-goal`、`tool-bash`、`tool-pwsh`、`tool-plugin-manager` 等），改由每个会话的 preset 挂载。
+3. `dsh-web-app/presets/{standard,ptc,minimal}.patch.yml`：preset 在 **agent scope** 挂 `tool-fs`、`tool-fs-search`、`tool-jobs`、`tool-schedule`、`tool-skill`、`tool-ask-user`、`tool-todo`、`tool-present`、`tool-subagent-control`、`tool-plugin-manager/tools` 等。`plugin_manager` 在 standard preset 里 `disabled: !!js "!ctx.get('profileContext')"`（有 profile 时启用），ptc preset 里 `disabled: true`。
+4. `dsh-plugin-manager/src/tools.ts`：`@param ctx Agent-scoped tool registration context`，`ctx.tools.register({ name: 'plugin_manager' … })` —— 印证它是 agent 级注册，不在全局面。
+5. `dsh-tools/src/index.ts`：`register()` 显式拒绝 `run_code`（`RUN_CODE_NAME` 是 PTC 传输保留名），所以它永远不在 `definitions()`，但中枢可用。
+6. 同一条链路上的其他会话工具：`dsh-tool-ask-user`（ask_user_question）、`dsh-tool-subagent-control`（send_message/wait_agent/list_agents）、`dsh-tool-todo`（todo_write）、`dsh-tool-present`（present）、`dsh-tool-fs`（read/read_image）、`dsh-tool-fs-search`（glob/grep）、`dsh-tool-skill`（skill）、`dsh-tool-jobs`（job_output/job_list/job_kill）、`dsh-tool-schedule`（schedule_create/list/view/edit）均由 preset 在 agent scope 挂载，全局视图看不到。
+
+**结论（名单）**：在中枢「协同 / 只读查看 / 会话控制 / 后台任务 / 调度」能力面内，确认全局 `definitions()` 缺失、但中枢实际可用的是上面 20 个名字（`HOST_SESSION_TOOLS`）。`memory_*` 由本插件在全局注册，不需要合成；`bash/gitbash_native/write/edit/office_*/subagent/goal/web_*` 也是 agent 级或第三方 shell 插件按 preset 挂载，但它们的可用性取决于所选 preset 与已装 bundle，工作区级面板无法诚实地标 `available: true`，因此不进本轮合成清单（仍可按名字手动加入白名单；后续宿主若提供按 scope 枚举再升级）。
+
+### 48.2 合成清单与规则
+
+实现集中在 `src/hub-policy.ts`（纯函数）：
+
+- `HUB_CATALOG_GROUPS.hostSession = 'source:host-session'`，组 `kind: 'host-session'`、`synthetic: true`、`inferred: false`，标签「宿主会话工具」，hint 明示「不在全局注册面（宿主保留名 / agent 级注册 / 会话级 API），但中枢会话实际可用；合成项永不判失效，清理不会移除」。
+- `HOST_SESSION_TOOLS` 是显式冻结清单，20 项，每项在 `HOST_SESSION_TOOL_EVIDENCE` 里有对应依据（宿主保留名 / agent 级注册 / 会话级 API），该依据同时作为面板项的 description，避免「靠猜堆名字」。
+- `buildHubCatalog`：先按真实 `definitions()` 建档；再逐项补 `HOST_SESSION_TOOLS` 中**尚未出现**的名字，标 `available: true`、`synthetic: true`，来源 `source:host-session`；`plugin_manager` 额外带 `noteKey: 'pluginManager'`（动态路径也显示「关掉后中枢也不能重载插件」的既有警告）。**真实定义优先**：同名已注册时完全跳过合成项，描述/来源都取真实定义，不会重复。
+- 合成项进入运行时映射后再算前缀：默认前缀 `schedule_` 匹配到合成的 `schedule_*`，因此不再被判失效；清理时前缀也保留。
+- `cleanStaleHubPolicy`：把 `HOST_SESSION_TOOLS` 加入运行时名字集合，清理永不删除它们（与锁定项同等待遇）；但合成项**不是锁定项**——不在 `LOCKED_HUB_TOOLS` 里，用户仍可关闭 `plugin_manager` 等，关闭只影响白名单，不影响目录显示。
+- `HubCatalogMeta.syntheticCount` 每次生成时报告合成项数量；面板元信息行显示「工具 N 项 / M 组 · 合成 K 项」。
+- 内置回退路径（枚举失败）同样按 `HOST_SESSION_TOOLS` 把合成项放进「宿主会话工具」组并标 `available: true`（这是显式知识，不依赖运行时枚举）；回退仍不伪造失效判定。
+
+### 48.3 面板变化
+
+- 来源组新增「宿主会话工具」，组头与每个条目都带「合成」徽标（hover 说明「不在全局注册面…永不判失效，清理不会移除」）。
+- `plugin_manager`、`run_code`、`ask_user_question`、`send_message`、`wait_agent`、`list_agents`、`todo_write`、`present`、`read`、`read_image`、`glob`、`grep`、`skill`、`job_output/list/kill`、`schedule_create/list/view/edit` 出现在该组，`available: true` 且不进入「已失效条目」。
+- 搜索、折叠、勾选/保存/恢复默认、前缀放行等既有交互不变；合成项未锁定时可正常勾选，`plugin_manager` 关闭后保留原有警告文案，可重新勾选。
+- 失效组现在只列真正缺失且不在合成清单里的名字（如真实卸载/改名的第三方工具），「一键清理」不会再把会话级工具删掉。
+
+### 48.4 断言与闸门（实测）
+
+- core-smoke 新增 `R40-1`：假 `definitions` 不含 `plugin_manager`/run_code，白名单含它们 → host-session 组、`available:true`、`synthetic:true`、`stale` 不含、清理保留；关闭后 `enabled:false` 且未锁定；真实定义存在时只出现一次、无 `synthetic` 标记、描述取真实值；组和项带合成标记。R39 断言按新模型更新（组顺序多 host-session、`schedule_` 由合成项匹配不再失效、失效前缀改用 `mcp__gone__` 覆盖）。
+- mechanism-smoke 新增 `R40-2`：真实 `SupermemoryPanelService` + 假 `definitions` 驱动 `getHubPolicy`/`setHubPolicy`/`cleanupStaleHubPolicy`——plugin_manager/run_code 在 host-session 组且 available；清理回执「没有失效条目需要清理」且行内保留；关闭后再打开可重新勾选；恢复默认回来；真实注册时只出现一次、描述取真实值。
+- `pnpm typecheck`：`tsc -p tsconfig.json` 与 `tsc -p tsconfig.client.json` 均 exit 0。
+- `pnpm build`：exit 0；宿主 10 files / 714.25 kB（`lib/supermemory.js` 506.51 kB / 506514 bytes）、client 170.84 kB、wrap-client 165700 bytes。
+- `pnpm smoke` 六套件全绿：core **34** / mechanism **104** / webui **35** / client-sim SIM SMOKE OK / capability **12** / workspace-scope **9**。
+- `git add -A` 暂存；不 commit/push、不重载（由中枢重载）。
+
+### 48.5 重载后验收步骤
+
+1. 打开面板「中枢权限」，应出现「宿主会话工具」组，组头与项带「合成」徽标；组内能看到 `plugin_manager`、`run_code`、`ask_user_question`、`read`、`glob`、`grep`、`job_output`、`schedule_create` 等。
+2. 「已失效条目」组应为空，或只剩真实卸载/改名的工具；`plugin_manager` 不再出现在失效组。
+3. 取消勾选 `plugin_manager` → 保存 → 组内该项变未勾选（仍可见、可再勾选），失效组仍不含它；再勾选 → 保存 → 回来。
+4. 点「恢复默认」→ `plugin_manager` 回到勾选态（默认白名单含它）。
+5. 若当前白名单里还有真实失效条目，点「一键清理」→ 只清真实失效项；`plugin_manager`/run_code/其它合成项仍在白名单。
+6. 真实注册 `plugin_manager` 的宿主（如 standard preset 的会话视图）不会出现两项：目录里只保留真实定义那一项。
+
+### 48.6 假设与已知限制
+
+- 合成清单是**显式维护**的：DSH 若改名/新增会话级工具，需要同步本清单；漏项仍会被旧逻辑判失效。选择显式清单而不是运行时推断，是因为全局 `definitions()` 结构上无法枚举 agent scope，而宿主没有「per-session 注册」字段。
+- 合成项按「中枢会话的稳定能力面」声明 `available: true`：它不区分用户当前选的是 standard/ptc/minimal preset；若某 preset 未挂载某项，面板仍会显示为可用（工作区级策略本就无法 per-session 展示）。这是有意的取舍，避免把 preset 差异误报成「已卸载」。
+- 实操/第三方工具（bash/gitbash_native/write/edit/office/subagent/goal/web）未合成：它们可能因 preset 或已装 bundle 不同而缺失，工作区级面板不能诚实断言可用；用户仍可用「添加自定义工具名」放行，清理时若它们不在全局面仍会被判失效（已知限制，留待宿主提供按 scope 枚举）。
+- 合成项永不被清理，但仍可被用户关闭（非锁定）；`run_code` 同时是锁定项，关闭无效（与 R36 锁定规则一致）。
+---
+
+## 49. R41：设置页收敛 + 默认模型 + 侧栏单选高亮 + 会话名称直述（2026-11-24）
+
+需求单把本轮记作「R32」，但 §42 已被 R32 占用、§47/§48 已推进到 R39/R40；为避免重复编号，本轮按顺序记为 **R41**（§49）。三项需求：
+
+1. 「中枢权限」收敛进面板「设置」页签，设置页新增中枢/分支默认模型并持久化；
+2. 修复「中枢会话（发现视图）」侧栏选中项的双高亮；
+3. 所有会话名称去掉前置描述/品牌前缀/令牌前缀，直接描述工作内容，并一次性迁移存量标题。
+
+### 49.1 需求①：设置页 = 权限 + 默认模型的单一入口
+
+- **页签收敛**：删除独立 `hub-policy` 视图与页签，新增 `settings`（「设置」）。原 R36/R39 的中枢权限 UI（动态目录、按来源分组、搜索/折叠、白名单勾选、6 项锁定、失效条目一键清理、宿主合成项）**原样**嵌入设置页下半部，能力零删减；上半部是「默认模型」卡片。
+- **持久化落点**：新表 `model_defaults`（schema.ts/store.ts 注册，v1 域兼容：无行即空表），一行一个工作区：`{ workspaceKey, hub?, branch?, updatedAt }`；选择结构 `{ provider, model, reasoningEffort? }`。新模块 `src/model-defaults.ts` 是读写唯一入口（read/写补丁：完整选择替换、`null` 清空单项、`reset` 删行、无行回退既有链路，从不抛给调用方）。
+- **宿主契约**：panel 新增 `getModelDefaults(cwd)` / `setModelDefaults(cwd, patch)`；PANEL_DESCRIPTORS + client remote + client API + 类型同步（mechanism E1 的 id/arity parity 自动把关）。
+- **生效点**：新建中枢会话在**无显式模型**时读取「中枢会话模型」默认（composer 显式选择优先）；新派发分支的解析顺序改为 `话题集默认 > 分支会话默认 > 中枢当前模型 > 宿主默认`，已有 per-member / per-topic-set 覆盖优先级不变（resume 仍 memberModel 优先），`fork` 同样带上分支默认。
+- 设置页模型选择复用 composer 的 `<select>` 形式（目录来自 `listModelCatalog`，空目录仅「跟随默认」，未知/未列出的已存选择仍显示为自定义项）。
+
+### 49.2 需求②：侧栏单选唯一高亮（根因）
+
+- **根因**：`panel-page.tsx` 侧栏的 `current` 把两个状态源 OR 在一起：`sessionId === row.id || (view.kind === 'chat' && view.id === row.id)`。面板打开任一中枢聊天后，`view.id` 命中该行、`sessionId`（宿主当前会话）命中另一行 → 两行同时 `data-current="true"`。不是双 class、不是重复 key，而是两个「当前」语义被并置。
+- **修复**：抽出纯函数 `src/rail-selection.ts#isRailCurrent`——聊天视图只认 `view.id`，其它视图只认 shell 的 `sessionId`，任何状态最多命中一行；面板改为调用它。
+- **同类列表检查**：分支列表（全部/集内）与话题集列表只做「可点击打开」，没有选中态/高亮，不存在第二状态源；打开分支聊天时侧栏不点亮任何中枢行（已断言）。
+- 断言：mechanism `R41-4` 用两行候选枚举，证明任何视图下 `filter(isRailCurrent)` 恰为 1 项（分支聊天为 0）。
+
+### 49.3 需求③：会话名称直接描述工作内容
+
+- **生成**：`title.ts` 新增 `stripLeadingDescription`（仅当「R31/R31-B/第 3 轮/Round 3/任务/分支/派发/请求/需求」后跟分隔符时剥离，重复 3 次；任务正文里「提到」轮次不会被误伤）与 `describeSessionTitle`（去 markdown/括号 → 去描述前缀 → 首行 → 48 字省略号；空文本→中性「新会话」）。
+  - 中枢：`hubSessionTitle(sessionId, firstMessage)` = 首条用户消息的直接描述；无内容=「新会话」。**不再生成**『SuperMemory 中枢 · id4』。
+  - 分支：`branchTitleFor(task)` 同规则（保持 48 字）；派发/恢复路径的宿主标题与 member 标题改为 `taskOnly`（`ensureMemberTitle(..., { taskOnly: true })`），不再拼「<话题集> · <任务>」；R31：/任务：等前缀被剥离。
+  - 面板内新中枢在 rail 创建时无首条消息 → 标题为「新会话」；用户在面板里发出第一条消息后，若标题仍是中性/旧前缀，`sendSessionMessage` 会一次性升级为消息描述（人工改过的标题不覆盖）。
+- **一次性迁移**（`hub-title-migration.ts` v2，marker `hub-titles` 版本 2）：
+  - 中枢候选（顶层、非子代理、非插件分支）且标题匹配旧品牌前缀或 `新会话 ·` → 用 `sessionQuery.readSurface` 的首条用户消息生成直接描述，读不到内容则「新会话」；
+  - 分支候选（`branch-*`/`fork-*`）→ 去掉**已知话题集标题 + ' · '** 前缀，再剥离描述性前缀；
+  - 改名**之前**先写正证据 `hub_sessions` 记录（source `title-migration`）：R35 的记录迁移曾以品牌前缀为证据，改名会让它失效，记录才是角色判定的实际依据；
+  - 同时清理 durable 标题：`dispatches.title` 与分支 member 标题，迁移/面板/卡片/管理台三面同步；dry-run 不写任何东西；会话未 attach 时保留 marker 让下次启动重试；
+  - 人工改名的标题、子代理、有 parent 的普通会话、非插件分支一律不碰。
+
+### 49.4 断言与闸门
+
+- 新增 mechanism 断言：`R41-1`（生成/迁移：内容标题、分支去前缀、用户改名/子会话/子代理不碰、先写 hub 记录、durable 清理、marker v2、幂等、dry-run、no-host）、`R41-2`（默认模型按工作区持久化/单项清空/reset/无行回退）、`R41-3`（真实 `SupermemoryPanelService`：保存/读取/清空/reset；新建中枢用中枢默认、显式选择优先；标题取首条消息/中性名）、`R41-4`（侧栏单选唯一高亮）。
+- `pnpm typecheck`：双 0；`pnpm build`：exit 0（宿主 10 files / 728.51 kB；client 177.00 kB → wrap 171557 bytes）；`pnpm smoke` 六套件全绿：core **34** / mechanism **107** / webui **35** / client-sim OK / capability **12** / workspace-scope **9**。
+
+### 49.5 假设与非阻塞决策
+
+- 轮次编号按实际顺序记 R41（见开头），不改历史小节。
+- 旧的一次性标题修复（`title-migration.ts`，marker `titles`）与 `/memory merge --rename` 仍按「话题集 · 任务」命名；它们只在显式执行/首次升级时运行，R41 的迁移在其后运行会再清理一次。未改这两条既有语义，避免影响话题集根会话与合并命名。
+- 迁移后多个无内容旧中枢都叫「新会话」（中性名，无乱码令牌）；用户可在宿主侧改名，或发首条消息由面板升级。
+- 面板「设置」的模型下拉只列运行时目录（与 composer 一致）；目录为空时只能「跟随默认」。
+- 在 DSH shell 输入框里直接发送首条消息不会触发面板侧升级（只有面板发消息会）；这是已知限制，见 §49.7。
+
+### 49.6 用户侧验收（重载插件 + 刷新 GUI 后）
+
+1. 面板页签：不再有「中枢权限」独立页签；「设置」内先看到默认模型（中枢/分支两个下拉 + 保存/恢复默认），下面是完整的中枢权限目录（来源分组、锁定 6 项、失效清理仍在）。
+2. 设置默认模型 → 保存 → 关闭面板重开仍是保存值；「恢复默认」回到跟随链路。新建中枢（composer 不选模型）→ 会话使用的模型即中枢默认；显式选模型时以显式为准。
+3. 侧栏：点亮任一中枢行只有该行高亮；在面板打开会话后不再出现「两行同时高亮」；打开分支聊天时中枢行不高亮。
+4. 会话名称：新建中枢标题为工作内容（如「检查设置页签」），无『SuperMemory 中枢 · xxxx』；新派发分支标题为任务本身（无「R31：」「任务：」「<话题集> · 」前缀）；重启后存量旧标题被一次性清理，人工改过的名字保持不动。
+
+### 49.7 未做 / 限制
+
+- 分支会话无法重载插件（会 BRANCH_RELOAD_DENIED）；重载与最终 GUI 验收由中枢/用户执行。
+- 未改 `title-migration.ts` 与 `topicset-merge` 的命名语义（见 §49.5）。
+- shell 内首条消息不触发中枢标题升级（见 §49.5）。
+- 宿主 `ctx.sessionQuery.readSurface` 不可用时，存量中枢迁移只能回退中性名（不会瞎猜内容）。
+
+

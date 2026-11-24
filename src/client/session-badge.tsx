@@ -26,13 +26,13 @@
  *   `createTopicSetSession` created): a 「话题集」 badge carrying the set name,
  *   so a topic-set hub is no longer mislabelled as a branch (the R18
  *   conflation) and is not left unmarked;
- * - `hub` (R31 需求②: a host-native `session-*` id in no topic set): a
- *   「中枢」 badge — a plugin hub conversation is now visible in the sidebar
- *   instead of being an unmarked row;
- * - `none` (R31 需求②: a plugin branch that has not joined a set yet, or an
- *   id the plugin cannot classify): renders nothing.
- * The badge is a pure projection of host membership and id shape; it never
- * fabricates one when the read fails.
+ * - `hub` (R31 需求②; R35 tightened): a session with a POSITIVE `hub_sessions`
+ *   record — the same mark resolveRole trusts. The old `session-*` id-shape
+ *   guess is gone (a stale/foreign session-* id must not claim 「中枢」);
+ * - `none` (R31 需求②: a plugin branch that has not joined a set yet, an
+ *   ordinary session, or an id the plugin cannot classify): renders nothing.
+ * The badge is a projection of host membership and positive hub records; it
+ * never fabricates one when the read fails.
  * @module supermemory/client/session-badge
  */
 import { createElement as h, useEffect, useState, type ReactElement } from 'react'

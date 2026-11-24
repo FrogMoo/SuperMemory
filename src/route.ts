@@ -14,7 +14,7 @@ import { loadHostModule } from './host.ts'
 import { tokenize } from './recall.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { isPluginBranchId } from './hub-sessions.ts'
+import { resolveRole } from './role.ts'
 import { noteTopicSetActivated } from './topic-shape.ts'
 import {
   getRouting, getTopicSet, listTopicSets, setRouting, touchTopicSet, createTopicSet,
@@ -162,16 +162,17 @@ export async function routeBatch(
   }
 }
 
-/** True when the session is one of this plugin's branch sessions. */
+/**
+ * True when the session is one of this plugin's branch sessions.
+ *
+ * R35: the local R19 rule (prefix + fork member) was a SECOND branch authority —
+ * it missed `dispatches.branchSessionId`, so a dispatch branch reached through
+ * `mode: continue` on a non-`branch-*` id could be routed as a hub. Resolution
+ * now goes through {@link resolveRole}, the single authority (branch facts win,
+ * then positive hub marks, otherwise other).
+ */
 function isBranchSession(store: Store, sessionId: string): boolean {
-  // R19 需求③④: plugin-minted branch ids are branches regardless of member
-  // kind (a fresh dispatch is `kind:'root'`); a host session that owns a set
-  // stays a routing hub.
-  if (isPluginBranchId(sessionId)) return true
-  for (const [, topicSet] of store.topicsets.entries()) {
-    if (topicSet.members.some((m) => m.sessionId === sessionId && m.kind === 'fork')) return true
-  }
-  return false
+  return resolveRole(store, { id: sessionId }).role === 'branch'
 }
 
 /** The model-facing topicset context card (§1.2 final step). */

@@ -30,6 +30,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Dispatch, TopicSet } from './schema.ts'
 import type { Store } from './store.ts'
+import { resolveRole } from './role.ts'
 
 /** One branch as a hub sees it. */
 export interface HubBranchView {
@@ -404,41 +405,25 @@ export function renderHubBranchesCard(
   return lines.join('\n')
 }
 
-/** Structural view of an agent (hub detection; no host import needed). */
-interface AgentLike {
-  id?: string
-  session?: { id?: string; header?: { parentSession?: unknown; origin?: string } }
-}
-
 /**
  * Is this agent a HUB session of its workspace?
  *
- * Hub = top-level (no `parentSession`), not a subagent child (`origin`), not a
- * plugin-minted branch id, and not a topic-set FORK member (archived sets
- * included — an archived set still owns its branches). Root members stay hubs:
- * they are a topic set's own conversation, not a dispatched branch.
+ * R33 需求②: a hub is a POSITIVE mark, never "a top-level session with no
+ * parentSession". That negation classified every ordinary conversation as a hub
+ * (the guard then denied bash/write/subagent in all of them) and contradicted
+ * the branch rule for a root member reused as a branch. {@link resolveRole}
+ * owns the single decision: branch facts win, hub marks are workspace-scoped,
+ * everything else is an ordinary session.
  *
- * Anything unknown is `false`: a wrong hub classification would make a branch
- * refuse to work (the hub role prompt is not injected) or make a hub skip work.
- * Shared with `index.ts` so the prompt gate and the branch card cannot drift.
+ * Never throws: a store read failure answers `false` (ordinary), which keeps the
+ * prompt gate and the guard total.
  */
 export function isHubSession(store: Store | undefined, agent: unknown): boolean {
-  if (!store) return false
-  const shaped = agent as AgentLike | undefined
-  const session = shaped?.session
-  const header = session?.header
-  if (!header) return false
-  const sessionId = String(shaped?.id ?? session?.id ?? '')
-  if (!sessionId) return false
-  if (header.parentSession) return false
-  if (header.origin === 'subagent') return false
-  // R19 需求③④: plugin-minted work branches use `branch-*` (fresh dispatch,
-  // recorded as kind 'root') or `fork-*` (fork member). Both are branches.
-  if (sessionId.startsWith('branch-') || sessionId.startsWith('fork-')) return false
-  for (const [, topicSet] of store.topicsets.entries()) {
-    if (topicSet.members.some((member) => member.sessionId === sessionId && member.kind === 'fork')) return false
+  try {
+    return resolveRole(store, agent).role === 'hub'
+  } catch {
+    return false
   }
-  return true
 }
 
 /** Convenience for callers that only have the Context's agents service. */

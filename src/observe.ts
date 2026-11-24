@@ -18,6 +18,8 @@ import { newId } from './store.ts'
 import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
 import { clipRelayResult, episodeResult } from './relay-text.ts'
 import { updateMember } from './topicsets.ts'
+import { relaySource, type ChatCardKind } from './chat-card.ts'
+import { sessionTitleOf, type TitleHost } from './title.ts'
 
 export interface ObserveConfig {
   enabled: boolean
@@ -31,6 +33,12 @@ export interface ObserveDeps {
   store: Store
   config: ObserveConfig
   logger: { warn: (msg: string) => void; info: (msg: string) => void }
+  /**
+   * R33: optional message factory seam. Production leaves it absent (the host
+   * `createUserMessage` is loaded lazily); host-free gates inject a fake so the
+   * delivery/outbox card fields can be asserted without a DSH install.
+   */
+  createMessage?: MessageFactory
 }
 
 interface ColdEvent {
@@ -353,10 +361,97 @@ async function settleBranch(deps: ObserveDeps, branchSessionId: string, turnEndS
   }
 }
 
+/** Card identity the relay message/source carries (R32/R33). */
+export interface RelayCardFields {
+  fromSessionId: string
+  fromTitle: string
+  fromKind: ChatCardKind
+  task: string
+  topicSetTitle: string
+  capability: string
+}
+
+/** Optional overrides when a card field is already known by the caller/outbox. */
+export interface RelayCardInput {
+  dispatchId?: string
+  groupId?: string
+  fromSessionId?: string
+  fromTitle?: string
+  fromKind?: ChatCardKind
+  task?: string
+  topicSetTitle?: string
+  capability?: string
+}
+
+/**
+ * Resolve every card field for one relay from durable rows.
+ *
+ * R33 需求⑦:
+ *   - a GROUP's source session is its first member BRANCH (`branchSessionId`),
+ *     not the group id; the group id is its own card row;
+ *   - task / topic set / capability are carried in both directions (they used to
+ *     be dropped for relays, so the branch→hub card rows were always empty);
+ *   - a pre-R33 outbox row (no persisted fields) is reconstructed from the
+ *     dispatch row / group member, and a missing title is looked up live.
+ *
+ * Pure except for the optional `sessionTitleOf` host read; never throws (a
+ * missing table answers ''), so a host-free fixture can still deliver.
+ */
+export function relayCardFields(
+  ctx: TitleHost,
+  store: Store,
+  input: RelayCardInput,
+): RelayCardFields {
+  let dispatch: Dispatch | undefined
+  let groupFirst: Dispatch | undefined
+  try {
+    dispatch = input.dispatchId ? store.dispatches.get(input.dispatchId) : undefined
+    groupFirst = input.groupId ? groupMembers(store, input.groupId)[0]?.[1] : undefined
+  } catch { /* a closing/partial store keeps the empty defaults */ }
+  const record = dispatch ?? groupFirst
+  const fromKind: ChatCardKind = input.fromKind ?? (input.groupId ? 'group' : 'branch')
+  const fromSessionId = String(
+    input.fromSessionId ?? record?.branchSessionId ?? '',
+  ).trim()
+  let topicSetTitle = String(input.topicSetTitle ?? '').trim()
+  if (!topicSetTitle && record?.topicSetId) {
+    try {
+      topicSetTitle = String(store.topicsets?.get?.(record.topicSetId)?.title ?? '').trim()
+    } catch { /* optional label */ }
+  }
+  let fromTitle = String(input.fromTitle ?? '').trim()
+  if (!fromTitle && fromSessionId) {
+    try {
+      fromTitle = String(sessionTitleOf(ctx, store, fromSessionId) ?? '').trim()
+    } catch { /* optional label */ }
+  }
+  if (!fromTitle && input.groupId) {
+    fromTitle = topicSetTitle ? `并行组 · ${topicSetTitle}` : '并行组'
+  }
+  return {
+    fromSessionId,
+    fromTitle,
+    fromKind,
+    task: String(input.task ?? record?.task ?? ''),
+    topicSetTitle,
+    capability: String(input.capability ?? record?.capability ?? ''),
+  }
+}
+
 /** Enqueue + send one relay delivery to the hub (at-least-once, idempotent). */
 async function deliver(
   deps: ObserveDeps,
-  input: { dispatchId: string; record: { hubSessionId: string }; text: string; groupId?: string; deliveryId?: string },
+  input: {
+    dispatchId: string
+    record: { hubSessionId: string }
+    text: string
+    groupId?: string
+    deliveryId?: string
+    /** R32: explicit card source when the caller is not a single dispatch row. */
+    fromSessionId?: string
+    fromTitle?: string
+    fromKind?: ChatCardKind
+  },
 ): Promise<void> {
   const { ctx, store, logger } = deps
   // STABLE idempotency key (file header contract): one relay per dispatch or
@@ -364,6 +459,18 @@ async function deliver(
   // duplicates and the hub's confirmation can match it. E: an explicit override
   // lets non-settle relays (startup interrupted notice) reuse this channel.
   const deliveryId = input.deliveryId ?? (input.groupId ? "dlv-grp-" + input.groupId : "dlv-" + input.dispatchId)
+  // R32 需求③ / R33 需求⑦: the card fields are resolved NOW (while the branch
+  // session and its dispatch row are live) and persisted with the outbox row,
+  // so a restart re-delivery still says "来自 <来源会话>" with the same task/set/
+  // capability rows. A group's source is the FIRST MEMBER BRANCH — never the
+  // group id (which used to be shown as if it were a session).
+  const card = relayCardFields(ctx, store, {
+    dispatchId: input.dispatchId,
+    groupId: input.groupId,
+    ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
+    ...(input.fromTitle === undefined ? {} : { fromTitle: input.fromTitle }),
+    ...(input.fromKind === undefined ? {} : { fromKind: input.fromKind }),
+  })
   await store.outbox.put(deliveryId, {
     dispatchId: input.groupId ? undefined : (input.dispatchId || undefined),
     groupId: input.groupId,
@@ -371,6 +478,12 @@ async function deliver(
     payload: input.text,
     status: 'pending',
     enqueuedAt: Date.now(),
+    ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+    ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+    ...(card.fromKind ? { fromKind: card.fromKind } : {}),
+    task: card.task,
+    topicSetTitle: card.topicSetTitle,
+    capability: card.capability,
   })
   const hub = ctx.agents.get(input.record.hubSessionId as never)
   if (!hub) {
@@ -378,10 +491,20 @@ async function deliver(
     return
   }
   try {
-    const factory = await messageFactory()
+    const factory = deps.createMessage ?? await messageFactory()
     hub.followup(factory({
       content: [{ type: 'text', text: input.text }],
-      source: { kind: 'supermemory', form: 'relay', deliveryId },
+      source: relaySource({
+        deliveryId,
+        ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+        ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+        fromKind: card.fromKind,
+        ...(input.groupId ? { groupId: input.groupId } : { dispatchId: input.dispatchId }),
+        ...(card.task ? { task: card.task } : {}),
+        ...(card.topicSetTitle ? { topicSetTitle: card.topicSetTitle } : {}),
+        ...(card.capability ? { capability: card.capability } : {}),
+        status: 'returned',
+      }) as never,
     }) as never)
     await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
     logger.info(`supermemory: relayed ${deliveryId} to hub`)
@@ -396,13 +519,24 @@ async function deliver(
  */
 export async function deliverRelay(
   deps: ObserveDeps,
-  input: { deliveryId: string; dispatchId?: string; hubSessionId: string; text: string },
+  input: {
+    deliveryId: string
+    dispatchId?: string
+    hubSessionId: string
+    text: string
+    fromSessionId?: string
+    fromTitle?: string
+    fromKind?: ChatCardKind
+  },
 ): Promise<void> {
   await deliver(deps, {
     dispatchId: input.dispatchId ?? '',
     record: { hubSessionId: input.hubSessionId },
     text: input.text,
     deliveryId: input.deliveryId,
+    ...(input.fromSessionId === undefined ? {} : { fromSessionId: input.fromSessionId }),
+    ...(input.fromTitle === undefined ? {} : { fromTitle: input.fromTitle }),
+    ...(input.fromKind === undefined ? {} : { fromKind: input.fromKind }),
   })
 }
 
@@ -466,12 +600,46 @@ export async function flushObserve(deps: ObserveDeps): Promise<void> {
       .some((message) => message.source?.deliveryId === deliveryId)
     if (queued) continue
     try {
-      const factory = await messageFactory()
+      // R33 需求⑦: a row written before R32/R33 may carry no source fields at
+      // all. Resolve them from the dispatch / group member (including the real
+      // branch title), then PERSIST them with the relayed status so the next
+      // restart does not have to reconstruct them again.
+      const card = relayCardFields(ctx, store, {
+        ...(item.dispatchId === undefined ? {} : { dispatchId: item.dispatchId }),
+        ...(item.groupId === undefined ? {} : { groupId: item.groupId }),
+        ...(item.fromSessionId ? { fromSessionId: item.fromSessionId } : {}),
+        ...(item.fromTitle ? { fromTitle: item.fromTitle } : {}),
+        ...(item.fromKind ? { fromKind: item.fromKind } : {}),
+        ...(item.task ? { task: item.task } : {}),
+        ...(item.topicSetTitle ? { topicSetTitle: item.topicSetTitle } : {}),
+        ...(item.capability ? { capability: item.capability } : {}),
+      })
+      const factory = deps.createMessage ?? await messageFactory()
       hub.followup(factory({
         content: [{ type: 'text', text: item.payload }],
-        source: { kind: 'supermemory', form: 'relay', deliveryId },
+        source: relaySource({
+          deliveryId,
+          ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+          ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+          fromKind: card.fromKind,
+          ...(item.groupId ? { groupId: item.groupId } : { dispatchId: item.dispatchId ?? '' }),
+          ...(card.task ? { task: card.task } : {}),
+          ...(card.topicSetTitle ? { topicSetTitle: card.topicSetTitle } : {}),
+          ...(card.capability ? { capability: card.capability } : {}),
+          status: 'returned',
+        }) as never,
       }) as never)
-      await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
+      await store.outbox.update(deliveryId, (r) => ({
+        ...r,
+        ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+        ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+        fromKind: card.fromKind,
+        task: card.task,
+        topicSetTitle: card.topicSetTitle,
+        capability: card.capability,
+        status: 'relayed',
+        relayedAt: Date.now(),
+      }))
       logger.info("supermemory: flushed pending delivery " + deliveryId)
     } catch (error) {
       logger.warn("supermemory: flush delivery " + deliveryId + " failed: " + String(error).slice(0, 160))

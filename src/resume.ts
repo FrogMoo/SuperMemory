@@ -30,6 +30,8 @@ import type { Store } from './store.ts'
 import { newId } from './store.ts'
 import { updateMember } from './topicsets.ts'
 import { loadHostModule } from './host.ts'
+import { dispatchSource } from './chat-card.ts'
+import { sessionTitleOf } from './title.ts'
 
 export interface ResumeDeps {
   ctx: Context
@@ -384,6 +386,9 @@ export async function resumeDispatch(
       startSeq: seqBefore,
       status: 'dispatched',
       resumeOf: dispatchId,
+      // R33 需求⑦: keep the granted profile on the resumed row (falls back to
+      // the profile this resume applied).
+      capability: record.capability || capabilities.profile,
       // R30 需求④: 续跑把标题/标签映射带前进（同一分支、同一身份词表）。
       title: record.title || branchTitleFor(record.task),
       tags: record.tags && record.tags.length > 0
@@ -404,13 +409,25 @@ export async function resumeDispatch(
     }
     try {
       const factory = options.createMessage ?? (await messageFactory())
+      // R32 需求③: a resumed dispatch is still a hub→branch request and must use
+      // the same card. kind stays 'user' for the R25 recency contract.
+      const hubTitle = sessionTitleOf(ctx, store, hubSessionId)
+      const topicSetTitle = record.topicSetId ? (store.topicsets.get(record.topicSetId)?.title ?? '') : ''
       agent.followup(factory({
         content: [{ type: 'text', text: resumeMessage(dispatchId, record, partial, hubSessionId) }],
         // R25: 续跑消息也以人类提示形态落账（kind 'user'，不再用 form
         // 'instructions'）：宿主会话列表的 recency 只认 kind 'user'，续跑一条
         // 已存在的分支才能回到列表顶部。归属由 kind 'user' + observe 的首个
         // 匹配扫描保证（与派发输入同一形态）。
-        source: { kind: 'user' },
+        source: dispatchSource({
+          fromSessionId: hubSessionId,
+          ...(hubTitle ? { fromTitle: hubTitle } : {}),
+          task: record.task,
+          ...(topicSetTitle ? { topicSetTitle } : {}),
+          capability: capabilities.profile,
+          dispatchId: newDispatchId,
+          status: 'dispatched',
+        }) as never,
       }) as UserMessage)
       const seqAfter = (ctx.sessions.get(record.branchSessionId as never) as { seq?: number } | undefined)?.seq ?? seqBefore
       if (seqAfter > seqBefore) {
@@ -508,6 +525,9 @@ export async function notifyInterruptedDispatches(
         dispatchId: rows[0].dispatchId,
         hubSessionId,
         text,
+        // R32 需求③: this notice is about the whole hub, not one branch.
+        fromKind: 'system',
+        fromTitle: 'SuperMemory 中断巡检',
       })
       notified += 1
       logger.info('supermemory: interrupted notice sent for hub ' + hubSessionId.slice(0, 13) + ' (' + rows.length + ' task(s))')

@@ -245,6 +245,7 @@ async function restoreOne(
       { sessionId: id, kind: 'fork' },
       target.topicTitle,
       target.task,
+      { taskOnly: true },
     )
     // 'already' inside applySessionTitle keeps a human rename from being
     // overwritten; a session the host never named gets the ledger title.

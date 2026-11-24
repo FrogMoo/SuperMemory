@@ -50,6 +50,15 @@ export const PANEL_REMOTE = Object.freeze({
     method('listMemoryCollections', [param('cwd')]),
     method('listMemoriesByCollection', [param('cwd'), param('collectionId'), param('query', true), param('limit', true)]),
     method('getMemoryDetail', [param('cwd'), param('id')]),
+    // R36 需求②: 「中枢权限」页签——白名单快照 / 保存（含 reset）。两端参数
+    // 个数必须一致（历史教训：arity 漂移会让客户端 api 直接拒调）。
+    method('getHubPolicy', [param('cwd')]),
+    method('setHubPolicy', [param('cwd'), param('patch')]),
+    // R39: 一键清理白名单里运行时已不存在的条目（动态目录的失效组）。
+    method('cleanupStaleHubPolicy', [param('cwd')]),
+    // R41 需求①b: 设置页签的默认模型（中枢/分支，按工作区）。
+    method('getModelDefaults', [param('cwd')]),
+    method('setModelDefaults', [param('cwd'), param('patch')]),
     method('createTopicSet', [param('cwd'), param('title'), param('tags', true), param('summary', true)]),
     method('suggestMemoryShape', [param('text')]),
     method('listHubSessions', [param('cwd')]),

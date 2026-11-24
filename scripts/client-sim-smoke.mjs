@@ -9,9 +9,14 @@ const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'
 const registrations = []
 const loaded = []
 const consoleErrors = []
+const consoleWarnings = []
 
 const sandbox = {
-  console: { error: (...args) => consoleErrors.push(args.map(String).join(' ')), log: () => {}, warn: () => {} },
+  console: {
+    error: (...args) => consoleErrors.push(args.map(String).join(' ')),
+    log: () => {},
+    warn: (...args) => consoleWarnings.push(args.map(String).join(' ')),
+  },
   window: {
     __ModuleLoader__: {
       load: (registration) => { loaded.push(registration) },
@@ -26,8 +31,21 @@ if (loaded.length !== 1) throw new Error('expected exactly one __ModuleLoader__.
 const registration = loaded[0]
 if (registration.id !== 'dsh-supermemory') throw new Error('wrong registration id: ' + registration.id)
 
+// R32 需求③: keep the element shape readable so the chat-card component can be
+// rendered headlessly and its dynamic title asserted (not just registered).
 const stubReact = {
-  createElement: () => ({ $$typeof: Symbol.for('react.element') }),
+  createElement: (type, props, ...children) => {
+    const element = {
+      $$typeof: Symbol.for('react.element'),
+      type,
+      props: { ...(props ?? {}), children: children.length <= 1 ? children[0] : children },
+    }
+    // Render the one function component under test headlessly; everything else
+    // keeps the opaque element shape (the panel components are only registered).
+    return typeof type === 'function' && type.name === 'SupermemoryCard'
+      ? type({ ...(props ?? {}), children: element.props.children })
+      : element
+  },
   useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
   useCallback: (fn) => fn,
   useEffect: () => {},
@@ -48,11 +66,48 @@ let mountedContribution
 const remoteNamespace = new Proxy({}, {
   get: (_target, method) => async () => ({ ok: true, value: { status: 'ok', message: 'mock', id: 'mock-id', topicSets: [], memories: [], counts: {} } }),
 })
+// R33: the shipped renderers' REAL contracts (host src/chat/MessageItem.tsx and
+// TurnTriggerNodeView.tsx): UserMessageNodeView needs `t` + `renderSlotChain`,
+// the trigger/context views need `t`. These fakes THROW when a delegated
+// message does not receive them, so "delegation keeps the host alive" is a
+// behavioural assertion, not a source-string check.
+const hostProps = (props, needsChain) => {
+  if (typeof props?.t !== 'function') throw new Error('shipped node view requires t (locale)')
+  if (needsChain && typeof props?.renderSlotChain !== 'function') {
+    throw new Error('shipped user/steering view requires renderSlotChain')
+  }
+}
+const fakeUserNode = (props) => {
+  hostProps(props, true)
+  return { $$typeof: Symbol.for('react.element'), type: 'shipped-user', props }
+}
+const fakeTriggerNode = (props) => {
+  hostProps(props, false)
+  return { $$typeof: Symbol.for('react.element'), type: 'shipped-trigger', props }
+}
+const fakeSteeringNode = (props) => {
+  hostProps(props, true)
+  return { $$typeof: Symbol.for('react.element'), type: 'shipped-steering', props }
+}
+const fakeContextNode = (props) => {
+  hostProps(props, false)
+  return { $$typeof: Symbol.for('react.element'), type: 'shipped-context', props }
+}
+const builtinChatNodes = [
+  { options: { key: 'user' }, component: fakeUserNode },
+  { options: { key: 'steering' }, component: fakeSteeringNode },
+  { options: { key: 'turn-trigger' }, component: fakeTriggerNode },
+  { options: { key: 'context' }, component: fakeContextNode },
+]
 const ctx = {
   effect: (fn) => { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
   locale: {
     register: () => () => {},
-    bind: () => (key) => key,
+    bind: () => (key, params) => key === 'chat.card.from'
+      ? '来自 ' + String(params?.session ?? '') + ' 的执行请求'
+      : key === 'chat.card.kind.hub' ? '中枢派发'
+        : key === 'chat.card.kind.branch' ? '分支回报'
+          : key,
   },
   get: (key) => {
     if (key === 'remote') return { $mount: async (contribution) => { mountedContribution = contribution; return () => {} } }
@@ -70,6 +125,8 @@ const ctx = {
       registrations.push({ slot: options.name, entry: { options, component } })
       return () => {}
     },
+    // R32 需求③: the shipped node renderers the card must delegate to.
+    entries: () => builtinChatNodes,
   },
 }
 
@@ -86,6 +143,12 @@ const expected = [
   // dot); the trailing cell is gated by `!row.blank` only, so the badge stays
   // visible while running and in approval states.
   'sidebar.session.row.trailing:supermemory-branch',
+  // R32 需求③: the two shadowing card cells (user + turn-trigger), each with a
+  // distinguishable id so the card can find and delegate to the shipped node.
+  'conversation.chat.node:supermemory-chat-card-user',
+  'conversation.chat.node:supermemory-chat-card-steering',
+  'conversation.chat.node:supermemory-chat-card-turn-trigger',
+  'conversation.chat.node:supermemory-chat-card-context',
 ]
 for (const want of expected) {
   if (!slots.includes(want)) throw new Error('missing registration: ' + want + ' (got ' + slots.join(', ') + ')')
@@ -169,6 +232,158 @@ assert.equal(listToolsParameters[0].name, 'cwd')
 assert.equal(listToolsParameters[0].acceptsUndefined, true, 'cwd is optional (old hosts / headless callers omit it)')
 for (const descriptor of mountedDescriptors) {
   assert.ok(Array.isArray(descriptor.parameters), `supermemoryPanel/${descriptor.method} must declare its parameters`)
+}
+
+// R33 需求①②③⑨: the hub↔branch card must render in BOTH node kinds from the
+// host's REAL node shape (`node.data`), with a dynamic title and the original
+// fields; a non-card message must delegate to the shipped renderer WITH the
+// props that renderer requires (t + renderSlotChain), never crash it.
+{
+  const collectText = (node) => {
+    if (node === null || node === undefined) return []
+    if (typeof node === 'string') return [node]
+    if (Array.isArray(node)) return node.flatMap(collectText)
+    if (typeof node === 'object' && node.props) return collectText(node.props.children)
+    return []
+  }
+  const findCell = (key) => registrations.find((row) => row.slot === 'conversation.chat.node'
+    && row.entry?.options?.key === key)
+  const cells = ['user', 'steering', 'turn-trigger', 'context']
+  for (const key of cells) {
+    const cell = findCell(key)
+    if (!cell) throw new Error('R33 card cell is not registered: ' + key)
+    // Without a locale the host binds `t === undefined` into the shipped view.
+    assert.equal(cell.entry.options.locale, 'chat', 'the shadowing cell must declare the host chat locale: ' + key)
+    const injected = cell.entry.options.inject()
+    assert.equal(typeof injected.smCardEnv?.t, 'function', 'the cell injects its own translator: ' + key)
+    if (key === 'user' || key === 'steering') {
+      assert.equal(typeof injected.renderSlotChain, 'function',
+        'the user/steering cell must provide a renderSlotChain (no-op is allowed): ' + key)
+    }
+  }
+  const userCell = findCell('user')
+  const triggerCell = findCell('turn-trigger')
+  const contextCell = findCell('context')
+  const steeringCell = findCell('steering')
+  const userEnv = userCell.entry.options.inject().smCardEnv
+  if (userEnv.findOriginal('user', 'supermemory-chat-card-user') !== fakeUserNode) {
+    throw new Error('R33 card must find the shipped user renderer for delegation')
+  }
+
+  // Negative control: the fake host is strict, so a delegated message that
+  // forgot t/renderSlotChain WOULD throw (this is the pre-R33 crash).
+  assert.throws(() => fakeUserNode({ node: {} }), /requires t \(locale\)/,
+    'the shipped user view must throw without t — proves the fake is real')
+  assert.throws(() => fakeUserNode({ node: {}, t: () => '' }), /requires renderSlotChain/,
+    'the shipped user view must throw without renderSlotChain')
+
+  const at = Date.parse('2026-11-24T08:15:00+08:00')
+  const dispatchRendered = userCell.entry.component({
+    node: {
+      kind: 'user',
+      data: {
+        time: at,
+        content: [{ type: 'text', text: '派发脚本正文' }],
+        source: {
+          kind: 'user', form: 'supermemory-dispatch', fromSessionId: 'session-hub1', fromTitle: '中枢甲',
+          task: '加测试', topicSetTitle: 'R33 话题集', capability: 'full', dispatchId: 'dsp-2', status: 'dispatched',
+        },
+      },
+    },
+    smCardEnv: userEnv,
+  })
+  if (dispatchRendered?.props?.['data-supermemory-card'] !== 'hub') {
+    throw new Error('R33 hub→branch dispatch did not render as a hub card (node.data.source not read?)')
+  }
+  const dispatchText = collectText(dispatchRendered)
+  if (!dispatchText.includes('来自 中枢甲 的执行请求')) {
+    throw new Error('R33 card title is not the dynamic source title: ' + JSON.stringify(dispatchText))
+  }
+  // The header clock comes from node.data.time; the top-level node.time is absent.
+  if (!/\d{1,2}:\d{2}/.test(dispatchText.join(' '))) {
+    throw new Error('R33 card time was not read from node.data.time: ' + JSON.stringify(dispatchText))
+  }
+
+  // Reading `node.source` instead of `node.data.source` must turn the next two
+  // assertions red: cardMetaOf(undefined) → delegation, not a card.
+  const triggerEnv = triggerCell.entry.options.inject().smCardEnv
+  const relayRendered = triggerCell.entry.component({
+    node: {
+      kind: 'turn-trigger',
+      data: {
+        time: at,
+        content: [{ type: 'text', text: '分支结果' }],
+        source: {
+          kind: 'supermemory', form: 'relay', fromSessionId: 'branch-abcd1234', fromTitle: '分支甲',
+          task: '加测试', topicSetTitle: 'R33 话题集', capability: 'read-write', dispatchId: 'dsp-1', status: 'returned',
+        },
+      },
+    },
+    smCardEnv: triggerEnv,
+  })
+  if (relayRendered?.props?.['data-supermemory-card'] !== 'branch') {
+    throw new Error('R33 branch→hub relay did not render as a branch card')
+  }
+  if (!collectText(relayRendered).includes('来自 分支甲 的执行请求')) {
+    throw new Error('R33 relay card title is not the dynamic source title')
+  }
+
+  // Title missing → the id's last four characters.
+  const fallbackRendered = triggerCell.entry.component({
+    node: { kind: 'turn-trigger', data: { content: [{ type: 'text', text: '结果' }], source: { kind: 'supermemory', form: 'relay', fromSessionId: 'branch-abcd1234' } } },
+    smCardEnv: triggerEnv,
+  })
+  if (!collectText(fallbackRendered).includes('来自 1234 的执行请求')) {
+    throw new Error('R33 relay card title did not fall back to the source id tail')
+  }
+
+  // A normal user message (no marker) is delegated to the shipped renderer and
+  // receives t + renderSlotChain (calling the real contract must not throw).
+  const normal = userCell.entry.component({
+    node: { kind: 'user', data: { content: [{ type: 'text', text: '普通用户消息' }], source: { kind: 'user' } } },
+    smCardEnv: userEnv,
+  })
+  if (normal?.type !== fakeUserNode) {
+    throw new Error('R33 card swallowed a normal user message instead of delegating it')
+  }
+  assert.equal(typeof normal.props.t, 'function', 'delegated user message keeps a translator')
+  assert.equal(typeof normal.props.renderSlotChain, 'function', 'delegated user message keeps a renderSlotChain')
+  assert.doesNotThrow(() => fakeUserNode(normal.props), 'delegated user message must survive the shipped view')
+  assert.equal(fakeUserNode(normal.props).props.node.data.content[0].text, '普通用户消息',
+    'the delegated node reaches the shipped view unchanged (node.data.content)')
+
+  // Goal / schedule trigger cards and context injections delegate with `t`.
+  for (const [key, cell, source] of [
+    ['turn-trigger', triggerCell, { kind: 'goal' }],
+    ['turn-trigger', triggerCell, { kind: 'schedule' }],
+    ['context', contextCell, { kind: 'supermemory', form: 'recall' }],
+    ['steering', steeringCell, { kind: 'user' }],
+  ]) {
+    const env = cell.entry.options.inject().smCardEnv
+    const rendered = cell.entry.component({
+      node: { kind: key, data: { content: [{ type: 'text', text: '普通内容' }], source } },
+      smCardEnv: env,
+    })
+    if (rendered?.type === undefined) throw new Error('R33 delegated node went blank: ' + key)
+    assert.equal(typeof rendered.props.t, 'function', 'delegated node keeps t: ' + key)
+    assert.doesNotThrow(() => rendered.type(rendered.props), 'delegated node survives its shipped view: ' + key)
+  }
+
+  // Without the raw entry view the plugin must NOT shadow any cell (otherwise
+  // ordinary messages would be swallowed with no way to delegate).
+  const before = registrations.length
+  const cellSlotsBefore = registrations.filter((row) => row.slot === 'conversation.chat.node').length
+  const entries = ctx.slots.entries
+  ctx.slots.entries = undefined
+  await moduleExports.apply(ctx)
+  const added = registrations.slice(before)
+  assert.equal(added.filter((row) => row.slot === 'conversation.chat.node').length, 0,
+    'a shell without slots.entries() must not shadow conversation.chat.node')
+  assert.equal(registrations.filter((row) => row.slot === 'conversation.chat.node').length, cellSlotsBefore,
+    'an already-mounted card set is not duplicated by a second apply')
+  assert.ok(consoleWarnings.some((message) => message.includes('entries() unavailable')),
+    'the degradation is logged, never silent')
+  ctx.slots.entries = entries
 }
 
 console.log('SIM SMOKE OK')

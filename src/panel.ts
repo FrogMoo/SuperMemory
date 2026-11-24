@@ -17,14 +17,14 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   topicSetIdsOf, touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
-import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, ensureMemberTitle } from './title.ts'
+import { TITLE_FALLBACK, TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, describeSessionTitle, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
   bumpCompositeUse, capabilityAppliesToWorkspace, capabilityHealthOf, deleteCompositeTool, editCompositeTool,
   liveCompositeSpecs, runCapability, type CapabilityRunResult, type CompositeSpec,
 } from './composite.ts'
-import { enumerateModels } from './model.ts'
+import { enumerateModels, type ModelSelection } from './model.ts'
 import { tokenize } from './recall.ts'
 // R22 需求⑤: 面板新建记忆与 memory_remember 共用同一套集合归属判定。
 import { collectionTierNote, listCollections, resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
@@ -36,10 +36,20 @@ import {
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
-import { isPluginBranchId, listHubSessions, hubSessionTitle, HUB_ID_PREFIX, type HubSessionView } from './hub-sessions.ts'
+import { isPluginBranchId, listHubSessions, hubSessionTitle, type HubSessionView } from './hub-sessions.ts'
+// R36 需求①②: 中枢白名单（默认拒绝）的读写；R39：动态目录按来源分组。
+import {
+  DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, LOCKED_HUB_TOOLS,
+  buildFallbackHubCatalog, buildHubCatalog, cleanStaleHubPolicy, declaredHubToolSource,
+  readHubPolicy, resetHubPolicy, writeHubPolicy,
+  type HubCatalogGroup, type HubCatalogItem, type HubCatalogMeta, type HubCatalogSnapshot,
+  type HubToolDescriptor, type ResolvedHubPolicy,
+} from './hub-policy.ts'
 import { BRANCH_CARD_EXCERPT_CHARS, hubsByBranch, latestTaskByBranch, listHubBranches, listWorkspaceBranches, taskExcerpt, type HubBranchView } from './hub-branches.ts'
 import { latestBranchMeta } from './branch-meta.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
+import { recordHubSession } from './role.ts'
+import { defaultModelFor, readModelDefaults, writeModelDefaults, type ModelDefaultsView } from './model-defaults.ts'
 
 export interface TopicSetView {
   id: string
@@ -116,6 +126,33 @@ export interface MemoryCollectionView {
   status: string
   createdAt: number
   updatedAt: number
+}
+
+/**
+ * R36 需求② / R39: 「中枢权限」页签快照。`tools`/`prefixes` 是当前生效的
+ * 白名单（存储行或内置默认），`defaults` 是内置默认值，「恢复默认」对照它
+ * 渲染；`catalog` 是每次调用即时生成的 DYNAMIC 目录（运行时全部工具按来源
+ * 分组，默认拒绝），`catalogMeta` 记录生成时间/模式/回退告警，`stale` 是
+ * 白名单有而运行时无的条目（单列最后一组，供一键清理）。
+ */
+export interface HubPolicyView {
+  workspaceKey: string
+  tools: string[]
+  prefixes: string[]
+  /** stored=工作区自有白名单；default=旧库无记录/读失败回退的内置默认。 */
+  source: 'stored' | 'default'
+  locked: string[]
+  defaults: { tools: string[]; prefixes: string[] }
+  catalog: HubCatalogGroup[]
+  catalogMeta: HubCatalogMeta
+  stale: HubCatalogItem[]
+}
+
+/** R36 需求②: 保存入参（整份替换或 reset）。 */
+export interface HubPolicyPatch {
+  tools?: string[]
+  prefixes?: string[]
+  reset?: boolean
 }
 
 /** R30 需求②: 记忆详情页——当前版本 + 全部历史版本（可展开）。 */
@@ -799,6 +836,181 @@ export class SupermemoryPanelService {
   }
 
   /**
+   * R36 需求② / R39: 中枢权限页签的一次性快照——当前白名单、内置默认、锁定项，
+   * 以及每次调用都从运行时重新生成的工具目录（按来源分组；宿主枚举失败时回退
+   * 内置清单并告警，页面不白屏，但默认路径永远是动态目录）。
+   */
+  getHubPolicy(cwd: string): HubPolicyView {
+    const workspaceKey = this.wk(cwd)
+    const resolved: ResolvedHubPolicy = readHubPolicy(this.store, workspaceKey, (message) => console.warn(message))
+    const snapshot = this.hubPolicyCatalogSnapshot(resolved.tools, resolved.prefixes)
+    return {
+      workspaceKey,
+      tools: [...resolved.tools],
+      prefixes: [...resolved.prefixes],
+      source: resolved.source,
+      locked: [...LOCKED_HUB_TOOLS],
+      defaults: { tools: [...DEFAULT_HUB_TOOLS], prefixes: [...DEFAULT_HUB_PREFIXES] },
+      catalog: snapshot.groups,
+      catalogMeta: snapshot.meta,
+      stale: snapshot.stale,
+    }
+  }
+
+  /**
+   * R39: 一键清理失效条目——白名单里有、当前运行时已不存在的工具（插件卸载/
+   * 改名）与匹配不到任何工具的前缀。锁定项永不清理（guard 始终放行它们）；
+   * 动态枚举失败时拒绝清理而不是瞎猜。原为内置默认时，清理会落一行工作区
+   * 自定义白名单（在回执里说明）。
+   */
+  async cleanupStaleHubPolicy(cwd: string): Promise<MutationResult> {
+    const workspaceKey = this.wk(cwd)
+    const resolved: ResolvedHubPolicy = readHubPolicy(this.store, workspaceKey, (message) => console.warn(message))
+    let runtimeNames: string[]
+    try {
+      runtimeNames = this.runtimeHubTools().map((tool) => tool.name)
+    } catch (error) {
+      return {
+        status: 'error',
+        message: `动态目录不可用，无法判断失效条目：${String(error instanceof Error ? error.message : error).slice(0, 160)}`,
+      }
+    }
+    const cleaned = cleanStaleHubPolicy({ allowTools: resolved.tools, prefixes: resolved.prefixes, runtimeNames })
+    if (cleaned.removed === 0) return { status: 'ok', message: '没有失效条目需要清理。' }
+    try {
+      await writeHubPolicy(this.store, workspaceKey, cleaned.tools, cleaned.prefixes)
+    } catch (error) {
+      return { status: 'error', message: `清理失效条目失败：${String(error).slice(0, 160)}` }
+    }
+    const preview = cleaned.removedNames.slice(0, 5).join('、') + (cleaned.removedNames.length > 5 ? '…' : '')
+    return {
+      status: 'ok',
+      message: `已清理 ${cleaned.removed} 个失效条目（${preview}）并保存。`
+        + (resolved.source === 'default' ? '原为内置默认，本次已写入工作区自定义白名单。' : ''),
+    }
+  }
+
+  /**
+   * R36 需求②: 保存白名单（整份替换：面板总是把两个列表一起送来）。锁定项在
+   * 写入时合并回去，用户无法通过一次保存把自己锁在派发链路之外。
+   */
+  async setHubPolicy(cwd: string, patch: HubPolicyPatch): Promise<MutationResult> {
+    const workspaceKey = this.wk(cwd)
+    if (patch.reset) {
+      // Awaited on purpose: the receipt must reflect the write, unlike the
+      // best-effort markers (a silent failure would leave the user believing
+      // the default was restored).
+      try {
+        await resetHubPolicy(this.store, workspaceKey)
+      } catch (error) {
+        return { status: 'error', message: `恢复默认失败：${String(error).slice(0, 160)}` }
+      }
+      return { status: 'ok', message: '已恢复内置默认白名单（下一个工具调用即生效）。' }
+    }
+    const tools = Array.isArray(patch.tools) ? patch.tools : undefined
+    const prefixes = Array.isArray(patch.prefixes) ? patch.prefixes : undefined
+    if (!tools || !prefixes) {
+      return { status: 'error', message: '保存白名单需要同时提供 tools 与 prefixes 两个列表。' }
+    }
+    try {
+      await writeHubPolicy(this.store, workspaceKey, tools, prefixes)
+    } catch (error) {
+      return { status: 'error', message: `保存失败：${String(error).slice(0, 160)}` }
+    }
+    return { status: 'ok', message: '白名单已保存（下一个工具调用即生效）。' }
+  }
+
+  /**
+   * R41 需求①b: the 设置 tab's default-model snapshot (per workspace).
+   */
+  getModelDefaults(cwd: string): ModelDefaultsView {
+    return readModelDefaults(this.store, this.wk(cwd))
+  }
+
+  /**
+   * R41 需求①b: save the 设置 tab's default models. A missing selection means
+   * "follow the existing chain"; `null` clears one kind; `reset` clears both.
+   */
+  async setModelDefaults(cwd: string, patch: {
+    hub?: ModelSelection | null
+    branch?: ModelSelection | null
+    reset?: boolean
+  }): Promise<MutationResult> {
+    const workspaceKey = this.wk(cwd)
+    const hub = patch?.hub === null ? null : (patch?.hub ?? undefined)
+    const branch = patch?.branch === null ? null : (patch?.branch ?? undefined)
+    if (!patch?.reset && hub === undefined && branch === undefined) {
+      return { status: 'error', message: '没有要保存的默认模型。' }
+    }
+    try {
+      const saved = await writeModelDefaults(this.store, workspaceKey, {
+        ...(patch?.reset ? { reset: true } : { hub, branch }),
+      })
+      const hubName = saved.hub ? `${saved.hub.provider}/${saved.hub.model}` : '跟随宿主默认'
+      const branchName = saved.branch ? `${saved.branch.provider}/${saved.branch.model}` : '跟随话题集/中枢/宿主默认'
+      return {
+        status: 'ok',
+        message: patch?.reset
+          ? '已恢复默认设置（中枢/分支会话跟随既有链路）。'
+          : `默认模型已保存：中枢会话 ${hubName}；分支会话 ${branchName}。`,
+      }
+    } catch (error) {
+      return { status: 'error', message: `保存默认模型失败：${String(error).slice(0, 160)}` }
+    }
+  }
+
+  /**
+   * R39: 宿主运行时工具清单——直接读 `ctx.tools.definitions()`（宿主契约：
+   * ToolDefinition extends ToolSchema，只有 name/description/parameters，没有
+   * owner/plugin 字段）。无该 seams、抛错或返回空清单都视为失败，由调用方回退
+   * 内置清单并告警；成功时只投影本模块需要的字段（name/description/来源）。
+   * 作用域：不传 scope = 全局视图（panel 服务不是 agent 作用域），因此
+   * agent 级 scoped 工具与 preset/session 级 restrict 不在目录里——见
+   * DEV-NOTES §47 的限制说明。
+   */
+  private runtimeHubTools(): HubToolDescriptor[] {
+    const tools = this.ctx?.tools as unknown as {
+      definitions?: (scope?: unknown) => unknown
+    } | undefined
+    if (!tools || typeof tools.definitions !== 'function') {
+      throw new Error('宿主未暴露 ctx.tools.definitions()')
+    }
+    const definitions = tools.definitions()
+    if (!Array.isArray(definitions)) throw new Error('ctx.tools.definitions() 未返回数组')
+    const descriptors: HubToolDescriptor[] = []
+    for (const definition of definitions) {
+      const record = definition as { name?: unknown; description?: unknown } | undefined
+      const name = String(record?.name ?? '').trim()
+      if (!name) continue
+      const declared = declaredHubToolSource(definition)
+      const description = typeof record?.description === 'string' ? record.description : undefined
+      descriptors.push({
+        name,
+        ...(description ? { description } : {}),
+        ...(declared ? { source: declared } : {}),
+      })
+    }
+    if (descriptors.length === 0) throw new Error('ctx.tools.definitions() 返回空清单')
+    return descriptors
+  }
+
+  /**
+   * R39: 动态目录 + 内置回退（永不抛）。失败路径必须留下告警：页面显示
+   * 「内置回退」徽标与警告条，而不是白屏或静默换源。
+   */
+  private hubPolicyCatalogSnapshot(allowTools: readonly string[], prefixes: readonly string[]): HubCatalogSnapshot {
+    const now = Date.now()
+    try {
+      return buildHubCatalog({ tools: this.runtimeHubTools(), allowTools, prefixes, now })
+    } catch (error) {
+      const detail = String(error instanceof Error ? error.message : error).slice(0, 200)
+      const warning = `动态工具目录生成失败，已回退内置清单：${detail}`
+      console.warn('supermemory: ' + warning)
+      return buildFallbackHubCatalog({ allowTools, prefixes, now, warning })
+    }
+  }
+
+  /**
    * R30 需求②: 记忆页签第一级——本工作区的记忆集合卡片（标题/标签/条目数/
    * 最近更新）。条目数按集合聚合（含未归集：id 为空串的虚拟集合，让旧数据
    * 与「没归集」的新数据在面板里仍然可见，不丢条目）。
@@ -1099,6 +1311,11 @@ export class SupermemoryPanelService {
     try {
       if (typeof agent?.followup !== 'function') return { status: 'error', message: '该会话的 agent 不可写（followup 不可用）。' }
       agent.followup(message)
+      // R41 需求③a: a hub created from the rail has no opening message, so its
+      // title is the neutral 「新会话」. The first message sent from the panel is
+      // the available work summary — upgrade the title once, never overwriting
+      // a title a person chose.
+      void this.refreshHubTitleFromMessage(id, body)
       return { status: 'ok', message: resumed ? '会话已恢复，消息已发送。' : '消息已发送。', id }
     } catch (error) {
       return { status: 'error', message: `发送失败：${String(error).slice(0, 160)}` }
@@ -1189,6 +1406,14 @@ export class SupermemoryPanelService {
       }
       await touchTopicSet(this.store, ids[0])
       applySessionTitle(ctx, sessionId, named, { warn: () => {} })
+      // R33 需求②: a topic-set conversation is a POSITIVE hub mark (root member
+      // + explicit record), never inferred from its missing parentSession.
+      await recordHubSession(this.store, {
+        sessionId,
+        workspaceKey: workspaceKeyOf(cwd),
+        title: named,
+        source: 'topicset-root',
+      })
       try {
         await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
       } catch { /* workspace attach is best-effort */ }
@@ -1209,17 +1434,61 @@ export class SupermemoryPanelService {
    * plain new session (host defaults for preset/model/permission).
    */
   async createHubSession(cwd: string, options: SessionOptions = {}, firstMessage = ''): Promise<MutationResult> {
-    const created = await this.createSessionWithOptions(cwd, options)
+    const workspaceKey = workspaceKeyOf(cwd)
+    // R41 需求①b: an explicit composer choice wins; otherwise the workspace's
+    // 中枢会话默认模型 applies, and finally the host default (no options).
+    const resolvedOptions: SessionOptions = { ...options }
+    if (!resolvedOptions.model) {
+      const hubDefault = defaultModelFor(this.store, workspaceKey, 'hub')
+      if (hubDefault) resolvedOptions.model = hubDefault
+    }
+    const created = await this.createSessionWithOptions(cwd, resolvedOptions)
     if ('error' in created) return { status: 'error', message: created.error }
-    // A short id suffix keeps several hub sessions distinguishable in the
-    // sidebar list (requirement C naming, hub flavour). R31 需求①: the prefix
-    // names the flavour explicitly instead of the generic 「新会话」.
-    const title = hubSessionTitle(created.sessionId)
+    // R41 需求③a: the name is the work itself — the opening message (48-char
+    // clip) or the neutral 「新会话」 when there is no content yet. No brand
+    // prefix, no id token.
+    const title = hubSessionTitle(created.sessionId, firstMessage)
     await this.finishSession(created.sessionId, cwd, title)
+    // R33 需求②: the plugin created this hub — record the positive mark.
+    await recordHubSession(this.store, {
+      sessionId: created.sessionId,
+      workspaceKey,
+      title,
+      source: 'panel',
+    })
     const delivered = await this.deliverFirstMessage(created.handle, firstMessage)
     if (delivered === true) return { status: 'ok', message: '已创建中枢会话并发送首条消息。', id: created.sessionId }
     if (typeof delivered === 'string') return { status: 'ok', message: `中枢会话已创建，但首条消息发送失败：${delivered}`, id: created.sessionId }
     return { status: 'ok', message: '已创建中枢会话。', id: created.sessionId }
+  }
+
+  /**
+   * R41 需求③a: upgrade a hub's neutral title from the first message the user
+   * sends in the panel. Only generic titles (「新会话」, the old brand prefix,
+   * the pre-R31「新会话 · id」) are upgraded — a title a person chose is kept.
+   */
+  private async refreshHubTitleFromMessage(sessionId: string, text: string): Promise<void> {
+    const ctx = this.ctx
+    if (!ctx) return
+    try {
+      const record = this.store?.hubs?.get?.(sessionId)
+      if (!record) return
+      const current = currentSessionTitle(ctx, sessionId) ?? record.title
+      const generic = !current
+        || current === TITLE_FALLBACK
+        || current.startsWith('SuperMemory 中枢')
+        || /^新会话\s*·/.test(current)
+      if (!generic) return
+      const title = describeSessionTitle(text)
+      if (!title || title === TITLE_FALLBACK) return
+      applySessionTitle(ctx, sessionId, title, { warn: () => {} }, { force: true })
+      await recordHubSession(this.store, {
+        sessionId,
+        workspaceKey: record.workspaceKey,
+        title,
+        source: record.source,
+      })
+    } catch { /* naming is best-effort; the message already went through */ }
   }
 
   /**
@@ -1599,6 +1868,15 @@ export class SupermemoryPanelService {
    * plain hub. Multiple hits inside one tier resolve to the newest
    * `lastActiveAt`. Archived sets never badge.
    */
+  /** Guarded positive hub-record read: badge truth, same table resolveRole uses. */
+  private hubRecordOf(sessionId: string): boolean {
+    try {
+      return Boolean(this.store?.hubs?.get?.(sessionId))
+    } catch {
+      return false
+    }
+  }
+
   sessionBadge(sessionId: string): SessionBadge {
     const pluginBranch = isPluginBranchId(sessionId)
     let bestFork: { topicSetId: string; title: string; status: string; lastActiveAt: number } | undefined
@@ -1627,18 +1905,19 @@ export class SupermemoryPanelService {
     if (bestRoot) {
       return { kind: 'hub-set', topicSetId: bestRoot.topicSetId, topicSetTitle: bestRoot.title }
     }
-    // R31 需求②: a session in NO topic set is badged by its id shape, because
-    // the old catch-all `{kind:'hub'}` marked every foreign id (a branch that
-    // has not joined a set yet, a subagent, a shell session) as a hub:
+    // R31 需求② + R35: a session in NO topic set is badged by POSITIVE evidence,
+    // because the old catch-all `{kind:'hub'}` marked every foreign id (a branch
+    // that has not joined a set yet, a subagent, a shell session) as a hub:
     // - a plugin-minted `branch-*`/`fork-*` id is a work branch that simply
     //   has no member row yet → no badge (`none`), never a hub;
-    // - a host-native `session-*` id is a plugin hub conversation → `hub`
-    //   (every hub the plugin creates carries that prefix; the sidebar badge
-    //   now renders it, so a hub is no longer an invisible row);
-    // - anything else (unknown minting) stays unbadged (`none`) rather than
-    //   being optimistically labelled a hub.
+    // - a session with a `hub_sessions` record → `hub` (the same positive mark
+    //   resolveRole trusts; a stale `session-*` id-shape guess is NOT a role);
+    // - anything else (no record: an ordinary conversation, a subagent, an
+    //   unknown minting) stays unbadged (`none`) rather than being optimistically
+    //   labelled a hub. Pre-R33 panel hubs get their record from the one-time
+    //   title migration (src/hub-records-migration.ts).
     if (isPluginBranchId(sessionId)) return { kind: 'none' }
-    if (sessionId.startsWith(HUB_ID_PREFIX)) return { kind: 'hub' }
+    if (this.hubRecordOf(sessionId)) return { kind: 'hub' }
     return { kind: 'none' }
   }
 }
@@ -1770,6 +2049,58 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R36 需求②: 中枢权限页签快照（当前白名单 + 默认值 + 锁定项 + 目录）。
+    id: 'dsh-supermemory#supermemoryPanel/getHubPolicy',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'getHubPolicy',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubPolicyView', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R36 需求②: 保存白名单（tools/prefixes 整份替换，或 reset 恢复默认）。
+    id: 'dsh-supermemory#supermemoryPanel/setHubPolicy',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'setHubPolicy',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubPolicyPatch', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R39: 一键清理白名单里运行时已不存在的条目（锁定项除外）。
+    id: 'dsh-supermemory#supermemoryPanel/cleanupStaleHubPolicy',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'cleanupStaleHubPolicy',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R41 需求①b: 设置页签的默认模型快照（中枢/分支，按工作区）。
+    id: 'dsh-supermemory#supermemoryPanel/getModelDefaults',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'getModelDefaults',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#ModelDefaultsView', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R41 需求①b: 保存默认模型（每项可选/可清空，reset 恢复默认）。
+    id: 'dsh-supermemory#supermemoryPanel/setModelDefaults',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'setModelDefaults',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#ModelDefaultsPatch', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

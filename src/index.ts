@@ -24,6 +24,7 @@ import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
 import { migrateHubSessionTitles } from './hub-title-migration.ts'
+import { knownWorkspaceKeys, migrateHubSessionRecords } from './hub-records-migration.ts'
 import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
@@ -34,6 +35,8 @@ import { openStoreWithRetry, workspaceKeyOf, type Store } from './store.ts'
 import { attachTools, type ToolsDeps } from './tools.ts'
 import { attachWebui } from './webui.ts'
 import { isHubSession } from './hub-branches.ts'
+import { backfillHubRecords } from './role.ts'
+import { ROLE_GUARD_VERSION, roleGuardDecision } from './role-guard.ts'
 import './services.ts'
 import './source.ts'
 
@@ -271,6 +274,11 @@ const HUB_ROLE_TEXT = [
   '[SuperMemory 中枢会话]',
   '- 你是中枢会话：只做判断、派发（memory_dispatch）与汇总（收到 relay 结果后转述给用户）。',
   '- 不要直接读改文件、执行命令、跑构建或长篇推理——这些操作交给分支会话完成；你的价值是定义清楚任务与边界，再整合结果。',
+  // R36 需求①②: the runtime guard is a WHITELIST. Saying so in the role prompt
+  // keeps the model from burning a turn on a tool that will be denied, and
+  // tells it where the switch lives (panel 「中枢权限」页签).
+  '- 工具白名单（默认拒绝）：你只能调用白名单内的工具；不在名单内的（含未来新增工具）会被运行时直接拒绝，'
+  + '需要某项时可在超级记忆面板「中枢权限」页签勾选启用（保存后下一个工具调用即生效）。',
   '- 派发时先设定能力：要改代码/跑命令用 capabilities=full；只审阅用 read；纯代码编辑用 read-write；汇总/轻量核对用 minimal。',
   // R19 协同①: the parallel-group guidance lives in the role prompt, not only in
   // the tool description, so the model plans the fan-out before it starts.
@@ -342,6 +350,14 @@ export async function apply(ctx: Context, config: Config) {
     logger.warn(`supermemory: storage domain unavailable, memory features disabled: ${String(error)}`)
   }
   ctx.effect(() => () => { void store?.close().catch(() => {}) }, 'supermemory: domain')
+  // R33 需求②: seed positive hub records from durable evidence written by
+  // earlier rounds (topic-set root members + every dispatch's hubSessionId).
+  // Resolution also reads those directly; the rows make the mark explicit.
+  if (store) {
+    void backfillHubRecords(store, logger).catch((error) => {
+      logger.warn('supermemory: hub record backfill failed: ' + String(error).slice(0, 160))
+    })
+  }
 
   const modelDeps: ModelDeps = { ctx, store: store as Store, logger }
 
@@ -365,6 +381,55 @@ export async function apply(ctx: Context, config: Config) {
   } catch (error) {
     logger.warn(`supermemory: tool registration failed: ${String(error)}`)
   }
+
+  // R32 需求①②: harden the hub/branch division of labour at RUNTIME, not in
+  // prompt text. `ctx.tools.guard` is DSH's monotonic pre-dispatch seam: it
+  // runs after every pre-execute policy/approval and before the tool body, so a
+  // denial is final. One guard covers both rules:
+  //   - a branch (or any non-hub) may not call plugin_manager's mutating
+  //     actions (disable/enable/install/remove) — that would kill its own agent;
+  //   - a hub may not call hands-on execution tools; it must dispatch instead.
+  // The relay link stays intact because memory_dispatch / recall / questions /
+  // send_message and the read-only inspection tools are NOT denied, and the
+  // PTC `run_code` transport necessarily remains allowed (it is how a hub
+  // invokes memory_dispatch at all; see role-guard.ts + DEV-NOTES §42).
+  ctx.effect(() => {
+    const tools = ctx.tools as unknown as {
+      guard?: (guard: (exec: { name: string; arguments: unknown; agent?: unknown }) => unknown) => () => void
+    }
+    // R33 需求⑧: a missing/failed guard is NOT a log line people never read.
+    // The failure is logged AND persisted to the meta row 'role-guard' (survives
+    // reloads, visible to the panel/console) so a silently unguarded host is
+    // diagnosable. A success also stamps the row (installed/version).
+    const markGuard = (patch: Record<string, unknown>): void => {
+      try {
+        const current = store?.meta.get('role-guard') ?? {}
+        void store?.meta.put('role-guard', { ...current, ...patch }).catch(() => {})
+      } catch { /* marker is best-effort; the warning below is the primary alert */ }
+    }
+    if (typeof tools.guard !== 'function') {
+      logger.warn('supermemory: [ALERT] ctx.tools.guard unavailable; hub/branch runtime guard NOT installed (host limitation)')
+      markGuard({ roleGuardFailedAt: Date.now(), roleGuardVersion: ROLE_GUARD_VERSION, roleGuardError: 'ctx.tools.guard unavailable' })
+      return () => {}
+    }
+    try {
+      const dispose = tools.guard((exec) => roleGuardDecision(
+        store, exec.agent, exec.name, exec.arguments,
+        (message) => logger.warn(message),
+      ))
+      markGuard({ roleGuardInstalledAt: Date.now(), roleGuardVersion: ROLE_GUARD_VERSION })
+      return dispose
+    } catch (error) {
+      logger.warn('supermemory: [ALERT] ctx.tools.guard registration failed; hub/branch runtime guard NOT installed: '
+        + String(error).slice(0, 200))
+      markGuard({
+        roleGuardFailedAt: Date.now(),
+        roleGuardVersion: ROLE_GUARD_VERSION,
+        roleGuardError: String(error).slice(0, 300),
+      })
+      return () => {}
+    }
+  }, 'supermemory: role guard')
 
   // Per-step context: opening recall (P0) + in-request repeat cards (需求 A).
   // agent/pre-step is the only supported place to append model-visible, logged
@@ -474,7 +539,9 @@ export async function apply(ctx: Context, config: Config) {
   // R18 需求⑤: hub-role section (order 901, right after the memory rules). The
   // provider reads the initiating agent at assembly time — `currentInitiator()`
   // is the agent whose turn triggered this prompt — and contributes NOTHING
-  // when that agent is not a hub (branches, subagents, topic-set sessions).
+  // when that agent is not a hub. R35: "hub" is resolveRole's POSITIVE judgement
+  // (hub_sessions record / topic-set ROOT member / a session that dispatched),
+  // so a topic-set root DOES get the hub prompt; branches and subagents do not.
   ctx.effect(() => ctx.systemPrompt.section({
     name: 'supermemory:hub-role',
     order: 901,
@@ -507,14 +574,26 @@ export async function apply(ctx: Context, config: Config) {
     void migrateTruncatedTitles({ ctx, store, logger }).catch((error) => {
       logger.warn('supermemory: title migration failed: ' + String(error).slice(0, 160))
     })
-    // R31 需求①: one-time rename of hub sessions still carrying the legacy
-    // '新会话 · <id4>' title to 'SuperMemory 中枢 · <id4>'. Marker-guarded
-    // (meta row 'hub-titles'), reads the live host title so a session somebody
-    // renamed by hand is never overwritten, and leaves the marker unwritten
-    // while a candidate is still unattached so the next startup retries it.
-    void migrateHubSessionTitles({ ctx, store, logger }).catch((error) => {
-      logger.warn('supermemory: hub title migration failed: ' + String(error).slice(0, 160))
-    })
+    // R41 需求③: one-time cleanup of plugin session names — branded hubs
+    // ('SuperMemory 中枢 · <id4>') and pre-R31 hubs ('新会话 · <id4>') become
+    // DIRECT work descriptions (first user message, else the neutral 「新会话」);
+    // plugin branch host titles lose a known topic-set prefix and leading
+    // 「R31：」「任务：」「分支 · 」 tokens; durable dispatch/member titles are
+    // cleaned too. Marker-guarded (meta row 'hub-titles', version 2), reads the
+    // live title so a human rename is never overwritten, and leaves the marker
+    // unwritten while a candidate is still unattached so the next startup retries.
+    // Before a branded hub is renamed it receives its positive hub record — the
+    // R35 hub-record migration used that prefix as evidence, and the record is
+    // what role resolution actually reads. The record migration still runs after
+    // this one (it also covers hubs whose title never carried the prefix).
+    void migrateHubSessionTitles({ ctx, store, logger })
+      .catch((error) => {
+        logger.warn('supermemory: hub title migration failed: ' + String(error).slice(0, 160))
+      })
+      .then(() => migrateHubSessionRecords({ ctx, store, logger, workspaceKeys: knownWorkspaceKeys(store) }))
+      .catch((error) => {
+        logger.warn('supermemory: hub record migration failed: ' + String(error).slice(0, 160))
+      })
     // R23: one-time memory re-layout into the R22 collection model. Marker-
     // guarded (meta row `organize-<digest>`), only targets this plugin
     // repo's workspace, and every destructive step is SHA-guarded against

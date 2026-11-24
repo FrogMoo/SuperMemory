@@ -26,6 +26,17 @@
  * prefix is a static fact and is therefore also the cycle-free alternative to
  * importing `branchHandles` from dispatch.ts into this module.
  *
+ * R35 boundary — DISCOVERY VIEW, NOT ROLE AUTHORITY: this list answers "which
+ * top-level conversations of this workspace can I open from the panel rail?".
+ * Its rules (no parent, not a subagent, not a plugin branch, workspace of the
+ * session cwd) are a LAYOUT heuristic, not a role decision. The role decision
+ * lives only in src/role.ts (`resolveRole`: positive hub marks, branch wins); a
+ * session appearing here may resolve to `other`. Do NOT feed this list into
+ * guards, prompts or dispatch — and do not "fix" role gaps by narrowing or
+ * widening it (pre-R33 panel hubs are handled by the one-time
+ * hub-records migration, never by treating "no parent" as proof). The rail
+ * label/tooltip says so explicitly in the client dictionaries (side.authority).
+ *
  * Reads go through `ctx.sessionQuery` (get, not inject: optional seam). Titles
  * come from one `readTitleSnapshots` batch, so a workspace with 50 sessions is
  * one read, not 50.
@@ -45,6 +56,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
+import { describeSessionTitle } from './title.ts'
 import { isOpenDispatch } from './hub-branches.ts'
 
 /** One hub-session row of the panel's left rail. */
@@ -98,19 +110,28 @@ export const FORK_ID_PREFIX = 'fork-'
 export const HUB_ID_PREFIX = 'session-'
 
 /**
- * R31 需求①: the title a plugin-created hub session gets. The prefix names the
- * flavour (「SuperMemory 中枢」) so a hub is recognizable in the sidebar at a
- * glance; the 4-char id suffix keeps several hub sessions distinguishable
- * (the same reason the pre-R31 format carried one).
+ * R31 需求①: the historical flavour prefix of plugin hub titles
+ * (`SuperMemory 中枢 · <id4>`). R41 stopped GENERATING it — a session name is now
+ * a direct description of its work — but the constant stays because the one-time
+ * migrations still recognize those old rows (hub records + rename pass).
  */
 export const HUB_TITLE_PREFIX = 'SuperMemory 中枢'
 
 /** The pre-R31 hub title prefix ('新会话 · <id4>'); hub-title-migration renames it. */
 export const LEGACY_HUB_TITLE_PREFIX = '新会话'
 
-/** The title {@link createHubSession} gives a new hub session. */
-export function hubSessionTitle(sessionId: string): string {
-  return `${HUB_TITLE_PREFIX} · ${sessionId.slice(-4)}`
+/**
+ * R41 需求③: the title a plugin-created hub session gets — the first user
+ * message / work summary itself (markup stripped, descriptive lead-ins removed,
+ * 48-char ellipsis clip), or the neutral 「新会话」 when there is no content
+ * yet. No brand prefix and no id token: the sidebar reads as the work.
+ *
+ * @param _sessionId - kept in the signature for callers/tests; no longer used
+ *   for the title (an id suffix is not a description).
+ * @param firstMessage - opening message used as the work summary.
+ */
+export function hubSessionTitle(_sessionId: string, firstMessage = ''): string {
+  return describeSessionTitle(firstMessage)
 }
 
 /**
@@ -273,6 +294,10 @@ function branchStatsOf(store: Store | undefined, hubSessionId: string): { total:
 
 /**
  * List the hub sessions of one workspace, newest activity first.
+ *
+ * R35: despite the historical name/field (`origin: 'hub'`), this is a discovery
+ * list — see the module header ("DISCOVERY VIEW, NOT ROLE AUTHORITY"). Role
+ * authority is resolveRole only.
  *
  * @param ctx - host context (sessionQuery/sessions are read with `get`).
  * @param store - the plugin store (topic-set membership + workspace facts).

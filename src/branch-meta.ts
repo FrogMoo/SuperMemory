@@ -24,7 +24,7 @@
  */
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
-import { clipEllipsis, cleanTitleText, firstLine } from './title.ts'
+import { clipEllipsis, describeSessionTitle } from './title.ts'
 
 /**
  * Character budget of a branch title (the task's first line). 48 matches the
@@ -44,11 +44,12 @@ const ROUND_TOKEN = /(?:^|[^A-Za-z0-9])((?:R|r)\d{1,3}(?:-[A-Za-z]{1,3})?)/g
 
 /**
  * The explicit branch title for one dispatch: the task's first line, markup
- * stripped and ellipsis-clipped. Empty when the task carries no readable line
- * (the caller then keeps the member title / task excerpt).
+ * stripped, descriptive lead-ins (「R31：」「任务：」「分支 · 」…) removed, and
+ * ellipsis-clipped to {@link BRANCH_TITLE_MAX_CHARS}. When the task carries no
+ * readable line the neutral 「新会话」 fallback is returned.
  */
 export function branchTitleFor(task: string): string {
-  return clipEllipsis(firstLine(cleanTitleText(task)), BRANCH_TITLE_MAX_CHARS)
+  return describeSessionTitle(task, BRANCH_TITLE_MAX_CHARS)
 }
 
 /**

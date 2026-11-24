@@ -22,6 +22,13 @@ const { extractFacts } = await import('../src/extract.ts')
 const { runMemoryCollectionChecks } = await import('./memory-collections-smoke.mjs')
 // R23：记忆整理（集合重排/合并/清占位）的引擎断言（也可单独运行）。
 const { runMemoryOrganizeChecks } = await import('./memory-organize-smoke.mjs')
+// R32: hub/branch runtime guard + the shared dynamic card contract.
+const {
+  BRANCH_RELOAD_DENIED, NON_HUB_RELOAD_DENIED, roleGuardDecision,
+} = await import('../src/role-guard.ts')
+const {
+  cardMetaOf, cardSourceLabel, dispatchSource, relaySource,
+} = await import('../src/chat-card.ts')
 
 function table(seed = []) {
   const map = new Map(seed)
@@ -42,7 +49,12 @@ const WS_A = 'G:\\work\\alpha'
 const WS_B = 'G:\\work\\beta'
 const store = {
   topicsets: table([
-    ['ts-a', { workspaceKey: WS_A, title: 'A 话题', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }],
+    // R33: hub detection is POSITIVE. These root members are the durable marks
+    // the R19/R33 hub assertions rely on (an empty member list is no longer a hub).
+    ['ts-a', { workspaceKey: WS_A, title: 'A 话题', summary: '', keywords: [], status: 'active', members: [
+      { sessionId: 'session-root', kind: 'root', title: 'A 中枢', summary: '', status: 'live', modelOverridden: false, lastActiveAt: now },
+      { sessionId: 'session-hub1', kind: 'root', title: 'A 中枢二', summary: '', status: 'live', modelOverridden: false, lastActiveAt: now },
+    ], createdAt: now, updatedAt: now, lastActiveAt: now }],
     ['ts-b', { workspaceKey: WS_B, title: 'B 话题', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }],
   ]),
   memories: table([
@@ -197,6 +209,23 @@ ok('rankMembers ranks by task overlap')
     'new forces a fresh branch')
   assert.equal(branchCandidates(ts, '修构建', 'fork', new Set(), new Set()).forkParent.sessionId, 'branch-a',
     'fork names the ranked parent')
+  // R33 需求④: the production caller passes resolveRole's predicate; a topic-set
+  // ROOT member that resolves to HUB is never reused as a branch. A panel-created
+  // branch-* row that happens to carry root membership is still a branch.
+  const tsHub = {
+    title: '构建',
+    members: [
+      ...ts.members,
+      { sessionId: 'session-set-root', kind: 'root', title: '集中枢', summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now },
+      { sessionId: 'branch-panel-root', kind: 'root', title: '面板分支', summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now },
+    ],
+  }
+  const isHubMember = (id) => id === 'session-set-root' || id === 'session-conflict'
+  assert.deepEqual(
+    branchCandidates(tsHub, '修构建', 'auto', new Set(), new Set(), isHubMember).candidates.map((m) => m.sessionId),
+    ['branch-a', 'branch-b', 'branch-c', 'branch-panel-root'],
+    'a hub root member is excluded from the candidate pool; a branch-* root member is kept',
+  )
   assert.deepEqual([...busyBranches({ dispatches: table([
     ['d1', { branchSessionId: 'branch-a', status: 'dispatched' }],
     ['d2', { branchSessionId: 'branch-b', status: 'delivered' }],
@@ -389,6 +418,747 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.ok(kw.includes('本任务'), '切段后取到完整词: ' + kw.join(','))
   assert.ok(kw.length <= 24, '关键词总数受限')
   ok('R27-2 记忆整形：原子拆分（上限 5 / 去重 / 丢步骤日志 / 无模型不拆）+ 抽取净化（包装/命令行/疑问句/滑窗碎片）')
+}
+
+// 9. R33 需求①②④⑧⑨: role resolution + runtime guard + dynamic card contract.
+// R36 需求①②: the hub model is a WHITELIST (default deny) — the R33 blacklist
+// assertions below were rewritten, not dropped: the same 20 hands-on tools are
+// now "outside the whitelist", and an unknown/future tool is denied too.
+{
+  const { resolveRole, backfillHubRecords } = await import('../src/role.ts')
+  const {
+    GUARD_ERROR_NAME, ROLE_GUARD_VERSION,
+  } = await import('../src/role-guard.ts')
+  const {
+    DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, HOST_SESSION_TOOLS, HUB_CATALOG_GROUPS, HUB_EXECUTION_TOOLS, LOCKED_HUB_TOOLS,
+    buildFallbackHubCatalog, buildHubCatalog, cleanStaleHubPolicy,
+    isHubAllowedTool, readHubPolicy, resetHubPolicy, writeHubPolicy,
+  } = await import('../src/hub-policy.ts')
+  const { readFileSync } = await import('node:fs')
+
+  const memberRow = (sessionId, kind, title = sessionId) => ({
+    sessionId, kind, title, summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now,
+  })
+  const roleStore = {
+    hubs: table([['session-hub-record', {
+      workspaceKey: WS_A, sessionId: 'session-hub-record', title: '记录中枢', source: 'panel', createdAt: now, updatedAt: now,
+    }]]),
+    topicsets: table([
+      ['ts-role', {
+        workspaceKey: WS_A, title: '角色', summary: '', keywords: [], status: 'active',
+        members: [
+          memberRow('session-root', 'root'),
+          memberRow('session-conflict', 'root'),
+          memberRow('sess-fork-member', 'fork'),
+        ],
+        createdAt: now, updatedAt: now, lastActiveAt: now,
+      }],
+      ['ts-foreign', {
+        workspaceKey: WS_B, title: '外部', summary: '', keywords: [], status: 'active',
+        members: [memberRow('session-foreign-root', 'root')],
+        createdAt: now, updatedAt: now, lastActiveAt: now,
+      }],
+    ]),
+    dispatches: table([
+      ['dsp-role', {
+        topicSetId: 'ts-role', branchSessionId: 'session-conflict', task: '冲突会话',
+        hubSessionId: 'session-hub-dispatch', startSeq: 0, status: 'delivered',
+        capability: '', title: '', tags: [], createdAt: now, updatedAt: now,
+      }],
+    ]),
+  }
+  const agent = (id, cwd = WS_A, extra = {}) => ({ id, session: { id, header: { cwd, ...extra } } })
+
+  // ---- positive hub marks only; branch facts win; workspace-scoped ----
+  assert.equal(resolveRole(roleStore, agent('session-hub-record')).role, 'hub', 'hub record is a positive mark')
+  assert.equal(resolveRole(roleStore, agent('session-hub-record')).reason, 'hub-record')
+  assert.equal(resolveRole(roleStore, agent('session-root')).role, 'hub', 'topic-set root member is a hub')
+  assert.equal(resolveRole(roleStore, agent('session-root')).reason, 'topic-set-root')
+  assert.equal(resolveRole(roleStore, agent('session-hub-dispatch')).role, 'hub', 'dispatching is a positive hub act')
+  assert.equal(resolveRole(roleStore, agent('session-hub-dispatch')).reason, 'dispatch-hub')
+  assert.equal(resolveRole(roleStore, agent('branch-abcd1234')).role, 'branch', 'branch-* id is a branch')
+  assert.equal(resolveRole(roleStore, agent('fork-abcd1234')).reason, 'plugin-branch-id')
+  assert.equal(resolveRole(roleStore, agent('sess-fork-member')).reason, 'fork-member', 'fork member is a branch')
+  assert.equal(resolveRole(roleStore, agent('session-conflict')).role, 'branch',
+    'a session with a branch fact and a hub mark is a BRANCH (branch priority)')
+  assert.equal(resolveRole(roleStore, agent('session-plain')).role, 'other',
+    'an ordinary top-level session is NOT a hub (the R32 over-broad inference)')
+  assert.equal(resolveRole(roleStore, agent('session-plain')).reason, 'no-positive-marker')
+  // R35: no second branch authority may be exported again. route.ts used to own
+  // its own prefix+fork rule (missing dispatches.branchSessionId); role-guard
+  // also exported a projection. Both now go through resolveRole only.
+  const roleGuardModule = await import('../src/role-guard.ts')
+  assert.equal(Object.prototype.hasOwnProperty.call(roleGuardModule, 'isBranchSession'), false,
+    'role-guard must not export a second isBranchSession authority (use resolveRole)')
+  assert.equal(resolveRole(roleStore, agent('session-foreign-root', WS_A)).role, 'other',
+    'a root mark from another workspace does not make a hub here')
+  assert.equal(resolveRole(roleStore, agent('session-foreign-root', WS_A)).reason, 'workspace-mismatch')
+  assert.equal(resolveRole(roleStore, agent('session-foreign-root', WS_B)).role, 'hub',
+    'the same root member IS a hub inside its own workspace')
+  assert.equal(resolveRole(roleStore, agent('session-sub', WS_A, { origin: 'subagent' })).reason, 'subagent-child')
+  assert.equal(resolveRole(undefined, agent('session-hub-record')).role, 'other', 'no store = no role')
+  // A table accessor that throws (a closing/reloading store) must not escape
+  // the resolution: no session can be classified and the guard must stay total.
+  const closedStore = Object.defineProperty({ hubs: table() }, 'topicsets', {
+    get() { throw new Error('store closed') },
+  })
+  const closedAgent = agent('sess-closed')
+  assert.equal(resolveRole(closedStore, closedAgent).role, 'other',
+    'a closing store degrades to OTHER instead of throwing through the guard')
+  assert.equal(resolveRole(closedStore, closedAgent).reason, 'resolution-error')
+  ok('R33-2 角色判定：正标记（hub 记录/root 成员/派发中枢）+ 工作区校验 + branch 优先 + 普通顶层不再误判')
+
+  // Positive hub records can be seeded from durable evidence written before R33.
+  const backfillStore = {
+    hubs: table(),
+    topicsets: roleStore.topicsets,
+    dispatches: roleStore.dispatches,
+  }
+  const seeded = await backfillHubRecords(backfillStore)
+  assert.equal(seeded, 3, 'root members + dispatch hubs are seeded once')
+  assert.equal(backfillStore.hubs.get('session-root').source, 'topicset-root')
+  assert.equal(backfillStore.hubs.get('session-hub-dispatch').source, 'dispatch')
+  assert.equal(await backfillHubRecords(backfillStore), 0, 'the backfill is idempotent')
+  ok('R33-2b hub 记录回填：root 成员 + 派发中枢幂等落库')
+
+  // R35: 一次性补记 R33 之前由面板创建、既未派发也非话题集 root 的中枢。
+  // 只接受窄证据：session-* 顶层 id + 标题前缀 SuperMemory 中枢 + 本工作区；
+  // 已有记录/分支事实/普通会话/外部工作区一律不写，标记防重跑。
+  const {
+    migrateHubSessionRecords, knownWorkspaceKeys, HUB_RECORDS_MIGRATION_VERSION,
+  } = await import('../src/hub-records-migration.ts')
+  const hubTitle = (suffix) => 'SuperMemory 中枢 · ' + suffix
+  const titles = new Map([
+    ['session-title-hub', hubTitle('thub')],
+    ['session-title-plain', '普通用户会话'],
+    ['session-title-branch', hubTitle('brch')],
+    ['session-title-foreign', hubTitle('frgn')],
+    ['session-title-parented', hubTitle('prnt')],
+    ['session-title-sub', hubTitle('subs')],
+    ['session-title-already', hubTitle('alrd')],
+  ])
+  const records = [
+    { header: { id: 'session-title-hub', cwd: WS_A } },
+    { header: { id: 'session-title-plain', cwd: WS_A } },
+    { header: { id: 'session-title-branch', cwd: WS_A } },
+    { header: { id: 'session-title-foreign', cwd: WS_B } },
+    { header: { id: 'session-title-parented', cwd: WS_A, parentSession: 'session-parent' } },
+    { header: { id: 'session-title-sub', cwd: WS_A, origin: 'subagent' } },
+    { header: { id: 'session-title-already', cwd: WS_A } },
+    { header: { id: 'branch-not-a-session', cwd: WS_A } },
+    { header: { id: 'plain-id', cwd: WS_A } },
+  ]
+  const seam = {
+    listSessions: async () => records,
+    readTitleSnapshots: async (ids) => ids.map((id) => ({
+      sessionId: id, status: titles.has(id) ? 'fulfilled' : 'rejected',
+      value: titles.has(id) ? { title: { title: titles.get(id) } } : undefined,
+    })),
+  }
+  const migrationCtx = { get: (name) => (name === 'sessionQuery' ? seam : undefined) }
+  const migrationStore = {
+    hubs: table([['session-title-already', {
+      workspaceKey: WS_A, sessionId: 'session-title-already', title: hubTitle('alrd'),
+      source: 'panel', createdAt: now, updatedAt: now,
+    }]]),
+    meta: table(),
+    topicsets: table(),
+    dispatches: table([['dsp-mig', {
+      branchSessionId: 'session-title-branch', task: '迁移用分支', hubSessionId: 'session-hub-record',
+      startSeq: 0, status: 'delivered', capability: '', title: '', tags: [], createdAt: now, updatedAt: now,
+    }]]),
+  }
+  const quietMigrationLogger = { warn: () => {}, info: () => {} }
+  const migrationDeps = { ctx: migrationCtx, store: migrationStore, logger: quietMigrationLogger, workspaceKeys: [WS_A] }
+
+  const migrationDry = await migrateHubSessionRecords(migrationDeps, { dryRun: true, ignoreMarker: true })
+  assert.equal(migrationDry.status, 'planned')
+  assert.equal(migrationDry.considered, 4, 'only session-* top-level sessions of this workspace are considered')
+  assert.deepEqual(migrationDry.plan.map((item) => item.sessionId), ['session-title-hub'],
+    'exactly the unrecorded hub-titled session is planned')
+  assert.equal(migrationDry.marked, 0)
+  assert.equal(migrationStore.hubs.get('session-title-hub'), undefined, 'dry-run writes nothing')
+
+  const migrationApplied = await migrateHubSessionRecords(migrationDeps, { ignoreMarker: true })
+  assert.equal(migrationApplied.marked, 1)
+  assert.equal(migrationStore.hubs.get('session-title-hub').source, 'title-migration')
+  assert.equal(migrationStore.hubs.get('session-title-hub').workspaceKey, WS_A)
+  assert.equal(migrationStore.hubs.get('session-title-plain'), undefined, 'a plain conversation is never marked')
+  assert.equal(migrationStore.hubs.get('session-title-foreign'), undefined, 'another workspace is never marked')
+  assert.equal(migrationStore.hubs.get('session-title-parented'), undefined, 'a parented child is never marked')
+  assert.equal(migrationStore.hubs.get('session-title-sub'), undefined, 'a subagent is never marked')
+  assert.deepEqual(
+    migrationApplied.skipped.map((row) => row.sessionId + ':' + row.reason).sort(),
+    ['session-title-already:already-recorded', 'session-title-branch:branch-fact'],
+    'existing records and branch facts are skipped, not overwritten',
+  )
+  assert.equal(migrationApplied.skippedNonHub, 1, 'the ordinary title is counted as a non-hub')
+  assert.equal(migrationStore.meta.get('hub-records')?.hubRecordsMigrationVersion, HUB_RECORDS_MIGRATION_VERSION)
+  assert.equal(migrationStore.meta.get('hub-records')?.hubRecordsMigratedAt > 0, true)
+
+  const migrationAgain = await migrateHubSessionRecords(migrationDeps, { ignoreMarker: true })
+  assert.equal(migrationAgain.marked, 0, 'the pass is idempotent (records already exist)')
+  assert.deepEqual(
+    migrationAgain.skipped.filter((row) => row.sessionId === 'session-title-hub').map((row) => row.reason),
+    ['already-recorded'],
+  )
+  assert.equal((await migrateHubSessionRecords(migrationDeps)).status, 'already-done', 'the marker short-circuits a restart')
+
+  // An unreadable title is UNKNOWN, not "not a hub": the marker stays unwritten
+  // so the next startup retries instead of losing the session forever.
+  const partialStore = { hubs: table(), meta: table(), topicsets: table(), dispatches: table() }
+  const partialSeam = {
+    listSessions: async () => [{ header: { id: 'session-title-unk', cwd: WS_A } }],
+    readTitleSnapshots: async () => [],
+  }
+  const partial = await migrateHubSessionRecords({
+    ctx: { get: (name) => (name === 'sessionQuery' ? partialSeam : undefined) },
+    store: partialStore, logger: quietMigrationLogger, workspaceKeys: [WS_A],
+  }, { ignoreMarker: true })
+  assert.equal(partial.marked, 0)
+  assert.equal(partial.pending, 1)
+  assert.equal(partialStore.meta.get('hub-records'), undefined, 'an unreadable title keeps the marker open')
+
+  // A BLANK (fulfilled) title is a known non-hub, not an unknown: it must not
+  // keep the marker open forever.
+  const blankStore = { hubs: table(), meta: table(), topicsets: table(), dispatches: table() }
+  const blankSeam = {
+    listSessions: async () => [{ header: { id: 'session-title-blank', cwd: WS_A } }],
+    readTitleSnapshots: async (ids) => ids.map((id) => ({
+      sessionId: id, status: 'fulfilled', value: { title: { title: '   ' } },
+    })),
+  }
+  const blankRun = await migrateHubSessionRecords({
+    ctx: { get: (name) => (name === 'sessionQuery' ? blankSeam : undefined) },
+    store: blankStore, logger: quietMigrationLogger, workspaceKeys: [WS_A],
+  }, { ignoreMarker: true })
+  assert.equal(blankRun.pending, 0, 'a blank title is known, not unreadable')
+  assert.equal(blankRun.skippedNonHub, 1)
+  assert.equal(blankStore.meta.get('hub-records')?.hubRecordsMigrationVersion, HUB_RECORDS_MIGRATION_VERSION,
+    'a blank title lets the pass finish and write the marker')
+
+  // The scope list comes from the store's own workspace-bearing tables, never
+  // from a guessed cwd; 'unknown' is not a workspace.
+  const knownKeys = knownWorkspaceKeys({
+    topicsets: table([['t-known', { workspaceKey: WS_A }]]),
+    hubs: table([['h-unknown', { workspaceKey: 'unknown' }]]),
+  })
+  assert.ok(knownKeys.includes(WS_A))
+  assert.ok(!knownKeys.includes('unknown'))
+  ok('R35-2 hub 记录迁移：窄证据（session-* + 标题前缀 + 本工作区）+ 分支/已记录/普通/外部不误标 + 幂等 + 未读标题留待重试')
+
+  // ---- the runtime guard: complete denial list, total decisions, codes ----
+  const hubAgent = agent('session-hub-record')
+  const rootHubAgent = agent('session-root')
+  const branchAgent = agent('branch-abcd1234')
+  const plainAgent = agent('session-plain')
+  const subagent = agent('session-sub', WS_A, { origin: 'subagent' })
+  const reasonOf = (decision) => decision?.reason
+  const codeOf = (decision) => decision?.info?.code
+
+  assert.equal(codeOf(roleGuardDecision(roleStore, branchAgent, 'plugin_manager', { action: 'set_plugin' })), 'BRANCH_RELOAD_DENIED')
+  assert.equal(reasonOf(roleGuardDecision(roleStore, branchAgent, 'plugin_manager', { action: 'set_plugin' })), BRANCH_RELOAD_DENIED)
+  assert.equal(codeOf(roleGuardDecision(roleStore, branchAgent, 'plugin_manager', { action: 'set_bundle' })), 'BRANCH_RELOAD_DENIED')
+  assert.equal(roleGuardDecision(roleStore, branchAgent, 'plugin_manager', { action: 'list_plugins' }), undefined,
+    'branch may still LIST plugins')
+  assert.equal(roleGuardDecision(roleStore, hubAgent, 'plugin_manager', { action: 'set_plugin' }), undefined,
+    'a positively marked hub may reload')
+  assert.equal(roleGuardDecision(roleStore, rootHubAgent, 'plugin_manager', { action: 'set_plugin' }), undefined,
+    'a topic-set root hub may reload')
+  assert.equal(codeOf(roleGuardDecision(roleStore, subagent, 'plugin_manager', { action: 'set_plugin' })), 'NON_HUB_RELOAD_DENIED')
+  assert.equal(codeOf(roleGuardDecision(roleStore, plainAgent, 'plugin_manager', { action: 'set_plugin' })), 'NON_HUB_RELOAD_DENIED',
+    'an ordinary session is not a hub, so it cannot reload (fail-closed)')
+  // Missing/unreadable action is a mutation: fail-closed for every non-hub.
+  assert.equal(codeOf(roleGuardDecision(roleStore, branchAgent, 'plugin_manager', {})), 'BRANCH_RELOAD_DENIED',
+    'missing action on a branch is still denied (fail-closed)')
+  assert.equal(codeOf(roleGuardDecision(roleStore, plainAgent, 'plugin_manager', {})), 'NON_HUB_RELOAD_DENIED',
+    'missing action on an ordinary session is still denied (fail-closed)')
+  assert.equal(roleGuardDecision(roleStore, hubAgent, 'plugin_manager', {}), undefined,
+    'a hub keeps the reload path; the host tool itself validates the action')
+  assert.equal(roleGuardDecision(undefined, branchAgent, 'plugin_manager', { action: 'set_plugin' }), undefined,
+    'before the store opens the guard stays inert (feature disabled, not a global deny)')
+
+  // ---- R36 需求①: whitelist model (default deny) ----
+  // The default whitelist is the R33 allowed set; every hands-on tool that used
+  // to be blacklisted is now simply OUTSIDE it, and an unknown/future tool is
+  // denied by the same rule.
+  const ALLOWED_DEFAULT = [
+    'memory_dispatch', 'memory_questions', 'memory_resume', 'memory_recall', 'memory_remember', 'memory_history',
+    'memory_topicsets', 'memory_new_topicset', 'memory_export', 'memory_scan', 'memory_set_model', 'memory_toolize',
+    'ask_user_question', 'send_message', 'wait_agent', 'list_agents', 'read', 'glob', 'grep',
+    'skill', 'todo_write', 'present', 'run_code', 'plugin_manager',
+  ]
+  assert.equal(DEFAULT_HUB_TOOLS.length, ALLOWED_DEFAULT.length,
+    'the default whitelist has exactly the documented members (adding/removing one must fail this line)')
+  for (const name of ALLOWED_DEFAULT) {
+    assert.ok(DEFAULT_HUB_TOOLS.includes(name), 'default whitelist must keep: ' + name)
+  }
+  assert.deepEqual([...DEFAULT_HUB_PREFIXES], ['schedule_'], 'the schedule family is the default prefix entry')
+  assert.equal(LOCKED_HUB_TOOLS.length, 6, 'six core locked entries')
+  for (const name of LOCKED_HUB_TOOLS) {
+    assert.ok(DEFAULT_HUB_TOOLS.includes(name), 'a locked entry is on the default whitelist: ' + name)
+  }
+
+  // Whitelist predicate: exact names, prefix entries, locked entries.
+  const defaultPolicy = { tools: [...DEFAULT_HUB_TOOLS], prefixes: [...DEFAULT_HUB_PREFIXES] }
+  assert.equal(isHubAllowedTool('memory_dispatch', defaultPolicy), true)
+  assert.equal(isHubAllowedTool('schedule_create', defaultPolicy), true, 'a prefix entry matches')
+  assert.equal(isHubAllowedTool('schedule_', defaultPolicy), true)
+  assert.equal(isHubAllowedTool('bash', defaultPolicy), false, 'a hands-on tool is outside the whitelist')
+  assert.equal(isHubAllowedTool('sm_composite_git_sync_supermemory', defaultPolicy), false,
+    'a capability/composite tool is outside the whitelist (no prefix entry)')
+  assert.equal(isHubAllowedTool('brand_new_future_tool', defaultPolicy), false,
+    'an unknown/future tool is denied by default (the R36 core requirement)')
+  assert.equal(isHubAllowedTool('', defaultPolicy), false, 'an empty name is never allowed')
+
+  // The 20 R33 hands-on tools: denied for a hub, still executable for everyone else.
+  for (const name of HUB_EXECUTION_TOOLS) {
+    const decision = roleGuardDecision(roleStore, hubAgent, name, {})
+    assert.equal(codeOf(decision), 'HUB_TOOL_NOT_IN_ALLOWLIST', 'a hub is denied (not whitelisted): ' + name)
+    assert.ok(reasonOf(decision).includes('不在中枢白名单中') && reasonOf(decision).includes('中枢权限'),
+      'the denial names the panel tab that can enable it: ' + name)
+    assert.equal(decision.info.name, GUARD_ERROR_NAME)
+    assert.equal(roleGuardDecision(roleStore, branchAgent, name, {}), undefined, 'a branch still executes: ' + name)
+    assert.equal(roleGuardDecision(roleStore, plainAgent, name, {}), undefined, 'an ordinary session still executes: ' + name)
+  }
+  // Unknown/future tool: denied for a hub, allowed for other roles.
+  assert.equal(codeOf(roleGuardDecision(roleStore, hubAgent, 'brand_new_future_tool', {})), 'HUB_TOOL_NOT_IN_ALLOWLIST',
+    'a hub cannot call a tool nobody whitelisted')
+  assert.equal(roleGuardDecision(roleStore, branchAgent, 'brand_new_future_tool', {}), undefined,
+    'the whitelist restricts HUBS only; a branch is governed by its capability profile')
+
+  // Default whitelist entries pass for a hub.
+  for (const name of ALLOWED_DEFAULT) {
+    assert.equal(roleGuardDecision(roleStore, hubAgent, name, {}), undefined, 'hub keeps the whitelisted tool: ' + name)
+  }
+  assert.equal(roleGuardDecision(roleStore, hubAgent, 'schedule_create', {}), undefined,
+    'a prefix entry passes for a hub')
+
+  // plugin_manager: allowed by default, denied once the user removes it.
+  assert.equal(roleGuardDecision(roleStore, hubAgent, 'plugin_manager', { action: 'set_plugin' }), undefined,
+    'plugin_manager is on the default whitelist, so a hub may still reload')
+  const noPluginManager = { tools: ALLOWED_DEFAULT.filter((name) => name !== 'plugin_manager'), prefixes: ['schedule_'] }
+  assert.equal(isHubAllowedTool('plugin_manager', noPluginManager), false, 'removing plugin_manager denies it')
+  const policyStore = {
+    ...roleStore,
+    hubPolicies: table([['hub-policy-ws-a', {
+      workspaceKey: WS_A, tools: noPluginManager.tools, prefixes: noPluginManager.prefixes, updatedAt: now,
+    }]]),
+  }
+  assert.equal(codeOf(roleGuardDecision(policyStore, hubAgent, 'plugin_manager', { action: 'set_plugin' })),
+    'HUB_TOOL_NOT_IN_ALLOWLIST', 'a hub that switched plugin_manager off cannot reload either')
+  assert.equal(roleGuardDecision(policyStore, hubAgent, 'memory_dispatch', {}), undefined,
+    'the custom policy keeps the dispatch link')
+
+  // Locked entries survive a hostile stored row: a row that omits them still
+  // allows them, so a hub can never lock itself out of dispatch/relay.
+  const hostile = { tools: ['read'], prefixes: [] }
+  for (const name of LOCKED_HUB_TOOLS) {
+    assert.equal(isHubAllowedTool(name, hostile), true, 'locked entry passes even when the stored row omits it: ' + name)
+  }
+  // ...and the writer merges the locked entries back in before persisting.
+  const lockStore = { ...roleStore, hubPolicies: table() }
+  await writeHubPolicy(lockStore, WS_A, ['read'], [], now)
+  const lockRow = [...lockStore.hubPolicies.entries()][0][1]
+  for (const name of LOCKED_HUB_TOOLS) {
+    assert.ok(lockRow.tools.includes(name), 'writeHubPolicy keeps the locked entry: ' + name)
+  }
+
+  // Persisted policy round-trip: write → read (stored) → reset → default.
+  const roundStore = { ...roleStore, hubPolicies: table() }
+  const roundWarnings = []
+  assert.equal(readHubPolicy(roundStore, WS_A, (message) => roundWarnings.push(message)).source, 'default',
+    'a workspace with no row reads the built-in default')
+  assert.equal(roundWarnings.length, 0, 'a missing row is normal, not a warning')
+  await writeHubPolicy(roundStore, WS_A, ['read', 'glob', 'bash'], ['schedule_'], now)
+  const stored = readHubPolicy(roundStore, WS_A)
+  assert.equal(stored.source, 'stored')
+  assert.deepEqual(stored.tools, ['read', 'glob', 'bash', ...LOCKED_HUB_TOOLS], 'the stored list is read back with the locked entries merged')
+  assert.equal(isHubAllowedTool('bash', stored), true, 'a user-enabled hands-on tool passes for a hub')
+  assert.equal(isHubAllowedTool('write', stored), false, 'a tool outside the stored list is still denied')
+  assert.equal(isHubAllowedTool('brand_new_future_tool', stored), false, 'unknown tools stay denied under a custom policy')
+  assert.equal(codeOf(roleGuardDecision(roundStore, hubAgent, 'bash', {})), undefined,
+    'the guard honours the stored policy (bash enabled by the user)')
+  assert.equal(codeOf(roleGuardDecision(roundStore, hubAgent, 'write', {})), 'HUB_TOOL_NOT_IN_ALLOWLIST',
+    'the guard denies a tool the stored policy does not list')
+  assert.equal(readHubPolicy(roundStore, WS_B).source, 'default', 'another workspace keeps its own default')
+  assert.equal(await resetHubPolicy(roundStore, WS_A), true, 'reset drops the stored row')
+  assert.equal(readHubPolicy(roundStore, WS_A).source, 'default', 'after reset the default applies again')
+  assert.equal(await resetHubPolicy(roundStore, WS_A), false, 'resetting twice is a no-op')
+
+  // Degradation: an unreadable table falls back to the default WITH a warning —
+  // neither fail-open (everything allowed) nor fail-closed (dispatch broken).
+  const brokenWarnings = []
+  const brokenStore = {
+    ...roleStore,
+    hubPolicies: {
+      entries: () => { throw new Error('simulated read failure') },
+    },
+  }
+  const broken = readHubPolicy(brokenStore, WS_A, (message) => brokenWarnings.push(message))
+  assert.equal(broken.source, 'default', 'a read failure degrades to the built-in default')
+  assert.ok(brokenWarnings.length === 1 && brokenWarnings[0].includes('hub policy read failed'),
+    'the degradation is reported, never silent')
+  assert.equal(isHubAllowedTool('memory_dispatch', broken), true, 'the default keeps the dispatch link alive')
+  assert.equal(isHubAllowedTool('bash', broken), false, 'the default does NOT fail open')
+  assert.equal(codeOf(roleGuardDecision(brokenStore, hubAgent, 'brand_new_future_tool', {},
+    (message) => brokenWarnings.push(message))), 'HUB_TOOL_NOT_IN_ALLOWLIST',
+    'a degraded read still denies unknown tools')
+  // A row with both lists empty is treated as absent (default), with a warning.
+  const emptyWarnings = []
+  const emptyStore = {
+    ...roleStore,
+    hubPolicies: table([['hub-policy-empty', { workspaceKey: WS_A, tools: [], prefixes: [], updatedAt: now }]]),
+  }
+  assert.equal(readHubPolicy(emptyStore, WS_A, (message) => emptyWarnings.push(message)).source, 'default')
+  assert.ok(emptyWarnings.length === 1 && emptyWarnings[0].includes('empty'))
+
+  // R39 catalog: the DEFAULT path is the DYNAMIC runtime list grouped by source.
+  // A fake runtime injects two different sources, one unknown tool, and one
+  // whitelisted-but-gone entry; grouping, default-deny, refresh and cleanup are
+  // asserted here, and the built-in list is checked only as the FALLBACK.
+  const catalogNow = 1_700_000_000_000
+  const runtimeDefs = [
+    { name: 'memory_recall', description: 'Recall conclusions\nsecond line' },
+    { name: 'read', description: 'Read a file' },
+    { name: 'mcp__rea__analyze_function', description: 'Analyze a native function' },
+    { name: 'brand_new_tool', description: 'A tool nobody reviewed' },
+    { name: 'bash', description: 'Run a shell command' },
+  ]
+  const allow = ['memory_recall', 'read', 'retired_tool', ...LOCKED_HUB_TOOLS]
+  const dynamic = buildHubCatalog({
+    tools: runtimeDefs,
+    allowTools: allow,
+    prefixes: ['schedule_', 'mcp__gone__'],
+    now: catalogNow,
+  })
+  assert.equal(dynamic.meta.mode, 'dynamic', 'the default catalog path is dynamic')
+  assert.equal(dynamic.meta.generatedAt, catalogNow)
+  const syntheticSeen = HOST_SESSION_TOOLS.filter((name) => !runtimeDefs.some((tool) => tool.name === name))
+  assert.equal(dynamic.meta.toolCount, runtimeDefs.length + syntheticSeen.length,
+    'the tool count includes both real definitions and synthesized host/session entries')
+  assert.equal(dynamic.meta.syntheticCount, syntheticSeen.length,
+    'the synthetic count is reported separately so the panel can label it')
+  assert.deepEqual(dynamic.groups.map((group) => group.id), [
+    HUB_CATALOG_GROUPS.supermemory,
+    HUB_CATALOG_GROUPS.mcpPrefix + 'rea',
+    HUB_CATALOG_GROUPS.hostSession,
+    HUB_CATALOG_GROUPS.host,
+    HUB_CATALOG_GROUPS.stale,
+  ], 'runtime tools are grouped by source, with the synthetic host-session group before host and the stale bucket last')
+  const groupOf = (id) => dynamic.groups.find((group) => group.id === id)
+  const itemOf = (id, name) => groupOf(id)?.items.find((entry) => entry.name === name)
+  assert.equal(itemOf(HUB_CATALOG_GROUPS.supermemory, 'memory_recall')?.enabled, true)
+  assert.equal(itemOf(HUB_CATALOG_GROUPS.supermemory, 'memory_recall')?.description, 'Recall conclusions',
+    'the item carries only the first line of the description')
+  assert.equal(groupOf(HUB_CATALOG_GROUPS.supermemory)?.inferred, true, 'memory_* attribution is labelled as inference')
+  assert.equal(groupOf(HUB_CATALOG_GROUPS.mcpPrefix + 'rea')?.label, 'MCP · rea')
+  assert.equal(groupOf(HUB_CATALOG_GROUPS.mcpPrefix + 'rea')?.inferred, true)
+  const unknown = itemOf(HUB_CATALOG_GROUPS.host, 'brand_new_tool')
+  assert.ok(unknown, 'an unknown runtime tool is visible, not dropped')
+  assert.equal(unknown.enabled, false, 'an unknown tool is denied by default')
+  assert.equal(unknown.locked, undefined, 'an unknown tool is not locked, so the user can check it')
+  assert.equal(unknown.stale, undefined, 'a present-but-unreviewed tool is not stale')
+  assert.equal(isHubAllowedTool('brand_new_tool', { tools: allow, prefixes: ['schedule_'] }), false,
+    'the whitelist still denies it until the user checks it')
+  const afterCheck = buildHubCatalog({
+    tools: runtimeDefs,
+    allowTools: [...allow, 'brand_new_tool'],
+    prefixes: ['schedule_'],
+    now: catalogNow,
+  })
+  assert.equal(afterCheck.groups.flatMap((group) => group.items).find((entry) => entry.name === 'brand_new_tool')?.enabled, true,
+    'checking an unknown tool whitelists it on the next generation')
+  assert.equal(itemOf(HUB_CATALOG_GROUPS.host, 'bash')?.risk, true, 'hands-on tools keep the risk note')
+  const synthetic = itemOf(HUB_CATALOG_GROUPS.hostSession, 'run_code')
+  assert.equal(synthetic?.locked, true, 'the PTC transport is synthesized, locked, and stays out of the stale group')
+  assert.equal(synthetic?.synthetic, true, 'the run_code entry is labelled as synthetic')
+  assert.equal(synthetic?.available, true, 'a synthetic host/session entry is always available')
+  assert.equal(groupOf(HUB_CATALOG_GROUPS.hostSession)?.synthetic, true, 'the host-session group carries the synthetic marker')
+  const flatNames = dynamic.groups.flatMap((group) => group.items.map((entry) => entry.name))
+  assert.equal(new Set(flatNames).size, flatNames.length, 'every catalog name appears exactly once')
+  const staleNames = dynamic.stale.map((entry) => entry.name)
+  for (const name of allow) {
+    if (runtimeDefs.some((tool) => tool.name === name) || HOST_SESSION_TOOLS.includes(name)) continue
+    assert.ok(staleNames.includes(name), 'a whitelisted name absent at runtime is listed, never silently dropped: ' + name)
+  }
+  assert.ok(staleNames.includes('mcp__gone__'), 'a whitelisted prefix absent at runtime is listed')
+  assert.equal(staleNames.includes('schedule_'), false,
+    'the schedule_ prefix matches the synthetic schedule tools, so it is not stale')
+  const schedulePrefix = dynamic.groups.flatMap((group) => group.items).find((entry) => entry.prefix === true && entry.name === 'schedule_')
+  assert.equal(schedulePrefix?.source, HUB_CATALOG_GROUPS.hostSession,
+    'the schedule_ rule renders inside the host-session group of the tools it matches')
+  assert.equal(dynamic.stale.find((entry) => entry.name === 'retired_tool')?.enabled, true)
+  assert.equal(dynamic.stale.find((entry) => entry.name === 'retired_tool')?.available, false)
+  assert.equal(dynamic.stale.find((entry) => entry.name === 'mcp__gone__')?.prefix, true,
+    'a prefix that matches nothing is stale too')
+  for (const name of LOCKED_HUB_TOOLS) {
+    const listed = dynamic.groups.flatMap((group) => group.items).find((entry) => entry.name === name)
+    if (runtimeDefs.some((tool) => tool.name === name) || HOST_SESSION_TOOLS.includes(name)) {
+      assert.ok(listed && listed.stale !== true, 'a present or synthetic locked tool is not stale: ' + name)
+      continue
+    }
+    // The locked tools the fake runtime omits and no synthetic list covers are stale — and still allowed.
+    assert.ok(dynamic.stale.some((entry) => entry.name === name && entry.locked === true),
+      'a missing locked tool is reported as stale (and still allowed): ' + name)
+  }
+
+  // Refresh: the next generation sees a newly registered tool; the real
+  // definition wins over its synthetic placeholder, and the timestamp moves.
+  const refreshed = buildHubCatalog({
+    tools: [...runtimeDefs, { name: 'schedule_create', description: 'Create a schedule' }],
+    allowTools: allow,
+    prefixes: ['schedule_', 'mcp__gone__'],
+    now: catalogNow + 1000,
+  })
+  const scheduleGroup = refreshed.groups.find((group) => group.id === HUB_CATALOG_GROUPS.schedule)
+  assert.ok(scheduleGroup, 'a newly registered tool creates its own source group on the next generation')
+  assert.ok(scheduleGroup.items.some((entry) => entry.name === 'schedule_create' && entry.enabled === true),
+    'the schedule_ prefix enables the newly added tool')
+  const realSchedule = scheduleGroup.items.find((entry) => entry.name === 'schedule_create')
+  assert.equal(realSchedule?.synthetic, undefined, 'a real definition replaces the synthetic placeholder')
+  assert.ok(scheduleGroup.items.some((entry) => entry.prefix === true && entry.name === 'schedule_'))
+  assert.equal(refreshed.stale.some((entry) => entry.name === 'schedule_'), false,
+    'the schedule_ prefix is never stale while synthetic schedule tools exist')
+  assert.equal(refreshed.stale.some((entry) => entry.name === 'retired_tool'), true)
+  assert.equal(refreshed.meta.generatedAt, catalogNow + 1000, 'the refresh timestamp advances')
+
+  // Declared source: a definition that carries one is NOT labelled as inference.
+  // This is future-proofing; the current host contract has no such field.
+  const declared = buildHubCatalog({
+    tools: [{ name: 'x_tool', description: 'x', source: 'Acme 插件' }],
+    allowTools: [],
+    prefixes: [],
+    now: catalogNow,
+  })
+  assert.equal(declared.groups[0].id, HUB_CATALOG_GROUPS.declaredPrefix + 'acme')
+  assert.equal(declared.groups[0].inferred, false, 'a declared source is not marked as inference')
+  assert.equal(declared.meta.anyDeclaredSource, true)
+
+  // Cleanup: exact stale names and non-matching prefixes go; locked and
+  // synthetic host/session entries stay.
+  const cleaned = cleanStaleHubPolicy({
+    allowTools: ['read', 'retired_tool', 'memory_dispatch', 'plugin_manager', 'run_code'],
+    prefixes: ['schedule_', 'mcp__gone__'],
+    runtimeNames: ['read', 'memory_recall', 'schedule_create'],
+  })
+  assert.deepEqual(cleaned.tools, ['read', 'memory_dispatch', 'plugin_manager', 'run_code'],
+    'stale names are removed; locked and synthetic host/session entries are kept')
+  assert.deepEqual(cleaned.prefixes, ['schedule_'], 'only prefixes with no runtime match are removed')
+  assert.deepEqual(cleaned.removedNames.sort(), ['mcp__gone__', 'retired_tool'])
+  assert.equal(cleaned.removed, 2)
+  const syntheticOnly = cleanStaleHubPolicy({
+    allowTools: [...HOST_SESSION_TOOLS],
+    prefixes: ['schedule_'],
+    runtimeNames: [],
+  })
+  assert.deepEqual(syntheticOnly.tools, [...HOST_SESSION_TOOLS],
+    'a cleanup with an empty global runtime keeps every synthetic host/session entry')
+  assert.deepEqual(syntheticOnly.removedNames, [], 'no synthetic entry is ever reported as removed')
+
+  // FALLBACK (built-in list) is kept as coverage, not as the default path: it
+  // still lists every default entry and every hands-on note, never drops a
+  // whitelist entry, and does not fabricate stale verdicts it cannot verify.
+  const fallback = buildFallbackHubCatalog({
+    allowTools: [...DEFAULT_HUB_TOOLS, 'retired_tool'],
+    prefixes: [...DEFAULT_HUB_PREFIXES],
+    now: catalogNow,
+    warning: 'simulated enumeration failure',
+  })
+  assert.equal(fallback.meta.mode, 'fallback')
+  assert.match(fallback.meta.warning, /simulated enumeration failure/)
+  const fallbackFlat = fallback.groups.flatMap((group) => group.items)
+  for (const name of DEFAULT_HUB_TOOLS) {
+    assert.ok(fallbackFlat.some((entry) => entry.name === name), 'the fallback lists the default entry: ' + name)
+  }
+  assert.equal(fallback.groups.find((group) => group.id === HUB_CATALOG_GROUPS.hostSession)?.synthetic, true,
+    'the fallback also renders the synthetic host-session group')
+  for (const name of ['plugin_manager', 'run_code', 'ask_user_question', 'job_output']) {
+    const entry = fallbackFlat.find((item) => item.name === name && item.prefix !== true)
+    assert.equal(entry?.synthetic, true, 'the fallback marks the synthetic entry: ' + name)
+    assert.equal(entry?.available, true, 'the fallback marks the synthetic entry available: ' + name)
+  }
+  for (const name of LOCKED_HUB_TOOLS) {
+    assert.equal(fallbackFlat.find((entry) => entry.name === name)?.locked, true,
+      'the fallback marks the locked entry: ' + name)
+  }
+  assert.ok(fallbackFlat.some((entry) => entry.name === 'bash' && entry.risk === true),
+    'the fallback keeps hands-on risk notes')
+  assert.ok(fallbackFlat.some((entry) => entry.name === 'retired_tool' && entry.enabled === true),
+    'the fallback never silently drops a whitelist entry it does not know')
+  assert.equal(fallback.groups.some((group) => group.id === HUB_CATALOG_GROUPS.stale), false,
+    'the fallback does not claim stale detection it cannot verify')
+  assert.equal(fallback.groups.some((group) => group.id === HUB_CATALOG_GROUPS.supermemory && group.inferred === true), true,
+    'the fallback uses the same source-grouping rules')
+
+  assert.equal(ROLE_GUARD_VERSION >= 3, true, 'the guard version is bumped so hosts can tell R33 from R36')
+  ok('R39-1 动态目录：运行时工具按来源分组（推断标注）+ 未知工具默认拒绝且可勾选 + 失效条目单列可清理'
+    + '+ 刷新反映新增工具 + 宿主声明来源优先 + 枚举失败回退内置清单（告警、不丢白名单条目）')
+
+  // ---- R40: host/session synthetic entries (never stale, never cleaned) ----
+  {
+    const now40 = catalogNow + 5000
+    const globalDefs = [
+      { name: 'memory_recall', description: 'Recall conclusions' },
+      { name: 'read', description: 'Real read definition' },
+    ]
+    const required = ['plugin_manager', 'run_code', 'ask_user_question', 'send_message', 'job_output']
+    const cat40 = buildHubCatalog({
+      tools: globalDefs,
+      allowTools: required,
+      prefixes: ['schedule_'],
+      now: now40,
+    })
+    const flat40 = cat40.groups.flatMap((group) => group.items)
+    const item40 = (name) => flat40.find((entry) => entry.name === name && entry.prefix !== true)
+    for (const name of required) {
+      const entry = item40(name)
+      assert.ok(entry, 'a whitelisted host/session tool is listed even when the global definitions omit it: ' + name)
+      assert.equal(entry.source, HUB_CATALOG_GROUPS.hostSession, 'it lands in the host-session group: ' + name)
+      assert.equal(entry.synthetic, true, 'it is labelled synthetic: ' + name)
+      assert.equal(entry.available, true, 'it is available: ' + name)
+      assert.notEqual(entry.stale, true, 'it is never stale: ' + name)
+      assert.equal(entry.enabled, true, 'a whitelisted synthetic entry is enabled: ' + name)
+    }
+    assert.equal(item40('plugin_manager').noteKey, 'pluginManager',
+      'the existing plugin-manager warning note is kept in the dynamic path too')
+    assert.equal(cat40.stale.length, 0, 'a whitelist made only of synthetic + real entries has no stale bucket')
+    const hostSessionGroup = cat40.groups.find((group) => group.id === HUB_CATALOG_GROUPS.hostSession)
+    assert.equal(hostSessionGroup?.synthetic, true, 'the host-session group carries the synthetic marker')
+    assert.match(hostSessionGroup?.hint ?? '', /不在全局注册面/, 'the group hint states why it is synthetic')
+    for (const entry of hostSessionGroup.items.filter((item) => item.prefix !== true)) {
+      assert.ok((entry.description ?? '').length > 0,
+        'every synthetic entry carries its per-name evidence (no guessed names): ' + entry.name)
+    }
+    const names40 = flat40.map((entry) => entry.name)
+    assert.equal(new Set(names40).size, names40.length, 'no name appears twice')
+
+    // Toggling plugin_manager OFF removes it from the whitelist but keeps the
+    // catalog row visible, unchecked and unlockable (it is not a locked entry).
+    const off = buildHubCatalog({ tools: globalDefs, allowTools: [], prefixes: [], now: now40 })
+    const pmOff = off.groups.flatMap((group) => group.items).find((entry) => entry.name === 'plugin_manager')
+    assert.equal(pmOff?.enabled, false, 'plugin_manager can be switched off')
+    assert.equal(pmOff?.locked, undefined, 'a synthetic entry is not locked (only locked entries are unremovable from the whitelist)')
+    assert.equal(pmOff?.synthetic, true)
+    assert.equal(off.stale.some((entry) => entry.name === 'plugin_manager'), false,
+      'switching it off does not make it stale')
+
+    // A real definition always wins: no duplicate, no synthetic description.
+    const withReal = buildHubCatalog({
+      tools: [...globalDefs, { name: 'plugin_manager', description: 'Real registration first line' }],
+      allowTools: ['plugin_manager'],
+      prefixes: [],
+      now: now40,
+    })
+    const realItems = withReal.groups.flatMap((group) => group.items).filter((entry) => entry.name === 'plugin_manager')
+    assert.equal(realItems.length, 1, 'a real plugin_manager definition is not duplicated by the synthetic list')
+    assert.equal(realItems[0].synthetic, undefined, 'the real definition is not labelled synthetic')
+    assert.equal(realItems[0].description, 'Real registration first line', 'the real description is used')
+    assert.equal(realItems[0].source, HUB_CATALOG_GROUPS.host, 'the real definition keeps its normal source attribution')
+    const withRealRunCode = buildHubCatalog({
+      tools: [...globalDefs, { name: 'run_code', description: 'A host that registers it anyway' }],
+      allowTools: ['run_code'],
+      prefixes: [],
+      now: now40,
+    })
+    const runCodeItems = withRealRunCode.groups.flatMap((group) => group.items).filter((entry) => entry.name === 'run_code')
+    assert.equal(runCodeItems.length, 1, 'run_code from a real definition is not duplicated either')
+    assert.equal(runCodeItems[0].synthetic, undefined, 'the real run_code definition wins over the synthetic entry')
+
+    // A global runtime that names a synthetic tool does not leave a phantom
+    // host-session group for that name; the group only carries the rest.
+    assert.ok(withReal.groups.some((group) => group.id === HUB_CATALOG_GROUPS.hostSession),
+      'the host-session group still lists the other synthetic capabilities')
+    assert.equal(withReal.groups.find((group) => group.id === HUB_CATALOG_GROUPS.hostSession)?.items
+      .some((entry) => entry.name === 'plugin_manager'), false,
+    'a real plugin_manager no longer appears in the synthetic group')
+  }
+  ok('R40-1 宿主会话工具合成项：全局 definitions 缺失时 plugin_manager/run_code 等仍列为 host-session'
+    + '+ available/永不失效/清理不移除 + 可关闭后重新勾选 + 真实定义优先且不重复 + 合成组徽标')
+
+  ok('R36-1 中枢白名单（默认拒绝）：默认名单逐条 + 前缀项 + 20 项实操工具改判「名单外拒绝」+ 未知/未来工具拒绝'
+    + '+ plugin_manager 可关 + 锁定项不可去 + 存取往返 + 读失败回退默认（不 fail-open 也不断派发）')
+
+  // ---- R37: R35 与 R36 两份并行改动必须同时存活（互相覆盖的防回归锚） ----
+  // R35（收尾/迁移/唯一角色入口）与 R36（白名单）由两个会话在同一工作树上
+  // 并行完成，曾互相覆盖过一次。这条断言把两侧最关键的事实钉在一起：任何
+  // 一侧被改回旧版，本行必定失败——而不是等下一次重载才发现。
+  {
+    const routeSrc = readFileSync('src/route.ts', 'utf8')
+    // R35：route 的分支判定只能走唯一权威 resolveRole，不能长回本地前缀规则。
+    assert.ok(/resolveRole\(store,\s*\{\s*id:\s*sessionId\s*\}\)\.role\s*===\s*'branch'/.test(routeSrc),
+      'R37: route.ts still decides branch via resolveRole(...).role === branch (R35)')
+    assert.equal(routeSrc.includes("startsWith('branch-')"), false,
+      'R37: route.ts must not regrow the local branch-prefix authority (R35)')
+    // R35：role-guard 不再导出第二套分支权威。
+    const guardModule = await import('../src/role-guard.ts')
+    assert.equal(Object.prototype.hasOwnProperty.call(guardModule, 'isBranchSession'), false,
+      'R37: role-guard still has no isBranchSession export (R35)')
+    // R35：启动期迁移的计划/应用入口仍是可调用函数（不是被删掉的死文件）。
+    assert.equal(typeof migrateHubSessionRecords, 'function',
+      'R37: the hub-records migration entry is still callable (R35)')
+    // R36：白名单默认拒绝仍生效，hub_policies 表仍在域声明里。
+    const defaultPolicyView = { tools: [...DEFAULT_HUB_TOOLS], prefixes: [...DEFAULT_HUB_PREFIXES] }
+    assert.equal(isHubAllowedTool('memory_dispatch', defaultPolicyView), true,
+      'R37: the default whitelist keeps the dispatch link (R36)')
+    assert.equal(isHubAllowedTool('bash', defaultPolicyView), false,
+      'R37: the default whitelist still denies hands-on tools (R36)')
+    assert.ok(readFileSync('src/schema.ts', 'utf8').includes('hub_policies:'),
+      'R37: the hub_policies table is still registered in schema.ts (R36)')
+    ok('R37 共存锚：R35（route 走 resolveRole + 无 isBranchSession 导出 + 迁移入口）与 R36（白名单默认拒绝 + hub_policies 表）同时在树')
+  }
+
+  // Total decision: a throwing store keeps plugin_manager closed and everything
+  // else open, and the failure is reported (never a silent unguarded host).
+  const warnings = []
+  assert.equal(codeOf(roleGuardDecision(closedStore, closedAgent, 'plugin_manager', { action: 'set_plugin' },
+    (message) => warnings.push(message))), 'NON_HUB_RELOAD_DENIED',
+  'a failing role resolution keeps plugin_manager denied')
+  assert.equal(roleGuardDecision(closedStore, closedAgent, 'bash', {}, (message) => warnings.push(message)), undefined,
+    'a failing role resolution does NOT fail ordinary tools')
+  assert.equal(warnings.length, 2, 'each failing resolution reports a warning')
+  assert.ok(warnings.every((message) => message.includes('role guard resolution failed')))
+  ok('R33-5 执行闸：结构化 code + 缺 action fail-closed + 异常时 plugin_manager 拒绝/其它放行（白名单判定见 R36-1）')
+
+  // ---- card contract (pure half; the DOM half is asserted in client-sim) ----
+  const relay = cardMetaOf({ kind: 'supermemory', form: 'relay', fromSessionId: 'branch-abcd1234', fromTitle: '分支甲 · 加测试', dispatchId: 'dsp-1', status: 'returned' })
+  assert.ok(relay, 'a relay is card-marked')
+  assert.equal(relay.kind, 'branch')
+  assert.equal(cardSourceLabel(relay), '分支甲 · 加测试')
+  assert.equal(cardSourceLabel({ fromTitle: '', fromSessionId: 'branch-abcd1234' }), '1234', 'title falls back to the id tail')
+  const dispatch = dispatchSource({ fromSessionId: 'session-hub1', fromTitle: '中枢甲', task: '加测试', topicSetTitle: 'R33 话题集', capability: 'full', dispatchId: 'dsp-2', status: 'dispatched' })
+  const dispatchMeta = cardMetaOf(dispatch)
+  assert.equal(dispatchMeta.kind, 'hub')
+  assert.equal(dispatchMeta.task, '加测试')
+  assert.equal(dispatchMeta.topicSetTitle, 'R33 话题集')
+  assert.equal(dispatchMeta.capability, 'full')
+  assert.equal(dispatchMeta.dispatchId, 'dsp-2')
+  assert.equal(cardMetaOf({ kind: 'user', form: '', text: 'hello' }), null, 'a normal user message is not card-marked')
+  assert.equal(cardMetaOf({ kind: 'supermemory', form: 'notice' }), null, 'a notice is not an execution request')
+  // R33 需求⑦: the relay card carries the SAME fields as the dispatch card.
+  const relayFields = relaySource({
+    deliveryId: 'dlv-1', fromSessionId: 'branch-abcd1234', fromTitle: '分支甲', fromKind: 'branch',
+    dispatchId: 'dsp-1', status: 'returned', task: '加测试', topicSetTitle: 'R33 话题集', capability: 'full',
+  })
+  assert.equal(relayFields.kind, 'supermemory')
+  assert.equal(relayFields.form, 'relay')
+  assert.equal(relayFields.fromTitle, '分支甲')
+  assert.equal(relayFields.task, '加测试', 'relay card carries the task')
+  assert.equal(relayFields.topicSetTitle, 'R33 话题集', 'relay card carries the topic set')
+  assert.equal(relayFields.capability, 'full', 'relay card carries the capability')
+  const relayMeta = cardMetaOf(relayFields)
+  assert.equal(relayMeta.task, '加测试')
+  assert.equal(relayMeta.capability, 'full')
+
+  // Wiring: the pure decision must be installed by apply() (the host seam cannot
+  // be built headlessly); the client cell wiring is asserted behaviourally in
+  // client-sim-smoke (delegation, t/renderSlotChain, entries() degradation).
+  const indexSrc = readFileSync('src/index.ts', 'utf8')
+  assert.ok(indexSrc.includes('roleGuardDecision(') && indexSrc.includes("meta.get('role-guard')"),
+    'apply() installs the runtime guard and records its meta marker')
+  const { zh } = await import('../src/client/locales.ts')
+  assert.equal(zh['chat.card.from'], '来自 {session} 的执行请求')
+  ok('R33-3 双向卡片契约：两向同字段（任务/话题集/能力/回执）+ 标题回退 + 普通消息不误伤')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

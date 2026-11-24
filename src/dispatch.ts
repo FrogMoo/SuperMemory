@@ -19,9 +19,11 @@ import {
   findVerifyTopicSet, matchTopicSetForTask, renderTopicSetConfirm, verifyTopicSetTitle,
 } from './topicset-match.ts'
 import {
-  TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine,
+  TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine, sessionTitleOf,
 } from './title.ts'
+import { dispatchSource } from './chat-card.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
+import { defaultModelFor } from './model-defaults.ts'
 import { branchTagsFor, branchTitleFor } from './branch-meta.ts'
 import { groupComplete, groupEpisodeSummaries, groupRelayExists, groupRelayText, newGroupId } from './group.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
@@ -29,6 +31,7 @@ import { noteTopicSetActivated } from './topic-shape.ts'
 import { applyCapabilities, resolveCapabilities, type CapabilityProfile, type ResolvedCapability } from './capabilities.ts'
 import { buildDispatchScript } from './script-delegation.ts'
 import { isOpenDispatch } from './hub-branches.ts'
+import { recordHubSession, resolveRole } from './role.ts'
 import { DISPATCH_NEXT_ACTION } from './round-end.ts'
 
 export interface DispatchConfig {
@@ -482,6 +485,8 @@ async function recordGroupFailure(
       turnEndReason: `dispatch-error: ${String(input.error).slice(0, 120)}`,
       title: branchTitleFor(input.task),
       tags: branchTagsFor({ topicTags: topicSet?.keywords, task: input.task }),
+      // No capability was ever granted to a member that failed before acquisition.
+      capability: '',
       createdAt: now,
       updatedAt: now,
     })
@@ -533,10 +538,21 @@ async function dispatchOne(
     // reads one durable mapping instead of re-deriving it per view.
     title: branchTitleFor(task),
     tags: branchTagsFor({ topicTags: topicSet.keywords, task, kind: taskKind, capability: capabilities.profile }),
+    // R33 需求⑦: the granted capability rides the dispatch row so a relay card
+    // can name it without reverse-engineering the tag snapshot.
+    capability: capabilities.profile,
     createdAt: now,
     updatedAt: now,
   }
   await store.dispatches.put(dispatchId, record)
+  // R33 需求②: dispatching is itself a positive hub act — mark the hub record
+  // (workspace-scoped) so the role guard/prompt do not depend on the old
+  // "top-level session" inference.
+  await recordHubSession(store, {
+    sessionId: hubSessionId,
+    workspaceKey: workspaceKeyOf(cwd),
+    source: 'dispatch',
+  })
 
   // ---- acquire the branch ----
   let branchSessionId: string
@@ -571,7 +587,9 @@ async function dispatchOne(
   // fork all leave the unnamed state behind (a reused member keeps its first
   // stable title; the host title is only applied while the session has none).
   try {
-    const named = await ensureMemberTitle(store, topicSetId, { sessionId: branchSessionId, kind }, topicSet.title, task)
+    // R41 需求③b: the branch title is the task itself — no topic-set prefix and
+    // no 「R31：」lead-in; the host title and the member title read the same.
+    const named = await ensureMemberTitle(store, topicSetId, { sessionId: branchSessionId, kind }, topicSet.title, task, { taskOnly: true })
     const applied = applySessionTitle(ctx, branchSessionId, named, logger)
     if (applied === 'host' || applied === 'fallback') {
       logger.info(`supermemory: named branch ${branchSessionId.slice(0, 20)} 「${named}」 via ${applied}`)
@@ -602,6 +620,11 @@ async function dispatchOne(
       // is relayed back to (the dispatch record's hubSessionId is the target).
       hubSessionId,
     })
+    // R32 需求③: the branch's first message keeps source.kind 'user' (R25 recency)
+    // but carries the dispatch marker, so the plugin's client card can render it
+    // as the SAME collapsible card as a hub→branch relay without losing the
+    // task/topic-set/capability/receipt fields.
+    const hubTitle = sessionTitleOf(ctx, store, hubSessionId)
     const message = factory({
       content: [{
         type: 'text',
@@ -612,7 +635,16 @@ async function dispatchOne(
       // R25: 派发输入以 kind 'user' 落账——宿主会话列表的 recency（lastPromptAt）
       // 只对 user/message 且 source.kind === 'user' 刷新，复用/续跑的分支因此能
       // 立即置顶。归属仍由 observe 的首个匹配扫描保证（见 observe.ts）。
-      source: { kind: 'user' },
+      source: dispatchSource({
+        fromSessionId: hubSessionId,
+        ...(hubTitle ? { fromTitle: hubTitle } : {}),
+        task,
+        topicSetTitle: topicSet.title,
+        capability: capabilities.profile,
+        dispatchId,
+        ...(groupId ? { groupId } : {}),
+        status: 'dispatched',
+      }) as never,
     })
     if (!handle) throw new Error('分支句柄缺失（acquireBranch 未返回 handle）')
     const seqBefore = (ctx.sessions.get(branchSessionId as never) as { seq?: number } | undefined)?.seq
@@ -661,9 +693,17 @@ export function branchCandidates(
   mode: 'auto' | 'continue' | 'fork' | 'new',
   busy: ReadonlySet<string>,
   exclude?: ReadonlySet<string>,
+  /** R33 需求④: roles resolved from the store; hub members are never branches. */
+  isHubMember?: (sessionId: string) => boolean,
 ): { forkParent?: TopicSet['members'][number]; candidates: TopicSet['members'] } {
   const taskTokens = new Set(task.toLowerCase().split(/[\s,，。;；:：]+/).filter(Boolean))
+  // R33 需求④: reusing a topic-set ROOT member as a branch made one session
+  // simultaneously `isBranchSession === true` and `isHubSession === true` (the
+  // R32 contradiction). The production caller passes resolveRole's predicate so
+  // a root member that resolves to HUB is excluded, while a panel-created
+  // `branch-*` session that was recorded as a root member stays reusable.
   const ranked = rankMembers(topicSet, taskTokens)
+    .filter((member) => !(isHubMember?.(member.sessionId) ?? false))
     .filter((member) => !exclude?.has(member.sessionId))
   if (mode === 'new') return { candidates: [] }
   return {
@@ -713,14 +753,20 @@ async function acquireBranch(
 ): Promise<{ sessionId: string; handle?: BranchHandle; kind: 'root' | 'fork' }> {
   const { ctx, store, logger } = deps
   const { topicSetId, topicSet, task, cwd, mode, hubModel, composition, capabilities, exclude } = input
-  const agentOptions = topicSet.defaultModel ?? hubModel
-  const plan = branchCandidates(topicSet, task, mode, busyBranches(store), exclude)
+  // R41 需求①b: branch default sits BETWEEN the topic-set default and the
+  // hub's current selection — an explicit per-set/per-branch override still wins.
+  const branchDefault = defaultModelFor(store, workspaceKeyOf(cwd), 'branch')
+  const agentOptions = topicSet.defaultModel ?? branchDefault ?? hubModel
+  const plan = branchCandidates(
+    topicSet, task, mode, busyBranches(store), exclude,
+    (sessionId) => resolveRole(store, { id: sessionId }).role === 'hub',
+  )
 
   // A fork needs a parent member. With an empty topic set (or no ranked member)
   // there is nothing to fork from, so fall through to a fresh branch instead of
   // dereferencing an absent member.
   if (mode === 'fork' && plan.forkParent) {
-    const forked = await forkFromParent(ctx, plan.forkParent.sessionId, cwd, topicSet.defaultModel, composition, capabilities, logger)
+    const forked = await forkFromParent(ctx, plan.forkParent.sessionId, cwd, topicSet.defaultModel ?? branchDefault, composition, capabilities, logger)
     if (forked) return { ...forked, kind: 'fork' as const }
   }
 

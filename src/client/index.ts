@@ -16,9 +16,10 @@ import { PANEL_REMOTE } from './remote.ts'
 import { en, NS, zh } from './locales.ts'
 import { SupermemoryIcon } from './icon.tsx'
 import { SupermemoryPanelPage } from './panel-page.tsx'
-import type { HubBranchView, HubSessionView, MemoryCollectionView, MemoryDetailView, MemoryShape, MemoryView, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
+import type { HubBranchView, HubPolicyView, HubSessionView, MemoryCollectionView, MemoryDetailView, MemoryShape, MemoryView, ModelDefaultsView, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
 import { NewSessionChoice } from './new-session.tsx'
 import { SupermemorySessionBadge, invalidateBadge } from './session-badge.tsx'
+import { attachChatCards } from './chat-card.tsx'
 
 export const name = 'dsh-supermemory-client'
 
@@ -65,6 +66,13 @@ function buildApi(ctx: Context): PanelApi | undefined {
     listMemoryCollections: (cwd) => call<MemoryCollectionView[]>('listMemoryCollections', cwd),
     listMemoriesByCollection: (cwd, collectionId, query) => call<MemoryView[]>('listMemoriesByCollection', cwd, collectionId, query, 200),
     getMemoryDetail: (cwd, id) => call<MemoryDetailView | undefined>('getMemoryDetail', cwd, id),
+    // R36 需求②: 「设置 → 中枢权限」——白名单快照 / 保存（含 reset）。
+    getHubPolicy: (cwd) => call<HubPolicyView>('getHubPolicy', cwd),
+    setHubPolicy: (cwd, patch) => call<MutationResult>('setHubPolicy', cwd, patch),
+    cleanupStaleHubPolicy: (cwd) => call<MutationResult>('cleanupStaleHubPolicy', cwd),
+    // R41 需求①b: 设置页签的默认模型（中枢会话 / 分支会话）。
+    getModelDefaults: (cwd) => call<ModelDefaultsView>('getModelDefaults', cwd),
+    setModelDefaults: (cwd, patch) => call<MutationResult>('setModelDefaults', cwd, patch),
     createTopicSet: (cwd, title, tags, summary) => call('createTopicSet', cwd, title, tags, summary),
     listHubSessions: (cwd) => call<HubSessionView[]>('listHubSessions', cwd),
     // R19 协同②: the hub's branch association (read model over dispatches).
@@ -175,6 +183,14 @@ function selectSuperPanel(ctx: Context): boolean {
  */
 export async function apply(ctx: Context): Promise<void> {
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'supermemory: dictionaries')
+
+  // R32 需求③: install the hub↔branch chat card BEFORE the panel API check —
+  // the conversation card must not depend on the panel remote being mountable.
+  try {
+    attachChatCards(ctx)
+  } catch (error) {
+    console.error('supermemory: chat card registration failed', error)
+  }
 
   // Mount the panel remote (host descriptors registered in src/panel.ts).
   try {

@@ -9,6 +9,7 @@
  */
 import { createElement as h, useCallback, useEffect, useMemo, useState, type ReactElement, type ReactNode } from 'react'
 import { subscribeHubReceipt, takePendingHubReceipt, type HubSessionReceipt } from './open-dispatch.ts'
+import { isRailCurrent } from '../rail-selection.ts'
 
 export interface TopicSetView {
   id: string
@@ -94,6 +95,93 @@ export interface MemoryVersionView {
 export interface MemoryDetailView {
   view: MemoryView
   versions: MemoryVersionView[]
+}
+
+/** R39: 「中枢权限」动态目录的一条目录项（运行时工具名或前缀规则）。 */
+export interface HubCatalogItem {
+  name: string
+  /** 首行描述摘要（宿主截断到 140 字）。 */
+  description?: string
+  /** 前缀项（如 `schedule_`），渲染时带 `*`。 */
+  prefix?: boolean
+  /** 锁定项：面板禁用取消勾选。 */
+  locked?: boolean
+  /** 实操执行类工具：带风险提示。 */
+  risk?: boolean
+  /** 每项附加说明的 locale key 后缀（如 pluginManager）。 */
+  noteKey?: string
+  /** 当前存储白名单命中（精确或前缀）。 */
+  enabled: boolean
+  /** 运行时可用性；undefined=未知（内置回退无法核验）。 */
+  available?: boolean
+  /** 白名单有、运行时无（只在失效组里）。 */
+  stale?: boolean
+  /** R40: 合成项——不在全局注册面，但中枢会话实际可用（永不失效、清理不移除）。 */
+  synthetic?: boolean
+  /** 归属来源 id（source:* / stale）。 */
+  source: string
+}
+
+/** R39: 目录分组——每个来源一组，失效条目单列最后一组。 */
+export interface HubCatalogGroup {
+  /** 来源 id：source:supermemory / source:composite / source:mcp:<server> / source:schedule / source:host / source:declared:<slug> / stale。 */
+  id: string
+  /** 宿主给的显示名（客户端对已知 id 优先本地化，未知 id 用它）。 */
+  label: string
+  kind: 'source' | 'stale'
+  /** 归属是否为推断（宿主定义无来源字段时的命名规则）。 */
+  inferred: boolean
+  /** 产生该归属的规则说明。 */
+  hint?: string
+  /** R40: 该组只存在于合成宿主会话面。 */
+  synthetic?: boolean
+  items: HubCatalogItem[]
+  total: number
+  enabledCount: number
+}
+
+/** R39: 一次目录生成的来源信息（新鲜度 + 降级）。 */
+export interface HubCatalogMeta {
+  generatedAt: number
+  mode: 'dynamic' | 'fallback'
+  toolCount: number
+  /** R40: `toolCount` 中合成宿主会话项的个数。 */
+  syntheticCount: number
+  groupCount: number
+  anyDeclaredSource: boolean
+  warning?: string
+}
+
+/** R39: 中枢权限页签快照（宿主 getHubPolicy 的投影）。 */
+export interface HubPolicyView {
+  workspaceKey: string
+  tools: string[]
+  prefixes: string[]
+  /** stored=工作区自有；default=旧库无记录/读失败回退的内置默认。 */
+  source: 'stored' | 'default'
+  locked: string[]
+  defaults: { tools: string[]; prefixes: string[] }
+  /** 动态目录：运行时全部工具按来源分组 + 失效条目组。 */
+  catalog: HubCatalogGroup[]
+  catalogMeta: HubCatalogMeta
+  /** 白名单里有、运行时已不存在的条目（一键清理用）。 */
+  stale: HubCatalogItem[]
+}
+
+/** R41 需求①b: 设置页签的默认模型快照（宿主 getModelDefaults 的投影）。 */
+export interface ModelSelectionView {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+
+export interface ModelDefaultsView {
+  workspaceKey: string
+  /** 新建中枢会话的默认模型；缺省=跟随宿主默认。 */
+  hub?: ModelSelectionView
+  /** 新派发分支会话的默认模型；缺省=跟随话题集/中枢/宿主默认。 */
+  branch?: ModelSelectionView
+  source: 'stored' | 'default'
 }
 
 export interface ToolView {
@@ -362,6 +450,13 @@ export interface PanelApi {
   listMemoryCollections(cwd: string): Promise<MemoryCollectionView[]>
   listMemoriesByCollection(cwd: string, collectionId: string, query?: string): Promise<MemoryView[]>
   getMemoryDetail(cwd: string, id: string): Promise<MemoryDetailView | undefined>
+  // R36 需求②: 「中枢权限」设置——白名单快照 / 保存（含 reset 恢复默认）。
+  getHubPolicy(cwd: string): Promise<HubPolicyView>
+  setHubPolicy(cwd: string, patch: { tools?: string[]; prefixes?: string[]; reset?: boolean }): Promise<MutationResult>
+  cleanupStaleHubPolicy(cwd: string): Promise<MutationResult>
+  // R41 需求①b: 设置页签的默认模型（中枢会话 / 分支会话，按工作区）。
+  getModelDefaults(cwd: string): Promise<ModelDefaultsView>
+  setModelDefaults(cwd: string, patch: { hub?: ModelSelectionView | null; branch?: ModelSelectionView | null; reset?: boolean }): Promise<MutationResult>
   createMemory(cwd: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   updateMemory(cwd: string, id: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   deleteMemory(cwd: string, id: string): Promise<MutationResult>
@@ -415,6 +510,8 @@ type View =
   | { kind: 'memory-collection'; id: string }
   | { kind: 'memory-detail'; id: string }
   | { kind: 'tools' }
+  // R36 需求② / R41 需求①a: 「设置」页签（默认模型 + 中枢权限，单一入口）。
+  | { kind: 'settings' }
   | { kind: 'chat'; id: string }
 
 const PANEL_CSS = `
@@ -424,6 +521,9 @@ const PANEL_CSS = `
 .sm-panel{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary,#f9fafb);background:var(--dsw-alias-bg-base,#151517);font-size:13px}
 .sm-panel *{box-sizing:border-box}
 .sm-shell{display:flex;height:100%;min-height:0;width:100%}
+
+/* ---- R41: settings section headings (默认模型 / 中枢权限) ---- */
+.sm-section-title{font-size:11px;font-weight:600;letter-spacing:.04em;opacity:.6;margin:4px 0 0}
 
 /* ---- left rail: hub sessions (R18 需求①) ---- */
 .sm-side{display:flex;flex-direction:column;gap:8px;width:232px;flex:none;min-height:0;padding:12px 8px;border-right:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));background:var(--dsw-alias-bg-layer-1,#1c1c1e)}
@@ -461,6 +561,11 @@ const PANEL_CSS = `
 .sm-item{border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));border-radius:10px;padding:8px 10px;background:var(--dsw-alias-bg-layer-1,#1f1f21);transition:border-color .12s ease,transform .12s ease,box-shadow .12s ease}
 .sm-item[data-clickable="true"]{cursor:pointer}
 .sm-item[data-clickable="true"]:hover{border-color:var(--dsw-alias-link,#7aaaff);box-shadow:0 2px 10px rgba(0,0,0,.18)}
+/* R36 需求②: 「中枢权限」开关行——label 即整行，checkbox 与标题同一基线；
+   锁定行置灰且禁点，风险/锁定徽标跟在标题后。 */
+.sm-item:has(> input[type="checkbox"]){display:flex;align-items:center;gap:8px;flex-wrap:wrap;cursor:pointer}
+.sm-item:has(> input[type="checkbox"]:disabled){opacity:.62;cursor:not-allowed}
+.sm-item > input[type="checkbox"]{flex:none;width:14px;height:14px;margin:0;accent-color:var(--dsw-alias-link,#7aaaff);cursor:inherit}
 .sm-item .sm-title{font-weight:600;font-size:12.5px}
 .sm-item .sm-sub{opacity:.58;font-size:11px;margin-top:2px;word-break:break-all}
 .sm-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -545,6 +650,11 @@ const PANEL_CSS = `
 .sm-code{display:inline-block;padding:0 5px;border-radius:5px;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.12));background:var(--dsw-alias-bg-layer-2,#2c2c2e);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:11px;word-break:break-all}
 .sm-notes{margin:0;padding-left:15px}
 .sm-warn{margin-left:4px;font-size:10.5px;color:var(--dsw-alias-state-error-primary,#f25a5a)}
+/* ---- R39: dynamic hub-policy catalog (source groups, collapse, stale) ---- */
+.sm-chevbtn{flex:none;background:none;border:0;padding:0;margin:0;color:inherit;font:inherit;font-size:11px;opacity:.6;cursor:pointer;line-height:1}
+.sm-chevbtn:hover{opacity:1}
+.sm-desc{flex:1 1 100%;font-size:11px;line-height:1.5;opacity:.58;word-break:break-word;margin-top:2px}
+.sm-warnbox{margin-top:6px;padding:6px 9px;border:1px solid var(--dsw-alias-state-warning-primary,#e8a33d);border-radius:8px;font-size:11px;line-height:1.5;color:var(--dsw-alias-state-warning-primary,#e8a33d);word-break:break-word}
 
 /* ---- R19: global workspace selector, in-panel chat, memory modal ---- */
 .sm-ws{display:inline-flex;align-items:center;gap:5px;font-size:11px;opacity:.9;min-width:0}
@@ -745,6 +855,17 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [memoryCollections, setMemoryCollections] = useState<MemoryCollectionView[]>([])
   const [collectionMemories, setCollectionMemories] = useState<MemoryView[]>([])
   const [memoryDetail, setMemoryDetail] = useState<MemoryDetailView | undefined>()
+  // R36 需求②: 「设置」页签的中枢权限——宿主快照 + 本地草稿（勾选态只在保存时写回）。
+  const [hubPolicy, setHubPolicy] = useState<HubPolicyView | undefined>()
+  const [hubPolicyDraft, setHubPolicyDraft] = useState<{ tools: string[]; prefixes: string[] } | undefined>()
+  const [hubPolicyCustom, setHubPolicyCustom] = useState('')
+  // R39: 动态目录的本地视图状态——跨来源搜索与按组折叠（勾选态仍在草稿里）。
+  const [hubPolicyQuery, setHubPolicyQuery] = useState('')
+  const [hubPolicyCollapsed, setHubPolicyCollapsed] = useState<string[]>([])
+  // R41 需求①b: 设置页签的默认模型（"provider/model" 文本，''=跟随默认）。
+  const [modelDefaults, setModelDefaults] = useState<ModelDefaultsView | undefined>()
+  const [hubModelDraft, setHubModelDraft] = useState('')
+  const [branchModelDraft, setBranchModelDraft] = useState('')
   const [tools, setTools] = useState<ToolView[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | undefined>()
@@ -960,6 +1081,45 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }, [api, cwd, t])
 
+  // R41 需求①b: 设置页签的默认模型快照；文本草稿与快照同步。
+  const refreshModelDefaults = useCallback(async () => {
+    if (!cwd) return
+    try {
+      const view = await api.getModelDefaults(cwd)
+      setModelDefaults(view)
+      setHubModelDraft(view.hub ? `${view.hub.provider}/${view.hub.model}` : '')
+      setBranchModelDraft(view.branch ? `${view.branch.provider}/${view.branch.model}` : '')
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  // R36 需求②: 设置页签的中枢权限数据——宿主快照拉到后同步为草稿（勾选态）。
+  const refreshHubPolicy = useCallback(async () => {
+    if (!cwd) return
+    try {
+      const view = await api.getHubPolicy(cwd)
+      setHubPolicy(view)
+      setHubPolicyDraft({ tools: [...view.tools], prefixes: [...view.prefixes] })
+      setHubPolicyCustom('')
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  // R39: 只刷新目录（运行时工具可能在两次保存之间新增/卸载）——保留当前勾选
+  // 草稿，刷新不等于放弃未保存的改动；catalogMeta.generatedAt 即"上次刷新"。
+  const refreshHubPolicyCatalog = useCallback(async () => {
+    if (!cwd) return
+    try {
+      const view = await api.getHubPolicy(cwd)
+      setHubPolicy(view)
+      setHubPolicyDraft((draft) => draft ?? { tools: [...view.tools], prefixes: [...view.prefixes] })
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
   // R30 需求②: 一次写操作后按当前所在层级刷新（集合卡片 / 集合内条目 / 详情），
   // 顺带刷新中枢计数，让「记忆 N」徽标即时跟上。
   const refreshMemoryViews = useCallback((): void => {
@@ -1002,6 +1162,12 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   useEffect(() => {
     if (view.kind === 'memory-detail') void refreshMemoryDetail(view.id)
   }, [view, refreshMemoryDetail])
+  useEffect(() => {
+    if (view.kind === 'settings') {
+      void refreshHubPolicy()
+      void refreshModelDefaults()
+    }
+  }, [view, refreshHubPolicy])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
 
   // 需求①: the shell's 新建会话 click CREATES a hub session and publishes its
@@ -1302,7 +1468,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       kind === 'hub' ? { kind: 'hub' }
         : kind === 'sets' ? { kind: 'sets' }
           : kind === 'memories' ? { kind: 'memories' }
-            : { kind: 'tools' },
+            : kind === 'settings' ? { kind: 'settings' }
+              : { kind: 'tools' },
     ),
   })
 
@@ -1932,6 +2099,232 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       )
     : h(EmptyState, { key: 'missing', label: t('memory.empty'), hint: t('memory.empty.hint') })
 
+  // -------------------------------------------------------------------------
+  // R39: 「中枢权限」页签 —— 动态目录（每次调用即时生成，按来源分组，默认拒绝）。
+  // 宿主工具定义不带来源字段，所以分组是「可解释的推断」：定义自带来源字段优先
+  // （标为非推断），否则 mcp__<server>__ / memory_* / sm_composite_* / schedule_*
+  // 依次判定，其余归宿主内置/未归属。白名单有、运行时无的条目单列失效组并可
+  // 一键清理；枚举失败时宿主回退内置清单并告警（页面不白屏），默认路径始终动态。
+  // -------------------------------------------------------------------------
+  const hubPolicySelected = (name: string, prefix = false): boolean => {
+    if (!hubPolicyDraft) return false
+    return prefix ? hubPolicyDraft.prefixes.includes(name) : hubPolicyDraft.tools.includes(name)
+  }
+  const hubPolicyToggle = (name: string, prefix = false): void => {
+    if (!hubPolicyDraft) return
+    if (prefix) {
+      const has = hubPolicyDraft.prefixes.includes(name)
+      setHubPolicyDraft({
+        ...hubPolicyDraft,
+        prefixes: has
+          ? hubPolicyDraft.prefixes.filter((entry) => entry !== name)
+          : [...hubPolicyDraft.prefixes, name],
+      })
+      return
+    }
+    const has = hubPolicyDraft.tools.includes(name)
+    setHubPolicyDraft({
+      ...hubPolicyDraft,
+      tools: has
+        ? hubPolicyDraft.tools.filter((entry) => entry !== name)
+        : [...hubPolicyDraft.tools, name],
+    })
+  }
+  const hubPolicyAddCustom = (): void => {
+    const name = hubPolicyCustom.trim()
+    if (!name || !hubPolicyDraft) return
+    if (!hubPolicyDraft.tools.includes(name)) {
+      setHubPolicyDraft({ ...hubPolicyDraft, tools: [...hubPolicyDraft.tools, name] })
+    }
+    setHubPolicyCustom('')
+  }
+  /** R39: 当前草稿是否通过前缀规则覆盖了某工具（此时单项开关由前缀决定）。 */
+  const hubPolicyPrefixCovered = (name: string): boolean => Boolean(hubPolicyDraft
+    && !hubPolicyDraft.tools.includes(name)
+    && hubPolicyDraft.prefixes.some((prefix) => prefix.length > 0 && name.startsWith(prefix)))
+
+  /** R39: 已知来源 id 本地化；未知来源（含宿主声明的来源名）直接用宿主 label。 */
+  const hubPolicyGroupLabel = (group: HubCatalogGroup): string => {
+    if (group.id === 'stale') return t('hubPolicy.group.stale')
+    if (group.id === 'source:supermemory') return t('hubPolicy.source.supermemory')
+    if (group.id === 'source:composite') return t('hubPolicy.source.composite')
+    if (group.id === 'source:schedule') return t('hubPolicy.source.schedule')
+    if (group.id === 'source:host-session') return t('hubPolicy.source.hostSession')
+    if (group.id === 'source:host') return t('hubPolicy.source.host')
+    if (group.id.startsWith('source:mcp:')) return t('hubPolicy.source.mcp', { server: group.id.slice('source:mcp:'.length) })
+    return group.label
+  }
+
+  const hubPolicyCount = hubPolicyDraft
+    ? hubPolicyDraft.tools.length + hubPolicyDraft.prefixes.length
+    : 0
+  const hubPolicyNeedle = hubPolicyQuery.trim().toLowerCase()
+  // 搜索跨来源分组：命中组名时整组显示，否则按工具名/描述过滤；空组隐藏。
+  const hubPolicyFiltered = (hubPolicy?.catalog ?? [])
+    .map((group) => {
+      const label = hubPolicyGroupLabel(group)
+      const groupHit = hubPolicyNeedle.length > 0
+        && (label.toLowerCase().includes(hubPolicyNeedle) || group.label.toLowerCase().includes(hubPolicyNeedle))
+      const items = groupHit
+        ? group.items
+        : group.items.filter((item) => hubPolicyNeedle.length === 0
+          || item.name.toLowerCase().includes(hubPolicyNeedle)
+          || (item.description ?? '').toLowerCase().includes(hubPolicyNeedle))
+      return { group, items }
+    })
+    .filter((row) => row.items.length > 0)
+
+  const toggleHubPolicyGroup = (id: string): void => {
+    setHubPolicyCollapsed((current) => current.includes(id)
+      ? current.filter((entry) => entry !== id)
+      : [...current, id])
+  }
+
+  /** R39: 一键清理 —— 先保存当前草稿（不丢未保存勾选），再由宿主按运行时清理。 */
+  const cleanHubPolicyStale = (): void => void run(async () => {
+    if (!hubPolicyDraft) return { status: 'error' as const, message: t('hubPolicy.loading') }
+    const saved = await api.setHubPolicy(cwd, { tools: hubPolicyDraft.tools, prefixes: hubPolicyDraft.prefixes })
+    if (saved.status !== 'ok') return saved
+    return api.cleanupStaleHubPolicy(cwd)
+  }, () => void refreshHubPolicy())
+
+  const hubPolicySwitch = (entry: HubCatalogItem): ReactNode => {
+    const locked = entry.locked === true || (hubPolicy?.locked ?? []).includes(entry.name)
+    const prefixCovered = !locked && entry.prefix !== true && hubPolicyPrefixCovered(entry.name)
+    const checked = locked || prefixCovered || hubPolicySelected(entry.name, entry.prefix === true)
+    const disabled = locked || prefixCovered
+    const title = locked
+      ? t('hubPolicy.locked.tip')
+      : prefixCovered
+        ? t('hubPolicy.viaPrefix.tip')
+        : entry.risk === true
+          ? t('hubPolicy.risk.tip')
+          : entry.description
+    return h('label', {
+      key: `${entry.source}:${entry.name}`,
+      className: 'sm-item',
+      'data-locked': String(disabled),
+      title,
+    },
+      h('input', {
+        key: 'box', type: 'checkbox', checked, disabled,
+        onChange: () => hubPolicyToggle(entry.name, entry.prefix === true),
+      }),
+      h('span', { key: 'name', className: 'sm-title' }, entry.prefix === true ? `${entry.name}*` : entry.name),
+      locked ? h('span', { key: 'lock', className: 'sm-badge' }, t('hubPolicy.locked')) : null,
+      prefixCovered ? h('span', { key: 'prefix', className: 'sm-badge' }, t('hubPolicy.viaPrefix')) : null,
+      entry.risk === true ? h('span', { key: 'risk', className: 'sm-badge' }, t('hubPolicy.risk')) : null,
+      entry.synthetic === true
+        ? h('span', { key: 'synthetic', className: 'sm-badge', title: t('hubPolicy.synthetic.tip') }, t('hubPolicy.synthetic'))
+        : null,
+      entry.stale === true ? h('span', { key: 'stale', className: 'sm-badge' }, t('hubPolicy.stale.badge')) : null,
+      entry.noteKey === 'pluginManager' && !locked
+        ? h('span', { key: 'note', className: 'sm-sub' }, t('hubPolicy.note.pluginManager'))
+        : null,
+      entry.description ? h('div', { key: 'desc', className: 'sm-desc' }, entry.description) : null,
+    )
+  }
+
+  const hubPolicyGroupCard = (group: HubCatalogGroup, items: HubCatalogItem[]): ReactNode => {
+    const collapsed = hubPolicyCollapsed.includes(group.id)
+    // 启用数按当前草稿算（含前缀覆盖与锁定项），勾选后立刻反映。
+    const enabled = group.items.filter((item) => item.locked === true
+      || hubPolicySelected(item.name, item.prefix === true)
+      || (item.prefix !== true && hubPolicyPrefixCovered(item.name))).length
+    const isStale = group.kind === 'stale'
+    return h('div', { key: group.id, className: 'sm-card' },
+      h('div', { key: 'head', className: 'sm-row' },
+        h('button', {
+          key: 'chev', type: 'button', className: 'sm-chevbtn',
+          title: collapsed ? t('hubPolicy.group.expand') : t('hubPolicy.group.collapse'),
+          onClick: () => toggleHubPolicyGroup(group.id),
+        }, collapsed ? '▸' : '▾'),
+        h('h3', { key: 'title', style: { margin: 0 } }, hubPolicyGroupLabel(group)),
+        group.inferred
+          ? h('span', { key: 'inferred', className: 'sm-badge', title: t('hubPolicy.inferred.tip') }, t('hubPolicy.inferred'))
+          : null,
+        group.synthetic === true
+          ? h('span', { key: 'synthetic', className: 'sm-badge', title: t('hubPolicy.synthetic.tip') }, t('hubPolicy.synthetic'))
+          : null,
+        h('span', { key: 'count', className: 'sm-badge' },
+          hubPolicyNeedle.length > 0
+            ? t('hubPolicy.group.match', { count: items.length, total: group.total })
+            : t('hubPolicy.group.count', { count: group.total })),
+        h('span', { key: 'enabled', className: 'sm-badge' },
+          t('hubPolicy.group.enabled', { enabled })),
+        isStale
+          ? h(Button, {
+              key: 'clean', size: 'sm', label: t('hubPolicy.stale.clean', { count: group.items.length }),
+              title: t('hubPolicy.stale.tip'),
+              disabled: group.items.every((item) => item.locked === true),
+              onClick: () => cleanHubPolicyStale(),
+            })
+          : null,
+      ),
+      group.hint && !collapsed ? h('div', { key: 'hint', className: 'sm-muted' }, group.hint) : null,
+      collapsed ? null : h('div', { key: 'rows', className: 'sm-list' }, items.map(hubPolicySwitch)),
+    )
+  }
+
+  const hubPolicyView: ReactNode = !hubPolicy || !hubPolicyDraft
+    ? h(EmptyState, { key: 'loading', label: t('hubPolicy.loading'), hint: t('hubPolicy.loading.hint') })
+    : h('div', { key: 'hp' },
+        h('div', { key: 'head', className: 'sm-card' },
+          h('div', { key: 'line', className: 'sm-row' },
+            h('span', { key: 'model', className: 'sm-title' },
+              t('hubPolicy.model', { count: hubPolicyCount })),
+            h('span', { key: 'source', className: 'sm-badge' },
+              hubPolicy.source === 'stored' ? t('hubPolicy.source.stored') : t('hubPolicy.source.default')),
+            h('span', { key: 'mode', className: 'sm-badge' },
+              hubPolicy.catalogMeta.mode === 'fallback' ? t('hubPolicy.catalog.fallback') : t('hubPolicy.catalog.dynamic')),
+          ),
+          h('div', { key: 'meta', className: 'sm-muted' },
+            t('hubPolicy.catalog.meta', { tools: hubPolicy.catalogMeta.toolCount, groups: hubPolicy.catalogMeta.groupCount }),
+            hubPolicy.catalogMeta.syntheticCount > 0
+              ? ' · ' + t('hubPolicy.catalog.synthetic', { count: hubPolicy.catalogMeta.syntheticCount })
+              : '',
+            ' · ',
+            t('hubPolicy.lastRefresh', { time: fmtTime(hubPolicy.catalogMeta.generatedAt) })),
+          hubPolicy.catalogMeta.warning
+            ? h('div', { key: 'warning', className: 'sm-warnbox' }, hubPolicy.catalogMeta.warning)
+            : null,
+          h('div', { key: 'hint', className: 'sm-muted' }, t('hubPolicy.hint')),
+          h('div', { key: 'actions', className: 'sm-actions' },
+            h(Button, {
+              key: 'reset', label: t('hubPolicy.reset'),
+              onClick: () => void run(async () => api.setHubPolicy(cwd, { reset: true }), () => void refreshHubPolicy()),
+            }),
+            h(Button, {
+              key: 'save', variant: 'primary', label: t('hubPolicy.save'),
+              onClick: () => void run(async () => api.setHubPolicy(cwd, {
+                tools: hubPolicyDraft.tools, prefixes: hubPolicyDraft.prefixes,
+              }), () => void refreshHubPolicy()),
+            }),
+          ),
+          h('div', { key: 'search', className: 'sm-form' },
+            h('input', {
+              key: 'searchInput', className: 'sm-input', value: hubPolicyQuery,
+              placeholder: t('hubPolicy.search.placeholder'),
+              onChange: (event: { target: { value: string } }) => setHubPolicyQuery(event.target.value),
+            }),
+            h(Button, { key: 'refresh', label: t('hubPolicy.refresh'), onClick: () => void refreshHubPolicyCatalog() }),
+          ),
+          h('div', { key: 'add', className: 'sm-form' },
+            h('input', {
+              key: 'input', className: 'sm-input', value: hubPolicyCustom,
+              placeholder: t('hubPolicy.custom.placeholder'),
+              onChange: (event: { target: { value: string } }) => setHubPolicyCustom(event.target.value),
+              onKeyDown: (event: { key: string }) => { if (event.key === 'Enter') hubPolicyAddCustom() },
+            }),
+            h(Button, { key: 'addBtn', label: t('hubPolicy.custom.add'), onClick: () => hubPolicyAddCustom() }),
+          ),
+        ),
+        hubPolicyFiltered.length === 0
+          ? h(EmptyState, { key: 'noMatch', label: t('hubPolicy.empty'), hint: t('hubPolicy.empty.hint') })
+          : h('div', { key: 'groups', className: 'sm-list' },
+              hubPolicyFiltered.map((row) => hubPolicyGroupCard(row.group, row.items))),
+      )
+
   // R10: memories are edited and read as title + tags + body. The search box
   // filters on every field, but the *hit source* is visible: a title/tag match
   // is highlighted, so the user never has to scan the body to find a record.
@@ -2150,20 +2543,87 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       )
     : null
 
+  // R41 需求①a/b: 「设置」页签——设置即权限与默认模型的单一入口。
+  // 上半部是默认模型（中枢/分支），下半部沿用 R36/R39 的中枢权限（动态目录、
+  // 按来源分组、锁定项、失效清理），不再有独立的「中枢权限」页签。
+  const modelDefaultsCard = (): ReactNode => {
+    const choices = catalog?.models ?? []
+    const known = (value: string): boolean => choices.some((model) => `${model.provider}/${model.id}` === value)
+    const select = (key: string, value: string, onChange: (next: string) => void): ReactNode =>
+      h('select', {
+        key, className: 'sm-opt-select', value,
+        onChange: (event: { target: { value: string } }) => onChange(String(event.target.value)),
+      },
+        h('option', { key: 'follow', value: '' }, t('settings.models.follow')),
+        choices.map((model) => {
+          const id = `${model.provider}/${model.id}`
+          return h('option', { key: id, value: id, title: model.name || undefined }, id)
+        }),
+        value && !known(value) ? h('option', { key: 'custom', value }, value) : null,
+      )
+    const saveDefaults = (): void => void run(async () => {
+      const parse = (text: string): { provider: string; model: string } | null => {
+        const slash = text.indexOf('/')
+        return slash > 0 ? { provider: text.slice(0, slash), model: text.slice(slash + 1) } : null
+      }
+      return api.setModelDefaults(cwd, {
+        hub: hubModelDraft ? parse(hubModelDraft) : null,
+        branch: branchModelDraft ? parse(branchModelDraft) : null,
+      })
+    }, () => void refreshModelDefaults())
+    return h('div', { key: 'models', className: 'sm-card' },
+      h('div', { key: 'head', className: 'sm-row' },
+        h('h3', { key: 'title' }, t('settings.models.title')),
+        h('span', { key: 'source', className: 'sm-badge' },
+          modelDefaults?.source === 'stored' ? t('hubPolicy.source.stored') : t('hubPolicy.source.default')),
+      ),
+      h('div', { key: 'hint', className: 'sm-muted' }, t('settings.models.hint')),
+      h('div', { key: 'form', className: 'sm-form' },
+        h('label', { key: 'hub', className: 'sm-opt' },
+          h('span', { key: 'label', className: 'sm-opt-label' }, t('settings.models.hub')),
+          select('hub', hubModelDraft, setHubModelDraft),
+        ),
+        h('label', { key: 'branch', className: 'sm-opt' },
+          h('span', { key: 'label', className: 'sm-opt-label' }, t('settings.models.branch')),
+          select('branch', branchModelDraft, setBranchModelDraft),
+        ),
+      ),
+      h('div', { key: 'actions', className: 'sm-actions' },
+        h(Button, {
+          key: 'save', variant: 'primary', label: t('settings.models.save'),
+          disabled: !cwd, onClick: saveDefaults,
+        }),
+        h(Button, {
+          key: 'reset', label: t('settings.models.reset'),
+          disabled: !cwd,
+          onClick: () => void run(async () => api.setModelDefaults(cwd, { reset: true }), () => void refreshModelDefaults()),
+        }),
+      ),
+      h('div', { key: 'precedence', className: 'sm-desc' }, t('settings.models.precedence')),
+    )
+  }
+
+  const settingsView: ReactNode = h('div', { key: 'settings' },
+    modelDefaultsCard(),
+    h('div', { key: 'policyTitle', className: 'sm-section-title' }, t('settings.policy.title')),
+    hubPolicyView,
+  )
+
   const body = view.kind === 'hub' ? hubView
     : view.kind === 'sets' ? setsView
       : view.kind === 'topic' ? topicView
         : view.kind === 'memories' ? memoriesView
           : view.kind === 'memory-collection' ? memoryCollectionView
             : view.kind === 'memory-detail' ? memoryDetailView
-              : view.kind === 'chat' ? chatView
-                : toolsView
+              : view.kind === 'settings' ? settingsView
+                : view.kind === 'chat' ? chatView
+                  : toolsView
 
   // R18 需求①: the panel is a two-column shell — a hub-session rail on the
   // left and the active view on the right. Under 760px the rail folds into a
   // horizontal strip (pure CSS).
   const sideRail = h('aside', { key: 'side', className: 'sm-side' },
-    h('div', { key: 'head', className: 'sm-side-head' },
+    h('div', { key: 'head', className: 'sm-side-head', title: t('side.authority') },
       h('span', { key: 'title' }, t('side.title')),
       h('span', { key: 'count', className: 'sm-side-count' }, t('side.count', { count: hubs.length })),
     ),
@@ -2173,7 +2633,10 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
           hubs.map((hubRow) => {
             // R19 需求⑤: a rail click takes over the conversation IN the panel;
             // 「打开会话」 remains the explicit navigation path inside the chat.
-            const current = sessionId === hubRow.sessionId || (view.kind === 'chat' && view.id === hubRow.sessionId)
+            // R41 需求②: ONE selection source (see src/rail-selection.ts). The
+            // old OR compared BOTH, so opening any hub in the panel highlighted
+            // that row AND the shell session's row (two highlights at once).
+            const current = isRailCurrent(view, hubRow.sessionId, sessionId)
             return h('button', {
               key: hubRow.sessionId,
               type: 'button',
@@ -2300,6 +2763,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       h('button', { key: 'sets', ...tabProps('sets') }, t('tab.sets')),
       h('button', { key: 'memories', ...tabProps('memories') }, t('tab.memories')),
       h('button', { key: 'tools', ...tabProps('tools') }, t('tab.tools')),
+      h('button', { key: 'settings', ...tabProps('settings') }, t('tab.settings')),
     ),
     bodyScroll,
   )

@@ -74,7 +74,15 @@ const fakeStore = (seed = {}) => ({
   hotcache: table(seed.hotcache ?? []),
   outbox: table(seed.outbox ?? []),
   questions: table(seed.questions ?? []),
+  // R33/R35: positive hub records (role authority + panel badge truth). A
+  // fixture without this table still works (guarded reads), but badge tests
+  // must seed it explicitly.
+  hubs: table(seed.hubs ?? []),
   meta: table(seed.meta ?? []),
+  // R39: the hub-policy whitelist table (seeded by the dynamic-catalog tests).
+  hubPolicies: table(seed.hubPolicies ?? []),
+  // R41: per-workspace default models (settings tab).
+  modelDefaults: table(seed.modelDefaults ?? []),
 })
 const obs = (name, text, isError = false) => ({ name, args: {}, text, isError })
 const quiet = { ...repeat, hotSignal: false }
@@ -443,6 +451,11 @@ const dDeps = (dispatches, options = {}) => {
   assert.equal(!!row, true, 'the interrupt must enqueue a relay')
   assert.equal(row.payload.includes('分支中断'), true)
   assert.equal(row.payload.includes('超时未结算'), true)
+  // R33 需求⑦: the relay card fields are durable with the outbox row.
+  assert.equal(row.fromSessionId, 'b1', 'the relay source is the real branch session')
+  assert.equal(row.fromKind, 'branch')
+  assert.equal(row.task, '任务甲', 'the card keeps the task')
+  assert.equal(row.capability, '', 'an old dispatch row without a capability keeps an empty card row')
   const second = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now })
   assert.equal(second.length, 0, 'a second sweep must not duplicate')
   assert.equal(store.outbox.size, 1)
@@ -455,6 +468,8 @@ const dDeps = (dispatches, options = {}) => {
   const settled = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now })
   assert.equal(settled.length, 1, 'a failed dispatch that never reached the hub is backfilled')
   assert.equal(store.outbox.get('dlv-dsp-2').payload.includes('aborted'), true)
+  assert.equal(store.outbox.get('dlv-dsp-2').fromSessionId, 'b2', 'the failure relay also names its branch')
+  assert.equal(store.outbox.get('dlv-dsp-2').task, '任务乙')
   ok('D2 已 failed 但从未送达 → 启动对账补发回执')
 }
 
@@ -481,11 +496,18 @@ const { PANEL_REMOTE } = await import('../src/client/remote.ts')
 
 const member = (sessionId, status, lastActiveAt, kind = 'fork') => ({ sessionId, kind, title: sessionId, summary: '', status, lastActiveAt })
 const topicSet = (id, status, members, lastActiveAt = now) => ({ workspaceKey: 'ws', title: id, summary: '', keywords: [], status, members, createdAt: now, updatedAt: now, lastActiveAt })
-const panelStore = () => fakeStore({ topicsets: [
-  ['ts-live', topicSet('ts-live', 'active', [member('branch-1', 'live', now - 1000), member('branch-2', 'idle', now), member('hub-root', 'live', now - 2000, 'root'), member('branch-fresh', 'live', now - 1500, 'root')])],
-  ['ts-other', topicSet('ts-other', 'active', [member('branch-1', 'live', now - 5000)], now - 6000)],
-  ['ts-archived', topicSet('ts-archived', 'archived', [member('branch-3', 'live', now)])],
-] })
+const panelStore = () => fakeStore({
+  topicsets: [
+    ['ts-live', topicSet('ts-live', 'active', [member('branch-1', 'live', now - 1000), member('branch-2', 'idle', now), member('hub-root', 'live', now - 2000, 'root'), member('branch-fresh', 'live', now - 1500, 'root')])],
+    ['ts-other', topicSet('ts-other', 'active', [member('branch-1', 'live', now - 5000)], now - 6000)],
+    ['ts-archived', topicSet('ts-archived', 'archived', [member('branch-3', 'live', now)])],
+  ],
+  // R35: the non-member `session-*` badge is driven by POSITIVE hub records, not
+  // by the id shape.
+  hubs: [
+    ['session-plain', { workspaceKey: 'ws', sessionId: 'session-plain', title: '中枢', source: 'panel', createdAt: now, updatedAt: now }],
+  ],
+})
 const fakeCtx = (services) => ({
   provide: (key, value) => { services[key] = value },
   get: (name) => (name === 'typert' ? services.typert : services[name]),
@@ -565,42 +587,93 @@ const fakeCtx = (services) => ({
   // A fresh dispatch records kind 'root' (its own session root) but its id is
   // `branch-*`: it must stay a branch, never become a hub-set.
   assert.deepEqual(service.sessionBadge('branch-fresh'), { kind: 'branch', topicSetId: 'ts-live', topicSetTitle: 'ts-live', status: 'live' })
-  // R31 需求②: the non-member rule is by id shape — a host-native `session-*`
-  // id is a plugin hub (badged 「中枢」), everything else is explicitly `none`.
-  assert.deepEqual(service.sessionBadge('session-plain'), { kind: 'hub' }, 'a host-native session-* id in no set is a hub')
+  // R35: the non-member rule is POSITIVE evidence (hub_sessions record), never
+  // the `session-*` id shape — a stale/foreign session-* id must not claim the
+  // 中枢 badge just because of how it was minted.
+  assert.deepEqual(service.sessionBadge('session-plain'), { kind: 'hub' }, 'a session-* id WITH a hub record is a hub')
+  assert.deepEqual(service.sessionBadge('session-unrecorded'), { kind: 'none' },
+    'a session-* id WITHOUT a hub record gets no badge (id shape is not a role)')
   assert.deepEqual(service.sessionBadge('hub-session'), { kind: 'none' }, 'an id this plugin cannot classify is not a hub')
   assert.deepEqual(service.sessionBadge('branch-lonely'), { kind: 'none' }, 'a plugin branch with no set yet gets no badge')
-  ok('E2 sessionBadge：fork→分支（最新 lastActiveAt），root→hub-set（不再错标分支），非成员按 id 形状（session-*→hub，其余→none）')
+  ok('E2 sessionBadge：fork→分支（最新 lastActiveAt），root→hub-set，非成员按正证据（hub 记录→hub，无记录→none）')
 }
 
-// ---- R31 需求①: hub session title generation + one-time legacy rename ----
+// ---- R35: routing must use the ONE branch authority (resolveRole) ----
 {
-  const { migrateHubSessionTitles, hubTitleFor, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
-  const { hubSessionTitle, HUB_TITLE_PREFIX } = await import('../src/hub-sessions.ts')
+  // Regression: route.ts used to own a local prefix+fork branch rule that missed
+  // `dispatches.branchSessionId`. A dispatch branch reached through mode:continue
+  // on a non-branch-* id was therefore routed as a hub (topic hint injected).
+  const { routeBatch } = await import('../src/route.ts')
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const cwd = process.cwd()
+  const ws = workspaceKeyOf(cwd)
+  const routeNow = Date.now()
+  const routeStore = fakeStore({
+    topicsets: [['ts-route', {
+      workspaceKey: ws, title: '构建命令发布', summary: '', keywords: ['构建'], status: 'active',
+      members: [], createdAt: routeNow, updatedAt: routeNow, lastActiveAt: routeNow,
+    }]],
+    dispatches: [['dsp-route', {
+      branchSessionId: 'session-route-branch', task: '路由分支', hubSessionId: 'session-route-hub',
+      startSeq: 0, status: 'dispatched', capability: '', title: '', tags: [],
+      createdAt: routeNow, updatedAt: routeNow,
+    }]],
+  })
+  const routeDeps = {
+    store: routeStore,
+    config: { enabled: true, driftTurns: 3, driftThreshold: 0.2, hint: true, llmFallback: false },
+    logger: { warn: () => {}, info: () => {} },
+  }
+  const routeAgent = (id) => ({ id, session: { header: { cwd } } })
+  const control = await routeBatch(undefined, routeDeps, routeAgent('session-route-plain'), 'session-route-plain', '构建命令发布')
+  assert.ok(control.card?.includes('[SuperMemory 话题提示]'),
+    'an ordinary session still gets the silent topic hint')
+  const branch = await routeBatch(undefined, routeDeps, routeAgent('session-route-branch'), 'session-route-branch', '构建命令发布')
+  assert.deepEqual(branch, {},
+    'a dispatch branch (only dispatches.branchSessionId) is not routed like a hub')
+  ok('R35-3 路由跳过分支统一走 resolveRole：dispatches.branchSessionId 命中的会话不再注入话题提示，普通会话行为不变')
+}
 
-  // 1) generation: the flavour prefix plus the 4-char id suffix.
-  assert.equal(hubSessionTitle('session-abcd1234'), 'SuperMemory 中枢 · 1234')
-  assert.equal(HUB_TITLE_PREFIX, 'SuperMemory 中枢')
-  assert.equal(hubTitleFor('session-abcd1234', '新会话 · 1234'), 'SuperMemory 中枢 · 1234')
+// ---- R41 需求③: direct session names + one-time cleanup of prefixed titles ----
+{
+  const { migrateHubSessionTitles, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
+  const { hubSessionTitle } = await import('../src/hub-sessions.ts')
+  const { branchTitleFor } = await import('../src/branch-meta.ts')
+  const { describeSessionTitle, stripLeadingDescription } = await import('../src/title.ts')
+  const cwd = process.cwd()
 
-  // 2) rename pass: a fake host seam. Only a plausible plugin hub whose LIVE
-  //    title still matches the legacy pattern is renamed; a branch id, a
-  //    parented child, a subagent and a user-renamed title are all left alone.
+  // 1) generation: the work itself, no brand prefix / id token / lead-in.
+  assert.equal(describeSessionTitle('R31：整理发布流程'), '整理发布流程')
+  assert.equal(describeSessionTitle('任务：修构建'), '修构建')
+  assert.equal(describeSessionTitle('分支 · 补测试'), '补测试')
+  assert.equal(describeSessionTitle('R41-B · 任务：设置页签'), '设置页签')
+  assert.equal(describeSessionTitle(''), '新会话')
+  assert.equal(hubSessionTitle('session-abcd1234'), '新会话', 'no content yet = neutral name, never an id token')
+  assert.equal(hubSessionTitle('session-abcd1234', 'R41：检查设置页签'), '检查设置页签')
+  assert.equal(branchTitleFor('R31：修构建'), '修构建', 'branch title is the task, not the round label')
+  assert.equal(stripLeadingDescription('R31 的需求'), 'R31 的需求', 'a task that MENTIONS a round is not mutilated')
+
+  // 2) one-time migration: only old branded/legacy hubs and plugin branches are
+  //    touched; content comes from the first user message when readable.
   const titles = new Map([
-    ['session-legacy1', '新会话 · legacy'],   // the rename target
-    ['session-useredit', '我自己起的名字'],     // user rename → never touched
-    ['branch-lonely2', '新会话 · nely2'],      // plugin branch → never a hub
-    ['session-child3', '新会话 · hild3'],      // parented → not a hub
-    ['session-agent4', '新会话 · gent4'],      // subagent → not a hub
-    ['session-fresh5', 'SuperMemory 中枢 · esh5'], // already new format
+    ['session-brand1', 'SuperMemory 中枢 · rand'],   // branded hub, readable content
+    ['session-legacy2', '新会话 · lega'],             // pre-R31 hub, readable content
+    ['session-useredit', '我自己起的名字'],             // user rename → never touched
+    ['branch-work1', '话题集甲 · R31：修构建'],          // branch: strip set prefix + lead-in
+    ['session-child4', 'SuperMemory 中枢 · hild'],    // parented → not a hub
+    ['session-agent5', 'SuperMemory 中枢 · gent'],    // subagent → not a hub
+  ])
+  const contents = new Map([
+    ['session-brand1', 'R41：检查设置页签'],
+    ['session-legacy2', '整理发布流程'],
   ])
   const records = [
-    { header: { id: 'session-legacy1', cwd: 'ws' } },
-    { header: { id: 'session-useredit', cwd: 'ws' } },
-    { header: { id: 'branch-lonely2', cwd: 'ws' } },
-    { header: { id: 'session-child3', cwd: 'ws', parentSession: 'session-parent' } },
-    { header: { id: 'session-agent4', cwd: 'ws', origin: 'subagent' } },
-    { header: { id: 'session-fresh5', cwd: 'ws' } },
+    { header: { id: 'session-brand1', cwd } },
+    { header: { id: 'session-legacy2', cwd } },
+    { header: { id: 'session-useredit', cwd } },
+    { header: { id: 'branch-work1', cwd } },
+    { header: { id: 'session-child4', cwd, parentSession: 'session-parent' } },
+    { header: { id: 'session-agent5', cwd, origin: 'subagent' } },
   ]
   const writes = []
   const titleService = {
@@ -614,38 +687,72 @@ const fakeCtx = (services) => ({
   const seam = {
     listSessions: async () => records,
     readTitleSnapshots: async (ids) => ids.map((id) => ({ sessionId: id, status: 'fulfilled', value: { title: { title: titles.get(id) ?? '' } } })),
+    readSurface: async (id) => ({
+      events: contents.has(id)
+        ? [{ type: 'user/message', data: { message: { content: [{ type: 'text', text: contents.get(id) }] } } }]
+        : [],
+    }),
   }
   const ctxWithSeam = { ...ctx, get: (name) => (name === 'sessionQuery' ? seam : name === 'sessionTitle' ? titleService : undefined) }
   const quiet = { warn: () => {}, info: () => {} }
+  const member = { sessionId: 'branch-work1', kind: 'fork', title: '话题集甲 · R31：修构建', summary: '', status: 'idle', modelOverridden: false, lastActiveAt: 1 }
+  const store = {
+    meta: table(),
+    hubs: table(),
+    topicsets: table([['ts-a', { workspaceKey: cwd, title: '话题集甲', summary: '', keywords: [], status: 'active', members: [member], createdAt: 1, updatedAt: 1, lastActiveAt: 1 }]]),
+    dispatches: table([['d1', {
+      topicSetId: 'ts-a', branchSessionId: 'branch-work1', task: 'R31：修构建', hubSessionId: 'session-brand1',
+      startSeq: 0, status: 'queued', title: 'R31：修构建', tags: [], capability: '', createdAt: 1, updatedAt: 1,
+    }]]),
+  }
 
-  const dry = await migrateHubSessionTitles({ ctx: ctxWithSeam, store: undefined, logger: quiet }, { dryRun: true, ignoreMarker: true })
+  const dry = await migrateHubSessionTitles({ ctx: ctxWithSeam, store, logger: quiet }, { dryRun: true, ignoreMarker: true })
   assert.equal(dry.status, 'planned')
-  assert.equal(dry.scanned, 3, 'plugin branch, parented child and subagent are all excluded from the candidate scan')
-  assert.deepEqual(dry.plan, [{ sessionId: 'session-legacy1', from: '新会话 · legacy', to: 'SuperMemory 中枢 · legacy' }], 'dry-run plans exactly the legacy hub')
+  assert.equal(dry.plan.length, 3, 'branded hub + legacy hub + work branch (user title, child, subagent excluded)')
+  assert.deepEqual(
+    dry.plan.map((row) => row.sessionId + ' => ' + row.to).sort(),
+    ['branch-work1 => 修构建', 'session-brand1 => 检查设置页签', 'session-legacy2 => 整理发布流程'],
+  )
   assert.equal(writes.length, 0, 'dry-run writes nothing')
+  assert.equal(store.dispatches.get('d1').title, 'R31：修构建', 'dry-run does not clean durable titles')
 
-  const applied = await migrateHubSessionTitles({ ctx: ctxWithSeam, store: undefined, logger: quiet }, { ignoreMarker: true })
+  const applied = await migrateHubSessionTitles({ ctx: ctxWithSeam, store, logger: quiet }, { ignoreMarker: true })
   assert.equal(applied.status, 'applied')
-  assert.equal(applied.renamed, 1)
-  assert.deepEqual(writes, [['session-legacy1', 'SuperMemory 中枢 · legacy']])
+  assert.equal(applied.renamed, 3)
   assert.equal(titles.get('session-useredit'), '我自己起的名字', 'a user-renamed title is never overwritten')
-  assert.equal(titles.get('branch-lonely2'), '新会话 · nely2', 'a plugin branch is never renamed as a hub')
+  assert.equal(store.hubs.get('session-brand1')?.title, '检查设置页签', 'a branded hub gets a positive record BEFORE the prefix disappears (R35 evidence)')
+  assert.equal(store.hubs.get('session-brand1')?.source, 'title-migration')
+  assert.equal(store.dispatches.get('d1').title, '修构建', 'durable dispatch title is cleaned')
+  assert.equal(store.topicsets.get('ts-a').members[0].title, '修构建', 'durable branch member title is cleaned')
+  assert.equal(store.meta.get('hub-titles')?.hubTitlesMigrationVersion, HUB_TITLES_MIGRATION_VERSION, 'a clean pass writes the version-2 marker')
 
-  // 3) marker guard: a store whose meta row is current short-circuits, and a
-  //    missing ctx (no host seam) degrades to no-host without writing.
-  const store = { meta: table([['hub-titles', { hubTitlesMigrationVersion: HUB_TITLES_MIGRATION_VERSION, hubTitlesMigratedAt: 1 }]]) }
+  // 3) marker guard + no-host degradation.
   const again = await migrateHubSessionTitles({ ctx: ctxWithSeam, store, logger: quiet })
   assert.equal(again.status, 'already-done')
   assert.equal(again.renamed, 0)
   const noHost = await migrateHubSessionTitles({ ctx: undefined, store: { meta: table() }, logger: quiet }, { ignoreMarker: true })
   assert.equal(noHost.status, 'no-host')
+  ok('R41-1 会话名称直接描述工作内容：生成去品牌前缀/令牌前缀（48 字）；迁移只改旧前缀中枢+插件分支（用户改名/子代理/子会话不碰），先写 hub 记录再改名，标记 v2 幂等 + durable 标题同步清理')
+}
 
-  // 4) a real store records the marker after a clean pass (nothing pending).
-  const metaTable = table()
-  const liveStore = { meta: metaTable }
-  await migrateHubSessionTitles({ ctx: ctxWithSeam, store: liveStore, logger: quiet }, { ignoreMarker: true })
-  assert.equal(metaTable.get('hub-titles')?.hubTitlesMigrationVersion, HUB_TITLES_MIGRATION_VERSION, 'a clean pass writes the marker')
-  ok('R31-1 中枢标题：生成格式 SuperMemory 中枢 · <id4>；一次性迁移只改旧格式的插件中枢（用户改名/分支/子代理不碰），标记守卫 + 无宿主降级')
+{
+  const { readModelDefaults, writeModelDefaults, defaultModelFor } = await import('../src/model-defaults.ts')
+  const store = { modelDefaults: table() }
+  assert.equal(readModelDefaults(store, 'ws-a').source, 'default', 'no row = follow the existing chain')
+  await writeModelDefaults(store, 'ws-a', {
+    hub: { provider: 'step', model: 'step-5' },
+    branch: { provider: 'step', model: 'step-4', reasoningEffort: 'high' },
+  })
+  assert.deepEqual(readModelDefaults(store, 'ws-a').hub, { provider: 'step', model: 'step-5' })
+  assert.equal(defaultModelFor(store, 'ws-a', 'branch').model, 'step-4')
+  assert.equal(defaultModelFor(store, 'ws-a', 'branch').reasoningEffort, 'high')
+  assert.equal(readModelDefaults(store, 'ws-b').source, 'default', 'defaults are workspace-scoped')
+  await writeModelDefaults(store, 'ws-a', { hub: null })
+  assert.equal(readModelDefaults(store, 'ws-a').hub, undefined, 'null clears one kind')
+  assert.equal(readModelDefaults(store, 'ws-a').branch.model, 'step-4', 'the sibling survives')
+  await writeModelDefaults(store, 'ws-a', { reset: true })
+  assert.equal(readModelDefaults(store, 'ws-a').source, 'default', 'reset drops the row')
+  ok('R41-2 默认模型设置：按工作区持久化 + 单项清空 + reset + 无行回退既有链路')
 }
 
 {
@@ -739,6 +846,8 @@ const { deleteCompositeTool } = await import('../src/composite.ts')
 
 const serviceCtx = (services = {}) => ({
   get: (name) => services[name],
+  // R39: the dynamic hub-policy catalog reads ctx.tools.definitions().
+  tools: services.tools,
   agents: services.agents ?? { create: async () => ({}), get: () => undefined },
   sessions: services.sessions ?? { get: () => undefined },
   workspaceRegistry: services.workspaceRegistry,
@@ -796,12 +905,262 @@ const serviceCtx = (services = {}) => ({
 }
 
 {
+  // R41 需求①b/③a through the REAL panel service: persisted defaults are used
+  // by a new hub (explicit composer choice wins), and the title is the work.
+  const created = []
+  const titles = new Map()
+  const services = {
+    agents: {
+      create: async (options) => { created.push(options); return { agent: { session: { id: options.sessionId } } } },
+      get: (id) => ({ id, session: { id } }),
+    },
+    sessionTitle: {
+      get: (session) => ({ title: titles.get(session.id) ?? '' }),
+      rename: (session, text) => { titles.set(session.id, text) },
+    },
+    sessions: { get: (id) => ({ id, append: () => {} }) },
+    workspaceRegistry: { resolveByPath: async () => ({ attachSession: async () => {} }) },
+  }
+  const service = new SupermemoryPanelService(fakeStore(), serviceCtx(services))
+  const cwd = 'F:\\ws-r41-defaults'
+  assert.equal(service.getModelDefaults(cwd).source, 'default', 'no row reads as default')
+  const saved = await service.setModelDefaults(cwd, {
+    hub: { provider: 'deepseek', model: 'step-5' },
+    branch: { provider: 'deepseek', model: 'step-4' },
+  })
+  assert.equal(saved.status, 'ok')
+  assert.equal(service.getModelDefaults(cwd).hub.model, 'step-5', 'hub default is persisted')
+  assert.equal(service.getModelDefaults(cwd).branch.model, 'step-4', 'branch default is persisted')
+  const hub = await service.createHubSession(cwd, {}, 'R41：检查设置页签')
+  assert.equal(hub.status, 'ok')
+  assert.deepEqual(created.at(-1).agentOptions, { provider: 'deepseek', model: 'step-5' }, 'a new hub uses the hub default')
+  assert.equal(titles.get(hub.id), '检查设置页签', 'the hub title is the first message, no brand prefix')
+  await service.createHubSession(cwd, { model: { provider: 'deepseek', model: 'manual' } }, '')
+  assert.deepEqual(created.at(-1).agentOptions, { provider: 'deepseek', model: 'manual' }, 'an explicit model wins over the default')
+  const cleared = await service.setModelDefaults(cwd, { hub: null })
+  assert.equal(cleared.status, 'ok')
+  assert.equal(service.getModelDefaults(cwd).hub, undefined, 'null clears the hub default')
+  assert.equal(service.getModelDefaults(cwd).branch.model, 'step-4', 'the branch default survives')
+  await service.setModelDefaults(cwd, { reset: true })
+  assert.equal(service.getModelDefaults(cwd).source, 'default', 'reset drops the row')
+  await service.createHubSession(cwd, {}, '')
+  assert.ok(!created.at(-1).agentOptions, 'after reset the host default applies (no forced model)')
+  assert.equal(titles.get(created.at(-1).sessionId), '新会话', 'no content = neutral name')
+  ok('R41-3 设置页签（真实服务）：默认模型按工作区保存/单项清空/reset；新建中枢用中枢默认且显式选择优先；标题取首条消息/中性名')
+}
+
+{
+  // R41 需求②: exactly ONE rail highlight in any state (root cause of the
+  // double-highlight bug: sessionId OR open-chat id matched two rows).
+  const { isRailCurrent } = await import('../src/rail-selection.ts')
+  assert.equal(isRailCurrent({ kind: 'hub' }, 'hub-a', 'hub-a'), true, 'the shell session is selected on the hub tab')
+  assert.equal(isRailCurrent({ kind: 'hub' }, 'hub-b', 'hub-a'), false)
+  assert.equal(isRailCurrent({ kind: 'chat', id: 'hub-b' }, 'hub-b', 'hub-a'), true, 'the opened chat wins')
+  assert.equal(isRailCurrent({ kind: 'chat', id: 'hub-b' }, 'hub-a', 'hub-a'), false,
+    'the shell session is NOT highlighted while another chat is open (the old OR highlighted both)')
+  const rows = ['hub-a', 'hub-b'].filter((id) => isRailCurrent({ kind: 'chat', id: 'hub-b' }, id, 'hub-a'))
+  assert.deepEqual(rows, ['hub-b'], 'exactly one row is current')
+  assert.equal(isRailCurrent({ kind: 'chat', id: 'branch-x' }, 'hub-a', 'hub-a'), false,
+    'a branch chat highlights no hub row')
+  assert.equal(isRailCurrent({ kind: 'settings' }, 'hub-a', 'hub-a'), true, 'settings keeps the shell selection')
+  ok('R41-4 侧栏单选唯一高亮：聊天视图按 chat id 判定、其它视图按 shell 会话判定；任何状态只命中一行')
+}
+
+{
   const services = {}
   const service = new SupermemoryPanelService(fakeStore(), serviceCtx(services))
   assert.deepEqual(await service.listAgentPresets(), [], 'a missing preset service degrades to an empty roster')
   assert.deepEqual(await service.listModelCatalog(), { providers: [], models: [] }, 'a missing llm service degrades to an empty catalog')
   assert.deepEqual(await service.listPermissions(), { options: [], defaultPreset: '' }, 'a missing permission service degrades to an empty catalog')
   ok('F2 降级：宿主目录服务缺失时快速启动仍可用（各自为空，不抛错）')
+}
+
+// ---- requirement R39: 「中枢权限」dynamic catalog (runtime sources + stale + fallback) ----
+// Drives the REAL panel service with fake ctx.tools.definitions(): the default
+// path is the dynamic runtime catalog grouped by source; unknown tools are
+// listed and default-denied; disappeared whitelist entries are listed and
+// cleanable; enumeration failure falls back to the built-in list with a warning.
+{
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const cwd = 'F:\\ws-policy'
+  const WS = workspaceKeyOf(cwd)
+  let definitions = [
+    { name: 'memory_recall', description: '召回结论\n第二行不该出现' },
+    { name: 'read', description: '读取文件' },
+    { name: 'mcp__rea__analyze_function', description: '分析函数' },
+    { name: 'brand_new_tool', description: '未来工具' },
+  ]
+  const store = fakeStore({
+    hubPolicies: [['hub-policy-dyn', {
+      workspaceKey: WS,
+      tools: ['memory_recall', 'read', 'retired_tool'],
+      prefixes: ['schedule_'],
+      updatedAt: now,
+    }]],
+  })
+  const service = new SupermemoryPanelService(store, serviceCtx({ tools: { definitions: () => definitions } }))
+  const first = service.getHubPolicy(cwd)
+  assert.equal(first.catalogMeta.mode, 'dynamic', 'the default path is the dynamic runtime catalog')
+  assert.ok(first.catalogMeta.generatedAt > 0)
+  assert.equal(first.catalogMeta.groupCount, first.catalog.length)
+  const ids = first.catalog.map((group) => group.id)
+  assert.ok(ids.includes('source:supermemory'))
+  assert.ok(ids.includes('source:mcp:rea'))
+  assert.ok(ids.includes('source:host-session'))
+  assert.ok(ids.includes('source:host'))
+  assert.equal(ids[ids.length - 1], 'stale', 'the stale bucket is listed last')
+  assert.deepEqual(first.stale.map((entry) => entry.name).sort(), ['retired_tool'],
+    'whitelisted names that vanished from the runtime are listed, not dropped; the schedule_ prefix matches the synthetic schedule tools')
+  const hostSession = first.catalog.find((group) => group.id === 'source:host-session')
+  assert.equal(hostSession?.synthetic, true, 'the host-session group is marked synthetic')
+  for (const name of ['plugin_manager', 'run_code', 'ask_user_question', 'job_output']) {
+    const entry = hostSession?.items.find((item) => item.name === name)
+    assert.equal(entry?.synthetic, true, 'the host/session tool is synthesized: ' + name)
+    assert.equal(entry?.available, true, 'the synthesized entry is available: ' + name)
+    assert.equal(entry?.stale, undefined, 'the synthesized entry is not stale: ' + name)
+  }
+  const unknown = first.catalog.flatMap((group) => group.items).find((entry) => entry.name === 'brand_new_tool')
+  assert.equal(unknown.enabled, false, 'an unknown runtime tool is listed and default-denied')
+  assert.equal(first.catalog.find((group) => group.id === 'source:supermemory').items[0].description, '召回结论',
+    'only the first description line is projected')
+  assert.equal(first.catalog.find((group) => group.id === 'source:supermemory').inferred, true,
+    'the memory_* attribution is labelled as inference')
+
+  // Refresh: a tool registered after the first call appears on the next one,
+  // and the schedule_ prefix stops being stale because it now matches.
+  definitions = [...definitions, { name: 'schedule_create', description: '建计划' }]
+  const refreshed = service.getHubPolicy(cwd)
+  assert.ok(refreshed.catalog.some((group) => group.id === 'source:schedule'
+    && group.items.some((entry) => entry.name === 'schedule_create')), 'a refresh reflects a newly registered tool')
+  assert.equal(refreshed.stale.some((entry) => entry.name === 'schedule_'), false,
+    'the prefix is no longer stale once it matches a runtime tool')
+  assert.ok(refreshed.catalogMeta.generatedAt >= first.catalogMeta.generatedAt)
+
+  // One-click cleanup: the vanished name is removed, locked entries are kept,
+  // and a prefix that now matches is kept.
+  const cleaned = await service.cleanupStaleHubPolicy(cwd)
+  assert.equal(cleaned.status, 'ok', 'cleanup succeeds with a runtime list')
+  assert.match(cleaned.message, /已清理 1 个失效条目/)
+  const row = [...store.hubPolicies.entries()][0][1]
+  assert.equal(row.tools.includes('retired_tool'), false, 'the stale name is gone from the stored whitelist')
+  assert.equal(row.tools.includes('memory_dispatch'), true, 'locked entries are never cleaned')
+  assert.deepEqual(row.prefixes, ['schedule_'], 'a prefix that now matches a runtime tool is kept')
+  assert.equal(row.tools.includes('read'), true)
+
+  // Save → the refreshed snapshot keeps the checked state.
+  const saved = await service.setHubPolicy(cwd, { tools: ['read'], prefixes: [] })
+  assert.equal(saved.status, 'ok')
+  const afterSave = service.getHubPolicy(cwd)
+  assert.equal(afterSave.tools.includes('memory_dispatch'), true, 'the writer keeps locked entries')
+  assert.equal(afterSave.catalog.flatMap((group) => group.items).find((entry) => entry.name === 'read').enabled, true)
+  assert.equal(afterSave.catalog.flatMap((group) => group.items).find((entry) => entry.name === 'brand_new_tool').enabled, false,
+    'an unlisted tool is unticked after the refresh (memory_recall stays locked)')
+
+  // Fallback: enumeration failure keeps the page renderable and warns loudly;
+  // cleanup refuses to guess without a runtime list.
+  const warnings = []
+  const originalWarn = console.warn
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')) }
+  const broken = new SupermemoryPanelService(fakeStore(), serviceCtx({
+    tools: { definitions: () => { throw new Error('simulated enumeration failure') } },
+  }))
+  const fallback = broken.getHubPolicy(cwd)
+  console.warn = originalWarn
+  assert.equal(fallback.catalogMeta.mode, 'fallback', 'a failure degrades to the built-in catalog')
+  assert.match(fallback.catalogMeta.warning, /内置清单/, 'the panel receives an explicit warning')
+  assert.ok(warnings.some((message) => message.includes('已回退内置清单')), 'the fallback is also logged')
+  assert.ok(fallback.catalog.flatMap((group) => group.items).some((entry) => entry.name === 'memory_recall'),
+    'the fallback still lists known tools (no blank page)')
+  const fallbackPm = fallback.catalog.flatMap((group) => group.items).find((entry) => entry.name === 'plugin_manager')
+  assert.equal(fallbackPm?.synthetic, true, 'the fallback labels host/session tools synthetic')
+  assert.equal(fallbackPm?.available, true, 'the fallback may claim availability for the explicit synthetic list')
+  assert.equal((await broken.cleanupStaleHubPolicy(cwd)).status, 'error',
+    'cleanup refuses to guess when the runtime list is unavailable')
+  const noTools = new SupermemoryPanelService(fakeStore(), serviceCtx({}))
+  assert.equal(noTools.getHubPolicy(cwd).catalogMeta.mode, 'fallback',
+    'a host without ctx.tools also degrades to the fallback instead of throwing')
+  ok('R39-1 中枢权限动态目录：运行时工具按来源分组（推断标注）+ 未知工具默认拒绝且可勾选 + 失效条目单列/可清理 + 刷新反映新增工具 + 枚举失败回退内置清单并告警')
+}
+
+// ---- requirement R40: host/session synthetic entries through the REAL panel service ----
+// The user-facing failure was plugin_manager showing up under 「已失效条目」. This
+// drives getHubPolicy / setHubPolicy / cleanupStaleHubPolicy with a fake global
+// definitions() that omits plugin_manager (the real Web composition does), and
+// asserts the synthetic host-session surface: available, never stale, never
+// cleaned, still switchable, and replaced by a real definition when one exists.
+{
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const cwd = 'F:\\ws-host-session'
+  const WS = workspaceKeyOf(cwd)
+  const globalDefs = [
+    { name: 'memory_recall', description: '召回结论' },
+    { name: 'read', description: '读取文件' },
+  ]
+  const store = fakeStore({
+    hubPolicies: [['hub-policy-host-session', {
+      workspaceKey: WS,
+      tools: ['plugin_manager', 'run_code', 'read'],
+      prefixes: ['schedule_'],
+      updatedAt: now,
+    }]],
+  })
+  const service = new SupermemoryPanelService(store, serviceCtx({ tools: { definitions: () => globalDefs } }))
+  const view = service.getHubPolicy(cwd)
+  const hostGroup = view.catalog.find((group) => group.id === 'source:host-session')
+  assert.equal(hostGroup?.synthetic, true, 'the panel receives a synthetic host-session group')
+  for (const name of ['plugin_manager', 'run_code', 'ask_user_question', 'send_message', 'job_output', 'schedule_create']) {
+    const entry = hostGroup?.items.find((item) => item.name === name)
+    assert.ok(entry, 'the host/session tool is listed: ' + name)
+    assert.equal(entry.synthetic, true, 'it is synthetic: ' + name)
+    assert.equal(entry.available, true, 'it is available: ' + name)
+    assert.equal(entry.stale, undefined, 'it is not stale: ' + name)
+  }
+  assert.equal(view.stale.length, 0, 'the stale group is empty for a whitelist of host/session tools')
+  assert.ok(view.catalogMeta.syntheticCount >= 18, 'the snapshot reports how many entries are synthetic')
+
+  // Cleanup must not remove any synthetic entry.
+  const cleaned = await service.cleanupStaleHubPolicy(cwd)
+  assert.equal(cleaned.status, 'ok')
+  assert.match(cleaned.message, /没有失效条目需要清理/)
+  const row = [...store.hubPolicies.entries()][0][1]
+  assert.equal(row.tools.includes('plugin_manager'), true, 'cleanup keeps plugin_manager')
+  assert.equal(row.tools.includes('run_code'), true, 'cleanup keeps run_code')
+  assert.deepEqual(row.prefixes, ['schedule_'], 'cleanup keeps the schedule_ prefix (synthetic schedule tools match)')
+
+  // Switching plugin_manager off removes it from the whitelist, and the panel
+  // still shows it as a re-checkable (unlocked) synthetic row.
+  assert.equal((await service.setHubPolicy(cwd, { tools: ['read'], prefixes: [] })).status, 'ok')
+  const afterOff = service.getHubPolicy(cwd)
+  const pmOff = afterOff.catalog.flatMap((group) => group.items).find((item) => item.name === 'plugin_manager')
+  assert.equal(pmOff?.enabled, false, 'plugin_manager is off after saving without it')
+  assert.equal(pmOff?.available, true, 'it stays available while off')
+  assert.equal(pmOff?.synthetic, true, 'it stays synthetic while off')
+  assert.equal(pmOff?.locked, undefined, 'it is not locked: the user may switch it back on')
+  assert.equal(afterOff.stale.some((item) => item.name === 'plugin_manager'), false,
+    'switching it off never puts it in the stale group')
+
+  assert.equal((await service.setHubPolicy(cwd, { tools: ['read', 'plugin_manager'], prefixes: [] })).status, 'ok')
+  assert.equal(service.getHubPolicy(cwd).catalog.flatMap((group) => group.items)
+    .find((item) => item.name === 'plugin_manager')?.enabled, true, 'switching it back on works')
+  assert.equal((await service.setHubPolicy(cwd, { reset: true })).status, 'ok')
+  assert.equal(service.getHubPolicy(cwd).catalog.flatMap((group) => group.items)
+    .find((item) => item.name === 'plugin_manager')?.enabled, true,
+  'restoring the default brings plugin_manager back (it is in the built-in default list)')
+
+  // A host that DOES register plugin_manager globally wins: one row, real text.
+  const realService = new SupermemoryPanelService(fakeStore(), serviceCtx({
+    tools: { definitions: () => [...globalDefs, { name: 'plugin_manager', description: '真实注册的第一行' }] },
+  }))
+  const realView = realService.getHubPolicy(cwd)
+  const pmItems = realView.catalog.flatMap((group) => group.items).filter((item) => item.name === 'plugin_manager')
+  assert.equal(pmItems.length, 1, 'the real definition is not duplicated by the synthetic list')
+  assert.equal(pmItems[0].synthetic, undefined, 'the real definition is not labelled synthetic')
+  assert.equal(pmItems[0].description, '真实注册的第一行', 'the real description is shown')
+  assert.equal(realView.catalog.find((group) => group.id === 'source:host-session')?.items
+    .some((item) => item.name === 'plugin_manager'), false,
+  'the real plugin_manager is not also listed in the synthetic group')
+  ok('R40-2 面板服务：plugin_manager/run_code 在全局 definitions 缺失时仍在 host-session 组（available/不失效）'
+    + ' + 清理不移除 + 关闭后仍可重新勾选 + 恢复默认回来 + 真实定义优先不重复')
 }
 
 {
@@ -1534,7 +1893,7 @@ const { groupRelayText } = await import('../src/group.ts')
   const WS3 = nodePath3.resolve('ws-r30b')
   const now3 = Date.now()
   const { branchTitleFor, branchTagsFor, roundTokensOf, latestBranchMeta } = await import('../src/branch-meta.ts')
-  assert.equal(branchTitleFor('## 【R30-B：中枢-分支协同】\n第二行'), 'R30-B：中枢-分支协同', '标题取任务首行（去标记）')
+  assert.equal(branchTitleFor('## 【R30-B：中枢-分支协同】\n第二行'), '中枢-分支协同', '标题取任务首行（去标记/去轮次前缀）')
   assert.ok(Array.from(branchTitleFor('任'.repeat(80))).length <= 48, '标题 48 字预算并以 … 标记截断')
   assert.deepEqual(roundTokensOf('【R30-B：…】与 R30 相关'), ['R30-B', 'R30'], '轮次令牌含裸轮次')
   assert.deepEqual(
@@ -1743,7 +2102,61 @@ const { groupRelayText } = await import('../src/group.ts')
   assert.ok(groupRow, 'the group relay is enqueued right after the interrupt sweep')
   assert.match(groupRow[1].payload, /\[supermemory-group-relay grp-i\]/)
   assert.match(groupRow[1].payload, /中断终态/, 'the queued group relay carries the interruption annotation')
+  // R33 需求⑦: the group card's SOURCE is the first member BRANCH; the group id
+  // is its own field — the pre-R33 code put the groupId into fromSessionId.
+  assert.equal(groupRow[1].fromSessionId, 'd1', 'a group relay names the first member branch as its source')
+  assert.equal(groupRow[1].groupId, 'grp-i', 'the group id stays in the group field')
+  assert.equal(groupRow[1].fromKind, 'group')
+  assert.equal(groupRow[1].fromTitle, '并行组', 'a group without a set/title keeps the explicit group label')
+  assert.equal(groupRow[1].task, '任务-d1', 'the group card carries the first member task')
+  ok('R19-协同1c 组回送卡：来源=首个成员分支、groupId 单列、任务/能力随行')
   ok('R19-协同1b 中断成员：interrupted 纳入组终态，整组汇总立即收敛且中断单独标注')
+}
+
+// ---- R33 需求⑦: flushObserve reconstructs a pre-R33 pending outbox row ----
+// A row written by an older round carries only dispatchId/payload; the flush
+// pass must resolve the source branch, its live/durable title, the task, the
+// topic set and the capability, SEND them on the source marker, and persist
+// them so the next restart needs no reconstruction.
+{
+  const { flushObserve } = await import('../src/observe.ts')
+  const stamp = Date.now()
+  const store = fakeStore({
+    topicsets: [['ts-f', {
+      workspaceKey: 'ws', title: '字段话题', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-f', kind: 'root', title: '分支F', summary: '', status: 'idle', lastActiveAt: stamp }],
+      createdAt: stamp, updatedAt: stamp, lastActiveAt: stamp,
+    }]],
+    dispatches: [['dsp-f', {
+      topicSetId: 'ts-f', branchSessionId: 'branch-f', task: '补字段', hubSessionId: 'hub-f',
+      startSeq: 0, status: 'delivered', capability: 'full', title: '', tags: [], createdAt: stamp, updatedAt: stamp,
+    }]],
+    outbox: [['dlv-dsp-f', { kind: 'single', dispatchId: 'dsp-f', status: 'pending', enqueuedAt: stamp, payload: '回送正文' }]],
+  })
+  const seen = []
+  const ctx = { agents: { get: () => ({ followup: (message) => { seen.push(message) } }) } }
+  await flushObserve({
+    ctx, store,
+    config: { enabled: true, maxTokensPolicy: 'deliver-partial' },
+    logger,
+    createMessage: (input) => input,
+  })
+  assert.equal(seen.length, 1, 'the pending row is delivered when the hub is live again')
+  const source = seen[0].source
+  assert.equal(source.fromSessionId, 'branch-f', 'the source session is the branch, not a group id')
+  assert.equal(source.fromTitle, '分支F', 'flushObserve resolves the missing source title')
+  assert.equal(source.task, '补字段', 'the flush card carries the task')
+  assert.equal(source.topicSetTitle, '字段话题', 'the flush card carries the topic set')
+  assert.equal(source.capability, 'full', 'the flush card carries the capability')
+  assert.equal(source.fromKind, 'branch')
+  const row = store.outbox.get('dlv-dsp-f')
+  assert.equal(row.status, 'relayed')
+  assert.equal(row.fromSessionId, 'branch-f')
+  assert.equal(row.fromTitle, '分支F')
+  assert.equal(row.task, '补字段')
+  assert.equal(row.topicSetTitle, '字段话题')
+  assert.equal(row.capability, 'full', 'the resolved fields are persisted with the relayed status')
+  ok('R33-7 flushObserve：来源=真实分支、fromTitle/任务/话题集/能力补齐并固化')
 }
 
 
@@ -2123,7 +2536,9 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   // R25: the continuation input lands as a human-form user message (kind
   // 'user', no form) so the branch's session-list recency advances.
   assert.equal(follows[0].source.kind, 'user', 'the resume input lands as kind user')
-  assert.equal(follows[0].source.form, undefined, 'no form: a plain user prompt, not a context card')
+  // R32 需求③: kind stays 'user' (recency) but the plugin's form marker turns
+  // the branch-side message into the same collapsible card as a relay.
+  assert.equal(follows[0].source.form, 'supermemory-dispatch', 'R32 card marker on the resume input')
   ok('R3 续跑：优先续接被保留的分支会话（live 直投），台账双向关联')
 }
 
@@ -2718,11 +3133,11 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   assert.equal(isDispatchInput(msg({ kind: 'agent' })), false, 'a non-user kind is never our input')
   const { readFileSync } = await import('node:fs')
   const observeSrc = readFileSync('src/observe.ts', 'utf8')
-  assert.ok(observeSrc.includes("{ kind: 'supermemory', form: 'relay'"),
-    'relay cards stay supermemory-kind (context, not input)')
+  assert.ok(observeSrc.includes('relaySource({'),
+    'relay cards stay supermemory-kind through the shared card source builder')
   const dispatchSrc = readFileSync('src/dispatch.ts', 'utf8')
-  assert.ok(dispatchSrc.includes("source: { kind: 'user' }"),
-    'the dispatch wake message lands as a human-form user message')
+  assert.ok(dispatchSrc.includes('dispatchSource({'),
+    'the dispatch wake message lands as a human-form user message carrying the R32 card marker')
   const panelSrc = readFileSync('src/panel.ts', 'utf8')
   assert.equal((panelSrc.match(/source: \{ kind: 'supermemory' \}/g) || []).length, 0,
     'no human-initiated panel delivery is left on the private kind')
@@ -2763,8 +3178,10 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   assert.equal(seen.length, 1, 'the branch is woken once')
   assert.equal(seen[0].source.kind, 'user',
     'the dispatch input records as user → lastPromptAt advances → the branch sorts to the top')
-  assert.equal(seen[0].source.form, undefined, 'no form on a dispatch input')
-  ok('R25-2 派发输入实测：runDispatch 交给分支的消息 source.kind=user（无 form）')
+  // R32 需求③: the form marker is additive — recency still keys off kind 'user'.
+  assert.equal(seen[0].source.form, 'supermemory-dispatch', 'R32 card marker on the dispatch input')
+  assert.equal(seen[0].source.fromSessionId, 'hub-r25', 'card source id is the dispatching hub session')
+  ok('R25-2 派发输入实测：runDispatch 交给分支的消息 source.kind=user（R32 卡片标记，recency 不变）')
 }
 
 // ---- R7: 重启后分支会话恢复（branch-restore：从持久台账重建分支注册表）----

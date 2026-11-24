@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type Memory, type MemoryCollection, type MemoryVersion, type Meta, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type HubPolicy, type HubSession, type Memory, type ModelDefaults, type MemoryCollection, type MemoryVersion, type Meta, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -38,6 +38,10 @@ export interface Store {
   memoryCollections: Table<MemoryCollection>
   /** R30 需求①: historical versions of memories (entries stay in `memories`). */
   memoryVersions: Table<MemoryVersion>
+  /** R36 需求①: the hub tool whitelist (one row per workspace). */
+  hubPolicies: Table<HubPolicy>
+  /** R41 需求①b: default hub/branch models (one row per workspace). */
+  modelDefaults: Table<ModelDefaults>
   episodes: Table<Episode>
   requirements: Table<Requirement>
   filemap: Table<FileMapEntry>
@@ -51,6 +55,8 @@ export interface Store {
   outbox: Table<OutboxItem>
   /** One-time migration markers (title repair); see title-migration.ts. */
   meta: Table<Meta>
+  /** R33 需求②: positive hub records (never inferred from a missing parent). */
+  hubs: Table<HubSession>
   close(): Promise<void>
 }
 
@@ -139,6 +145,9 @@ export async function openStore(
       routing: sd.domainTable(schemas.routing),
       hotcache: sd.domainTable(schemas.hotcache),
       meta: sd.domainTable(schemas.meta),
+      hub_sessions: sd.domainTable(schemas.hub_sessions),
+      hub_policies: sd.domainTable(schemas.hub_policies),
+      model_defaults: sd.domainTable(schemas.model_defaults),
     },
   }) as SupermemorySpec
   const domain = await storageDomain.open(spec)
@@ -161,6 +170,9 @@ export async function openStore(
     questions: table<Question>('questions'),
     outbox: table<OutboxItem>('outbox'),
     meta: table<Meta>('meta'),
+    hubs: table<HubSession>('hub_sessions'),
+    hubPolicies: table<HubPolicy>('hub_policies'),
+    modelDefaults: table<ModelDefaults>('model_defaults'),
     close: () => domain.close(),
   }
 }

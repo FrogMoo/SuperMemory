@@ -119,6 +119,35 @@ export async function buildSchemas() {
     changeType: z.enum(['create', 'update', 'migrate']),
   })
 
+  // R36 需求①: 中枢工具白名单（默认拒绝）——每个工作区一行。它是有工作区
+  // 归属的数据（不是 meta 标记），所以独立建表：旧介质没有行即空表，读取时
+  // 回退内置默认白名单，域保持 v1 兼容（同 memory_collections 的新表模式）。
+  const hubPolicies = z.object({
+    workspaceKey: z.string(),
+    tools: z.array(z.string()).default([]),
+    prefixes: z.array(z.string()).default([]),
+    updatedAt: z.number().int(),
+  })
+
+  // R41 需求①b: 默认模型设置——每个工作区一行（中枢会话 / 分支会话）。和
+  // hub_policies 一样是「有工作区归属的数据」，不是进程级 meta 标记。
+  const modelDefaults = z.object({
+    workspaceKey: z.string(),
+    /** 新建中枢会话的默认模型；缺省=跟随宿主默认。 */
+    hub: z.object({
+      provider: z.string(),
+      model: z.string(),
+      reasoningEffort: z.string().optional(),
+    }).optional(),
+    /** 新派发分支会话的默认模型；缺省=跟随话题集/中枢/宿主默认。 */
+    branch: z.object({
+      provider: z.string(),
+      model: z.string(),
+      reasoningEffort: z.string().optional(),
+    }).optional(),
+    updatedAt: z.number().int(),
+  })
+
   const episodes = z.object({
     topicSetId: z.string().optional(),
     branchSessionId: z.string().optional(),
@@ -216,6 +245,10 @@ export async function buildSchemas() {
     // 带默认值：R30 之前的派发记录读作 ''/[]，存储域保持 v1 兼容（同 D/E 的可选字段）。
     title: z.string().default(''),
     tags: z.array(z.string()).default([]),
+    // R33 需求⑦: 派发时授予分支的能力档位（read/read-write/full/minimal）。
+    // relay 卡片要显示「能力档位」，但标签里只有一个无法区分的快照；独立字段让
+    // 回送路径无需反解 tags。旧记录读作 ''（卡片该行留空），域保持 v1 兼容。
+    capability: z.string().default(''),
     // E: 续跑关联（中断任务由用户决定继续）。续跑产生的新派发记录原 dispatchId
     // （resumeOf），原派发回写续跑派发 id（resumedBy）。两个字段都是可选的：
     // 旧记录读作 undefined，存储域保持 v1 兼容（同 D 的 interrupted/lastActivityAt）。
@@ -262,6 +295,38 @@ export async function buildSchemas() {
     status: z.enum(['pending', 'relayed', 'confirmed', 'failed']).default('pending'),
     enqueuedAt: z.number().int(),
     relayedAt: z.number().int().optional(),
+    // R32 需求③: the card source survives a restart with the pending outbox
+    // row, so a re-relayed message still says "来自 <来源会话>". Optional with
+    // defaults absent: pre-R32 rows read as before and the delivery path
+    // reconstructs what it can from the dispatch row.
+    fromSessionId: z.string().optional(),
+    fromTitle: z.string().optional(),
+    fromKind: z.enum(['hub', 'branch', 'group', 'system']).optional(),
+    // R33 需求⑦: the rest of the card survives the same way (task / topic set /
+    // capability). Defaults keep pre-R33 rows readable; the delivery path falls
+    // back to the dispatch row or group member when a value is absent.
+    task: z.string().default(''),
+    topicSetTitle: z.string().default(''),
+    capability: z.string().default(''),
+  })
+
+  // R33 需求②: positive hub records. A hub is NEVER inferred from "top-level
+  // session with no parent" (that classified every ordinary conversation as a
+  // hub and denied its bash/write/subagent). This table is the durable positive
+  // mark written when the plugin creates a hub (panel 新会话 / 话题集会话) or
+  // when the session dispatches (a hub by action). Topic-set root members and
+  // dispatch.hubSessionId references are also positive marks, resolved without
+  // this table; the row makes the mark explicit and workspace-scoped.
+  const hubSessions = z.object({
+    workspaceKey: z.string(),
+    sessionId: z.string(),
+    title: z.string().default(''),
+    /** How the hub was marked (audit only; resolution trusts every source). */
+    // R35: 'title-migration' is the one-time migration that marks pre-R33
+    // panel-created hubs from their host title; 'migration' stays for older rows.
+    source: z.enum(['panel', 'topicset-root', 'dispatch', 'migration', 'title-migration']).default('panel'),
+    createdAt: z.number().int(),
+    updatedAt: z.number().int(),
   })
 
   const routing = z.object({
@@ -304,12 +369,27 @@ export async function buildSchemas() {
     // reason as above: an undeclared marker key would be stripped on load.
     hubTitlesMigrationVersion: z.number().int().optional(),
     hubTitlesMigratedAt: z.number().int().optional(),
+    // R35 marker (meta row 'hub-records'): the one-time backfill of positive
+    // hub_sessions rows for pre-R33 panel-created hubs. Declared here because
+    // the meta schema strips unknown marker keys on load.
+    hubRecordsMigrationVersion: z.number().int().optional(),
+    hubRecordsMigratedAt: z.number().int().optional(),
+    // R33 需求⑧ marker (meta row 'role-guard'): whether the monotonic runtime
+    // guard actually installed. A missing/failed guard used to be a single
+    // logger.warn; the marker makes the failure visible in the panel/console
+    // and survives a reload. Declared here because the meta schema strips
+    // unknown keys on load (same rule as every other marker).
+    roleGuardInstalledAt: z.number().int().optional(),
+    roleGuardFailedAt: z.number().int().optional(),
+    roleGuardVersion: z.number().int().optional(),
+    roleGuardError: z.string().optional(),
   })
 
   return {
     topicsets, memories, memory_collections: memoryCollections, memory_versions: memoryVersions,
     episodes, requirements, filemap,
     tool_memory: toolMemory, signals, dispatches, questions, outbox, routing, hotcache, meta,
+    hub_sessions: hubSessions, hub_policies: hubPolicies, model_defaults: modelDefaults,
   }
 }
 
@@ -320,12 +400,17 @@ export type Memory = z.infer<Schemas['memories']>
 export type MemoryCollection = z.infer<Schemas['memory_collections']>
 /** R30 需求①: one historical version of a memory (full snapshot). */
 export type MemoryVersion = z.infer<Schemas['memory_versions']>
+/** R36 需求①: one workspace's hub tool whitelist (default deny). */
+export type HubPolicy = z.infer<Schemas['hub_policies']>
+export type ModelDefaults = z.infer<Schemas['model_defaults']>
 export type Episode = z.infer<Schemas['episodes']>
 export type Requirement = z.infer<Schemas['requirements']>
 export type FileMapEntry = z.infer<Schemas['filemap']>
 export type ToolMemory = z.infer<Schemas['tool_memory']>
 export type Signal = z.infer<Schemas['signals']>
 export type Dispatch = z.infer<Schemas['dispatches']>
+/** R33 需求②: one positive hub record (workspace-scoped). */
+export type HubSession = z.infer<Schemas['hub_sessions']>
 export type Question = z.infer<Schemas['questions']>
 export type OutboxItem = z.infer<Schemas['outbox']>
 export type Routing = z.infer<Schemas['routing']>

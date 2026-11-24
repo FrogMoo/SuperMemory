@@ -115,6 +115,37 @@ export function firstLine(text: string): string {
 }
 
 /**
+ * Strip the descriptive lead-ins users and older rounds put in front of a task:
+ * 「R31：」「R31-B · 」「任务：」「分支 · 」「第 3 轮：」… The strip only fires
+ * when the token is followed by a separator, so a task that merely MENTIONS a
+ * round («R31 的需求…») is not mutilated. Repeats up to three times so stacked
+ * prefixes («R31：任务：…») collapse to the task itself.
+ */
+const LEADING_DESCRIPTION = /^(?:(?:R|r)\d{1,3}(?:-[A-Za-z]{1,3})?|第\s*\d+\s*轮|Round\s*\d+|任务书|任务|分支|派发|请求|工作内容|需求)\s*(?:[：:·•・|\-—–]|\s{2,})\s*/i
+
+/** Remove leading descriptive tokens (round / 任务 / 分支 …) from one line. */
+export function stripLeadingDescription(text: string): string {
+  let value = String(text ?? '').trim()
+  for (let round = 0; round < 3; round += 1) {
+    const next = value.replace(LEADING_DESCRIPTION, '').trim()
+    if (next === value) break
+    value = next
+  }
+  return value
+}
+
+/**
+ * A session's display name as a DIRECT description of its work: markdown and
+ * brackets stripped, descriptive lead-ins removed, first line clipped with an
+ * ellipsis. An empty text falls back to the neutral {@link TITLE_FALLBACK}
+ * (「新会话」) — never a brand prefix and never an id token.
+ */
+export function describeSessionTitle(text: string, maxChars = TITLE_TASK_SNIPPET_CHARS): string {
+  const cleaned = firstLine(stripLeadingDescription(cleanTitleText(text)))
+  return cleaned ? clipEllipsis(cleaned, Math.max(4, Math.floor(maxChars))) : TITLE_FALLBACK
+}
+
+/**
  * Strip markdown and bracket markup before truncation: fences, inline code,
  * emphasis markers, ATX headings, blockquotes, list bullets, task boxes and
  * square/full-width bracket characters. Newlines are preserved so the caller can
@@ -187,6 +218,8 @@ export function sessionTitleFor(
  * @param member - branch identity and kind.
  * @param topicTitle - topic-set title fallback when the row is gone.
  * @param task - task text used for the snippet.
+ * @param options - `taskOnly` names a WORK BRANCH: the title is the task
+ *   itself (no topic-set prefix), matching 「会话名称直接描述工作内容」.
  * @returns the title now stored on the member.
  */
 export async function ensureMemberTitle(
@@ -195,15 +228,18 @@ export async function ensureMemberTitle(
   member: NamedMember,
   topicTitle: string,
   task: string,
+  options: { taskOnly?: boolean } = {},
 ): Promise<string> {
   const record = store.topicsets.get(topicSetId)
-  if (!record) return sessionTitleFor(topicTitle, task)
+  if (!record) return options.taskOnly ? describeSessionTitle(task) : sessionTitleFor(topicTitle, task)
   const current = record.members.find((entry) => entry.sessionId === member.sessionId)
   if (current && current.title.trim()) return current.title
   const others = record.members
     .filter((entry) => entry.sessionId !== member.sessionId)
     .map((entry) => entry.title)
-  const title = sessionTitleFor(record.title || topicTitle, task, others)
+  const title = options.taskOnly
+    ? describeSessionTitle(task)
+    : sessionTitleFor(record.title || topicTitle, task, others)
   if (current) {
     await updateMember(store, topicSetId, member.sessionId, { title })
   } else {
@@ -288,3 +324,35 @@ export function currentSessionTitle(ctx: TitleHost, sessionId: string): string |
   } catch { /* no title service: treat as untitled */ }
   return undefined
 }
+/**
+ * R32 需求③: the best available title for a message's SOURCE session.
+ *
+ * Reads the live host title first, then the plugin's durable branch title
+ * mapping (a branch can be detached/reloaded while its dispatch row still
+ * carries the name), and returns '' when neither knows one — the card then
+ * falls back to the id's last four characters (see chat-card.ts).
+ *
+ * @param ctx - host context (structural view; never throws).
+ * @param store - durable plugin store (optional).
+ * @param sessionId - session whose title should label a card.
+ * @returns a trimmed title, or ''.
+ */
+export function sessionTitleOf(ctx: TitleHost, store: Store | undefined, sessionId: string): string {
+  if (!sessionId) return ''
+  const live = currentSessionTitle(ctx, sessionId)
+  if (live && live.trim()) return live.trim()
+  if (!store) return ''
+  try {
+    for (const [, topicSet] of store.topicsets.entries()) {
+      for (const member of topicSet.members) {
+        if (member.sessionId === sessionId && typeof member.title === 'string' && member.title.trim()) {
+          return member.title.trim()
+        }
+      }
+    }
+  } catch {
+    // A partly materialized table only loses the fallback label, never the card.
+  }
+  return ''
+}
+

@@ -14,8 +14,9 @@ import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { loadHostModule } from './host.ts'
 import type { Store } from './store.ts'
 import { branchHandles } from './dispatch.ts'
-import { applySessionTitle, ensureMemberTitle } from './title.ts'
-import { flushObserve, isDispatchInput, settleOpenDispatches } from './observe.ts'
+import { applySessionTitle, ensureMemberTitle, sessionTitleOf } from './title.ts'
+import { dispatchSource, relaySource } from './chat-card.ts'
+import { flushObserve, isDispatchInput, relayCardFields, settleOpenDispatches } from './observe.ts'
 import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
 
 export interface ReconcileDeps {
@@ -52,21 +53,39 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number): Prom
 async function failureDelivery(
   deps: ReconcileDeps,
   dispatchId: string,
-  record: { hubSessionId: string; task: string; branchSessionId: string },
+  record: { hubSessionId: string; task: string; branchSessionId: string; topicSetId?: string },
   reason: string,
 ): Promise<void> {
-  const { store, logger } = deps
+  const { ctx, store, logger } = deps
   const deliveryId = 'dlv-fail-' + record.branchSessionId
   if (store.outbox.get(deliveryId)) return
   const questionBlock = renderQuestionsBlock(openQuestionsOfDispatch(store, dispatchId))
   const payload = '[supermemory-relay ' + record.branchSessionId + ']\n任务：' + record.task + '\n结果：' + reason
     + (questionBlock ? '\n\n' + questionBlock : '')
+  const dispatch = store.dispatches.get(dispatchId)
+  const topicSetTitle = record.topicSetId
+    ? String(store.topicsets?.get?.(record.topicSetId)?.title ?? '')
+    : ''
+  const card = relayCardFields(ctx, store, {
+    dispatchId,
+    fromSessionId: record.branchSessionId,
+    fromKind: 'branch',
+    task: record.task,
+    ...(topicSetTitle ? { topicSetTitle } : {}),
+    ...(dispatch?.capability ? { capability: dispatch.capability } : {}),
+  })
   await store.outbox.put(deliveryId, {
     dispatchId,
     kind: 'single',
     payload,
     status: 'pending',
     enqueuedAt: Date.now(),
+    fromSessionId: record.branchSessionId,
+    ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+    fromKind: 'branch',
+    task: card.task,
+    topicSetTitle: card.topicSetTitle,
+    capability: card.capability,
   })
   logger.info('supermemory: failure delivery ' + deliveryId + ' queued for the hub')
 }
@@ -136,7 +155,7 @@ export function runReconciliation(deps: ReconcileDeps): void {
               if (record.topicSetId) {
                 try {
                   const topicTitle = store.topicsets.get(record.topicSetId)?.title ?? ''
-                  const named = await ensureMemberTitle(store, record.topicSetId, { sessionId: record.branchSessionId, kind: 'root' }, topicTitle, record.task)
+                  const named = await ensureMemberTitle(store, record.topicSetId, { sessionId: record.branchSessionId, kind: 'root' }, topicTitle, record.task, { taskOnly: true })
                   applySessionTitle(ctx, record.branchSessionId, named, logger)
                 } catch { /* naming is best-effort on recovery */ }
               }
@@ -150,6 +169,9 @@ export function runReconciliation(deps: ReconcileDeps): void {
             continue
           }
           const make = await ensureFactory()
+          // R32 需求③: restart re-dispatch is still a hub→branch request.
+          const hubTitle = sessionTitleOf(ctx, store, record.hubSessionId)
+          const topicSetTitle = record.topicSetId ? (store.topicsets.get(record.topicSetId)?.title ?? '') : ''
           target.followup(make({
             content: [{
               type: 'text',
@@ -157,7 +179,14 @@ export function runReconciliation(deps: ReconcileDeps): void {
             }],
             // R25: 重启重投同样是派发输入（kind 'user'），否则 observe 的
             // isDispatchInput 认领不到它，这条 dispatch 会永久悬空。
-            source: { kind: 'user' },
+            source: dispatchSource({
+              fromSessionId: record.hubSessionId,
+              ...(hubTitle ? { fromTitle: hubTitle } : {}),
+              task: record.task,
+              ...(topicSetTitle ? { topicSetTitle } : {}),
+              dispatchId,
+              status: 'dispatched',
+            }) as never,
           }) as never)
           logger.info(`supermemory: reconcile ${dispatchId}: re-followed branch`)
           continue
@@ -210,11 +239,45 @@ export function runReconciliation(deps: ReconcileDeps): void {
           continue
         }
         const make = await ensureFactory()
+        // R32/R33 需求⑦: prefer the source persisted with the outbox row; a
+        // pre-R33 row reconstructs every field from the dispatch row / group
+        // member. A GROUP's source is its first member BRANCH, never the group
+        // id; groupId stays its own card row.
+        const card = relayCardFields(ctx, store, {
+          ...(item.dispatchId === undefined ? {} : { dispatchId: item.dispatchId }),
+          ...(item.groupId === undefined ? {} : { groupId: item.groupId }),
+          ...(item.fromSessionId ? { fromSessionId: item.fromSessionId } : {}),
+          ...(item.fromTitle ? { fromTitle: item.fromTitle } : {}),
+          ...(item.fromKind ? { fromKind: item.fromKind } : {}),
+          ...(item.task ? { task: item.task } : {}),
+          ...(item.topicSetTitle ? { topicSetTitle: item.topicSetTitle } : {}),
+          ...(item.capability ? { capability: item.capability } : {}),
+        })
         hub.followup(make({
           content: [{ type: 'text', text: item.payload }],
-          source: { kind: 'supermemory', form: 'relay', deliveryId },
+          source: relaySource({
+            deliveryId,
+            ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+            ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+            fromKind: card.fromKind,
+            ...(item.groupId ? { groupId: item.groupId } : { dispatchId: item.dispatchId ?? '' }),
+            ...(card.task ? { task: card.task } : {}),
+            ...(card.topicSetTitle ? { topicSetTitle: card.topicSetTitle } : {}),
+            ...(card.capability ? { capability: card.capability } : {}),
+            status: 'returned',
+          }) as never,
         }) as never)
-        await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
+        await store.outbox.update(deliveryId, (r) => ({
+          ...r,
+          ...(card.fromSessionId ? { fromSessionId: card.fromSessionId } : {}),
+          ...(card.fromTitle ? { fromTitle: card.fromTitle } : {}),
+          fromKind: card.fromKind,
+          task: card.task,
+          topicSetTitle: card.topicSetTitle,
+          capability: card.capability,
+          status: 'relayed',
+          relayedAt: Date.now(),
+        }))
         logger.info(`supermemory: reconcile ${deliveryId}: re-relayed to hub`)
       } catch (error) {
         logger.warn(`supermemory: reconcile path2 ${deliveryId} failed: ${String(error).slice(0, 160)}`)

@@ -21,6 +21,16 @@ declare module '@deepseek-ai/cordis' {
     slots: {
       inject(name: string, callback: () => () => void): () => void
       register(definition: unknown, component: unknown): () => void
+      /**
+       * R32 需求③: every live registration behind one slot (raw order, NOT the
+       * per-cell winners). The card renderer uses it to delegate every message
+       * it does not own back to the host's shipped node renderer. Optional:
+       * a shell that does not expose it keeps the shipped renderers untouched.
+       */
+      entries?(name: string): ReadonlyArray<{
+        options?: { key?: string; id?: string; priority?: number }
+        component?: unknown
+      }>
     }
     /** Client-side session navigation owned by the shell. */
     uiWorkspace: {
