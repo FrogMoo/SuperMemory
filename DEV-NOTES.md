@@ -2697,3 +2697,222 @@ core-smoke 新增一条 `ok('R37 共存锚…')`，同时断言：route 的 `res
 - 宿主 `ctx.sessionQuery.readSurface` 不可用时，存量中枢迁移只能回退中性名（不会瞎猜内容）。
 
 
+## 50. R42：会话名称前置描述收尾——前缀规则补强 + 冷会话兜底 + 迁移 marker 收敛（2026-11-24）
+
+R41（§49）把「会话名称直接描述工作内容」落地并双推；重载后只读核验发现两类收尾
+问题：① 存量标题里仍有未被剥离的前置描述（「R32 只读复核：…」「Rnn+空格」形式与
+「项目：」「背景：」标签形式）；② 7 个冷会话的宿主标题仍是旧格式（1 个
+「SuperMemory 中枢 · ry6q」+ 6 个「新会话 · xxxx」），而 `applySessionTitle`
+只能改 live 会话，GUI 侧栏继续显示旧名。本轮修这两类问题。
+
+### 50.1 需求①：前缀剥离规则补强（src/title.ts）
+
+`LEADING_DESCRIPTION` 从「单一大杂烩正则」拆成两种形状，仍是正则字面量：
+
+- **轮次令牌**（`R32` / `r7` / `R41-B` / `第 3 轮` / `Round 3`）：分隔符**或
+  单个空格**都剥离——派发标题就是 «R32 只读复核：…» 这种形态；
+- **描述标签**（`项目：` `背景：` `仓库：` `任务：` `需求：` `派发：` `请求：`
+  等，含 R41 已有的 `任务书/任务/工作内容/分支`）：仍然**必须有分隔符**，所以
+  «需求分析：…» 这种以标签词开头的正常标题不误伤。
+
+两种形状都以 `^` 锚定：句中提到轮次（«参考 R31 的实现»）永远不剥。代价（明确
+记录）：句首的 «R31 的需求» 这类文本现在会被剥成 «的需求»——这是「Rnn+空格」规则
+的既定取舍，R41 的对应断言已按新语义更新。剥离仍最多重复 3 次（堆叠前缀
+«R31：任务：…»）。
+
+### 50.2 需求①：存量记录一次性清理（store 正规写路径）
+
+新增 `scripts/cleanup-legacy-titles.mjs`（默认 dry-run，`--apply` 才写）。它
+**不手改 JSON**：
+
+- **域层**：从 `_dsh_src` 复制同版本（0.2.2-rc.3）的
+  `@deepseek-ai/dsh-storage-domain` lib 到 `.probe/`（gitignored），为只存在于
+  宿主 asar 内的 `@deepseek-ai/dsh-storage` 写最小桩（域层仅用
+  StorageError/UNIT_NAME_RE/storageBackendServiceKey 三个符号）；schema 用插件
+  自己的 `buildSchemas()`，域声明用 `store.ts` 新导出的 `supermemorySpec()`
+  （openStore 随之重构为复用它，杜绝两份表清单漂移）。因此读有 zod 校验、写走
+  域层 `putRecord` 写链；
+- **介质层**：KvUnit 适配器包住 `~/.dsh/storages/supermemory.json`，每次写都是
+  「读-改-写 + 临时文件原子替换」，与宿主并发写的丢失窗口压到最小。
+
+清理前后样本（本次实跑，`--apply`）：
+
+| 记录 | before | after |
+| --- | --- | --- |
+| dsp-mwthbp9n-aaw8cr | R32 只读复核：中枢-分支协同三条硬规则的代码落地质量 | 只读复核：中枢-分支协同三条硬规则的代码落地质量 |
+| dsp-mwticfu5-zqaf83 | R34 只读复验：R33 修复是否真的关掉 6 个 P0/P1 | 只读复验：R33 修复是否真的关掉 6 个 P0/P1 |
+| dsp-mwu4vzba-1y3xhv | R38 只读核验：重载后运行时数据是否落库 | 只读核验：重载后运行时数据是否落库 |
+| dsp-mwu8ycbg-851kjw | 项目：F:\10-SuperMemory（DSH 插件 dsh-supermemory / S… | F:\10-SuperMemory（DSH 插件 dsh-supermemory / S… |
+| session-mwkvs5ec-26dg8h（hub_sessions） | 背景：仓库 F:\10-SuperMemory（DSH 插件 dsh-supermemory）。面板页 src/cli… | 仓库 F:\10-SuperMemory（DSH 插件 dsh-supermemory）。面板… |
+
+5 条全部经域层 `update` 写入并在同进程内读回 OK。
+
+**已知限制（重要）**：宿主进程持有同一域，JSON 后端的 `single` 布局每次写都用
+内存态整单重写——脚本落地后，宿主的下一次写可能把它覆盖回去（R23 的
+`applyMemoryOrganize` 注释早已记下同一事实，这也是它必须在宿主内跑的原因）。
+
+
+因此**权威清理是重启后的 hub-titles v3 迁移**（幂等，会再清一次，本轮已把
+`hub_sessions` 行纳入 durable 清理范围）；脚本提供的是即时证据与写路径证明。
+**本轮已实证覆盖**：脚本写入约 10 分钟后，宿主下一次整单重写（store 文件 mtime
+20:05:40）把 5 条标题恢复成清理前的值——与上述限制完全一致，也再次说明为什么
+迁移必须在宿主内跑。
+
+### 50.3 需求②：冷会话的面板兜底（src/hub-sessions.ts）
+
+- 新增 `isLegacyHubTitle(title)`：品牌前缀（`SuperMemory 中枢` 起头）或
+  `新会话 · <id>` 形态为旧格式；**裸「新会话」是 R41 的中性名，不算旧格式**——
+  这条界线保证兜底不会去改一个本来就干净的名字；
+- 新增 `durableHubTitle(store, sessionId)`：纯 store 读（先 `hub_sessions`
+  正证据行，再话题集 root 成员标题），不依赖 live 会话；
+- `listHubSessions` 行映射：宿主标题匹配旧前缀模式**且**有记录标题时，展示
+  `describeSessionTitle(记录标题)`（幂等：干净标题原样通过）；无记录则保留宿主
+  标题。7 个冷会话因此在面板 rail 上显示记录名（如「新会话」/ 直接描述），
+  不再显示「新会话 · xxxx」「SuperMemory 中枢 · ry6q」。
+
+### 50.4 需求②：迁移 marker v3 收敛 + 首事件补改名（src/hub-title-migration.ts）
+
+v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pending → 每次启动
+全量重扫（线上 meta 里 `hub-titles` 行压根没写过，实证）。v3 改为：
+
+- marker 记录 **id 集合**：`hubTitlesProcessedIds`（已改名/已验证干净/人工改名）
+  与 `hubTitlesPendingIds`（匹配旧模式但当前不可 attach）；写入时与既有集合
+  合并、按 `MARKER_ID_CAP`（500）截断，幂等；
+- **每次非 dry-run 巡检都写 marker**（收敛条件改为「无 live 可重命名项」）；
+- 新增 `finishPendingHubTitle(ctx, store, logger, sessionId)`：对 pending 集合里
+  的会话，live 标题仍是旧模式才用首条用户消息改名（人工改名过 → 直接结算为
+  clean，绝不覆盖）；
+- 新增 `attachPendingHubTitleRename(...)`：一个 `session/event` 监听，pending
+  集合在启动巡检落定后惰性载入一次，之后每次事件只做一次 Set 查找；冷会话
+  **首次活动即补改名**并从 pending 移入 processed。index.ts 以 effect 挂载。
+
+### 50.5 断言与闸门
+
+- mechanism 新增 `R42-1`：前缀规则（Rnn+空格/标签形式、句中轮次不误伤、标签词
+  无分隔符不剥）+ 冷会话兜底（旧前缀让位记录标题、无记录保留宿主标题、裸「新会话」
+  不算旧格式）+ v3 收敛（不可 attach 候选进 pending 且 marker 仍写、二次启动
+  already-done、首事件补改名与集合排空、hook 对已结算 id 不重改、hub_sessions
+  行标题同步清理）。
+- 闸门退出码（本分支实跑，工作区含并行分支的 relay 修复未提交改动，混合树全绿）：
+  `pnpm typecheck` exit 0；`pnpm build` exit 0（宿主 + client 177.00 kB → wrap 171557 bytes）；
+
+
+  `pnpm smoke` exit 0：core **34** / mechanism **112**（含本分支 R42-5 与并行分支 relay 的
+  R42-1..4）/ webui **35** / client-sim OK / capability **12** / workspace-scope **9**。
+- **提交/推送归属**：并行分支（中断 relay 重复投递修复）与本节改动同工作区在途，中枢另派
+  集成提交轮（dispatch `dsp-mwunlqrv-ptfpgb`）把两部分一次性提交并双推；本节不单独提交，
+  避免工作区竞争。集成时注意：本分支测试标签已避让为 `R42-5`（relay 占用 R42-1..4），
+  DEV-NOTES 本节占 §50，relay 部分建议接 §51。
+
+### 50.6 假设与非阻塞决策
+
+- 「项目：」「背景：」等标签只在**带分隔符**时剥离；「仓库 F:\…」（无冒号）保留
+  为描述一部分，不额外造规则。
+- 句首 «R31 的需求» 被剥成 «的需求» 是「Rnn+空格」规则的既定取舍（见 §50.1）。
+- 冷会话宿主标题的最终改名时机是「首次活动」而非「被打开」：宿主没有暴露
+  attach 生命周期事件，`session/event` 是成本最低的实证信号；面板兜底保证
+  打开前展示也已正确。
+- 一次性清理脚本与重启迁移双轨：脚本管即时证据，迁移管最终一致（见 §50.2 限制）。
+- 本轮不改 `title-migration.ts`（marker `titles`）与 `topicset-merge --rename`
+  的命名语义（§49.5 的决定继续有效）。
+
+### 50.7 用户侧验收（重载插件 + 刷新 GUI 后）
+
+1. 面板左侧 rail：7 个旧格式冷会话显示记录标题（「新会话」或直接描述），不再出现
+   「新会话 · xxxx」「SuperMemory 中枢 · ry6q」；
+2. 打开其中任意一个会话并发一句话：宿主标题被补改成直接描述（侧栏同步），之后
+   面板与宿主显示一致；
+3. 话题集 root 中枢（session-mwkvs5ec）标题为「仓库 F:\10-SuperMemory…」类直接
+   描述，无「背景：」前缀；
+4. 派发/分支列表里的存量任务标题无「Rnn 」「项目：」前缀；重启后复查
+   `~/.dsh/storages/supermemory.json` 的 `meta.hub-titles` 行含 version 3 与
+   processed/pending 集合（pending 随冷会话被打开而排空）；
+5. 新建派发/分支标题继续为任务本身（R41 行为不回退）。
+
+### 50.8 未做 / 限制
+
+- 冷会话宿主标题在「首次活动」前不会被宿主同步改写（面板已兜底展示）；宿主侧栏
+  在该窗口内仍显示旧名，这是宿主能力所限，非插件可改。
+- 分支会话不能重载插件；重载与 GUI 验收由中枢/用户执行。
+- 一次性清理脚本在宿主运行期间的写入可能被宿主下一次整单重写覆盖（见 §50.2），
+  以重启迁移为准。
+
+
+
+---
+
+## 51. R42：中断任务 relay 重复投递修复（持久幂等 + 同批 twin 抑制 + 公告持久增量）
+
+### 现象与根因（只读诊断，store + hub 会话日志双向实证）
+
+用户报告「中断的任务被多次送回中枢」。诊断证据：
+
+- 真实 ledger（`~/.dsh/storages/supermemory.json`，只读）里 4 组**同 payload 双键**回执
+  （如 `dlv-dsp-mwumfv62-8a4nhh` 与 `dlv-dsp-mwumg5vc-byit3a`，enqueued 相距 260ms，
+  均 confirmed）；hub 会话日志（zstd 多帧解码）里同一任务的两条 `⏹ 中断终态`
+  relay 先后落账（seq 135 / 161），该 hub 全程只发过一次 `memory_dispatch`
+  （seq 36，且首报 `unknown tool` 错误 → 模型重试派发 → 同分支同任务两条派发记录）。
+- 另有 `dlv-resume-<hub>` 多条（多条 pending 从未确认）：中断清单 notice 每次重载后
+  整批重投。
+
+根因（四个路径，前两个是真正的「重复」，后两个是「丢失/重投」）：
+
+1. **同批 twin 双投**（observe.ts `settleInterruptedDispatches`）：两条同分支同任务的
+   派发在同一次巡检里都被标记 interrupted，各按自己的 `dlv-<dispatchId>` 投一份逐字
+   相同的回执 → 中枢一次中断收到 2 份。
+2. **notice 内存去重不跨重载**（resume.ts `notifyInterruptedDispatches`）：签名表
+   `NotifyState.signatures` 是纯内存，插件重载后清空 → 同一批中断任务被整批再公告
+   一次；清单刷新（新中断加入）也会把已公告的整批重列。
+3. **reconcile 失败回执键不统一**（reconcile.ts `failureDelivery`）：键是
+   `dlv-fail-<branchSessionId>`（按分支，不是按派发），与巡检的 `dlv-<dispatchId>`
+   守卫不是同一个键 → 分支已死的派发会被 reconcile 和巡检**各投一次**；且同一分支
+   两条派发都死时后者被前者撞键吞掉（ledger 里存在零回执行的派发）。
+4. **deliver 自身无持久守卫**（observe.ts `deliver`）：巡检/对账/notice 三条路径都靠
+   调用方各自的前置检查，检查与投递之间有 await（partialSummary 冷读），并发或重载
+   窗口下会双投；已投行被重复 `put` 还会抹掉 confirmed 状态。
+
+### 修复（持久幂等为主，twin 抑制与公告增量为辅）
+
+- **observe.ts `deliver()`（:474）**：新增**持久守卫**——outbox 行已 `relayed`/
+  `confirmed` 时任何路径都不再发送、也不再 put（保护确认态）；只有从未投出的
+  `pending`/`failed` 行才允许重投（at-least-once 的重试，不是重复）。
+- **observe.ts `settleInterruptedDispatches()`（:725）**：同一批巡检里
+  「同分支 + 同任务」只投一份回执； twin 行只落 ledger（`status: relayed` +
+  `suppressedOf: <代投派发 id>`），永不重投。集合按批清空——换一批/换一天重新派发
+  同一任务仍正常告知。
+- **observe.ts `flushObserve()`（:613）**：`suppressedOf` 行在自愈重投路径里同样跳过。
+- **reconcile.ts `failureDelivery()`（:68）**：键改为规范键 `dlv-<dispatchId>`，与巡检
+  守卫/deliver 守卫同一键空间——分支已死的派发从此只投一次，同分支多派发不再互相吞。
+- **resume.ts `notifyInterruptedDispatches()`（:521-563）**：公告改**持久增量**——
+  `dispatches.interruptNoticedAt` 落库标记，每条派发最多被公告一次；重载后签名表清空、
+  清单刷新都只补新增的。幂等键按批次稳定 `dlv-resume-<hub>-<签名散列>`，不同批次的
+  pending 行互不覆盖。
+- **schema.ts**：`dispatches.interruptNoticedAt`、`outbox.suppressedOf` 两个可选字段
+  （旧介质读作缺省，域保持 v1 兼容）。
+
+### 明确不做（范围取舍，写进汇报）
+
+- **不跨批抑制续跑链**：原派发已公告中断、其续跑派发（resumeOf）后来也失败时，续跑
+  仍会收到自己的回执——它是带独立回执的另一次派发，吞掉它会藏掉「重试也失败」这一
+  新信息（ledger 与 memory_resume 清单仍可查）。同批 twin 抑制已覆盖用户实际撞到的
+  「一次中断两份相同 relay」。
+- reconcile path 2 对 `relayed` 未确认行的重启重投保持原语义（at-least-once 的既有
+  设计，inbox 已在队列里的情况有专门检查）。
+
+### 回归覆盖与闸门
+
+- `scripts/mechanism-smoke.mjs` 新增 4 条（宿主无关，假 store + 假 hub 计数 followup）：
+  R42-1 同派发多次巡检 + 重载（新 deps、同一 ledger）只投 1 次；R42-2 deliver 持久
+  守卫（relayed/confirmed 不重投、不覆盖确认）；R42-3 同分支同任务双派发只投 1 份
+  （twin 行 `suppressedOf` 代投标记）；R42-4 中断公告持久增量（重载/清单刷新只报新增）。
+- 闸门：`pnpm typecheck` 双 0 错；`pnpm build` exit 0；`pnpm smoke` 六套件全绿
+  （core 34 / mechanism 112 / webui 35 / client-sim SIM SMOKE OK / capability 12 /
+  workspace-scope 9）。
+- **未重载插件**（分支内 reload 会自杀）：需中枢在 GUI 侧重载后，store 里的
+  `dlv-resume-<hub>` 旧行保持惰性（不再被引用），新键与 `interruptNoticedAt` 标记
+  随首次巡检自然生效。
+- 本轮改动**未提交**：工作树同时有另一个分支正在进行中的 R42「会话名称」改动
+  （src/title.ts、src/hub-title-migration.ts、src/index.ts、src/hub-sessions.ts、
+  src/store.ts、DEV-NOTES §50、scripts/cleanup-legacy-titles.mjs 等，mtime 均在
+  20 分钟内），且 schema.ts / mechanism-smoke.mjs / lib/ 为双方共用——建议该分支
+  到终态后由中枢一次性提交（同 R30 集成轮做法）。

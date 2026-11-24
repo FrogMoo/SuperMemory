@@ -254,6 +254,11 @@ export async function buildSchemas() {
     // 旧记录读作 undefined，存储域保持 v1 兼容（同 D 的 interrupted/lastActivityAt）。
     resumeOf: z.string().optional(),
     resumedBy: z.string().optional(),
+    // R42: 中断清单已向中枢公告过的时间戳（relay 重复投递修复的持久增量标记）。
+    // 「检测到 N 个被中断的任务」notice 原来只靠内存签名去重——插件重载后签名表
+    // 清空，同一批中断任务会被再次整批送达中枢。落库后每个派发最多被公告一次，
+    // 重载/清单刷新都只补新增的。旧记录读作 undefined（= 尚未公告），域保持 v1 兼容。
+    interruptNoticedAt: z.number().int().optional(),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })
@@ -308,6 +313,10 @@ export async function buildSchemas() {
     task: z.string().default(''),
     topicSetTitle: z.string().default(''),
     capability: z.string().default(''),
+    // R42: 同一批中断里「同分支 + 同任务」的重复派发只投一份回执，其余行的 ledger
+    // 标记为「已由哪条派发代投」（status 仍写 relayed，避免被 flush 重投）。
+    // 可选：旧行没有这个字段，读作 undefined，域保持 v1 兼容。
+    suppressedOf: z.string().optional(),
   })
 
   // R33 需求②: positive hub records. A hub is NEVER inferred from "top-level
@@ -369,6 +378,12 @@ export async function buildSchemas() {
     // reason as above: an undeclared marker key would be stripped on load.
     hubTitlesMigrationVersion: z.number().int().optional(),
     hubTitlesMigratedAt: z.number().int().optional(),
+    // R42: the v3 marker records WHICH ids were handled so a COLD session
+    // (not attachable, so not renamable now) no longer blocks convergence.
+    // hubTitlesProcessedIds = renamed or verified clean; hubTitlesPendingIds
+    // = still carrying a legacy host title, finished on its first live event.
+    hubTitlesProcessedIds: z.array(z.string()).optional(),
+    hubTitlesPendingIds: z.array(z.string()).optional(),
     // R35 marker (meta row 'hub-records'): the one-time backfill of positive
     // hub_sessions rows for pre-R33 panel-created hubs. Declared here because
     // the meta schema strips unknown marker keys on load.

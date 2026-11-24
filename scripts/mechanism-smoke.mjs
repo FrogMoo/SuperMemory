@@ -473,6 +473,121 @@ const dDeps = (dispatches, options = {}) => {
   ok('D2 已 failed 但从未送达 → 启动对账补发回执')
 }
 
+// ---- R42: relay 重复投递修复（中断回执只送达一次）----
+// 真实病例（store + hub 会话日志双向实证）：同一批巡检里同分支同任务的两条派发
+// （中枢在 host 工具报错后重试派发）各自投了一份逐字相同的「⏹ 中断终态」relay；
+// 插件重载后中断清单 notice 又整批重投（内存签名去重不跨重载）。
+const { deliverRelay } = await import('../src/observe.ts')
+const { notifyInterruptedDispatches } = await import('../src/resume.ts')
+// A LIVE hub that counts every followup, plus the R33 message-factory seam so no
+// host module is needed. A fresh deps object over the SAME store simulates a
+// plugin reload (module state gone, ledger kept).
+const liveDeps = (dispatches, extra = {}) => {
+  const sent = []
+  const store = { dispatches: table(dispatches), outbox: table(), episodes: table(), topicsets: table(), ...extra }
+  const ctx = { agents: { get: (id) => (id === 'hub' ? { followup: (message) => sent.push(message) } : undefined) } }
+  const deps = {
+    ctx, store,
+    config: { enabled: true, maxTokensPolicy: 'deliver-partial' },
+    logger,
+    createMessage: (input) => ({ content: input.content, source: input.source }),
+  }
+  return { deps, store, sent }
+}
+
+{
+  // 同一派发：连续多次巡检 + 重载（新 deps、同一 store）都只投一次。
+  const stale = now - 3600000
+  const seed = [['dsp-r1', { branchSessionId: 'b-r1', task: '任务甲', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: stale, updatedAt: stale }]]
+  const first = liveDeps(seed)
+  const one = await settleInterruptedDispatches(first.deps, { timeoutMs: 60000, now, reason: '超时未结算' })
+  assert.equal(one.length, 1, 'the first sweep interrupts the stale dispatch')
+  assert.equal(first.sent.length, 1, 'exactly one relay reaches the hub')
+  assert.equal(first.store.outbox.get('dlv-dsp-r1').status, 'relayed')
+  const two = await settleInterruptedDispatches(first.deps, { timeoutMs: 60000, now })
+  assert.equal(two.length, 0, 'a second sweep in the SAME process sends nothing')
+  assert.equal(first.sent.length, 1)
+  // reload: fresh deps (fresh module state), same ledger.
+  const reloaded = liveDeps([...first.store.dispatches.entries()], { outbox: first.store.outbox })
+  const three = await settleInterruptedDispatches(reloaded.deps, { timeoutMs: 60000, now })
+  assert.equal(three.length, 0, 'after a reload the ledger alone suppresses the re-send')
+  assert.equal(reloaded.sent.length, 0, 'no duplicate relay after reload')
+  assert.equal(first.store.outbox.size, 1, 'still exactly one outbox row')
+  ok('R42-1 中断派发多次巡检/重载只投一次（持久幂等）')
+}
+
+{
+  // deliver 自身的持久守卫：已 relayed/confirmed 的行任何路径都不再发送。
+  const stale = now - 3600000
+  const { deps, store, sent } = liveDeps([['dsp-r2', { branchSessionId: 'b-r2', task: '任务乙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', createdAt: stale, updatedAt: stale }]])
+  await deliverRelay(deps, { deliveryId: 'dlv-dsp-r2', dispatchId: 'dsp-r2', hubSessionId: 'hub', text: '回执一' })
+  assert.equal(sent.length, 1)
+  await deliverRelay(deps, { deliveryId: 'dlv-dsp-r2', dispatchId: 'dsp-r2', hubSessionId: 'hub', text: '回执一（重试）' })
+  assert.equal(sent.length, 1, 'an already-relayed delivery is never re-sent')
+  assert.equal(store.outbox.get('dlv-dsp-r2').status, 'relayed', 'and the confirmation is not destroyed')
+  await store.outbox.update('dlv-dsp-r2', (r) => ({ ...r, status: 'confirmed' }))
+  await deliverRelay(deps, { deliveryId: 'dlv-dsp-r2', dispatchId: 'dsp-r2', hubSessionId: 'hub', text: '回执一（再次）' })
+  assert.equal(sent.length, 1, 'a confirmed delivery is final')
+  ok('R42-2 deliver 持久守卫：relayed/confirmed 不重投、不覆盖确认')
+}
+
+{
+  // 同分支 + 同任务的两条派发（中枢重试派发）在同一批巡检里只投一份回执。
+  const stale = now - 3600000
+  const seed = [
+    ['dsp-r3a', { branchSessionId: 'b-r3', task: '同一个任务', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: stale, updatedAt: stale }],
+    ['dsp-r3b', { branchSessionId: 'b-r3', task: '同一个任务', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: stale + 14000, updatedAt: stale + 14000 }],
+  ]
+  const { deps, store, sent } = liveDeps(seed)
+  const settled = await settleInterruptedDispatches(deps, { timeoutMs: 60000, now })
+  assert.equal(settled.length, 2, 'both dispatch rows are still marked interrupted')
+  assert.equal(store.dispatches.get('dsp-r3a').status, 'interrupted')
+  assert.equal(store.dispatches.get('dsp-r3b').status, 'interrupted')
+  assert.equal(sent.length, 1, 'the twin is NOT re-sent: one relay for one logical interruption')
+  assert.equal(store.outbox.get('dlv-dsp-r3b').suppressedOf, 'dsp-r3a', 'the twin ledger row names the dispatch that carried it')
+  assert.equal(store.outbox.get('dlv-dsp-r3b').status, 'relayed', 'and is marked handled so flush never retries it')
+  assert.equal(store.outbox.size, 2, 'both rows exist in the ledger')
+  // 换一批（不同任务）不受影响：照样投递。
+  const other = liveDeps([['dsp-r3c', { branchSessionId: 'b-r3', task: '另一个任务', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', createdAt: stale, updatedAt: stale }]])
+  const sent2 = await settleInterruptedDispatches(other.deps, { timeoutMs: 60000, now })
+  assert.equal(sent2.length, 1)
+  assert.equal(other.sent.length, 1, 'a different task on the same branch is still announced')
+  ok('R42-3 同分支同任务的双重派发只投一份（ledger 代投标记）')
+}
+
+{
+  // 中断清单 notice 的持久增量：重载（全新签名表）后不重复公告。
+  const stale = now - 3600000
+  const seed = [
+    ['dsp-r4a', { topicSetId: 'ts-1', branchSessionId: 'b-r4', task: '任务甲', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', turnEndReason: 'silent', createdAt: stale, updatedAt: stale }],
+    ['dsp-r4b', { topicSetId: 'ts-1', branchSessionId: 'b-r4', task: '任务乙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', turnEndReason: 'silent', createdAt: stale, updatedAt: stale }],
+  ]
+  const first = liveDeps(seed, { topicsets: table([['ts-1', { workspaceKey: 'ws', title: '集一', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }]]) })
+  // ResumeDeps 未声明 createMessage（生产走 host 锚）；先赋给变量再传，绕过字面量
+  // 的多余属性检查——deliver 在运行时仍会优先用它（R33 测试缝）。
+  const rdeps = { ctx: first.deps.ctx, store: first.store, logger, createMessage: first.deps.createMessage }
+  const n1 = await notifyInterruptedDispatches(rdeps, { now, state: { signatures: new Map() } })
+  assert.equal(n1, 1, 'the first pass announces the batch once')
+  assert.equal(first.sent.length, 1, 'one notice message reaches the hub')
+  assert.ok(String(first.sent[0].content[0].text).includes('2 个被中断的任务'), 'the notice lists both dispatches')
+  assert.equal(!!first.store.dispatches.get('dsp-r4a').interruptNoticedAt, true, 'the delta marker is persisted')
+  assert.equal(!!first.store.dispatches.get('dsp-r4b').interruptNoticedAt, true)
+  // reload: fresh signature map (the old in-memory dedup is gone), same ledger.
+  const reloaded = liveDeps([...first.store.dispatches.entries()], { outbox: first.store.outbox, topicsets: first.store.topicsets })
+  const rdeps2 = { ctx: reloaded.deps.ctx, store: reloaded.store, logger, createMessage: reloaded.deps.createMessage }
+  const n2 = await notifyInterruptedDispatches(rdeps2, { now, state: { signatures: new Map() } })
+  assert.equal(n2, 0, 'after a reload the SAME batch is not re-announced')
+  assert.equal(reloaded.sent.length, 0, 'no duplicate notice after reload')
+  // 清单刷新：新中断加入时只公告新增的那条。
+  await reloaded.store.dispatches.put('dsp-r4c', { topicSetId: 'ts-1', branchSessionId: 'b-r4', task: '任务丙', hubSessionId: 'hub', startSeq: 0, status: 'interrupted', turnEndReason: 'silent', createdAt: stale, updatedAt: stale })
+  const n3 = await notifyInterruptedDispatches(rdeps2, { now, state: { signatures: new Map() } })
+  assert.equal(n3, 1, 'a new interruption is announced')
+  assert.equal(reloaded.sent.length, 1, 'exactly one new notice')
+  assert.ok(String(reloaded.sent[0].content[0].text).includes('dsp-r4c'), 'the delta notice carries only the new dispatch')
+  assert.ok(!String(reloaded.sent[0].content[0].text).includes('dsp-r4a'), 'and never re-lists the announced ones')
+  ok('R42-4 中断公告持久增量：重载/清单刷新不重复（只报新增）')
+}
+
 {
   const fresh = now - 1000
   const { deps: freshDeps, store: freshStore } = dDeps([['dsp-3', { branchSessionId: 'b3', task: '任务丙', hubSessionId: 'hub', startSeq: 0, status: 'dispatched', lastActivityAt: fresh, createdAt: fresh, updatedAt: fresh }]])
@@ -651,7 +766,22 @@ const fakeCtx = (services) => ({
   assert.equal(hubSessionTitle('session-abcd1234'), '新会话', 'no content yet = neutral name, never an id token')
   assert.equal(hubSessionTitle('session-abcd1234', 'R41：检查设置页签'), '检查设置页签')
   assert.equal(branchTitleFor('R31：修构建'), '修构建', 'branch title is the task, not the round label')
-  assert.equal(stripLeadingDescription('R31 的需求'), 'R31 的需求', 'a task that MENTIONS a round is not mutilated')
+
+  // R42: the strip now also covers 「Rnn + 单个空格」 (dispatch titles are
+  // «R32 只读复核：…»); the anchor is what keeps mid-sentence mentions safe.
+  assert.equal(stripLeadingDescription('R31 的需求'), '的需求', 'R42: a round token at the START strips after one space')
+  assert.equal(stripLeadingDescription('参考 R31 的实现'), '参考 R31 的实现', 'a round MENTIONED inside a sentence is never mutilated')
+
+  // R42: the strip now also covers the label forms 「项目：」「背景：」「仓库：」
+  // (a label keeps requiring a separator).
+  assert.equal(stripLeadingDescription('R32 只读复核：代码落地质量'), '只读复核：代码落地质量', 'Rnn + single space strips at the start')
+  assert.equal(stripLeadingDescription('第 3 轮 收尾'), '收尾', '第 N 轮 + space strips')
+  assert.equal(stripLeadingDescription('Round 3 总结'), '总结', 'Round N + space strips')
+  assert.equal(stripLeadingDescription('项目：整理发布'), '整理发布', 'a 项目： label strips')
+  assert.equal(stripLeadingDescription('背景：仓库 F:\\repo'), '仓库 F:\\repo', 'a 背景： label strips')
+  assert.equal(stripLeadingDescription('仓库：F:\\repo'), 'F:\\repo', 'a 仓库： label strips')
+  assert.equal(stripLeadingDescription('需求分析：保持完整'), '需求分析：保持完整', 'a label WORD without a separator stays whole')
+  assert.equal(describeSessionTitle('R38 只读核验：重载后运行时数据是否落库'), '只读核验：重载后运行时数据是否落库')
 
   // 2) one-time migration: only old branded/legacy hubs and plugin branches are
   //    touched; content comes from the first user message when readable.
@@ -733,6 +863,130 @@ const fakeCtx = (services) => ({
   const noHost = await migrateHubSessionTitles({ ctx: undefined, store: { meta: table() }, logger: quiet }, { ignoreMarker: true })
   assert.equal(noHost.status, 'no-host')
   ok('R41-1 会话名称直接描述工作内容：生成去品牌前缀/令牌前缀（48 字）；迁移只改旧前缀中枢+插件分支（用户改名/子代理/子会话不碰），先写 hub 记录再改名，标记 v2 幂等 + durable 标题同步清理')
+
+// ---- R42 需求③ 收尾：前缀规则补强 + 冷会话兜底 + 迁移 marker 收敛 ----
+{
+  const { migrateHubSessionTitles, finishPendingHubTitle, attachPendingHubTitleRename, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
+  const { isLegacyHubTitle, durableHubTitle, listHubSessions } = await import('../src/hub-sessions.ts')
+  const cwd = process.cwd()
+  assert.equal(HUB_TITLES_MIGRATION_VERSION, 3, 'R42 bumps the marker to v3')
+
+  // 1) legacy detection: brand prefix and 新会话 · <id> are legacy; a bare
+  //    neutral name must not be treated as legacy.
+  assert.equal(isLegacyHubTitle('SuperMemory 中枢 · ry6q'), true)
+  assert.equal(isLegacyHubTitle('新会话 · s5vx5v'), true)
+  assert.equal(isLegacyHubTitle('新会话'), false, 'the neutral name is not a legacy shape')
+  assert.equal(isLegacyHubTitle('重载后只读核验'), false)
+
+  // 2) the rail fallback: a COLD session keeps its legacy host title; the row
+  //    shows the DURABLE record title instead (pure store read, no live session).
+  const hubRow = (over = {}) => ({ workspaceKey: cwd, sessionId: 'session-cold', title: '', source: 'title-migration', createdAt: now, updatedAt: now, ...over })
+  const fallbackStore = {
+    hubs: table([
+      ['session-cold', hubRow({ title: '重载后只读核验' })],
+      ['session-warm', hubRow({ sessionId: 'session-warm', title: '直接描述的名字' })],
+    ]),
+    topicsets: table(),
+    dispatches: table(),
+  }
+  const seam = {
+    listSessions: async () => [
+      { header: { id: 'session-cold', cwd } },
+      { header: { id: 'session-warm', cwd } },
+      { header: { id: 'session-norecord', cwd } },
+    ],
+    readTitleSnapshots: async (ids) => ids.map((id) => ({
+      sessionId: id, status: 'fulfilled',
+      value: { title: { title: id === 'session-cold' ? '新会话 · cold' : id === 'session-warm' ? 'SuperMemory 中枢 · warm' : 'SuperMemory 中枢 · nore' } },
+    })),
+  }
+  const railCtx = { get: (name) => (name === 'sessionQuery' ? seam : undefined), sessions: { get: () => undefined } }
+  const railRows = await listHubSessions(railCtx, fallbackStore, cwd)
+  const byId = new Map(railRows.map((row) => [row.sessionId, row.title]))
+  assert.equal(byId.get('session-cold'), '重载后只读核验', 'a legacy host title yields to the durable record title')
+  assert.equal(byId.get('session-warm'), '直接描述的名字', 'a legacy host title yields to the durable record title (brand prefix case)')
+  assert.equal(byId.get('session-norecord'), 'SuperMemory 中枢 · nore', 'without a durable record the host title stays')
+  assert.equal(durableHubTitle(fallbackStore, 'session-cold'), '重载后只读核验')
+  assert.equal(durableHubTitle(fallbackStore, 'session-norecord'), '', 'no record = no durable title')
+
+  // 3) v3 convergence: an unattachable candidate is recorded as PENDING and the
+  //    marker is still written, so the next startup does not rescan.
+  const titles = new Map([['session-cold2', '新会话 · cold2']])
+  const contents = new Map([['session-cold2', '重载后只读核验']])
+  const live = new Set() // session-cold2 is NOT live during the startup pass
+  const writes = []
+  const titleService = {
+    get: (session) => ({ title: titles.get(session.id) ?? '' }),
+    rename: (session, text) => { titles.set(session.id, text); writes.push([session.id, text]) },
+  }
+  const coldSeam = {
+    listSessions: async () => [{ header: { id: 'session-cold2', cwd } }],
+    readTitleSnapshots: async (ids) => ids.map((id) => ({ sessionId: id, status: 'fulfilled', value: { title: { title: titles.get(id) ?? '' } } })),
+    readSurface: async (id) => ({ events: [{ type: 'user/message', data: { message: { content: [{ type: 'text', text: contents.get(id) ?? '' }] } } }] }),
+  }
+  const coldCtx = {
+    sessions: { get: (id) => (live.has(id) ? { id, append: () => {} } : undefined) },
+    get: (name) => (name === 'sessionQuery' ? coldSeam : name === 'sessionTitle' ? titleService : undefined),
+  }
+  const coldStore = {
+    meta: table(),
+    hubs: table(),
+    topicsets: table(),
+    dispatches: table([['d-cold', {
+      topicSetId: 'ts-a', branchSessionId: 'branch-cold', task: 'R32 只读复核：x', hubSessionId: 'session-cold2',
+      startSeq: 0, status: 'delivered', title: 'R32 只读复核：x', tags: [], capability: '', createdAt: 1, updatedAt: 1,
+    }]]),
+  }
+  const pass = await migrateHubSessionTitles({ ctx: coldCtx, store: coldStore, logger: quiet }, { ignoreMarker: true })
+  assert.equal(pass.status, 'applied')
+  assert.equal(pass.pending, 1, 'the unattachable candidate is pending')
+  const marker = coldStore.meta.get('hub-titles')
+  assert.equal(marker?.hubTitlesMigrationVersion, 3)
+  assert.deepEqual(marker?.hubTitlesPendingIds, ['session-cold2'], 'the pending id is recorded')
+  assert.equal(coldStore.dispatches.get('d-cold').title, '只读复核：x', 'durable dispatch titles are still cleaned this pass')
+  const converged = await migrateHubSessionTitles({ ctx: coldCtx, store: coldStore, logger: quiet })
+  assert.equal(converged.status, 'already-done', 'the marker converged: no rescan on the next startup')
+
+  // 4) the first live event finishes the pending rename and settles the id.
+  assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'no-host', 'still not live = stays pending')
+  live.add('session-cold2')
+  assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'renamed')
+  assert.equal(titles.get('session-cold2'), '重载后只读核验', 'the cold session is renamed from its first user message')
+  assert.deepEqual(coldStore.meta.get('hub-titles')?.hubTitlesPendingIds ?? [], [], 'the pending set drained')
+  assert.ok((coldStore.meta.get('hub-titles')?.hubTitlesProcessedIds ?? []).includes('session-cold2'))
+  assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'not-pending')
+
+  // 5) the hook: one session/event listener renames pending ids on first activity.
+  let listener
+  const hookCtx = { ...coldCtx, on: (_type, cb) => { listener = cb; return () => {} } }
+  const off = attachPendingHubTitleRename(hookCtx, coldStore, quiet)
+  assert.equal(typeof listener, 'function', 'the hook registers one session/event listener')
+  assert.equal(typeof off, 'function')
+  await coldStore.meta.put('hub-titles', { hubTitlesMigrationVersion: 3, hubTitlesPendingIds: ['session-cold3'], hubTitlesProcessedIds: ['session-cold2'] })
+  titles.set('session-cold3', '新会话 · cold3')
+  // cold3 is pending but has no session object yet -> stays pending.
+  await new Promise((resolve) => { listener({ id: 'session-cold3' }); setTimeout(resolve, 10) })
+  assert.deepEqual(coldStore.meta.get('hub-titles')?.hubTitlesPendingIds ?? [], ['session-cold3'], 'an unreachable id stays pending')
+  // now it goes live with readable content -> renamed and settled.
+  live.add('session-cold3')
+  contents.set('session-cold3', '冷会话补改名')
+  await new Promise((resolve) => { listener({ id: 'session-cold3' }); setTimeout(resolve, 10) })
+  assert.equal(titles.get('session-cold3'), '冷会话补改名')
+  assert.deepEqual(coldStore.meta.get('hub-titles')?.hubTitlesPendingIds ?? [], [], 'the hook drains the pending set')
+  assert.equal(writes.filter(([id]) => id === 'session-cold2').length, 1, 'a settled id is not renamed twice')
+  off()
+
+  // 6) durable hub records are cleaned by the same rule.
+  const hubCleanStore = {
+    meta: table(),
+    hubs: table([['session-legacy-hub', hubRow({ sessionId: 'session-legacy-hub', title: '背景：仓库 F:\\repo（DSH 插件）。面板页…' })]]),
+    topicsets: table(),
+    dispatches: table(),
+  }
+  await migrateHubSessionTitles({ ctx: coldCtx, store: hubCleanStore, logger: quiet }, { ignoreMarker: true })
+  assert.equal(hubCleanStore.hubs.get('session-legacy-hub')?.title, '仓库 F:\\repo（DSH 插件）。面板页…', 'hub record titles are cleaned too')
+  ok('R42-5 会话名称收尾：前缀规则补强（Rnn+空格/标签形式，句中轮次不误伤）+ 冷会话面板兜底（旧前缀让位记录标题）+ 迁移 marker v3 收敛（pending 集合 + 首事件补改名 + hub 记录标题同步清理）')
+}
 }
 
 {

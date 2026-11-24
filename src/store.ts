@@ -116,17 +116,23 @@ export async function openStoreWithRetry(
   return retryDomainOpen(() => openStore(storageDomain, logger), logger)
 }
 
+
+
 /**
- * Open the storage domain. A failure is logged and rethrown — the caller
- * decides whether to degrade (P0: degrade to a disabled store).
+ * The supermemory domain declaration. Exported (besides openStore) so the
+ * offline maintenance script (scripts/cleanup-legacy-titles.mjs) can open the
+ * SAME domain through the real domain layer — schema-validated reads and the
+ * domain write chain — instead of hand-editing the JSON medium.
+ *
+ * @param sd - one storage-domain module (the host copy in the plugin; the
+ *   _dsh_src copy in the script — same 0.2.2-rc.3 version).
+ * @param schemas - record schemas from buildSchemas.
  */
-export async function openStore(
-  storageDomain: StorageDomain.DomainFacility,
-  logger: { warn: (msg: string) => void; info: (msg: string) => void },
-): Promise<Store> {
-  const sd = await loadHostModule('@deepseek-ai/dsh-storage-domain') as typeof StorageDomain
-  const schemas = await buildSchemas()
-  const spec = sd.defineDomain({
+export function supermemorySpec(
+  sd: typeof StorageDomain,
+  schemas: Awaited<ReturnType<typeof buildSchemas>>,
+): SupermemorySpec {
+  return sd.defineDomain({
     name: 'supermemory',
     version: 1,
     tables: {
@@ -150,6 +156,19 @@ export async function openStore(
       model_defaults: sd.domainTable(schemas.model_defaults),
     },
   }) as SupermemorySpec
+}
+
+/**
+ * Open the storage domain. A failure is logged and rethrown — the caller
+ * decides whether to degrade (P0: degrade to a disabled store).
+ */
+export async function openStore(
+  storageDomain: StorageDomain.DomainFacility,
+  logger: { warn: (msg: string) => void; info: (msg: string) => void },
+): Promise<Store> {
+  const sd = await loadHostModule('@deepseek-ai/dsh-storage-domain') as typeof StorageDomain
+  const schemas = await buildSchemas()
+  const spec = supermemorySpec(sd, schemas)
   const domain = await storageDomain.open(spec)
   logger.info('supermemory: storage domain opened')
   const table = <V>(name: string) => domain.table(name) as unknown as Table<V>

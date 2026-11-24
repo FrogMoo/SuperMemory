@@ -23,7 +23,7 @@ import { isPluginBranchId } from './hub-sessions.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
-import { migrateHubSessionTitles } from './hub-title-migration.ts'
+import { attachPendingHubTitleRename, migrateHubSessionTitles } from './hub-title-migration.ts'
 import { knownWorkspaceKeys, migrateHubSessionRecords } from './hub-records-migration.ts'
 import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
@@ -578,15 +578,21 @@ export async function apply(ctx: Context, config: Config) {
     // ('SuperMemory 中枢 · <id4>') and pre-R31 hubs ('新会话 · <id4>') become
     // DIRECT work descriptions (first user message, else the neutral 「新会话」);
     // plugin branch host titles lose a known topic-set prefix and leading
-    // 「R31：」「任务：」「分支 · 」 tokens; durable dispatch/member titles are
-    // cleaned too. Marker-guarded (meta row 'hub-titles', version 2), reads the
-    // live title so a human rename is never overwritten, and leaves the marker
-    // unwritten while a candidate is still unattached so the next startup retries.
+
+
+    // 「R31：」「R32 」「项目：」「背景：」 tokens; durable dispatch/member/hub
+    // titles are cleaned too. Marker-guarded (meta row 'hub-titles', version 3),
+    // reads the live title so a human rename is never overwritten. R42: the
+    // marker CONVERGES — a not-yet-attached candidate is recorded as pending
+    // (renamed on its first live event by attachPendingHubTitleRename) instead
+    // of keeping the marker unwritten, which used to rescan every startup.
     // Before a branded hub is renamed it receives its positive hub record — the
     // R35 hub-record migration used that prefix as evidence, and the record is
     // what role resolution actually reads. The record migration still runs after
     // this one (it also covers hubs whose title never carried the prefix).
-    void migrateHubSessionTitles({ ctx, store, logger })
+
+
+    const hubTitlePass = migrateHubSessionTitles({ ctx, store, logger })
       .catch((error) => {
         logger.warn('supermemory: hub title migration failed: ' + String(error).slice(0, 160))
       })
@@ -594,6 +600,11 @@ export async function apply(ctx: Context, config: Config) {
       .catch((error) => {
         logger.warn('supermemory: hub record migration failed: ' + String(error).slice(0, 160))
       })
+    // R42: a COLD session keeps its legacy host title until something attaches
+    // to it (applySessionTitle needs a live session). The v3 marker records
+    // those ids as pending instead of blocking convergence; this hook renames
+    // each one on its first live event, so the set drains without a rescan.
+    ctx.effect(() => attachPendingHubTitleRename(ctx, store, logger, hubTitlePass), 'supermemory: pending-hub-titles')
     // R23: one-time memory re-layout into the R22 collection model. Marker-
     // guarded (meta row `organize-<digest>`), only targets this plugin
     // repo's workspace, and every destructive step is SHA-guarded against

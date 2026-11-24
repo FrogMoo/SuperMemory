@@ -121,6 +121,44 @@ export const HUB_TITLE_PREFIX = 'SuperMemory 中枢'
 export const LEGACY_HUB_TITLE_PREFIX = '新会话'
 
 /**
+ * R42: does this HOST title still carry a legacy shape the plugin no longer
+ * generates? Two patterns: the brand prefix (SuperMemory 中枢 · <id4>, with or
+ * without the id token) and the pre-R31 neutral format (新会话 · <id4>). A bare
+ * 「新会话」 is the CURRENT neutral name (R41) and is NOT legacy — this
+ * distinction keeps the rail fallback from fighting an already-clean title.
+ */
+export function isLegacyHubTitle(title: string): boolean {
+  const value = String(title ?? '').trim()
+  if (!value) return false
+  if (value.startsWith(HUB_TITLE_PREFIX)) return true
+  return new RegExp('^' + LEGACY_HUB_TITLE_PREFIX + '\\s*·\\s*.+$').test(value)
+}
+
+/**
+ * R42: the DURABLE title the plugin recorded for one hub session — the
+ * positive hub_sessions row first, the topic-set root member title second. A
+ * pure store read (no live session, no host seam), so the rail can show the
+ * recorded name even while the host still carries a legacy title for a session
+ * that has not been opened since the rename.
+ */
+export function durableHubTitle(store: Store | undefined, sessionId: string): string {
+  if (!store || !sessionId) return ''
+  try {
+    const row = store.hubs.get(sessionId)
+    if (row && typeof row.title === 'string' && row.title.trim()) return row.title.trim()
+  } catch { /* a partly materialized table only loses the fallback */ }
+  try {
+    for (const [, topicSet] of store.topicsets.entries()) {
+      for (const member of topicSet.members) {
+        if (member.sessionId !== sessionId || member.kind !== 'root') continue
+        if (typeof member.title === 'string' && member.title.trim()) return member.title.trim()
+      }
+    }
+  } catch { /* ditto */ }
+  return ''
+}
+
+/**
  * R41 需求③: the title a plugin-created hub session gets — the first user
  * message / work summary itself (markup stripped, descriptive lead-ins removed,
  * 48-char ellipsis clip), or the neutral 「新会话」 when there is no content
@@ -383,9 +421,18 @@ export async function listHubSessions(
     const sessionCwd = String(record.header.cwd ?? cwd)
     const owner = topicSetOfRootMember(store, sessionId)
     const branchStats = branchStatsOf(store, sessionId)
+    // R42: a COLD session (never opened since the rename pass) still carries
+    // its legacy host title, and applySessionTitle can only rename a LIVE
+    // session. When the recorded title is already the direct description, show
+    // THAT instead of the stale host name — pure store data, no live session.
+    const hostTitle = title?.title ?? fallbackTitle(sessionId)
+    const durable = durableHubTitle(store, sessionId)
+    const shown = isLegacyHubTitle(hostTitle) && durable
+      ? describeSessionTitle(durable) || hostTitle
+      : hostTitle
     return {
       sessionId,
-      title: title?.title ?? fallbackTitle(sessionId),
+      title: shown,
       live: isRunning(sessionId),
       online: record.live === true,
       // The header has no updatedAt; the latest title event is the only cheap

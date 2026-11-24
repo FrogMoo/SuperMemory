@@ -451,6 +451,13 @@ async function deliver(
     fromSessionId?: string
     fromTitle?: string
     fromKind?: ChatCardKind
+    /**
+     * R42: write the ledger row WITHOUT sending. Used when a twin dispatch
+     * (same branch + same task, interrupted in the same sweep pass) already
+     * relayed this outcome: the row records "handled" so the sweep/flush never
+     * retries it, and `suppressedOf` names the dispatch that carried it.
+     */
+    ledgerOnly?: string
   },
 ): Promise<void> {
   const { ctx, store, logger } = deps
@@ -459,6 +466,16 @@ async function deliver(
   // duplicates and the hub's confirmation can match it. E: an explicit override
   // lets non-settle relays (startup interrupted notice) reuse this channel.
   const deliveryId = input.deliveryId ?? (input.groupId ? "dlv-grp-" + input.groupId : "dlv-" + input.dispatchId)
+  // R42 (relay 重复投递修复): the PERSISTENT guard. A row already relayed or
+  // confirmed means this outcome reached the hub — every caller (settle, sweep,
+  // flush, reconcile, notice) must not send it again, and a re-`put` would also
+  // destroy the confirmation. Only a row that never left ('pending' / 'failed')
+  // may be (re)sent: that is the at-least-once retry, not a duplicate.
+  const existing = store.outbox.get(deliveryId)
+  if (existing && (existing.status === 'relayed' || existing.status === 'confirmed')) {
+    logger.info(`supermemory: delivery ${deliveryId} already ${existing.status}; not re-sending`)
+    return
+  }
   // R32 需求③ / R33 需求⑦: the card fields are resolved NOW (while the branch
   // session and its dispatch row are live) and persisted with the outbox row,
   // so a restart re-delivery still says "来自 <来源会话>" with the same task/set/
@@ -484,7 +501,16 @@ async function deliver(
     task: card.task,
     topicSetTitle: card.topicSetTitle,
     capability: card.capability,
+    ...(input.ledgerOnly ? { suppressedOf: input.ledgerOnly } : {}),
   })
+  // R42: a suppressed twin records "handled" and returns — the information was
+  // already delivered by the dispatch named in `suppressedOf`.
+  if (input.ledgerOnly) {
+    await store.outbox.update(deliveryId, (r) => ({ ...r, status: 'relayed', relayedAt: Date.now() }))
+      .catch(() => { /* the pending row stays retryable rather than lost */ })
+    logger.info(`supermemory: delivery ${deliveryId} suppressed (twin ${input.ledgerOnly} already relayed)`)
+    return
+  }
   const hub = ctx.agents.get(input.record.hubSessionId as never)
   if (!hub) {
     logger.info(`supermemory: hub ${input.record.hubSessionId.slice(0, 13)} not live; delivery ${deliveryId} stays pending`)
@@ -581,6 +607,10 @@ export async function flushObserve(deps: ObserveDeps): Promise<void> {
   // ---- 2. pending outbox rows whose hub is live again ----
   for (const [deliveryId, item] of [...store.outbox.entries()]) {
     if (item.status !== 'pending') continue
+    // R42: a twin-suppressed row (same branch + task already relayed in the same
+    // sweep pass) must never be sent by the retry path either — its information
+    // was delivered by the dispatch named in `suppressedOf`.
+    if (item.suppressedOf) continue
     const hubSessionId = item.dispatchId
       ? store.dispatches.get(item.dispatchId)?.hubSessionId
       : (item.groupId ? groupMembers(store, item.groupId)[0]?.[1].hubSessionId : undefined)
@@ -670,6 +700,13 @@ export interface InterruptOptions {
  *  - a terminal dispatch that never reached the hub (crash between settle and
  *    deliver) is backfilled with the same one-shot relay.
  * Group members are skipped: their single relay belongs to the group.
+ *
+ * R42 (relay 重复投递修复): idempotency is PERSISTENT and two-layered —
+ *  1. the canonical `dlv-<dispatchId>` outbox row (deliver() refuses to re-send
+ *     a row already relayed/confirmed), so ticks, reloads and late events never
+ *     produce a second copy;
+ *  2. within ONE pass, a twin dispatch (same branch + same task — the hub
+ *     retried a dispatch after a host tool error) is ledgered, not re-sent.
  */
 export async function settleInterruptedDispatches(
   deps: ObserveDeps,
@@ -679,6 +716,13 @@ export async function settleInterruptedDispatches(
   const now = options.now ?? Date.now()
   const settled: string[] = []
   const touchedGroups = new Set<string>()
+  // R42 (relay 重复投递修复): 同一批巡检里「同分支 + 同任务」只投一份中断回执。
+  // 真实病例：中枢对同一任务重试派发（host 工具报错后模型重试），两条派发记录
+  // 在同一次巡检里被标记 interrupted，各自按自己的 deliveryId 投递——中枢收到
+  // 两份逐字相同的「⏹ 中断终态」relay（store 与 hub 会话日志均已实证）。
+  // 映射只在本次巡检内有效：换一批/换一天重新派发同一任务仍会正常告知。
+  // key = `<branch>\u0000<task>`，value = 代投的 dispatchId。
+  const announced = new Map<string, string>()
   for (const [dispatchId, record] of [...store.dispatches.entries()]) {
     if (record.status === 'delivered') continue
     const deliveryId = 'dlv-' + dispatchId
@@ -697,6 +741,9 @@ export async function settleInterruptedDispatches(
       ? `分支中断（${record.turnEndReason ? '终态 ' + record.turnEndReason : (options.reason ?? '未结算')}）`
       : `分支中断（${options.reason ?? '超时未结算'}）`
     if (record.groupId) touchedGroups.add(record.groupId)
+    // 同分支 + 同任务的逻辑键（任务文本逐字相同才算同一次尝试的重投）。
+    const logicalKey = `${record.branchSessionId}\u0000${record.task}`
+    const twinOf = announced.get(logicalKey)
     try {
       const partial = await partialSummary(deps, record)
       if (!record.groupId) {
@@ -707,7 +754,10 @@ export async function settleInterruptedDispatches(
           await deliver(deps, {
             dispatchId, record,
             text: relayText(record, partial, reason, openQuestionsOfDispatch(store, dispatchId)),
+            // R42: 本批已由同分支同任务的另一条派发投过 → 只落 ledger 不重投。
+            ...(twinOf ? { ledgerOnly: twinOf } : {}),
           })
+          if (!twinOf) announced.set(logicalKey, dispatchId)
         } catch (error) {
           logger.warn(`supermemory: interrupt relay ${dispatchId} deferred: ${String(error).slice(0, 160)}`)
         }

@@ -116,12 +116,19 @@ export function firstLine(text: string): string {
 
 /**
  * Strip the descriptive lead-ins users and older rounds put in front of a task:
- * 「R31：」「R31-B · 」「任务：」「分支 · 」「第 3 轮：」… The strip only fires
- * when the token is followed by a separator, so a task that merely MENTIONS a
- * round («R31 的需求…») is not mutilated. Repeats up to three times so stacked
- * prefixes («R31：任务：…») collapse to the task itself.
+ * 「R31：」「R31-B · 」「R32 」「第 3 轮：」「Round 3 」「项目：」「背景：」
+ * 「任务：」「分支 · 」… Two shapes:
+ *   - a ROUND token («R32», «R41-B», «第 3 轮», «Round 3») strips after a
+ *     separator OR a single space, because dispatch titles are exactly
+ *     «R32 只读复核：…». It is anchored, so a round merely MENTIONED inside a
+ *     sentence («参考 R31 的实现») is never touched;
+ *   - a LABEL («项目：」「背景：」「仓库：」「任务：」「需求：」「派发：」
+ *     「请求：」…) keeps REQUIRING a separator, so a title that merely starts
+ *     with a label word («需求分析：…») stays whole.
+ * Repeats up to three times so stacked prefixes («R31：任务：…») collapse to
+ * the task itself.
  */
-const LEADING_DESCRIPTION = /^(?:(?:R|r)\d{1,3}(?:-[A-Za-z]{1,3})?|第\s*\d+\s*轮|Round\s*\d+|任务书|任务|分支|派发|请求|工作内容|需求)\s*(?:[：:·•・|\-—–]|\s{2,})\s*/i
+const LEADING_DESCRIPTION = /^(?:(?:(?:R|r)\d{1,3}(?:-[A-Za-z]{1,3})?|第\s*\d+\s*轮|Round\s*\d+)\s*(?:[：:·•・|\-—–]\s*|\s+)|(?:项目|背景|仓库|任务书|任务|工作内容|需求|派发|请求|分支)\s*(?:[：:·•・|\-—–]|\s{2,})\s*)/i
 
 /** Remove leading descriptive tokens (round / 任务 / 分支 …) from one line. */
 export function stripLeadingDescription(text: string): string {

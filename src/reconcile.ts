@@ -49,6 +49,14 @@ async function coldRead(ctx: Context, sessionId: string, afterSeq: number): Prom
  * The row is persisted FIRST and actually sent by the flush pass: the old code
  * returned early when the hub was not live, and since the dispatch was already
  * terminal nothing ever retried it — a restart-time failure was lost forever.
+ *
+ * R42 (relay 重复投递修复): the key is the CANONICAL `dlv-<dispatchId>` — the
+ * same key the interrupt sweep's guard (observe.ts settleInterruptedDispatches)
+ * and deliver()'s persistent guard check. It used to be `dlv-fail-<branchSessionId>`,
+ * which (a) did not satisfy either guard, so a branch-died dispatch was relayed
+ * TWICE (once here, once by the sweep), and (b) collided across the dispatches
+ * of one branch, so a second dispatch's failure relay was silently swallowed
+ * (observed in the real ledger: a dispatch with no relay row at all).
  */
 async function failureDelivery(
   deps: ReconcileDeps,
@@ -57,7 +65,7 @@ async function failureDelivery(
   reason: string,
 ): Promise<void> {
   const { ctx, store, logger } = deps
-  const deliveryId = 'dlv-fail-' + record.branchSessionId
+  const deliveryId = 'dlv-' + dispatchId
   if (store.outbox.get(deliveryId)) return
   const questionBlock = renderQuestionsBlock(openQuestionsOfDispatch(store, dispatchId))
   const payload = '[supermemory-relay ' + record.branchSessionId + ']\n任务：' + record.task + '\n结果：' + reason

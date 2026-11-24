@@ -483,11 +483,34 @@ export async function resumeDispatch(
 }
 
 /**
+ * 一批中断公告的稳定短键（同一批派发集合 → 同一键）。
+ *
+ * 只用确定性字符串散列（FNV-1a，base36）：不引入 crypto 依赖，键长短固定，
+ * 足够把不同批次（新中断加入）区分开——它们的 outbox 行因此互不覆盖，
+ * hub 不在线时各自 pending 自愈。
+ */
+function noticeBatchKey(signature: string): string {
+  let hash = 0x811c9dc5
+  const text = String(signature ?? '')
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return hash.toString(36)
+}
+
+/**
  * 启动/巡检时的中断清单主动触达（复用 observe 的 at-least-once relay 通道）。
  *
- * 每个 hub 一条稳定幂等键（dlv-resume-<hub>，outbox 行挂首个中断派发 id 以便
- * flushObserve 解析 hub）：hub 在线立即投递，不在线则 pending 自愈重投。签名
- * 去重（state.signatures）保证同一清单不重复刷屏，清单变化才再通知。
+ * R42（relay 重复投递修复）：公告是**持久增量**——每条派发只在第一次进入清单时
+ * 被公告一次（`dispatches.interruptNoticedAt` 落库标记），重载后签名表清空、
+ * 清单刷新（新中断加入）都不会把已公告过的任务重新整批送来。旧的实现只有内存
+ * 签名去重：插件每次重载后同一批中断任务会被再送达一次（真实 ledger 里同一个
+ * hub 存在多条 dlv-resume-* 行，多条 pending 从未确认）。
+ *
+ * 幂等键按批次稳定：`dlv-resume-<hub>-<签名摘要>`。同一批（相同派发集合）重复
+ * 触发时键相同 → deliver 的持久守卫直接跳过；不同批（新中断加入）键不同 →
+ * 各自一行，hub 不在线时都可 pending 自愈，互不覆盖。
  */
 export async function notifyInterruptedDispatches(
   deps: ResumeDeps & { config?: ObserveConfig },
@@ -495,9 +518,11 @@ export async function notifyInterruptedDispatches(
 ): Promise<number> {
   const { ctx, store, logger } = deps
   const now = options.now ?? Date.now()
-  const views = listInterruptedDispatches(store, { now })
+  // 持久增量：只取从未公告过的派发（interruptNoticedAt 未设置）。
+  const pending = listInterruptedDispatches(store, { now })
+    .filter((view) => !store.dispatches.get(view.dispatchId)?.interruptNoticedAt)
   const byHub = new Map<string, InterruptedDispatchView[]>()
-  for (const view of views) {
+  for (const view of pending) {
     const bucket = byHub.get(view.hubSessionId) ?? []
     bucket.push(view)
     byHub.set(view.hubSessionId, bucket)
@@ -521,7 +546,7 @@ export async function notifyInterruptedDispatches(
     try {
       // deliverRelay 只消费 ctx/store/logger（config 不参与投递），这里结构上转过去。
       await deliverRelay(deps as ObserveDeps, {
-        deliveryId: 'dlv-resume-' + hubSessionId,
+        deliveryId: 'dlv-resume-' + hubSessionId + '-' + noticeBatchKey(signature),
         dispatchId: rows[0].dispatchId,
         hubSessionId,
         text,
@@ -530,6 +555,15 @@ export async function notifyInterruptedDispatches(
         fromTitle: 'SuperMemory 中断巡检',
       })
       notified += 1
+      // 持久增量标记：这一批从此不再公告（重载/清单刷新都跳过）。
+      const stampedAt = Date.now()
+      for (const row of rows) {
+        try {
+          await store.dispatches.update(row.dispatchId, (r) => (
+            r.interruptNoticedAt ? r : { ...r, interruptNoticedAt: stampedAt }
+          ))
+        } catch { /* 标记失败不影响本次投递；下一批会自然重试 */ }
+      }
       logger.info('supermemory: interrupted notice sent for hub ' + hubSessionId.slice(0, 13) + ' (' + rows.length + ' task(s))')
     } catch (error) {
       logger.warn('supermemory: interrupted notice for ' + hubSessionId.slice(0, 13)

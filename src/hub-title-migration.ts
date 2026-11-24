@@ -27,17 +27,48 @@
  * marker (store meta row `hub-titles`, version 2) keeps the startup pass from
  * rescanning. When a candidate cannot be renamed yet (not attached, outcome
  * `none`) the marker is NOT written, so the next startup retries it.
+ *
+ * R42 (v3): the v2 marker never converged. A COLD session (one the user has not
+ * opened since the pass) cannot be renamed — applySessionTitle needs an
+ * attached session — so pending stayed above zero forever and every startup
+ * rescanned the whole corpus. The v3 marker records id SETS instead:
+ *   - hubTitlesProcessedIds: renamed, or verified clean / human-renamed;
+ *   - hubTitlesPendingIds: matched a legacy pattern but was not attachable.
+ * The marker is ALWAYS written at the end of a pass (converged: "no live
+ * renamable item left"), and the pending ids are finished by
+ * attachPendingHubTitleRename the first time their session goes live — so the
+ * pass is idempotent AND eventually completes without a rescan loop.
  * @module supermemory/hub-title-migration
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { HUB_TITLE_PREFIX, LEGACY_HUB_TITLE_PREFIX, isPluginBranchId } from './hub-sessions.ts'
+import { HUB_TITLE_PREFIX, LEGACY_HUB_TITLE_PREFIX, isLegacyHubTitle, isPluginBranchId } from './hub-sessions.ts'
 import { recordHubSession } from './role.ts'
 import { TITLE_FALLBACK, applySessionTitle, currentSessionTitle, describeSessionTitle, stripLeadingDescription } from './title.ts'
 
-/** Bump when the rename rules change; a marker of an older version re-runs. */
-export const HUB_TITLES_MIGRATION_VERSION = 2
+/**
+ * Bump when the rename rules change; a marker of an older version re-runs.
+ * v2 (R41): direct-description renames + durable cleanup.
+ * v3 (R42): converged marker with processed/pending id sets; a cold session
+ * waits for its first live event instead of blocking the marker.
+ */
+export const HUB_TITLES_MIGRATION_VERSION = 3
+
+/**
+ * R42: the persisted migration marker. Version 3 added the id sets: a cold
+ * session no longer blocks convergence (it waits in hubTitlesPendingIds for
+ * its first live event instead of keeping the marker unwritten).
+ */
+export interface HubTitlesMarker {
+  hubTitlesMigratedAt?: number
+  hubTitlesMigrationVersion?: number
+  hubTitlesProcessedIds?: string[]
+  hubTitlesPendingIds?: string[]
+}
+
+/** Bound on the recorded id sets: the marker is diagnostics, not an archive. */
+const MARKER_ID_CAP = 500
 
 /** The meta-table row key of the migration marker. */
 const MARKER_KEY = 'hub-titles'
@@ -235,6 +266,8 @@ async function cleanDurableTitles(store: Store | undefined, topicTitles: readonl
       cleaned += 1
     }
   } catch { /* durable cleanup is best-effort */ }
+
+
   try {
     for (const [id, record] of store.topicsets.entries()) {
       let changed = false
@@ -250,18 +283,62 @@ async function cleanDurableTitles(store: Store | undefined, topicTitles: readonl
       cleaned += 1
     }
   } catch { /* durable cleanup is best-effort */ }
+  // R42: positive hub records carry a title too (the rail fallback reads it),
+  // so a pre-R42 row like 「背景：仓库 …」 is cleaned by the same rule.
+  try {
+    for (const [id, row] of store.hubs.entries()) {
+      const next = cleanOnce(row.title)
+      if (!next) continue
+      await store.hubs.update(id, (record) => ({ ...record, title: next }))
+      cleaned += 1
+    }
+  } catch { /* durable cleanup is best-effort */ }
   return cleaned
 }
 
 /** The persisted migration marker (undefined when never run). */
-export async function hubTitlesMigrationMarker(store: Store | undefined): Promise<{ hubTitlesMigratedAt?: number; hubTitlesMigrationVersion?: number } | undefined> {
+export async function hubTitlesMigrationMarker(store: Store | undefined): Promise<HubTitlesMarker | undefined> {
   return store?.meta?.get(MARKER_KEY)
 }
 
-/** Record a successful run so a restart does not rescan. */
-async function writeHubTitlesMigrationMarker(store: Store | undefined): Promise<void> {
+/**
+ * Record a converged pass. R42: the id sets are MERGED with the persisted ones
+ * (a later pass never forgets an earlier settle), bounded by MARKER_ID_CAP, and
+ * an empty pending set is stored as absent so the row stays small.
+ */
+async function writeHubTitlesMigrationMarker(
+  store: Store | undefined,
+  ids: { settled?: readonly string[]; pending?: readonly string[] } = {},
+): Promise<void> {
   if (!store?.meta) return
-  await store.meta.put(MARKER_KEY, { hubTitlesMigratedAt: Date.now(), hubTitlesMigrationVersion: HUB_TITLES_MIGRATION_VERSION })
+  const marker = await hubTitlesMigrationMarker(store)
+  const processed = [...new Set([...(marker?.hubTitlesProcessedIds ?? []), ...(ids.settled ?? [])])]
+  const pending = [...new Set([...(marker?.hubTitlesPendingIds ?? []), ...(ids.pending ?? [])])]
+    .filter((id) => !processed.includes(id))
+  await store.meta.put(MARKER_KEY, {
+    hubTitlesMigratedAt: Date.now(),
+    hubTitlesMigrationVersion: HUB_TITLES_MIGRATION_VERSION,
+    ...(processed.length ? { hubTitlesProcessedIds: processed.slice(-MARKER_ID_CAP) } : {}),
+    ...(pending.length ? { hubTitlesPendingIds: pending.slice(-MARKER_ID_CAP) } : {}),
+  })
+}
+
+/**
+ * Move one id out of the pending set: it was renamed, or its title is no
+ * longer legacy (human rename / already clean). Merges into the persisted
+ * marker so a restart never re-opens a settled id.
+ */
+async function settlePendingId(store: Store | undefined, sessionId: string): Promise<void> {
+  if (!store?.meta) return
+  const marker = await hubTitlesMigrationMarker(store)
+  const pending = (marker?.hubTitlesPendingIds ?? []).filter((id) => id !== sessionId)
+  const processed = [...new Set([...(marker?.hubTitlesProcessedIds ?? []), sessionId])]
+  await store.meta.put(MARKER_KEY, {
+    hubTitlesMigratedAt: Date.now(),
+    hubTitlesMigrationVersion: HUB_TITLES_MIGRATION_VERSION,
+    ...(processed.length ? { hubTitlesProcessedIds: processed.slice(-MARKER_ID_CAP) } : {}),
+    ...(pending.length ? { hubTitlesPendingIds: pending } : {}),
+  })
 }
 
 /**
@@ -271,6 +348,92 @@ async function writeHubTitlesMigrationMarker(store: Store | undefined): Promise<
 export async function hubTitleFor(ctx: Context, sessionId: string): Promise<string> {
   const content = await firstUserMessageText(ctx, sessionId)
   return content ? describeSessionTitle(content) : TITLE_FALLBACK
+}
+
+/**
+ * R42: finish a PENDING rename once its session is live. The startup pass
+ * cannot rename a session that is not attached (applySessionTitle needs the
+ * live session object), so such ids wait in the marker's pending set; this
+ * runs on the session's first event and settles the id either way.
+ *
+ * A title the human renamed in the meantime is never overwritten: the live
+ * title no longer matches a legacy pattern, which settles the id as clean.
+ *
+ * @returns what happened; never throws.
+ */
+export async function finishPendingHubTitle(
+  deps: HubTitleMigrationDeps,
+  sessionId: string,
+): Promise<'renamed' | 'skipped' | 'not-pending' | 'no-host' | 'failed'> {
+  const { ctx, store, logger } = deps
+  const id = String(sessionId ?? '')
+  if (!ctx || !store || !id) return 'no-host'
+  try {
+    const marker = await hubTitlesMigrationMarker(store)
+    if (!(marker?.hubTitlesPendingIds ?? []).includes(id)) return 'not-pending'
+    const current = currentSessionTitle(ctx, id)
+    if (!current) return 'no-host'
+    if (!isLegacyHubTitle(current)) {
+      await settlePendingId(store, id)
+      return 'skipped'
+    }
+    const to = await hubTitleFor(ctx, id)
+    if (!to || to === current) {
+      await settlePendingId(store, id)
+      return 'skipped'
+    }
+    const outcome = applySessionTitle(ctx, id, to, logger, { force: true })
+    if (outcome !== 'host' && outcome !== 'fallback') return 'failed'
+    await settlePendingId(store, id)
+    logger.info('supermemory: pending hub title renamed for ' + id)
+    return 'renamed'
+  } catch (error) {
+    logger.warn('supermemory: pending hub title rename failed for ' + id + ': ' + String(error).slice(0, 160))
+    return 'failed'
+  }
+}
+
+/**
+ * R42: attach the first-event rename hook for pending legacy titles. The
+ * pending set is loaded lazily — after the startup pass finished when its
+ * promise is supplied — and kept in memory as ids settle, so the steady-state
+ * cost per event is one Set lookup.
+ *
+ * @param startupPass - the startup migrateHubSessionTitles promise (optional);
+ *   awaited once before the pending set is first read, so a session that goes
+ *   live during the pass is not missed.
+ * @returns the listener disposer.
+ */
+export function attachPendingHubTitleRename(
+  ctx: Context | undefined,
+  store: Store | undefined,
+  logger: { warn: (msg: string) => void; info: (msg: string) => void },
+  startupPass?: Promise<unknown>,
+): () => void {
+  if (!ctx || !store || typeof ctx.on !== 'function') return () => {}
+  let cache: Set<string> | undefined
+  const load = async (): Promise<Set<string>> => {
+    if (cache) return cache
+    try { await startupPass } catch { /* the pass already logged its own failure */ }
+    const marker = await hubTitlesMigrationMarker(store)
+    cache = new Set(marker?.hubTitlesPendingIds ?? [])
+    return cache
+  }
+  const off = ctx.on('session/event', (session: { id?: unknown }) => {
+    const id = String(session?.id ?? '')
+    if (!id) return
+    void load()
+      .then((pending) => {
+        if (!pending.has(id)) return undefined
+        return finishPendingHubTitle({ ctx, store, logger }, id).then((outcome) => {
+          if (outcome === 'renamed' || outcome === 'skipped') pending.delete(id)
+        })
+      })
+      .catch((error) => {
+        logger.warn('supermemory: pending hub title hook failed: ' + String(error).slice(0, 160))
+      })
+  })
+  return off
 }
 
 /**
@@ -357,6 +520,11 @@ export async function migrateHubSessionTitles(
   let renamed = 0
   let skipped = 0
   let pending = 0
+  // R42: which ids this pass SETTLED (renamed / human-renamed / verified clean)
+  // and which it could not reach (not attached). The marker records both, so a
+  // cold session waits for its first live event instead of blocking convergence.
+  const settled = new Set<string>()
+  const unfinished = new Set<string>()
   for (const item of plan) {
     try {
       // Re-read the LIVE title: the batch read above may be stale, and a title
@@ -364,20 +532,29 @@ export async function migrateHubSessionTitles(
       const current = currentSessionTitle(ctx, item.sessionId)
       if (current && current !== item.from) {
         skipped += 1
+        settled.add(item.sessionId)
         logger.info(`supermemory: title migration skipped ${item.sessionId} — the host title was renamed by somebody else`)
         continue
       }
       const outcome = applySessionTitle(ctx, item.sessionId, item.to, logger, { force: true })
-      if (outcome === 'host' || outcome === 'fallback') renamed += 1
-      else pending += 1
+      if (outcome === 'host' || outcome === 'fallback') {
+        renamed += 1
+        settled.add(item.sessionId)
+      } else {
+        pending += 1
+        unfinished.add(item.sessionId)
+      }
     } catch (error) {
       pending += 1
+      unfinished.add(item.sessionId)
       logger.warn('supermemory: title migration failed for ' + item.sessionId + ': ' + String(error).slice(0, 160))
     }
   }
-  // Only mark done when nothing is left to retry: a not-yet-attached session
-  // keeps the pass open so the next startup picks it up.
-  if (pending === 0) await writeHubTitlesMigrationMarker(store)
+  // R42: CONVERGE. The marker is written on every non-dry pass — "no live
+  // renamable item left" is the completion condition, not "nothing pending".
+  // Unfinished ids stay in hubTitlesPendingIds for the session/event hook
+  // (attachPendingHubTitleRename), which renames them once they go live.
+  await writeHubTitlesMigrationMarker(store, { settled: [...settled], pending: [...unfinished] })
   logger.info(
     `supermemory: title migration applied — scanned ${scanned}, renamed ${renamed}`
     + `, skipped ${skipped}, pending ${pending}, durable cleaned ${cleaned}`,
