@@ -21,7 +21,7 @@
 //                                                                                 # 资产默认 release/dsh-supermemory-<版本>.zip
 // 退出码：0 成功 / 1 失败（含任一 SHA 校验不符）。
 // 背景与实测记录见 docs/git-sync.md §11。
-import { execSync } from 'node:child_process'
+import { execFileSync, execSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 
@@ -74,6 +74,8 @@ async function api(method, path, body) {
 
 // ---------- 本地元数据（全部来自 git 原生命令，避开 % 日期格式的管线差异） ----------
 const git = (cmd) => execSync(cmd, { cwd: ROOT, encoding: 'utf8' })
+/** Bytes of one object, no shell quoting (paths may contain spaces/non-ASCII). */
+const gitBuf = (args) => execFileSync('git', args, { cwd: ROOT, maxBuffer: 64 * 1024 * 1024 })
 function afterBlank(text) {
   const i = text.indexOf(NL + NL)
   return i < 0 ? text : text.slice(i + 2)
@@ -135,27 +137,53 @@ if (ghMain.object.sha !== local.parent) {
 
 // ---------- 2. 变更文件 -> blob（SHA 逐个校验） ----------
 const baseTree = (await api('GET', '/repos/' + REPO + '/git/commits/' + local.parent)).tree.sha
-const diff = git('git diff --name-status -M ' + local.parent + ' ' + local.commit).trim()
-const tree = []
-if (diff) {
-  for (const line of diff.split(NL)) {
-    const parts = line.split(TAB)
-    const status = parts[0]
-    const p = parts[1]
-    if (status.startsWith('D')) {
-      tree.push({ path: p, mode: '100644', type: 'blob', sha: null })
-      log('  del', p)
-      continue
-    }
-    const path = status.startsWith('R') ? parts[2] : p
-    const content = readFileSync(ROOT + '/' + path)
-    const blob = await api('POST', '/repos/' + REPO + '/git/blobs', { content: content.toString('base64'), encoding: 'base64' })
-    const localBlobSha = createHash('sha1').update(Buffer.concat([Buffer.from('blob ' + content.length + NUL, 'utf8'), content])).digest('hex')
-    if (blob.sha !== localBlobSha) fail('blob SHA 不一致: ' + path)
-    const mode = git('git ls-tree ' + local.commit + ' -- ' + path).trim().split(TAB)[0].split(' ')[0]
-    tree.push({ path, mode, type: 'blob', sha: blob.sha })
-    log('  blob ok', path, blob.sha.slice(0, 10), (content.length / 1024).toFixed(1) + 'kB')
+// -z: NUL-separated, unquoted paths (a non-ASCII filename used to arrive as a
+// quoted octal string and quietly create a junk path upstream). Renames must
+// DELETE the old path too — base_tree otherwise keeps it and the tree diverges.
+const modeMap = new Map()
+for (const entry of execFileSync('git', ['ls-tree', '-r', '-z', local.commit], { cwd: ROOT, maxBuffer: 64 * 1024 * 1024 }).toString('utf8').split(NUL).filter(Boolean)) {
+  const tab = entry.indexOf(TAB)
+  if (tab < 0) continue
+  modeMap.set(entry.slice(tab + 1), entry.slice(0, tab).split(' ')[0])
+}
+const diffRaw = git('git diff --name-status -z -M ' + local.parent + ' ' + local.commit)
+const tokens = diffRaw.split(NUL).filter((t) => t.length > 0)
+const changes = []
+for (let i = 0; i < tokens.length;) {
+  const status = tokens[i++]
+  if (status.startsWith('R') || status.startsWith('C')) {
+    const from = tokens[i++]
+    const to = tokens[i++]
+    changes.push({ status, from, to })
+  } else {
+    changes.push({ status, path: tokens[i++] })
   }
+}
+const tree = []
+const addBlob = async (path) => {
+  // Read the COMMITTED bytes (never the worktree): a CRLF/checkout difference
+  // would otherwise produce a valid blob whose SHA is not the tree's.
+  const content = gitBuf(['cat-file', 'blob', local.commit + ':' + path])
+  const blob = await api('POST', '/repos/' + REPO + '/git/blobs', { content: content.toString('base64'), encoding: 'base64' })
+  const localBlobSha = createHash('sha1').update(Buffer.concat([Buffer.from('blob ' + content.length + NUL, 'utf8'), content])).digest('hex')
+  if (blob.sha !== localBlobSha) fail('blob SHA 不一致: ' + path)
+  const mode = modeMap.get(path) || '100644'
+  tree.push({ path, mode, type: 'blob', sha: blob.sha })
+  log('  blob ok', path, blob.sha.slice(0, 10), (content.length / 1024).toFixed(1) + 'kB')
+}
+for (const change of changes) {
+  if (change.status.startsWith('D')) {
+    tree.push({ path: change.path, mode: '100644', type: 'blob', sha: null })
+    log('  del', change.path)
+    continue
+  }
+  if (change.status.startsWith('R')) {
+    tree.push({ path: change.from, mode: '100644', type: 'blob', sha: null })
+    log('  del', change.from, '(renamed)')
+    await addBlob(change.to)
+    continue
+  }
+  await addBlob(change.path)
 }
 
 // ---------- 3. tree / commit（SHA 与本地一致才继续） ----------
