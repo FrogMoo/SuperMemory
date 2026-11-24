@@ -2916,3 +2916,31 @@ v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pend
   src/store.ts、DEV-NOTES §50、scripts/cleanup-legacy-titles.mjs 等，mtime 均在
   20 分钟内），且 schema.ts / mechanism-smoke.mjs / lib/ 为双方共用——建议该分支
   到终态后由中枢一次性提交（同 R30 集成轮做法）。
+
+---
+
+## 52. v1.1.0 发布轮：R32–R42 能力合集 + 双端 Release（2026-11-24）
+
+### 背景与定级
+
+- v1.0.1（tag v1.0.1，对象 e37ad0f）之后本地又落了三个提交并已双推：87f7ab1（feat(round-41) 集成提交，实际涵盖 R32–R41 全部改动）、1efbe89（fix(git-sync)：GitHub API 补推增强）、07b0dec（fix(round-42)：relay 重复投递修复 + 会话名称收尾）。三端 main 一致于 07b0dec 后本轮做发布。
+- 定级 **minor → v1.1.0**：区间含新功能（设置页收敛、默认模型持久化、会话名称直述体系、中枢权限白名单/动态目录、工具合成项），非纯修复。
+
+### 改动清单
+
+- `package.json` 版本 1.0.1 → 1.1.0；`CHANGELOG.md` [1.1.0] 条目（新增/修复/工程/兼容性/已知限制）；`README.md` 版本行、`INSTALL.md` 三处示例版本号同步。
+- 本小节（§52）。
+
+### 闸门与打包
+
+- 闸门三连全绿：`pnpm typecheck` 双 0 错；`pnpm build` exit 0；`pnpm smoke` 六套件（core 34 / mechanism 112 / webui 35 / client-sim OK / capability 12 / workspace-scope 9）。
+- 打包 `node scripts/package-release.mjs` → `release/dsh-supermemory-1.1.0.zip`（文件数与 sha256 见提交信息）；解压全文件 grep 敏感身份串 0 命中；临时目录解压 + `node scripts/install-into-dsh.mjs --dry-run` 自检通过（dry-run 的「profile 依赖」FAIL 为脚本既定语义：不写盘、比对期望 link 与现网 profile 指向开发工作区，非包缺陷）。
+
+### 提交、tag 与双端推送
+
+- 提交「release: v1.1.0 …」+ 附注 tag v1.1.0；两端分别独立推送（Gitea=Zry 账号、GitHub=FrogMoo 账号，推前 credential fill 探测 + API 留证），推后 `git ls-remote` 核对三端 main+tag 一致，零分叉。
+- Release 页：GitHub 建 v1.1.0 Release 并上传发布包；Gitea 同建（用 Zry 凭据）。上传后核对服务端资产 digest 与本地一致。
+
+### 备注
+
+- 本轮提交作者身份为 FogFrost <88362780+FrogMoo@users.noreply.github.com>（repo-local config；--global 未设置）。

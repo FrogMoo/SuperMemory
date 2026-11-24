@@ -2,6 +2,42 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.1.0] - 2026-11-24
+
+v1.0.1 之后的能力轮次合集（R32–R42）：中枢-分支协同规则硬化进插件运行时、中枢权限白名单与设置页收敛、默认模型持久化、会话名称直述体系、中断 relay 重复投递修复。全量闸门（typecheck + 六套冒烟）通过。
+
+### 新增
+
+- **中枢-分支协同规则硬化**（R32/R33/R35）：三条规则从提示词落进运行时——分支内调用插件重载入口被拒（BRANCH_RELOAD_DENIED）；分支→中枢 relay 与中枢→分支派发/续跑的卡片双向通路（来源标题/任务/话题集/能力字段补全）；角色判定收敛至唯一权威 `src/role.ts` `resolveRole`（branch 优先 → hub 正标记 → other），guard 改全量捕获 + 失败显式告警与 meta 标记。
+- **中枢权限白名单**（R36/R37/R39）：默认拒绝；面板原「中枢权限」页签为动态目录（按工具来源分组、搜索/折叠、白名单勾选、6 项锁定、失效条目一键清理、宿主合成项）。
+- **工具合成项**（R40）：会话级/宿主保留工具进入目录，修掉「已失效」误判。
+- **设置页 = 权限 + 默认模型单一入口**（R41）：原「中枢权限」页签并入「设置」；新增默认模型卡片（中枢/分支两个下拉，按工作区持久化，新表 `model_defaults`；「恢复默认」回到跟随链路）。新建中枢会话无显式模型时读中枢默认；新派发分支模型解析顺序为 话题集默认 > 分支会话默认 > 中枢当前模型 > 宿主默认（既有 per-member / per-topic-set 覆盖优先级不变）。
+- **会话名称直述体系**（R41/R42）：去掉前置描述/品牌前缀/令牌前缀，直接描述工作内容——中枢标题取首条用户消息描述（不再生成「SuperMemory 中枢 · id4」）；分支标题为任务本身（不再拼「<话题集> · <任务>」）；一次性迁移存量标题（hub-title-migration v2/v3：人工改名不覆盖、durable 记录 dispatches.title 与 member 标题三面同步清理、冷会话面板兜底）；配套工具 `scripts/cleanup-legacy-titles.mjs`（默认 dry-run、--apply 才写、走域层正规写路径）。
+- **GitHub API 补推增强**：`scripts/github-api-release.mjs` 支持文件重命名与非 ASCII 路径，提交内容改取 blob。
+
+### 修复
+
+- **中断 relay 重复投递**（用户实测「中断任务被多次送回中枢」，R42）：`observe.deliver()` 新增持久守卫（relayed/confirmed 行不再重投、不再抹确认态）；同批巡检「同分支+同任务」只投一份回执（twin 行落 ledger 带 `suppressedOf`，永不重投）；reconcile 失败回执键统一为 `dlv-<dispatchId>`（分支已死的派发只投一次、同分支多派发不再互吞）；中断公告改持久增量（`dispatches.interruptNoticedAt`，每条最多公告一次，重载/清单刷新只补新增）。
+- **侧栏单选唯一高亮**（R41）：纯函数 `isRailCurrent`（src/rail-selection.ts）——聊天视图只认 view.id、其它视图只认 sessionId，任何状态最多命中一行。
+- **前缀剥离规则补强**（R42）：轮次令牌（R32/r7/R41-B/第 3 轮/Round 3）分隔符或单空格均剥；描述标签（项目：/背景：/仓库：等）仍须分隔符，«需求分析：…» 不误伤。
+
+### 工程
+
+- 提交作者身份统一为 FogFrost <88362780+FrogMoo@users.noreply.github.com>（GitHub noreply 格式，提交在 GitHub 侧关联 FrogMoo 账号）。
+- 六套冒烟规模：core 34 / mechanism 112 / webui 35 / client-sim OK / capability 12 / workspace-scope 9。
+
+### 兼容性
+
+- 宿主要求 DSH `>=0.2.0 <0.3.0`（`engines.dsh` 不变）。
+- 存储域 `supermemory` version 1 不变；新表 `model_defaults` 无行即空表；`dispatches.interruptNoticedAt` 与 `outbox.suppressedOf` 为可选字段，旧介质读作缺省，自动兼容无需迁移。
+
+### 已知限制
+
+- 分支会话无法重载插件（BRANCH_RELOAD_DENIED）；重载与 GUI 验收由中枢/用户执行。
+- DSH shell 输入框直接发首条消息不触发面板侧中枢标题升级（仅面板发消息会）。
+- 会话标题句首「R31 的需求」这类文本会被剥成「的需求」（Rnn+空格规则的既定取舍）。
+
+[1.1.0]: https://github.com/FrogMoo/SuperMemory/releases/tag/v1.1.0
 ## [1.0.1] - 2026-11-23
 
 补全发布元数据的维护版：新增专有 LICENSE 文件、登记 v1.0.0 发布轮记录，重新打包发布。无功能与行为变更，v1.0.0 用户可按 INSTALL.md「升级」一节平滑升级（亦可停留在 v1.0.0，两者功能等价）。
