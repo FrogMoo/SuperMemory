@@ -3019,3 +3019,31 @@ v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pend
 - 闸门：`pnpm typecheck` 双工程 0 错；`pnpm build` exit 0；`pnpm smoke` 六套件全绿——
   core **34** / mechanism **113** / webui **35** / client-sim **OK** / capability **12** / workspace-scope **9**。
 - 插件未重载、未 commit/push（分支约束）；需中枢/GUI 重载并刷新 GUI 验收。
+
+---
+
+## 54. v1.2.0 发布轮：R43 卡片点击修复 + 会话名称说清主题（2026-11-25）
+
+### 背景与定级
+
+- v1.1.0（tag v1.1.0，对象 19e541d）之后区间仅一个提交 9ecea34（feat(round-43)：分支卡片点击不再跳「新建」+ 中枢/分支会话名称说清主题；14 文件 +706/−86，含 lib 重建），已双推、三端 main 一致于 9ecea34 后本轮做发布。
+- 定级 **minor → v1.2.0**：区间含新功能（中枢命名默认带工作区+主题、shell 路径补名、分支标题预算 48→60），非纯修复。
+
+### 改动清单
+
+- `package.json` 版本 1.1.0 → 1.2.0；`CHANGELOG.md` [1.2.0] 条目（新增/修复/工程/兼容性/已知限制）；`README.md` 版本行、`INSTALL.md` 三处示例版本号同步。
+- 本小节（§54）。
+
+### 闸门与打包
+
+- 闸门三连全绿：`pnpm typecheck` 双 0 错；`pnpm build` exit 0；`pnpm smoke` 六套件（core 34 / mechanism 113 含 R43-1 / webui 35 / client-sim OK 含 R43 可驱动+产物护栏 / capability 12 / workspace-scope 9）。
+- 打包 `node scripts/package-release.mjs` → `release/dsh-supermemory-1.2.0.zip`（文件数与 sha256 见提交信息）；解压全文件 grep 敏感身份串 0 命中；临时目录解压 + `node scripts/install-into-dsh.mjs --dry-run` 自检通过（dry-run 的「profile 依赖」FAIL 为脚本既定语义：不写盘、比对期望 link 与现网 profile 指向开发工作区，非包缺陷）。
+
+### 提交、tag 与双端推送
+
+- 提交「release: v1.2.0 …」+ 附注 tag v1.2.0；两端分别独立推送（Gitea=Zry 账号、GitHub=FrogMoo 账号，推前 credential fill 探测 + API 留证）；GitHub 若遇 §11 连接重置，按「先单推 Gitea 保底 + API 补推/退避重试」处置。推后 `git ls-remote` 核对三端 main+tag 一致，零分叉。
+- Release 页：GitHub 与 Gitea 分别建 v1.2.0 Release 并上传发布包；上传后核对服务端资产 digest 与本地一致。
+
+### 备注
+
+- 本轮提交作者身份为 FogFrost <88362780+FrogMoo@users.noreply.github.com>（repo-local config；--global 未设置）。

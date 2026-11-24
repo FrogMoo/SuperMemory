@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的跨会话记忆插件：把「结论性事实、话题集、派发归档、固化能力」持久化到存储域，让中枢/分支会话协同工作跨会话可续、可追溯、可召回。
 
-- **包名**：`dsh-supermemory`　**版本**：`1.1.0`（最新 Release，tag `v1.1.0`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
+- **包名**：`dsh-supermemory`　**版本**：`1.2.0`（最新 Release，tag `v1.2.0`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
 - **宿主要求**：DSH `>=0.2.0 <0.3.0`（见 `package.json` 的 `engines.dsh`）
 - **产物形态**：ESM。宿主半边 `lib/supermemory.js`，浏览器半边 `lib/client.js`（DSH 侧边栏/主区面板）
 - **存储**：DSH `storageDomain` 域 `supermemory`（version 1），表定义集中在 `src/schema.ts`；所有业务表按工作区隔离（`workspaceKey`，决策 D4）
