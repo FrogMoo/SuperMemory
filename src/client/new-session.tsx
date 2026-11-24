@@ -26,6 +26,12 @@
  * shell's own new-session flow runs untouched. If the session was created but
  * the panel could not be revealed (no layout service), the created session is
  * opened directly so the click still has a visible result.
+ *
+ * R43 ①: two surfaces are skipped because they are OUR OWN and merely contain
+ * matching text — the panel (`[data-sm-panel]`, whose in-panel controls act
+ * locally) and a SuperMemory chat card (`[data-supermemory-card]`), whose head
+ * button's accessible name is 「来自 <来源会话> 的执行请求」 and therefore
+ * matches the pattern whenever the source session is named 「新会话」.
  * @module supermemory/client/new-session
  */
 import { useEffect, type ReactElement } from 'react'
@@ -98,6 +104,16 @@ export function NewSessionChoice(props: NewSessionChoiceProps): ReactElement | n
       // Our own panel must never re-trigger the entry: its 「＋ 新中枢会话」
       // button and every in-panel control already act locally.
       if (target.closest('[data-sm-panel]') !== null) return
+      // R43 ①: a SuperMemory chat card lives in the shell's CONVERSATION area,
+      // not inside the panel, so the guard above never covered it. Its head is
+      // a <button> whose accessible name is 「来自 <来源会话> 的执行请求 …」 —
+      // and a hub that still carries the neutral 「新会话」 name (or a task
+      // that merely mentions 新建会话) makes that name match the New-session
+      // pattern below, so collapsing/expanding the card CREATED a hub session
+      // and opened the panel: the user's 「点卡片跳到新建」. The card marks its
+      // own surface (data-supermemory-card); skipping it keeps the card's own
+      // click handling intact.
+      if (target.closest('[data-supermemory-card]') !== null) return
       const control = target.closest('button, [role="button"], a')
       if (control === null) return
       const name = [

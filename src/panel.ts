@@ -17,7 +17,7 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   topicSetIdsOf, touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
-import { TITLE_FALLBACK, TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, describeSessionTitle, ensureMemberTitle } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, ensureMemberTitle } from './title.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
@@ -36,7 +36,7 @@ import {
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
-import { isPluginBranchId, listHubSessions, hubSessionTitle, type HubSessionView } from './hub-sessions.ts'
+import { isPluginBranchId, isNeutralHubTitle, listHubSessions, hubSessionTitle, type HubSessionView } from './hub-sessions.ts'
 // R36 需求①②: 中枢白名单（默认拒绝）的读写；R39：动态目录按来源分组。
 import {
   DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, LOCKED_HUB_TOOLS,
@@ -1444,10 +1444,13 @@ export class SupermemoryPanelService {
     }
     const created = await this.createSessionWithOptions(cwd, resolvedOptions)
     if ('error' in created) return { status: 'error', message: created.error }
-    // R41 需求③a: the name is the work itself — the opening message (48-char
-    // clip) or the neutral 「新会话」 when there is no content yet. No brand
-    // prefix, no id token.
-    const title = hubSessionTitle(created.sessionId, firstMessage)
+    // R41 需求③a / R43 需求②③: the name is the work itself — the opening
+    // message (48-char clip) qualified by the workspace name, or
+    // 「<工作区名> · 新会话」 when there is no content yet. Never a bare
+    // 「新会话」 (it said nothing, and it made the shell's New-session capture
+    // interceptor fire on this hub's chat cards), never a brand prefix, never
+    // an id token.
+    const title = hubSessionTitle(created.sessionId, firstMessage, cwd)
     await this.finishSession(created.sessionId, cwd, title)
     // R33 需求②: the plugin created this hub — record the positive mark.
     await recordHubSession(this.store, {
@@ -1463,9 +1466,12 @@ export class SupermemoryPanelService {
   }
 
   /**
-   * R41 需求③a: upgrade a hub's neutral title from the first message the user
-   * sends in the panel. Only generic titles (「新会话」, the old brand prefix,
-   * the pre-R31「新会话 · id」) are upgraded — a title a person chose is kept.
+   * R41 需求③a / R43 需求②: upgrade a hub's neutral title from the first message
+   * the user sends in the panel. Only titles that carry NO topic (the bare
+   * fallback, the R43 「<工作区名> · 新会话」 default, the old brand prefix, the
+   * pre-R31 「新会话 · id」) are upgraded — a title a person or the host title
+   * service chose is kept. The new name uses the SAME rule as creation, so the
+   * panel path and the shell path (attachHubTitleFromFirstMessage) agree.
    */
   private async refreshHubTitleFromMessage(sessionId: string, text: string): Promise<void> {
     const ctx = this.ctx
@@ -1473,18 +1479,15 @@ export class SupermemoryPanelService {
     try {
       const record = this.store?.hubs?.get?.(sessionId)
       if (!record) return
+      const workspace = record.workspaceKey
       const current = currentSessionTitle(ctx, sessionId) ?? record.title
-      const generic = !current
-        || current === TITLE_FALLBACK
-        || current.startsWith('SuperMemory 中枢')
-        || /^新会话\s*·/.test(current)
-      if (!generic) return
-      const title = describeSessionTitle(text)
-      if (!title || title === TITLE_FALLBACK) return
+      if (!isNeutralHubTitle(current, workspace)) return
+      const title = hubSessionTitle(sessionId, text, workspace)
+      if (!title || isNeutralHubTitle(title, workspace)) return
       applySessionTitle(ctx, sessionId, title, { warn: () => {} }, { force: true })
       await recordHubSession(this.store, {
         sessionId,
-        workspaceKey: record.workspaceKey,
+        workspaceKey: workspace,
         title,
         source: record.source,
       })

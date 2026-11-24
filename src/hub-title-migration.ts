@@ -43,9 +43,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { HUB_TITLE_PREFIX, LEGACY_HUB_TITLE_PREFIX, isLegacyHubTitle, isPluginBranchId } from './hub-sessions.ts'
+import { HUB_TITLE_PREFIX, LEGACY_HUB_TITLE_PREFIX, hubSessionTitle, isLegacyHubTitle, isNeutralHubTitle, isPluginBranchId } from './hub-sessions.ts'
 import { recordHubSession } from './role.ts'
-import { TITLE_FALLBACK, applySessionTitle, currentSessionTitle, describeSessionTitle, stripLeadingDescription } from './title.ts'
+import type { SessionEventLike, UserMessageLike } from './events.ts'
+import type { HubSession } from './schema.ts'
+import { applySessionTitle, currentSessionTitle, describeSessionTitle, stripLeadingDescription } from './title.ts'
 
 /**
  * Bump when the rename rules change; a marker of an older version re-runs.
@@ -207,6 +209,23 @@ function contentText(content: unknown): string {
   return parts.join(String.fromCharCode(10)).trim()
 }
 
+/**
+ * The canonical workspace key of a LIVE session (its header cwd), or '' when
+ * the session is not attached / carries no cwd. Used as the workspace fallback
+ * when a hub has no durable record to read the key from.
+ */
+function liveWorkspaceKey(ctx: Context, sessionId: string): string {
+  try {
+    const sessions = (ctx as unknown as {
+      sessions?: { get?: (id: string) => { header?: { cwd?: string } } | undefined }
+    }).sessions
+    const cwd = sessions?.get?.(sessionId)?.header?.cwd
+    return typeof cwd === 'string' && cwd ? workspaceKeyOf(cwd) : ''
+  } catch {
+    return ''
+  }
+}
+
 /** The first user message of one session, or '' when unreadable. */
 async function firstUserMessageText(ctx: Context, sessionId: string): Promise<string> {
   const query = serviceOf<SessionQueryLike>(ctx, 'sessionQuery')
@@ -345,9 +364,18 @@ async function settlePendingId(store: Store | undefined, sessionId: string): Pro
  * The direct title for one legacy hub row: its first user message, or the
  * neutral fallback when there is no readable content.
  */
-export async function hubTitleFor(ctx: Context, sessionId: string): Promise<string> {
+/**
+ * The R41/R43 target title of one hub: the first user message as a direct
+ * description, qualified by the workspace name; 「<工作区名> · 新会话」 when
+ * the session carries no message yet.
+ *
+ * @param ctx - host context (used to read the first user message).
+ * @param sessionId - hub session id.
+ * @param workspaceKey - canonical workspace path of that hub (the label).
+ */
+export async function hubTitleFor(ctx: Context, sessionId: string, workspaceKey = ''): Promise<string> {
   const content = await firstUserMessageText(ctx, sessionId)
-  return content ? describeSessionTitle(content) : TITLE_FALLBACK
+  return hubSessionTitle(sessionId, content ?? '', workspaceKey)
 }
 
 /**
@@ -373,11 +401,16 @@ export async function finishPendingHubTitle(
     if (!(marker?.hubTitlesPendingIds ?? []).includes(id)) return 'not-pending'
     const current = currentSessionTitle(ctx, id)
     if (!current) return 'no-host'
-    if (!isLegacyHubTitle(current)) {
+    // R43: the workspace label comes from the hub record the pass wrote before
+    // renaming (every pending id has one); when that row is missing — a hub the
+    // record migration never covered — fall back to the LIVE session header so
+    // the name is still workspace-qualified rather than bare.
+    const workspace = store.hubs.get(id)?.workspaceKey ?? liveWorkspaceKey(ctx, id)
+    if (!isLegacyHubTitle(current) && !isNeutralHubTitle(current, workspace)) {
       await settlePendingId(store, id)
       return 'skipped'
     }
-    const to = await hubTitleFor(ctx, id)
+    const to = await hubTitleFor(ctx, id, workspace)
     if (!to || to === current) {
       await settlePendingId(store, id)
       return 'skipped'
@@ -437,6 +470,73 @@ export function attachPendingHubTitleRename(
 }
 
 /**
+ * R43 需求②: name a hub from the user's first message, WHEREVER that message
+ * is typed. The panel's send path upgrades the title itself
+ * (`refreshHubTitleFromMessage`), but a hub opened from the sidebar and then
+ * used in the shell never went through it — that is the documented R41 gap
+ * behind 「中枢会话名称固定显示新会话」. This hook closes it: on the first
+ * `user/message` event of a plugin hub whose title still carries NO topic, the
+ * title becomes the same value creation would have produced.
+ *
+ * Guards (a hook that renames on every message would fight the user):
+ *   - only sessions with a plugin `hub_sessions` record (a hub this plugin
+ *     created), so an ordinary conversation is never renamed;
+ *   - only `source.kind === 'user'` — a relay, a notice or a tool receipt is
+ *     not the user's own words and must not name the session;
+ *   - only while the title is neutral ({@link isNeutralHubTitle}), so a name a
+ *     person or the host title service chose is kept;
+ *   - one upgrade per session per process (a Set), plus the neutral check.
+ *
+ * @returns the listener disposer; never throws.
+ */
+export function attachHubTitleFromFirstMessage(
+  ctx: Context | undefined,
+  store: Store | undefined,
+  logger: { warn: (msg: string) => void; info: (msg: string) => void },
+): () => void {
+  if (!ctx || !store || typeof ctx.on !== 'function') return () => {}
+  const upgraded = new Set<string>()
+  const off = ctx.on('session/event', (session: { id?: unknown }, event: SessionEventLike) => {
+    if (event?.type !== 'user/message') return
+    const id = String(session?.id ?? '')
+    if (!id || upgraded.has(id)) return
+    let record: HubSession | undefined
+    try {
+      record = store.hubs.get(id)
+    } catch {
+      return
+    }
+    if (!record) return
+    const data = event.data as UserMessageLike | undefined
+    // Only the user's own words name a session (the panel path uses kind
+    // 'user'; relays/notices carry kind 'supermemory').
+    const kind = data?.source?.kind
+    if (kind && kind !== 'user') return
+    const text = contentText(data?.content)
+    if (!text.trim()) return
+    upgraded.add(id)
+    const workspace = record.workspaceKey
+    const current = currentSessionTitle(ctx, id) ?? record.title
+    if (!isNeutralHubTitle(current, workspace)) return
+    const title = hubSessionTitle(id, text, workspace)
+    if (!title || isNeutralHubTitle(title, workspace)) return
+    try {
+      applySessionTitle(ctx, id, title, { warn: () => {} }, { force: true })
+      void recordHubSession(store, {
+        sessionId: id,
+        workspaceKey: workspace,
+        title,
+        source: record.source,
+      }).catch(() => { /* the host title already landed; the record is a cache */ })
+      logger.info(`supermemory: hub ${id.slice(0, 20)} named from its first message 「${title}」`)
+    } catch (error) {
+      logger.warn('supermemory: hub first-message naming failed for ' + id + ': ' + String(error).slice(0, 160))
+    }
+  })
+  return off
+}
+
+/**
  * Run (or preview) the rename. Startup calls it with no options (marker-
  * guarded and best-effort); tests call it with `ignoreMarker` to force a pass.
  */
@@ -491,8 +591,14 @@ export async function migrateHubSessionTitles(
   for (const candidate of hubCandidates) {
     const title = titles.get(candidate.sessionId)
     if (!title) continue
-    if (!BRANDED_HUB_TITLE.test(title) && !LEGACY_HUB_TITLE.test(title)) continue
-    const to = await hubTitleFor(ctx, candidate.sessionId)
+    // R43 需求②: a bare/neutral 「新会话」 is also a title this plugin no longer
+    // generates (it now emits 「<工作区名> · 新会话」), so the pass upgrades it
+    // too — a hub must never sit in the list with a name that says nothing.
+    const needsRename = BRANDED_HUB_TITLE.test(title)
+      || LEGACY_HUB_TITLE.test(title)
+      || isNeutralHubTitle(title, candidate.workspaceKey)
+    if (!needsRename) continue
+    const to = await hubTitleFor(ctx, candidate.sessionId, candidate.workspaceKey)
     if (!to || to === title) continue
     plan.push({ sessionId: candidate.sessionId, from: title, to })
     hubTargets.push({ ...candidate, from: title, to })

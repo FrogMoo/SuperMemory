@@ -24,14 +24,15 @@
  */
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
-import { clipEllipsis, describeSessionTitle } from './title.ts'
+import { TITLE_BRANCH_TASK_CHARS, clipEllipsis, describeSessionTitle } from './title.ts'
 
 /**
- * Character budget of a branch title (the task's first line). 48 matches the
- * session-title task snippet budget (title.ts TITLE_TASK_SNIPPET_CHARS): a
- * normal one-line task stays whole, a runaway one says it was clipped.
+ * Character budget of a branch title (the task's first line). R43 需求③ raised
+ * it from 48 to {@link TITLE_BRANCH_TASK_CHARS} (60): users reported branch
+ * names as over-truncated, and the rail ellipsizes visually while the stored
+ * title stays complete.
  */
-export const BRANCH_TITLE_MAX_CHARS = 48
+export const BRANCH_TITLE_MAX_CHARS = TITLE_BRANCH_TASK_CHARS
 
 /** Maximum tags carried per branch (index, not a taxonomy). */
 export const BRANCH_TAGS_MAX = 8

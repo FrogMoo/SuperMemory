@@ -176,6 +176,20 @@ if (typeof injectedNewSession?.selectPanel !== 'function') {
   throw new Error('new-session entry must inject selectPanel: the receipt must become visible')
 }
 
+// R43 ① regression guard on the BUILT bundle: the capture-phase interceptor
+// must skip our own chat card. Its head button's accessible name is
+// 「来自 <来源会话> 的执行请求」, which matches the New-session pattern whenever
+// the source session is named 「新会话」 — without this guard every card click
+// created a hub session and opened the panel (the user's 「点卡片跳到新建」).
+// The click path itself cannot be driven headlessly (it lives in a useEffect
+// over a document listener), so the guard is asserted on the shipped source.
+if (!source.includes('[data-supermemory-card]')) {
+  throw new Error('R43: new-session interceptor is missing the [data-supermemory-card] skip guard')
+}
+if (!source.includes('data-supermemory-card')) {
+  throw new Error('R43: the chat card no longer marks its own surface (data-supermemory-card)')
+}
+
 // The client half only reaches the browser when the package manifest declares
 // it: dsh.client.platform 'web' makes clientModules add the package to
 // window.__DSH_BOOT__, and exports["./client"] names the artifact to serve.
@@ -248,6 +262,23 @@ for (const descriptor of mountedDescriptors) {
   }
   const findCell = (key) => registrations.find((row) => row.slot === 'conversation.chat.node'
     && row.entry?.options?.key === key)
+  // Depth-first search for an element whose props satisfy a predicate (used to
+  // reach the card's head button inside the rendered tree).
+  const findProp = (node, predicate) => {
+    if (node === null || node === undefined) return undefined
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const hit = findProp(child, predicate)
+        if (hit) return hit
+      }
+      return undefined
+    }
+    if (typeof node === 'object' && node.props) {
+      if (predicate(node.props)) return node.props
+      return findProp(node.props.children, predicate)
+    }
+    return undefined
+  }
   const cells = ['user', 'steering', 'turn-trigger', 'context']
   for (const key of cells) {
     const cell = findCell(key)
@@ -368,6 +399,35 @@ for (const descriptor of mountedDescriptors) {
     assert.equal(typeof rendered.props.t, 'function', 'delegated node keeps t: ' + key)
     assert.doesNotThrow(() => rendered.type(rendered.props), 'delegated node survives its shipped view: ' + key)
   }
+
+  // R43 ①: the card head must STOP PROPAGATING. A document-level capture
+  // interceptor (the plugin's own new-session entry) used to match this
+  // button's text — 「来自 新会话 的执行请求」 — as the shell's 新建会话 control
+  // and created a hub session on every card click. The interceptor now skips
+  // `[data-supermemory-card]`; stopping propagation here additionally keeps any
+  // ANCESTOR bubble handler (row click / navigation) from acting on a click
+  // that only expands the card.
+  const clickCard = userCell.entry.component({
+    node: {
+      kind: 'user',
+      data: {
+        time: at,
+        content: [{ type: 'text', text: '派发脚本正文' }],
+        source: {
+          kind: 'user', form: 'supermemory-dispatch', fromSessionId: 'session-hub1', fromTitle: '新会话',
+          task: '加测试', topicSetTitle: 'R33 话题集', capability: 'full', dispatchId: 'dsp-2', status: 'dispatched',
+        },
+      },
+    },
+    smCardEnv: userEnv,
+  })
+  const head = findProp(clickCard, (props) => props.className === 'sm-chat-card-head' && typeof props.onClick === 'function')
+  if (!head) throw new Error('R43 card head button not found')
+  let propagated = true
+  head.onClick({ stopPropagation: () => { propagated = false } })
+  assert.equal(propagated, false, 'R43: a card click must not propagate to ancestor handlers')
+  // The card's own surface is marked, which is what the interceptor skips.
+  assert.equal(clickCard?.props?.['data-supermemory-card'], 'hub', 'R43: the card marks its own surface')
 
   // Without the raw entry view the plugin must NOT shadow any cell (otherwise
   // ordinary messages would be swallowed with no way to delegate).

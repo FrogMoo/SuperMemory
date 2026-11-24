@@ -150,6 +150,16 @@ function SupermemoryCard(props: { meta: ChatCardMeta; node: CardNode | undefined
   const body = contentText(node?.data?.content)
   const time = clockText(node?.data?.time)
   const receipt = [meta.dispatchId, meta.status].filter(Boolean).join(' · ')
+  // R43 ①: the card head is a <button> inside the shell's chat row, and a
+  // document-level capture interceptor (the plugin's own new-session entry)
+  // matched this button's text as a 新建会话 control and created a hub session
+  // on every card click. The interceptor now skips `[data-supermemory-card]`;
+  // stopping propagation here as well keeps any ANCESTOR bubble handler (row
+  // click, navigation) from acting on a click that only expands the card.
+  const toggle = (event: { stopPropagation?: () => void }): void => {
+    try { event?.stopPropagation?.() } catch { /* a synthetic event without it is still a toggle */ }
+    setOpen((value) => !value)
+  }
   return h('section', {
     className: 'sm-chat-card',
     'data-supermemory-card': meta.kind,
@@ -158,7 +168,7 @@ function SupermemoryCard(props: { meta: ChatCardMeta; node: CardNode | undefined
       key: 'head', type: 'button', className: 'sm-chat-card-head',
       'aria-expanded': String(open),
       'aria-label': t(open ? 'chat.card.collapse' : 'chat.card.expand'),
-      onClick: () => setOpen((value) => !value),
+      onClick: toggle,
     },
       h('span', { key: 'dot', className: 'sm-chat-card-dot', 'aria-hidden': 'true' }, '↔'),
       h('span', { key: 'title', className: 'sm-chat-card-title' }, title),

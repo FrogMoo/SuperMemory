@@ -56,7 +56,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { describeSessionTitle } from './title.ts'
+import { TITLE_FALLBACK, clipEllipsis, describeSessionTitle } from './title.ts'
 import { isOpenDispatch } from './hub-branches.ts'
 
 /** One hub-session row of the panel's left rail. */
@@ -159,17 +159,71 @@ export function durableHubTitle(store: Store | undefined, sessionId: string): st
 }
 
 /**
- * R41 需求③: the title a plugin-created hub session gets — the first user
- * message / work summary itself (markup stripped, descriptive lead-ins removed,
- * 48-char ellipsis clip), or the neutral 「新会话」 when there is no content
- * yet. No brand prefix and no id token: the sidebar reads as the work.
- *
- * @param _sessionId - kept in the signature for callers/tests; no longer used
- *   for the title (an id suffix is not a description).
- * @param firstMessage - opening message used as the work summary.
+ * R43 需求②③: the total budget of a hub session title — the workspace label,
+ * the separator and the topic summary share it. Longer than a plain task
+ * snippet (48) because the user asked for names that say the whole topic.
  */
-export function hubSessionTitle(_sessionId: string, firstMessage = ''): string {
-  return describeSessionTitle(firstMessage)
+export const HUB_TITLE_MAX_CHARS = 60
+
+/** The topic-summary budget inside a hub title (before the workspace prefix). */
+export const HUB_TITLE_TOPIC_CHARS = 48
+
+/** The readable label of a workspace path: its last segment (no drive/UNC). */
+export function workspaceLabel(cwd: string): string {
+  const value = String(cwd ?? '').replace(/[\\/]+$/, '')
+  if (!value) return ''
+  const segments = value.split(/[\\/]/).filter((segment) => segment.length > 0)
+  return segments.length > 0 ? segments[segments.length - 1] : ''
+}
+
+/**
+ * R41 需求③ / R43 需求②③: the title a plugin-created hub session gets.
+ *
+ * R41 named it after the work alone, so a hub opened before its first message
+ * (sidebar 新建会话 / 「＋新中枢会话」 with an empty composer) showed the bare
+ * neutral 「新会话」 — which says nothing about the session, and (see R43 ①)
+ * even made the shell's New-session capture interceptor treat the chat card of
+ * such a hub as a 新建会话 control. R43 makes the name meaningful by default:
+ *
+ *   `<工作区名> · <主题/首条消息摘要>`   (clipped to {@link HUB_TITLE_MAX_CHARS})
+ *   `<工作区名> · 新会话`                (no topic yet — still says WHICH workspace)
+ *
+ * No brand prefix and no id token. When no workspace path is available the
+ * shape degrades to the topic alone / the bare fallback, exactly as R41 did.
+ *
+ * @param _sessionId - kept in the signature for callers/tests; an id suffix is
+ *   not a description and is never part of the title.
+ * @param firstMessage - opening message used as the work summary.
+ * @param cwd - workspace path (or its canonical key) for the label.
+ */
+export function hubSessionTitle(sessionId: string, firstMessage = '', cwd = ''): string {
+  const workspace = workspaceLabel(cwd)
+  const topic = describeSessionTitle(firstMessage, HUB_TITLE_TOPIC_CHARS)
+  if (topic && topic !== TITLE_FALLBACK) {
+    return workspace ? clipEllipsis(`${workspace} · ${topic}`, HUB_TITLE_MAX_CHARS) : topic
+  }
+  return workspace ? `${workspace} · ${TITLE_FALLBACK}` : TITLE_FALLBACK
+}
+
+/**
+ * R43 需求②: does this title carry NO topic — i.e. is it the neutral default of
+ * ANY generation? The upgrade paths (panel send, first-message event hook and
+ * the startup rename pass) use it so they never overwrite a name a person or
+ * the host title service chose. Recognised neutral shapes:
+ *   - empty / the bare fallback 「新会话」;
+ *   - the R31 brand prefix 「SuperMemory 中枢 …」 and the pre-R31 「新会话 · id」;
+ *   - the R43 default `<工作区名> · 新会话` (with the caller's workspace, or any
+ *     workspace when the path is unknown).
+ */
+export function isNeutralHubTitle(title: string, cwd = ''): boolean {
+  const value = String(title ?? '').trim()
+  if (!value) return true
+  if (value === TITLE_FALLBACK) return true
+  if (value.startsWith(HUB_TITLE_PREFIX)) return true
+  if (/^新会话\s*·/.test(value)) return true
+  const workspace = workspaceLabel(cwd)
+  if (workspace) return value === `${workspace} · ${TITLE_FALLBACK}`
+  return /·\s*新会话$/.test(value)
 }
 
 /**
@@ -425,9 +479,14 @@ export async function listHubSessions(
     // its legacy host title, and applySessionTitle can only rename a LIVE
     // session. When the recorded title is already the direct description, show
     // THAT instead of the stale host name — pure store data, no live session.
+    // R43 需求②: the same applies to the NEW neutral default
+    // 「<工作区名> · 新会话」 — a hub whose record already carries a topic must
+    // not show the topic-less host name just because it has not been opened
+    // since the rename.
     const hostTitle = title?.title ?? fallbackTitle(sessionId)
     const durable = durableHubTitle(store, sessionId)
-    const shown = isLegacyHubTitle(hostTitle) && durable
+    const stale = isLegacyHubTitle(hostTitle) || isNeutralHubTitle(hostTitle, sessionCwd)
+    const shown = stale && durable
       ? describeSessionTitle(durable) || hostTitle
       : hostTitle
     return {

@@ -2944,3 +2944,78 @@ v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pend
 ### 备注
 
 - 本轮提交作者身份为 FogFrost <88362780+FrogMoo@users.noreply.github.com>（repo-local config；--global 未设置）。
+
+---
+
+## 53. R43：分支卡片点击不再跳「新建」+ 中枢/分支会话名称说清主题（2026-11-24）
+
+对应用户三项缺陷（①分支会话点卡片跳到新建 ②中枢名称固定「新会话」③中枢与分支名称过于简略）。
+①②同源：中枢会话名裸「新会话」既是缺陷本身，又让卡片头部按钮的可及名命中新建拦截正则。
+代码改动 + 闸门全绿；未重载、未提交（由中枢集成轮负责）。
+
+### 53.1 ① 卡片点击跳到「新建」——根因与修法
+
+- **根因**：`src/client/new-session.tsx` 的 shell「新建会话」入口是 document 级 **capture** 监听，
+  命中条件 = 最近的 `button/[role=button]/a` 的可及名（aria-label + title + **textContent**）匹配
+  `/(新建|新的?)\s*会话|新建对话|新对话|new\s+(session|chat|conversation)/i`。
+  聊天卡片的头部就是一个 `<button>`，其文本是「来自 <来源会话> 的执行请求 …」——而来源会话
+  （中枢）的名字常年是裸「新会话」，`新的?\s*会话` 恰好命中「新会话」。于是点卡片（展开/收起）
+  被当成点「新建会话」：preventDefault + selectPanel + createHubSession，用户看到的就是「跳到新建」。
+  原有护栏 `target.closest('[data-sm-panel]')` 只保护面板，不保护会话区里的卡片。
+- **修法（两处，纯插件侧）**：
+  1. `new-session.tsx`：capture 里新增 `if (target.closest('[data-supermemory-card]') !== null) return`
+     ——卡片自带 `data-supermemory-card` 标记（R32 起就有），精确跳过自己的表面；
+  2. `chat-card.tsx`：卡片头部 onClick 改为先 `stopPropagation()` 再切换展开——
+     capture 监听在 document 层早于 React 根监听，气泡阶段的 stop 拦不住它（所以第 1 处是必须的），
+     但这一处能挡住任何**祖先气泡处理器**（行点击/导航）把「只想展开卡片」的点击吃掉。
+- **残留风险（已记录）**：拦截器按「可及名包含新建会话」匹配，会话区内若出现别的 `<button>/<a>`
+  且其文本含这些词（例如用户消息里的链接），理论上仍会被误拦。卡片是本次报告的唯一真实案例；
+  更一般的做法是限定只匹配侧栏/头部的控件，但宿主没有稳定的区域属性可依赖，故未做。
+
+### 53.2 ② 中枢名称固定「新会话」——根因与修法
+
+- **根因**：R41 起 `hubSessionTitle(id, firstMessage)` = 首条消息直述，**无内容即裸「新会话」**。
+  从侧栏「新建会话」或面板「＋新中枢会话」创建的中枢首条消息为空 → 名字就是「新会话」；
+  唯一的升级路径 `refreshHubTitleFromMessage` 只在**面板里发消息**时触发，
+  在 shell 会话里打字的那条路从不升级（R41 已知限制）→ 名字永久停在「新会话」。
+- **修法**：
+  1. **默认就有意义**（`src/hub-sessions.ts`）：`hubSessionTitle(sessionId, firstMessage, cwd)` →
+     「<工作区名> · <主题/首条消息摘要>」（`HUB_TITLE_MAX_CHARS=60` 截断）；无主题 →
+     「<工作区名> · 新会话」（至少说清是哪个工作区）。无 cwd 时退化为 R41 形状（主题/裸回退）。
+     工作区名取路径最后一段（`workspaceLabel`）。
+  2. **shell 路径也补名**（`src/hub-title-migration.ts` 新增 `attachHubTitleFromFirstMessage`）：
+     监听 `session/event` 的 `user/message`，对**有 hub_sessions 记录的插件中枢**、且当前标题仍是
+     中性名（`isNeutralHubTitle`）时，用与创建完全相同的规则命名。护栏：只认 `source.kind==='user'`
+     （relay/公告/回执不拿来命名）、每会话每进程只升一次、人改过或宿主标题服务起过名的一律不覆盖。
+  3. **存量也升级**：hub-titles 迁移的候选条件从「旧品牌前缀/pre-R31 形态」扩展到
+     「中性名」（`isNeutralHubTitle`），冷会话的 `finishPendingHubTitle` 增加 live header.cwd 作为
+     工作区回退（无 hub 记录时也能带工作区名）。
+  4. **面板/管理台列表兜底**：`listHubSessions` 的「旧前缀让位记录标题」从 `isLegacyHubTitle`
+     扩展到 `isLegacyHubTitle || isNeutralHubTitle`——冷会话宿主名是中性名时也展示记录里的主题。
+  5. `panel.ts` 的 `refreshHubTitleFromMessage`（面板路径）改用同一函数 + 同一中性名判定，两条路一致。
+
+### 53.3 ③ 名称过于简略——加长预算
+
+- 分支任务标题预算 `TITLE_TASK_SNIPPET_CHARS=48` → **`TITLE_BRANCH_TASK_CHARS=60`**
+  （`src/title.ts` 新增常量；`ensureMemberTitle` 的 taskOnly 路径与 `branch-meta.ts` 的
+  `BRANCH_TITLE_MAX_CHARS` 都改读它，宿主标题/成员标题/面板行三处同值）。
+- 取舍：**未**给分支加「分支：」前缀——侧栏徽标已标明分支身份，前缀只吃预算；任务书的「或」允许二选一。
+- 中枢总预算 60 字（含「工作区名 · 」前缀），主题部分 48 字，超出部分以 … 截断。
+- 话题集 root 会话仍走 `<话题集标题> · <任务>`（话题集名比工作区名信息量更大），未加工作区前缀。
+
+### 53.4 断言与闸门
+
+- mechanism-smoke **R43-1**（新增，113 项，+1）：hub 命名形状（工作区+主题/无主题/无 cwd/60 字预算）、
+  中性名判定（可升级的四种形态 vs 须保留的人名/宿主名）、分支 48→60 的截断差异、
+  shell 路径首条消息补名（只认 user 消息/只升中性名/一次性/无 hub 记录不碰/人名不覆盖）、
+  面板列表对中性宿主名的兜底。
+- client-sim 新增两类 R43 断言：**可驱动的**——无头渲染卡片并调用头部 onClick，断言
+  `stopPropagation` 被调用且卡片标记了 `data-supermemory-card`；**构建产物护栏**——
+  `lib/client.js` 必须包含 `[data-supermemory-card]` 跳过守卫（点击链路在 useEffect 里，
+  无法无头驱动，故对出货源码断言）。
+- 既有断言按新规则更新（非删除）：R41-1 迁移计划/记录标题期望值加工作区前缀（用 `workspaceLabel(cwd)`
+  推导，不写死目录名）、R42-5 冷会话改名期望值加前缀、R41-3 新建中枢标题两处、
+  R30 分支标题预算 48→60。
+- 闸门：`pnpm typecheck` 双工程 0 错；`pnpm build` exit 0；`pnpm smoke` 六套件全绿——
+  core **34** / mechanism **113** / webui **35** / client-sim **OK** / capability **12** / workspace-scope **9**。
+- 插件未重载、未 commit/push（分支约束）；需中枢/GUI 重载并刷新 GUI 验收。

@@ -51,6 +51,15 @@ export const TITLE_MAX_CHARS = 80
  */
 export const TITLE_TASK_SNIPPET_CHARS = 48
 
+/**
+ * R43 需求③: the task budget of a WORK BRANCH title. The user reported branch
+ * names as over-truncated (48 characters cut a task mid-clause), so a branch
+ * keeps up to 60 characters of its task — the topic-set members, the host
+ * session title and the rail badge all read the same value, and the rail
+ * ellipsizes visually anyway (the stored title stays complete).
+ */
+export const TITLE_BRANCH_TASK_CHARS = 60
+
 /** Fallback title when both the topic-set title and the task are empty. */
 export const TITLE_FALLBACK = '新会话'
 
@@ -227,6 +236,8 @@ export function sessionTitleFor(
  * @param task - task text used for the snippet.
  * @param options - `taskOnly` names a WORK BRANCH: the title is the task
  *   itself (no topic-set prefix), matching 「会话名称直接描述工作内容」.
+ *   R43 需求③ widened that budget to {@link TITLE_BRANCH_TASK_CHARS} so the
+ *   topic is not cut mid-clause.
  * @returns the title now stored on the member.
  */
 export async function ensureMemberTitle(
@@ -238,14 +249,14 @@ export async function ensureMemberTitle(
   options: { taskOnly?: boolean } = {},
 ): Promise<string> {
   const record = store.topicsets.get(topicSetId)
-  if (!record) return options.taskOnly ? describeSessionTitle(task) : sessionTitleFor(topicTitle, task)
+  if (!record) return options.taskOnly ? describeSessionTitle(task, TITLE_BRANCH_TASK_CHARS) : sessionTitleFor(topicTitle, task)
   const current = record.members.find((entry) => entry.sessionId === member.sessionId)
   if (current && current.title.trim()) return current.title
   const others = record.members
     .filter((entry) => entry.sessionId !== member.sessionId)
     .map((entry) => entry.title)
   const title = options.taskOnly
-    ? describeSessionTitle(task)
+    ? describeSessionTitle(task, TITLE_BRANCH_TASK_CHARS)
     : sessionTitleFor(record.title || topicTitle, task, others)
   if (current) {
     await updateMember(store, topicSetId, member.sessionId, { title })

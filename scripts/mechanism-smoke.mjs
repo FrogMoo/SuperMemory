@@ -752,10 +752,13 @@ const fakeCtx = (services) => ({
 // ---- R41 需求③: direct session names + one-time cleanup of prefixed titles ----
 {
   const { migrateHubSessionTitles, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
-  const { hubSessionTitle } = await import('../src/hub-sessions.ts')
+  const { hubSessionTitle, workspaceLabel } = await import('../src/hub-sessions.ts')
   const { branchTitleFor } = await import('../src/branch-meta.ts')
   const { describeSessionTitle, stripLeadingDescription } = await import('../src/title.ts')
   const cwd = process.cwd()
+  // R43 需求②③: a hub name is 「<工作区名> · <主题>」, so every expectation
+  // below derives the label instead of hardcoding the repo directory name.
+  const ws = workspaceLabel(cwd)
 
   // 1) generation: the work itself, no brand prefix / id token / lead-in.
   assert.equal(describeSessionTitle('R31：整理发布流程'), '整理发布流程')
@@ -763,8 +766,8 @@ const fakeCtx = (services) => ({
   assert.equal(describeSessionTitle('分支 · 补测试'), '补测试')
   assert.equal(describeSessionTitle('R41-B · 任务：设置页签'), '设置页签')
   assert.equal(describeSessionTitle(''), '新会话')
-  assert.equal(hubSessionTitle('session-abcd1234'), '新会话', 'no content yet = neutral name, never an id token')
-  assert.equal(hubSessionTitle('session-abcd1234', 'R41：检查设置页签'), '检查设置页签')
+  assert.equal(hubSessionTitle('session-abcd1234'), '新会话', 'no content and no workspace = neutral name, never an id token')
+  assert.equal(hubSessionTitle('session-abcd1234', 'R41：检查设置页签'), '检查设置页签', 'without a workspace the topic stands alone')
   assert.equal(branchTitleFor('R31：修构建'), '修构建', 'branch title is the task, not the round label')
 
   // R42: the strip now also covers 「Rnn + 单个空格」 (dispatch titles are
@@ -841,7 +844,7 @@ const fakeCtx = (services) => ({
   assert.equal(dry.plan.length, 3, 'branded hub + legacy hub + work branch (user title, child, subagent excluded)')
   assert.deepEqual(
     dry.plan.map((row) => row.sessionId + ' => ' + row.to).sort(),
-    ['branch-work1 => 修构建', 'session-brand1 => 检查设置页签', 'session-legacy2 => 整理发布流程'],
+    ['branch-work1 => 修构建', `session-brand1 => ${ws} · 检查设置页签`, `session-legacy2 => ${ws} · 整理发布流程`],
   )
   assert.equal(writes.length, 0, 'dry-run writes nothing')
   assert.equal(store.dispatches.get('d1').title, 'R31：修构建', 'dry-run does not clean durable titles')
@@ -850,7 +853,7 @@ const fakeCtx = (services) => ({
   assert.equal(applied.status, 'applied')
   assert.equal(applied.renamed, 3)
   assert.equal(titles.get('session-useredit'), '我自己起的名字', 'a user-renamed title is never overwritten')
-  assert.equal(store.hubs.get('session-brand1')?.title, '检查设置页签', 'a branded hub gets a positive record BEFORE the prefix disappears (R35 evidence)')
+  assert.equal(store.hubs.get('session-brand1')?.title, `${ws} · 检查设置页签`, 'a branded hub gets a positive record BEFORE the prefix disappears (R35 evidence)')
   assert.equal(store.hubs.get('session-brand1')?.source, 'title-migration')
   assert.equal(store.dispatches.get('d1').title, '修构建', 'durable dispatch title is cleaned')
   assert.equal(store.topicsets.get('ts-a').members[0].title, '修构建', 'durable branch member title is cleaned')
@@ -867,9 +870,12 @@ const fakeCtx = (services) => ({
 // ---- R42 需求③ 收尾：前缀规则补强 + 冷会话兜底 + 迁移 marker 收敛 ----
 {
   const { migrateHubSessionTitles, finishPendingHubTitle, attachPendingHubTitleRename, HUB_TITLES_MIGRATION_VERSION } = await import('../src/hub-title-migration.ts')
-  const { isLegacyHubTitle, durableHubTitle, listHubSessions } = await import('../src/hub-sessions.ts')
+  const { isLegacyHubTitle, isNeutralHubTitle, durableHubTitle, listHubSessions, workspaceLabel } = await import('../src/hub-sessions.ts')
   const cwd = process.cwd()
   assert.equal(HUB_TITLES_MIGRATION_VERSION, 3, 'R42 bumps the marker to v3')
+  // R43 需求②: hub names are workspace-qualified, so the cold-session
+  // expectations below derive the label rather than hardcode the repo name.
+  const ws = workspaceLabel(cwd)
 
   // 1) legacy detection: brand prefix and 新会话 · <id> are legacy; a bare
   //    neutral name must not be treated as legacy.
@@ -925,7 +931,9 @@ const fakeCtx = (services) => ({
     readSurface: async (id) => ({ events: [{ type: 'user/message', data: { message: { content: [{ type: 'text', text: contents.get(id) ?? '' }] } } }] }),
   }
   const coldCtx = {
-    sessions: { get: (id) => (live.has(id) ? { id, append: () => {} } : undefined) },
+    // R43: the live session carries its header cwd, which is the workspace
+    // fallback when a pending id has no durable hub record.
+    sessions: { get: (id) => (live.has(id) ? { id, header: { cwd }, append: () => {} } : undefined) },
     get: (name) => (name === 'sessionQuery' ? coldSeam : name === 'sessionTitle' ? titleService : undefined),
   }
   const coldStore = {
@@ -951,7 +959,7 @@ const fakeCtx = (services) => ({
   assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'no-host', 'still not live = stays pending')
   live.add('session-cold2')
   assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'renamed')
-  assert.equal(titles.get('session-cold2'), '重载后只读核验', 'the cold session is renamed from its first user message')
+  assert.equal(titles.get('session-cold2'), `${ws} · 重载后只读核验`, 'the cold session is renamed from its first user message')
   assert.deepEqual(coldStore.meta.get('hub-titles')?.hubTitlesPendingIds ?? [], [], 'the pending set drained')
   assert.ok((coldStore.meta.get('hub-titles')?.hubTitlesProcessedIds ?? []).includes('session-cold2'))
   assert.equal(await finishPendingHubTitle({ ctx: coldCtx, store: coldStore, logger: quiet }, 'session-cold2'), 'not-pending')
@@ -971,7 +979,7 @@ const fakeCtx = (services) => ({
   live.add('session-cold3')
   contents.set('session-cold3', '冷会话补改名')
   await new Promise((resolve) => { listener({ id: 'session-cold3' }); setTimeout(resolve, 10) })
-  assert.equal(titles.get('session-cold3'), '冷会话补改名')
+  assert.equal(titles.get('session-cold3'), `${ws} · 冷会话补改名`)
   assert.deepEqual(coldStore.meta.get('hub-titles')?.hubTitlesPendingIds ?? [], [], 'the hook drains the pending set')
   assert.equal(writes.filter(([id]) => id === 'session-cold2').length, 1, 'a settled id is not renamed twice')
   off()
@@ -986,6 +994,118 @@ const fakeCtx = (services) => ({
   await migrateHubSessionTitles({ ctx: coldCtx, store: hubCleanStore, logger: quiet }, { ignoreMarker: true })
   assert.equal(hubCleanStore.hubs.get('session-legacy-hub')?.title, '仓库 F:\\repo（DSH 插件）。面板页…', 'hub record titles are cleaned too')
   ok('R42-5 会话名称收尾：前缀规则补强（Rnn+空格/标签形式，句中轮次不误伤）+ 冷会话面板兜底（旧前缀让位记录标题）+ 迁移 marker v3 收敛（pending 集合 + 首事件补改名 + hub 记录标题同步清理）')
+}
+
+// ---- R43: card click must not become 新建 + hub/branch names say the topic ----
+{
+  const { hubSessionTitle, isNeutralHubTitle, workspaceLabel, HUB_TITLE_MAX_CHARS, listHubSessions } = await import('../src/hub-sessions.ts')
+  const { attachHubTitleFromFirstMessage } = await import('../src/hub-title-migration.ts')
+  const { TITLE_BRANCH_TASK_CHARS, describeSessionTitle } = await import('../src/title.ts')
+  const cwd = 'F:\\10-SuperMemory'
+  const ws = workspaceLabel(cwd)
+  assert.equal(ws, '10-SuperMemory', 'the workspace label is the last path segment')
+
+  // 1) hub naming: 「<工作区名> · <主题>」, never a bare 新会话.
+  assert.equal(hubSessionTitle('session-x', '', cwd), '10-SuperMemory · 新会话',
+    'no topic yet still says WHICH workspace (never the bare 新会话)')
+  assert.equal(hubSessionTitle('session-x', 'R43：修卡片跳转', cwd), '10-SuperMemory · 修卡片跳转')
+  assert.equal(hubSessionTitle('session-x', 'R43：修卡片跳转'), '修卡片跳转',
+    'without a workspace path the topic stands alone (R41 shape)')
+  const long = 'R43 需求：把分支卡片点击从跳新建改成打开对应会话，并让中枢与分支名称说清楚主题且允许更长'
+  assert.equal(hubSessionTitle('session-x', long, cwd).length <= HUB_TITLE_MAX_CHARS, true,
+    'the workspace-qualified title respects the 60-char budget')
+  assert.ok(hubSessionTitle('session-x', long, cwd).startsWith('10-SuperMemory · '), 'the workspace prefix survives clipping')
+
+  // 2) neutral detection: what may be upgraded, what must be kept.
+  assert.equal(isNeutralHubTitle('新会话'), true)
+  assert.equal(isNeutralHubTitle(''), true)
+  assert.equal(isNeutralHubTitle('SuperMemory 中枢 · ry6q'), true, 'the old brand prefix is neutral (upgradeable)')
+  assert.equal(isNeutralHubTitle('新会话 · s5vx5v'), true, 'the pre-R31 shape is neutral (upgradeable)')
+  assert.equal(isNeutralHubTitle('10-SuperMemory · 新会话', cwd), true, 'the R43 default carries no topic')
+  assert.equal(isNeutralHubTitle('10-SuperMemory · 修卡片跳转', cwd), false, 'a topic-bearing title is NOT neutral')
+  assert.equal(isNeutralHubTitle('我自己起的名字', cwd), false, 'a human rename is kept')
+  assert.equal(isNeutralHubTitle('重载后只读核验', cwd), false, 'a host/LLM title is kept')
+
+  // 3) branch budget: 60 chars, not 48 (the user asked for the whole topic).
+  assert.equal(TITLE_BRANCH_TASK_CHARS, 60)
+  const task48 = 'R43 需求：把分支卡片点击从跳新建改成打开对应会话，并让中枢与分支会话名称都说清楚主题且允许更长一些，避免过度截断'
+  assert.ok(describeSessionTitle(task48, 48).endsWith('…'), '48 chars still clipped (the old behaviour)')
+  assert.ok(!describeSessionTitle(task48, TITLE_BRANCH_TASK_CHARS).endsWith('…'),
+    '60 chars keep a normal one-line task whole')
+
+  // 4) the first-message hook: names a neutral hub from the user's own message
+  //    wherever it is typed (the shell path the panel never covered).
+  const titles = new Map([['session-hub1', '新会话']])
+  const writes = []
+  const titleService = {
+    get: (session) => ({ title: titles.get(session.id) ?? '' }),
+    rename: (session, text) => { writes.push([session.id, text]); titles.set(session.id, text) },
+  }
+  const recordTitle = new Map()
+  const hubStore = {
+    hubs: {
+      get: (id) => (id === 'session-hub1'
+        ? { sessionId: id, workspaceKey: cwd, title: '新会话', source: 'panel', createdAt: 1, updatedAt: 1 }
+        : undefined),
+    },
+  }
+  const hookCtx = {
+    sessions: { get: (id) => (titles.has(id) ? { id, append: () => {} } : undefined) },
+    get: (name) => (name === 'sessionTitle' ? titleService : undefined),
+    on: (_type, cb) => { hookListener = cb; return () => {} },
+  }
+  let hookListener
+  const off = attachHubTitleFromFirstMessage(hookCtx, hubStore, { warn: () => {}, info: () => {} })
+  assert.equal(typeof hookListener, 'function', 'the hook registers one session/event listener')
+  const userMessage = (text, kind = 'user') => ({
+    type: 'user/message', seq: 1, time: 1,
+    data: { id: 'm1', role: 'user', content: [{ type: 'text', text }], source: { kind } },
+  })
+  await new Promise((resolve) => { hookListener({ id: 'session-hub1' }, userMessage('R43：修卡片跳转')); setTimeout(resolve, 10) })
+  assert.equal(titles.get('session-hub1'), '10-SuperMemory · 修卡片跳转', 'the shell-path first message names the hub')
+  assert.equal(writes.length, 1, 'exactly one rename')
+  // A second message must not rename again (the Set + the neutral check).
+  await new Promise((resolve) => { hookListener({ id: 'session-hub1' }, userMessage('第二条消息')); setTimeout(resolve, 10) })
+  assert.equal(writes.length, 1, 'a second message never renames')
+  // A relay/notice (kind supermemory) is not the user's words.
+  await new Promise((resolve) => { hookListener({ id: 'session-hub2' }, userMessage('分支回报正文', 'supermemory')); setTimeout(resolve, 10) })
+  assert.equal(writes.length, 1, 'a relay must not name a session')
+  // An ordinary conversation (no hub record) is never touched.
+  await new Promise((resolve) => { hookListener({ id: 'session-plain' }, userMessage('普通对话')); setTimeout(resolve, 10) })
+  assert.equal(writes.length, 1, 'a session without a plugin hub record is never renamed')
+  // A title a person chose is kept even though the message arrives.
+  titles.set('session-hub3', '我自己起的名字')
+  const hubStore3 = {
+    hubs: { get: (id) => (id === 'session-hub3' ? { sessionId: id, workspaceKey: cwd, title: '我自己起的名字', source: 'panel', createdAt: 1, updatedAt: 1 } : undefined) },
+  }
+  let listener3
+  const off3 = attachHubTitleFromFirstMessage(
+    { ...hookCtx, on: (_t, cb) => { listener3 = cb; return () => {} } },
+    hubStore3, { warn: () => {}, info: () => {} },
+  )
+  await new Promise((resolve) => { listener3({ id: 'session-hub3' }, userMessage('R43：新消息')); setTimeout(resolve, 10) })
+  assert.equal(titles.get('session-hub3'), '我自己起的名字', 'a human rename is never overwritten by the hook')
+  assert.equal(writes.length, 1)
+  // 5) the rail: a COLD hub whose host title is the new neutral default still
+  //    shows the DURABLE topic (the R42 fallback, widened to the R43 shape).
+  const railHubStore = {
+    hubs: table([['session-cold4', { workspaceKey: cwd, sessionId: 'session-cold4', title: '重载后只读核验', source: 'panel', createdAt: 1, updatedAt: 1 }]]),
+    topicsets: table(),
+    dispatches: table(),
+  }
+  const railSeam = {
+    listSessions: async () => [{ header: { id: 'session-cold4', cwd } }],
+    readTitleSnapshots: async (ids) => ids.map((id) => ({
+      sessionId: id, status: 'fulfilled', value: { title: { title: '10-SuperMemory · 新会话' } },
+    })),
+  }
+  const railCtx2 = { get: (name) => (name === 'sessionQuery' ? railSeam : undefined), sessions: { get: () => undefined } }
+  const railRows2 = await listHubSessions(railCtx2, railHubStore, cwd)
+  assert.equal(railRows2[0]?.title, '重载后只读核验',
+    'a neutral host title yields to the durable record title (R42 fallback widened to the R43 shape)')
+
+  off(); off3()
+  ok('R43-1 命名规则：中枢「<工作区名> · <主题>」（无主题=工作区+新会话，60 字预算）+ 中性名判定（可升级/须保留）+ 分支任务预算 60 + shell 路径首条消息补名（只认 user 消息、只升中性名、一次性）')
 }
 }
 
@@ -1188,7 +1308,7 @@ const serviceCtx = (services = {}) => ({
   const hub = await service.createHubSession(cwd, {}, 'R41：检查设置页签')
   assert.equal(hub.status, 'ok')
   assert.deepEqual(created.at(-1).agentOptions, { provider: 'deepseek', model: 'step-5' }, 'a new hub uses the hub default')
-  assert.equal(titles.get(hub.id), '检查设置页签', 'the hub title is the first message, no brand prefix')
+  assert.equal(titles.get(hub.id), 'ws-r41-defaults · 检查设置页签', 'R43: the hub title is 「<工作区名> · <首条消息>」')
   await service.createHubSession(cwd, { model: { provider: 'deepseek', model: 'manual' } }, '')
   assert.deepEqual(created.at(-1).agentOptions, { provider: 'deepseek', model: 'manual' }, 'an explicit model wins over the default')
   const cleared = await service.setModelDefaults(cwd, { hub: null })
@@ -1199,8 +1319,8 @@ const serviceCtx = (services = {}) => ({
   assert.equal(service.getModelDefaults(cwd).source, 'default', 'reset drops the row')
   await service.createHubSession(cwd, {}, '')
   assert.ok(!created.at(-1).agentOptions, 'after reset the host default applies (no forced model)')
-  assert.equal(titles.get(created.at(-1).sessionId), '新会话', 'no content = neutral name')
-  ok('R41-3 设置页签（真实服务）：默认模型按工作区保存/单项清空/reset；新建中枢用中枢默认且显式选择优先；标题取首条消息/中性名')
+  assert.equal(titles.get(created.at(-1).sessionId), 'ws-r41-defaults · 新会话', 'R43: no content = 「<工作区名> · 新会话」, never a bare name')
+  ok('R41-3 设置页签（真实服务）：默认模型按工作区保存/单项清空/reset；新建中枢用中枢默认且显式选择优先；标题取「<工作区名> · 首条消息」/无内容=工作区+新会话')
 }
 
 {
@@ -2148,7 +2268,10 @@ const { groupRelayText } = await import('../src/group.ts')
   const now3 = Date.now()
   const { branchTitleFor, branchTagsFor, roundTokensOf, latestBranchMeta } = await import('../src/branch-meta.ts')
   assert.equal(branchTitleFor('## 【R30-B：中枢-分支协同】\n第二行'), '中枢-分支协同', '标题取任务首行（去标记/去轮次前缀）')
-  assert.ok(Array.from(branchTitleFor('任'.repeat(80))).length <= 48, '标题 48 字预算并以 … 标记截断')
+  // R43 需求③: the branch budget is 60 (was 48) — the user reported names as
+  // over-truncated, so a normal one-line task now stays whole.
+  assert.equal(branchTitleFor('任'.repeat(80)).length, 60, '标题 60 字预算并以 … 标记截断')
+  assert.ok(branchTitleFor('任'.repeat(80)).endsWith('…'), '截断以 … 标记')
   assert.deepEqual(roundTokensOf('【R30-B：…】与 R30 相关'), ['R30-B', 'R30'], '轮次令牌含裸轮次')
   assert.deepEqual(
     branchTagsFor({ topicTags: ['supermemory'], task: '【R30-B：…】', kind: 'verify', capability: 'full' }),
