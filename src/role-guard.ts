@@ -41,7 +41,12 @@
  */
 import type { Store } from './store.ts'
 import { agentSessionId, agentWorkspaceKey, resolveRole, type SessionRole } from './role.ts'
-import { isHubAllowedTool, readHubPolicy } from './hub-policy.ts'
+import {
+  CAPABILITY_DOC_TOOL,
+  isCapabilityExecutionTool,
+  isHubAllowedTool,
+  readHubPolicy,
+} from './hub-policy.ts'
 
 export { agentSessionId }
 
@@ -61,6 +66,26 @@ export function hubToolNotAllowed(toolName: string): string {
 }
 
 /**
+ * R55: exact refusal for a hub that tries to RUN a capability. Deliberately
+ * distinct from the generic allowlist wording (which suggests ticking a panel
+ * checkbox): there is no checkbox that makes a hub run a capability — the tool
+ * is hidden from the hub's surface and the only correct move is to dispatch.
+ */
+export function hubCapabilityExecDenied(toolName: string): string {
+  return '中枢不能执行固化能力；请用 memory_dispatch 派发到分支，任务里写明能力名、是否先预演、写操作需 confirm=true。'
+    + '（被拒绝的工具：' + toolName + '）'
+}
+
+/**
+ * R55: exact refusal for an ordinary (non-hub, non-branch) session reading a
+ * capability knowledge face. The tool stays registered on purpose so the model
+ * gets this explanation instead of a bare `UNKNOWN_TOOL`.
+ */
+export const CAPABILITY_DOC_ROLE_DENIED =
+  '固化能力知识面（sm_cap_doc）只允许中枢/分支会话读取：当前会话既不是中枢也不是分支，不能读取能力正文；'
+  + '请在对应话题集的中枢或分支会话中查看（普通会话仍可使用宿主 skill 目录里的第三方 skill）。'
+
+/**
  * R36 需求①: the whitelist test moved to `hub-policy.ts` (it needs the stored
  * policy, and the panel/catalog share the same rule). `isHubAllowedTool` is
  * re-exported here so the guard's decision reads in one place.
@@ -71,7 +96,7 @@ export { isHubAllowedTool } from './hub-policy.ts'
 export const GUARD_ERROR_NAME = 'supermemory:role-guard'
 
 /** Bump when the guard/role rules change; the meta marker records the version. */
-export const ROLE_GUARD_VERSION = 3
+export const ROLE_GUARD_VERSION = 4
 
 /**
  * Machine-readable rule identity. R36 replaced the blacklist code
@@ -83,6 +108,9 @@ export type GuardCode =
   | 'BRANCH_RELOAD_DENIED'
   | 'NON_HUB_RELOAD_DENIED'
   | 'HUB_TOOL_NOT_IN_ALLOWLIST'
+  // R55: capability division of labour — a hub reads the knowledge face only.
+  | 'HUB_CAPABILITY_EXEC_DENIED'
+  | 'CAPABILITY_DOC_ROLE_DENIED'
 
 /** The shape `ctx.tools.guard()` accepts: a reason plus structured identity. */
 export interface RoleGuardDenial {
@@ -174,6 +202,20 @@ export function roleGuardDecision(
     return isPluginManagementMutation(toolName, args)
       ? guardDenial(NON_HUB_RELOAD_DENIED, 'NON_HUB_RELOAD_DENIED')
       : undefined
+  }
+  // R55 需求①②: capability division of labour. Decided BEFORE the generic
+  // allowlist on purpose: the allowlist wording tells a hub to tick a panel
+  // checkbox, but no checkbox may let a hub RUN a capability — the corrective
+  // instruction is "dispatch it to a branch". The knowledge face is read-only
+  // routing and only hub/branch sessions get it.
+  if (toolName === CAPABILITY_DOC_TOOL) {
+    if (role !== 'hub' && role !== 'branch') {
+      return guardDenial(CAPABILITY_DOC_ROLE_DENIED, 'CAPABILITY_DOC_ROLE_DENIED')
+    }
+    return undefined
+  }
+  if (role === 'hub' && isCapabilityExecutionTool(toolName)) {
+    return guardDenial(hubCapabilityExecDenied(toolName), 'HUB_CAPABILITY_EXEC_DENIED')
   }
   if (toolName === 'plugin_manager' && isPluginManagementMutation(toolName, args)) {
     if (role === 'branch') return guardDenial(BRANCH_RELOAD_DENIED, 'BRANCH_RELOAD_DENIED')

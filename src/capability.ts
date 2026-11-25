@@ -38,6 +38,7 @@ import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
 import { charCount, clipAtBoundary } from './clip.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
+import { resolveRole } from './role.ts'
 import {
   adoptCapabilityDocVersion, archiveCapabilityDoc, archiveCapabilitySkill, archiveShellSkills,
   archivedCapabilityDocFiles, bodyHashOf, buildCapabilitySkill, capabilityDocFileName, capabilityDocPath,
@@ -1295,7 +1296,9 @@ export function renderCapabilityIndex(rows: CapabilityIndexInput[], options: {
     .sort((left, right) => left.name.localeCompare(right.name))
   if (eligible.length === 0) return { text: '', included: 0, omitted: 0, truncated: false }
   const header = '[SuperMemory 可用能力]（仅中枢/分支会话注入；正文按需读取）'
-  const footer = '正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；第三方 skill 仍走宿主 skill 目录。'
+  // R55: the hub reads this card to DECIDE, then dispatches the execution; the
+  // footer states the boundary so the model never tries sm_cap_* from a hub.
+  const footer = '正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；中枢只读，执行需派发分支；第三方 skill 仍走宿主 skill 目录。'
   const lines = eligible.map((row) => {
     const hint = capabilityIndexHint(row)
     const clipped = clipAtBoundary(hint, 80) || hint.slice(0, 80)
@@ -1516,13 +1519,36 @@ export async function registerCapabilityTool(ctx: Context, store: Store, entry: 
   const toolName = capabilityToolName(entry.record.name)
   disposeCapabilityTool(toolName)
   const tools = await loadHostModule('@deepseek-ai/dsh-tools') as typeof Tools
+  const workspaceGate = capabilityWhenGate(entry.record, workspaceKey)
+  // R55: two independent conditions — the existing workspace/scope rule, and
+  // the role rule that hides the execution face from hub steps.
+  const gate = (context: unknown): boolean => capabilityVisibleToCaller(store, context) && workspaceGate(context)
   const disposer = ctx.tools.register(
     tools.defineTool(capabilityToolDef(store, entry.record, entry.id, workspaceKey) as never),
-    { when: capabilityWhenGate(entry.record, workspaceKey) },
+    { when: gate },
   )
   liveCapabilities.set(toolName, disposer)
   liveCapabilityToolNames.add(toolName)
   return disposer
+}
+
+/**
+ * R55: a hub never SEES the execution surface (`sm_cap_*`) in its tool list.
+ * Hiding is the first layer (tool declarations), the role guard is the second
+ * (dispatch): a stale/foreign call is still refused with
+ * `HUB_CAPABILITY_EXEC_DENIED`. `sm_cap_doc` is registered unconditionally, so
+ * the hub keeps its read-only capability check. An unknown/absent agent or a
+ * resolution failure stays visible (fail-open on VISIBILITY only — the guard
+ * still decides execution); branch/ordinary sessions are untouched.
+ */
+export function capabilityVisibleToCaller(store: Store, context: unknown): boolean {
+  const agent = (context as { agent?: unknown } | undefined)?.agent
+  if (!agent) return true
+  try {
+    return resolveRole(store, agent).role !== 'hub'
+  } catch {
+    return true
+  }
 }
 
 /** Registration-side visibility gate (same semantics as execute). */

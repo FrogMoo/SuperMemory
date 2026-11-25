@@ -2239,6 +2239,14 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       }),
       h('span', { key: 'name', className: 'sm-title' }, entry.prefix === true ? `${entry.name}*` : entry.name),
       locked ? h('span', { key: 'lock', className: 'sm-badge' }, t('hubPolicy.locked')) : null,
+      // R55: capability rows carry their boundary in the panel — sm_cap_doc is
+      // read-only routing (locked), the execution face is hub-denied.
+      entry.noteKey === 'capabilityDoc'
+        ? h('span', { key: 'capdoc', className: 'sm-badge', title: t('hubPolicy.note.capabilityDoc.tip') }, t('hubPolicy.note.capabilityDoc'))
+        : null,
+      entry.noteKey === 'capabilityExecDenied'
+        ? h('span', { key: 'capexec', className: 'sm-badge', title: t('hubPolicy.note.capabilityExecDenied.tip') }, t('hubPolicy.note.capabilityExecDenied'))
+        : null,
       prefixCovered ? h('span', { key: 'prefix', className: 'sm-badge' }, t('hubPolicy.viaPrefix')) : null,
       entry.risk === true ? h('span', { key: 'risk', className: 'sm-badge' }, t('hubPolicy.risk')) : null,
       entry.synthetic === true

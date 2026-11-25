@@ -1520,6 +1520,84 @@ const serviceCtx = (services = {}) => ({
     + ' + 清理不移除 + 关闭后仍可重新勾选 + 恢复默认回来 + 真实定义优先不重复')
 }
 
+// ---- requirement R55: locked sm_cap_doc + one-time merge + panel badges ----
+// A pre-R55 stored row omits the locked entries; the guard already allows them
+// (isHubAllowedTool), and this one-time merge makes the durable row truthful so
+// the panel reads it back as checked. The second boot is a no-op (marker), and
+// the panel surfaces the R55 boundary badges.
+{
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const hubPolicy = await import('../src/hub-policy.ts')
+  const cwd = 'F:\\ws-r55'
+  const WS = workspaceKeyOf(cwd)
+  const store = fakeStore({
+    hubPolicies: [['hub-policy-r55', {
+      workspaceKey: WS, tools: ['read', 'memory_recall'], prefixes: ['schedule_'], updatedAt: now,
+    }]],
+  })
+  const merged = await hubPolicy.mergeLockedHubPolicies(store)
+  assert.equal(merged.status, 'merged', 'the first pass merges locked entries')
+  assert.equal(merged.updated, 1)
+  assert.ok(merged.added.includes('sm_cap_doc'), 'sm_cap_doc is the R55 addition: ' + merged.added.join(','))
+  const row = [...store.hubPolicies.entries()][0][1]
+  for (const name of hubPolicy.LOCKED_HUB_TOOLS) {
+    assert.ok(row.tools.includes(name), 'the stored row now carries the locked entry: ' + name)
+  }
+  assert.ok(row.tools.includes('read') && row.tools.includes('memory_recall'), 'user entries are preserved')
+  assert.deepEqual(row.prefixes, ['schedule_'], 'prefixes are untouched')
+  const marker = store.meta.get('hub-policy-locked')
+  assert.equal(marker?.hubPolicyLockedVersion, 1, 'the merge marker records the schema version')
+  assert.equal(marker?.hubPolicyLockedUpdated, 1)
+  const again = await hubPolicy.mergeLockedHubPolicies(store)
+  assert.equal(again.status, 'already-done', 'a second boot is a no-op (marker)')
+  assert.equal(again.updated, 0)
+  const forced = await hubPolicy.mergeLockedHubPolicies(store, { ignoreMarker: true })
+  assert.equal(forced.updated, 0, 're-scanning finds nothing missing (idempotent)')
+  assert.deepEqual(forced.added, [])
+  // The guard/policy read reflects the merged row; locked cannot be removed by a save.
+  const resolved = hubPolicy.readHubPolicy(store, WS)
+  assert.ok(resolved.tools.includes('sm_cap_doc'), 'the resolved policy carries the locked read-only tool')
+
+  const cwd2 = 'F:\\ws-r55-panel'
+  const WS2 = workspaceKeyOf(cwd2)
+  const definitions = [
+    { name: 'sm_cap_doc', description: '按需读取能力知识面' },
+    { name: 'sm_cap_git_sync_supermemory', description: '执行 git 同步能力' },
+    { name: 'memory_recall', description: '召回结论' },
+    { name: 'read', description: '读取文件' },
+  ]
+  const panelStore = fakeStore({
+    hubPolicies: [['hub-policy-r55-panel', { workspaceKey: WS2, tools: ['read'], prefixes: [], updatedAt: now }]],
+  })
+  const service = new SupermemoryPanelService(panelStore, serviceCtx({ tools: { definitions: () => definitions } }))
+  await hubPolicy.mergeLockedHubPolicies(panelStore)
+  const view = service.getHubPolicy(cwd2)
+  assert.ok(view.locked.includes('sm_cap_doc'), 'the panel receives sm_cap_doc as a locked entry')
+  const items = view.catalog.flatMap((group) => group.items)
+  const docItem = items.find((item) => item.name === 'sm_cap_doc')
+  assert.equal(docItem?.locked, true, 'the knowledge face renders as locked')
+  assert.equal(docItem?.noteKey, 'capabilityDoc', 'the knowledge face carries the read-only-routing badge')
+  assert.equal(docItem?.enabled, true, 'locked means always enabled')
+  const execItem = items.find((item) => item.name === 'sm_cap_git_sync_supermemory')
+  assert.equal(execItem?.noteKey, 'capabilityExecDenied', 'the execution face carries the hub-cannot-execute badge')
+  assert.equal(execItem?.enabled, false, 'the execution face is outside the hub whitelist by default')
+  assert.equal(execItem?.locked, undefined, 'the execution face is not locked (ticking it still never grants hub execution)')
+  // A save that omits sm_cap_doc cannot remove it (writeHubPolicy merges locks).
+  assert.equal((await service.setHubPolicy(cwd2, { tools: ['read'], prefixes: [] })).status, 'ok')
+  const savedRow = [...panelStore.hubPolicies.entries()][0][1]
+  assert.ok(savedRow.tools.includes('sm_cap_doc'), 'the writer keeps the locked read-only tool')
+  // Cleanup keeps locked entries even when the fake runtime omits them.
+  assert.equal((await service.cleanupStaleHubPolicy(cwd2)).status, 'ok')
+  assert.ok([...panelStore.hubPolicies.entries()][0][1].tools.includes('sm_cap_doc'),
+    'cleanup never removes a locked entry')
+  // The fallback catalog (no runtime enumeration) still renders the locked row.
+  const fallback = new SupermemoryPanelService(fakeStore(), serviceCtx({})).getHubPolicy(cwd2)
+  const fallbackDoc = fallback.catalog.flatMap((group) => group.items).find((item) => item.name === 'sm_cap_doc')
+  assert.equal(fallbackDoc?.locked, true, 'the fallback catalog locks sm_cap_doc too')
+  assert.equal(fallbackDoc?.noteKey, 'capabilityDoc')
+  ok('R55-4 锁定与合并：sm_cap_doc 默认允许且锁定（存盘/清理不可移除）；旧存储行一次性合并+标记+二次幂等；面板锁定/中枢不可执行徽标（动态与回退目录）')
+}
+
 {
   const store = fakeStore({ topicsets: [['ts-1', { workspaceKey: 'ws', title: '话题一', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }]] })
   const created = []
@@ -3017,11 +3095,14 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   // graph), so the prompt contract is asserted at the source level.
   const { readFileSync } = await import('node:fs')
   const index = readFileSync('src/index.ts', 'utf8')
+  // R55: the hub role prompt moved to its own module (index.ts is not
+  // importable host-free); read it from there.
+  const hubRole = readFileSync('src/hub-role-text.ts', 'utf8')
   const route = readFileSync('src/route.ts', 'utf8')
   const tools = readFileSync('src/tools.ts', 'utf8')
   const dispatchSource = readFileSync('src/dispatch.ts', 'utf8')
-  assert.ok(index.includes('立即结束本轮回复'), 'hub role text: end the turn right after the receipt')
-  assert.ok(index.includes('subagent 树') && index.includes('wait_agent'), 'hub role text: branches are not subagent-tree members')
+  assert.ok(hubRole.includes('立即结束本轮回复'), 'hub role text: end the turn right after the receipt')
+  assert.ok(hubRole.includes('subagent 树') && hubRole.includes('wait_agent'), 'hub role text: branches are not subagent-tree members')
   assert.ok(index.includes('派发后即结束本轮回复'), 'the memory prompt block repeats the rule')
   assert.ok(route.includes('立即结束本轮回复'), 'the routing card repeats the rule')
   assert.ok(tools.includes('R24 收口') && tools.includes('wait_agent'), 'both tool descriptions repeat the rule')

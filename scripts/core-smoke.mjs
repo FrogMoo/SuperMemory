@@ -687,6 +687,8 @@ passed += await runMemoryOrganizeChecks({ ok, now })
     'memory_topicsets', 'memory_new_topicset', 'memory_export', 'memory_scan', 'memory_set_model', 'memory_toolize',
     'ask_user_question', 'send_message', 'wait_agent', 'list_agents', 'read', 'glob', 'grep',
     'skill', 'todo_write', 'present', 'run_code', 'plugin_manager',
+    // R55: read-only capability knowledge face (locked; execution is denied).
+    'sm_cap_doc',
   ]
   assert.equal(DEFAULT_HUB_TOOLS.length, ALLOWED_DEFAULT.length,
     'the default whitelist has exactly the documented members (adding/removing one must fail this line)')
@@ -694,7 +696,7 @@ passed += await runMemoryOrganizeChecks({ ok, now })
     assert.ok(DEFAULT_HUB_TOOLS.includes(name), 'default whitelist must keep: ' + name)
   }
   assert.deepEqual([...DEFAULT_HUB_PREFIXES], ['schedule_'], 'the schedule family is the default prefix entry')
-  assert.equal(LOCKED_HUB_TOOLS.length, 6, 'six core locked entries')
+  assert.equal(LOCKED_HUB_TOOLS.length, 7, 'seven core locked entries (R55 adds sm_cap_doc)')
   for (const name of LOCKED_HUB_TOOLS) {
     assert.ok(DEFAULT_HUB_TOOLS.includes(name), 'a locked entry is on the default whitelist: ' + name)
   }

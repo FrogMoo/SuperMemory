@@ -708,6 +708,132 @@ const legacyCapSpec = {
   ok('R54-3 注入卡：何时用优先 title、机器名不再当主语；无 title 退 description/whenToUse')
 }
 
+
+// ---- R55-1 中枢只读检查 + 执行禁令（角色闸门） ----
+{
+  const guard = await import('../src/role-guard.ts')
+  const hubPolicy = await import('../src/hub-policy.ts')
+  const hubStore = {
+    hubs: table([['hub-r55', {
+      workspaceKey, sessionId: 'hub-r55', title: 'R55 中枢', source: 'manual', createdAt: 1, updatedAt: 1,
+    }]]),
+    topicsets: table(),
+    dispatches: table(),
+    meta: table(),
+  }
+  const hubAgent = { id: 'hub-r55', session: { header: { cwd: ws } } }
+  const branchAgent = { id: 'branch-r55', session: { header: { cwd: ws } } }
+  const shellAgent = { id: 'shell-r55', session: { header: { cwd: ws } } }
+
+  // 读权限：中枢/分支可读；普通 shell 会话得到明确拒绝（不是 UNKNOWN_TOOL）。
+  assert.equal(guard.roleGuardDecision(hubStore, hubAgent, 'sm_cap_doc', {}), undefined,
+    'a hub may READ a capability knowledge face')
+  assert.equal(guard.roleGuardDecision(hubStore, branchAgent, 'sm_cap_doc', {}), undefined,
+    'a branch may read the knowledge face too')
+  const shellDenied = guard.roleGuardDecision(hubStore, shellAgent, 'sm_cap_doc', {})
+  assert.equal(shellDenied?.info.code, 'CAPABILITY_DOC_ROLE_DENIED', 'an ordinary shell session is refused explicitly')
+  assert.ok(shellDenied.reason.includes('只允许中枢/分支会话读取'), 'the refusal explains the role boundary: ' + shellDenied.reason)
+  assert.equal(hubPolicy.isHubAllowedTool('sm_cap_doc', { tools: ['read'], prefixes: [] }), true,
+    'sm_cap_doc is locked: a hostile stored row cannot remove it')
+
+  // 执行禁令：中枢 sm_cap_* → 专用错误码，先于泛化白名单拒绝；分支照常。
+  const execDenied = guard.roleGuardDecision(hubStore, hubAgent, 'sm_cap_r55_exec', {})
+  assert.equal(execDenied?.info.code, 'HUB_CAPABILITY_EXEC_DENIED', 'a hub cannot run a capability')
+  assert.ok(execDenied.reason.includes('中枢不能执行固化能力；请用 memory_dispatch 派发到分支'),
+    'the refusal is corrective (dispatch), not the panel-checkbox wording: ' + execDenied.reason)
+  assert.ok(execDenied.reason.includes('confirm=true') && execDenied.reason.includes('写操作需 confirm=true'),
+    'the refusal states the confirm requirement for write operations')
+  assert.equal(guard.roleGuardDecision(hubStore, hubAgent, 'sm_composite_legacy_cap', {})?.info.code,
+    'HUB_CAPABILITY_EXEC_DENIED', 'the legacy capability prefix is denied the same way')
+  assert.equal(guard.roleGuardDecision(hubStore, branchAgent, 'sm_cap_r55_exec', {}), undefined,
+    'a branch still executes capabilities')
+  assert.equal(guard.roleGuardDecision(hubStore, shellAgent, 'sm_cap_r55_exec', {}), undefined,
+    'the execution ban targets HUBS only (ordinary sessions keep their profile)')
+
+  // hub 调 sm_cap_doc 成功并 loadCount+1：sm_cap_doc.execute 就是 loadCapabilityDoc。
+  const loadStore = fakeStore()
+  const { ctx } = ctxOf()
+  const reg = await capability.registerCapability(ctx, loadStore, {
+    name: 'r55-doc', title: 'R55 只读能力', description: '中枢只读检查测试', entry: 'echo r55-doc', scope: ws,
+  }, workspaceKey)
+  assert.equal(reg.status, 'ok', reg.message)
+  const first = await capability.loadCapabilityDoc(loadStore, workspaceKey, 'r55-doc')
+  assert.equal(first.status, 'ok', first.message)
+  assert.equal(first.loadCount, 1, 'a successful hub read increments loadCount')
+  assert.ok(String(first.body).includes('R55 只读能力') || String(first.body).includes('r55-doc'), 'the body is returned')
+  const second = await capability.loadCapabilityDoc(loadStore, workspaceKey, 'r55-doc')
+  assert.equal(second.loadCount, 2, 'each read is counted (conversion denominator)')
+  ok('R55-1 中枢只读检查：hub/branch 可读 sm_cap_doc（loadCount+1）、普通会话明确拒绝；hub 调 sm_cap_* 返回 HUB_CAPABILITY_EXEC_DENIED（先于白名单）；branch 照常执行')
+}
+
+// ---- R55-2 工具面收敛：hub 的 step 工具列表不出现 sm_cap_* ----
+{
+  const visibleStore = {
+    ...fakeStore(),
+    hubs: table([['hub-r55-vis', {
+      workspaceKey, sessionId: 'hub-r55-vis', title: 'R55 中枢', source: 'manual', createdAt: 1, updatedAt: 1,
+    }]]),
+    topicsets: table(),
+  }
+  const hubAgent = { id: 'hub-r55-vis', session: { header: { cwd: ws } } }
+  const branchAgent = { id: 'branch-r55-vis', session: { header: { cwd: ws } } }
+  assert.equal(capability.capabilityVisibleToCaller(visibleStore, { agent: hubAgent }), false,
+    'a hub step never admits the execution surface')
+  assert.equal(capability.capabilityVisibleToCaller(visibleStore, { agent: branchAgent }), true,
+    'a branch step keeps the execution surface')
+  assert.equal(capability.capabilityVisibleToCaller(visibleStore, {}), true,
+    'an unknown agent stays visible (the guard still decides execution)')
+  const { ctx, captured } = ctxOf()
+  const reg = await capability.registerCapability(ctx, visibleStore, {
+    name: 'r55-visible', title: 'R55 工具面', description: '工具面收敛测试', entry: 'echo r55-visible', scope: ws, dryRunArg: '--dry-run',
+  }, workspaceKey)
+  assert.equal(reg.status, 'ok', reg.message)
+  const registered = captured.find((item) => item.def.name === 'sm_cap_r55_visible')
+  assert.ok(registered, 'the execution tool is registered with a step gate')
+  assert.equal(registered.opts.when({ agent: hubAgent }), false, 'hub step: hidden')
+  assert.equal(registered.opts.when({ agent: branchAgent }), true, 'branch step: visible')
+  assert.equal(registered.opts.when({}), true, 'no agent: visible (host-side calls are guard-decided)')
+  // 分支预演成功（默认 dry-run，写确认语义沿用 R50）。
+  const dry = await registered.def.execute({}, { signal: new AbortController().signal, agent: branchAgent })
+  assert.equal(dry.status, 'completed', dry.summary)
+  assert.equal(dry.dryRun, true, 'a branch run defaults to dry-run')
+  // sm_cap_doc 始终注册、且不带执行面的 when 闸门（只读检查不能被隐藏）。
+  const capabilitySrc = readFileSync(new URL('../src/capability.ts', import.meta.url), 'utf8')
+  assert.ok(capabilitySrc.includes('capabilityVisibleToCaller(store, context) && workspaceGate(context)'),
+    'registerCapabilityTool composes the role gate with the workspace gate')
+  const toolsSrc = readFileSync(new URL('../src/tools.ts', import.meta.url), 'utf8')
+  assert.ok(toolsSrc.includes("name: 'sm_cap_doc'"), 'sm_cap_doc stays a registered tool for hub/branch')
+  ok('R55-2 工具面收敛：hub 的 step 看不到 sm_cap_*（分支/无 agent 不受影响）；分支预演成功；sm_cap_doc 始终注册')
+}
+
+// ---- R55-3 路由与提示 + 面板锁定徽标的源码接线 ----
+{
+  const { HUB_ROLE_TEXT } = await import('../src/hub-role-text.ts')
+  for (const needle of [
+    '能力检查（R55）', 'memory_toolize', 'sm_cap_doc', 'HUB_CAPABILITY_EXEC_DENIED',
+    'memory_dispatch 派发到分支', '是否先预演', '写操作需 confirm=true',
+  ]) {
+    assert.ok(HUB_ROLE_TEXT.includes(needle), 'HUB_ROLE_TEXT carries the capability-check instruction: ' + needle)
+  }
+  const card = capability.renderCapabilityIndex([{
+    name: 'r55-card', title: 'R55 卡片', description: '当需要 R55 卡片时加载', entry: 'echo x', runnable: true,
+    enabled: true, kind: 'capability', status: 'active',
+  }], { maxItems: 8, budget: 1600 })
+  assert.ok(card.text.includes('中枢只读，执行需派发分支'), 'the capability index card states the hub boundary: ' + card.text)
+  assert.ok(CAPABILITY_ROUTING_RULES.includes('sm_cap_* 在中枢被 HUB_CAPABILITY_EXEC_DENIED 拒绝'),
+    'the shared routing rules state the execution ban')
+  const panelSrc = readFileSync(new URL('../src/client/panel-page.tsx', import.meta.url), 'utf8')
+  assert.ok(panelSrc.includes("entry.noteKey === 'capabilityDoc'")
+    && panelSrc.includes("entry.noteKey === 'capabilityExecDenied'"),
+  'the hub-permission tab renders both capability badges')
+  const localesSrc = readFileSync(new URL('../src/client/locales.ts', import.meta.url), 'utf8')
+  assert.ok(localesSrc.includes("'hubPolicy.note.capabilityDoc': '只读路由，锁定'"),
+    'the locked read-only badge is localized')
+  assert.ok(localesSrc.includes("'hubPolicy.note.capabilityExecDenied': '中枢不可执行'"),
+    'the hub-cannot-execute badge is localized')
+  ok('R55-3 路由与提示：HUB_ROLE_TEXT 能力检查+派发指令；索引卡「中枢只读，执行需派发分支」；面板锁定/不可执行徽标已接线')
+}
+
 rmSync(root, { recursive: true, force: true })
 console.log('\ncapability-smoke: ' + passed + ' groups passed')
 process.exit(0)

@@ -2,6 +2,46 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.3.3] - 2026-11-26
+
+发布轮（R55）：把「中枢 = 判断与派发、分支 = 执行」从软提示升级为**结构性边界**。中枢现在可以**只读**检查固化能力的知识面（`sm_cap_doc`，默认允许且锁定），但**不能执行** `sm_cap_*`：中枢调用返回专用错误码 `HUB_CAPABILITY_EXEC_DENIED` 并提示派发分支，执行面同时从中枢可见工具列表中隐藏。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 新增（R55：中枢只读检查）
+
+- **`sm_cap_doc` 纳入中枢默认允许 + 锁定**：加入 `LOCKED_HUB_TOOLS` 与 `DEFAULT_HUB_TOOLS`，与 `memory_dispatch`/`memory_recall` 同级——即使工作区已存的白名单行没有该项，守卫也按内置锁定项放行（`isHubAllowedTool` 先判锁定项），面板不可取消。
+- **一次性合并迁移**：`mergeLockedHubPolicies` 在启动时把锁定项合并进每个 `hub_policies` 存储行（写回 `updatedAt`），meta 行 `hub-policy-locked` 记录版本/行数；已经有标记时二次启动零写入，`ignoreMarker` 可强制重扫，重扫同样幂等。合并只改「存储行是否如实」，不是权限变更（守卫本来就放行锁定项）。
+- **角色限制**：`sm_cap_doc` 仅中枢/分支可读；普通会话（非中枢/非分支）调用返回 `CAPABILITY_DOC_ROLE_DENIED`（工具仍在注册面上，错误是明确解释，不是 `UNKNOWN_TOOL`）。
+
+### 收紧（R55：中枢执行禁令）
+
+- **专用错误码 `HUB_CAPABILITY_EXEC_DENIED`**：中枢调用 `sm_cap_*`（含历史 `sm_composite_*` 前缀）被拒绝，提示「中枢不能执行固化能力；请用 memory_dispatch 派发到分支，任务里写明能力名、是否先预演、写操作需 confirm=true」。该判定在角色守卫里**先于**泛化白名单拒绝，模型得到的是可纠正的指令，而不是「去面板勾选」的错误暗示。
+- **工具面收敛**：能力执行工具的注册 `when` 条件叠加 `capabilityVisibleToCaller`——中枢的 step 工具列表里**不再出现** `sm_cap_*`（宿主 `ToolRegistrationOptions.when` 会同时排除声明与分发）；分支/普通会话、以及无 agent 的宿主侧调用不受影响。`sm_cap_doc` 始终注册，保证中枢的只读检查可用。调用期守卫仍然保留为第二层（隐藏失败时照样拒绝）。
+- **分支执行不变**：scope/工作区闸门、默认预演、`writeConfirm` 需 `confirm=true`、超时/输出裁剪、统计口径全部沿用 R50，无行为变更。
+
+### 路由与文案
+
+- `HUB_ROLE_TEXT` 抽出为独立模块 `src/hub-role-text.ts`（可测试），新增「能力检查（R55）」步骤：先用 `memory_toolize` 看 units（名称/徽标/何时用/入口是否待验证），需要细节时用 `sm_cap_doc` 读正文判断适用性；确认执行时不要自己调 `sm_cap_*`，用 `memory_dispatch` 派发到分支并在任务文本里带能力名 + 是否先预演 + `confirm=true`，分支回报后中枢汇总。
+- `CAPABILITY_ROUTING_RULES` 增加 ⑤ 职责边界；能力索引卡 footer 增加「中枢只读，执行需派发分支」；`sm_cap_doc` 工具描述写清错误码与角色限制。
+- 面板「中枢权限」页签：`sm_cap_doc` 显示「锁定」+「只读路由，锁定」徽标，`sm_cap_*` 显示「中枢不可执行」徽标（含提示：勾选也不会让中枢获得执行权）；目录项新增 `noteKey: capabilityDoc | capabilityExecDenied`（动态目录与内置回退目录一致）。
+
+### 测试（R55 新增断言）
+
+- R55-1：hub 调 `sm_cap_doc` 通过、普通 shell 会话 `CAPABILITY_DOC_ROLE_DENIED`、hub 调 `sm_cap_*`/`sm_composite_*` 返回 `HUB_CAPABILITY_EXEC_DENIED`（含派发/confirm 文案）、branch 读取与执行均通过；`sm_cap_doc` 读取链路 `loadCount+1`（连续两次 1→2）。
+- R55-2：能力注册的 `when` 闸门对 hub 返回 false、branch/无 agent 返回 true；branch 执行默认预演成功；`sm_cap_doc` 仍注册且不带执行面闸门（源码接线断言）。
+- R55-3：`HUB_ROLE_TEXT` 含「能力检查」与派发/预演/confirm 指令；索引卡含「中枢只读，执行需派发分支」；面板源码渲染两个徽标、locale 含中文文案。
+- R55-4（mechanism）：旧存储行一次性合并 + meta 标记 + 二次幂等 + 强制重扫零改动；面板服务把 `sm_cap_doc` 标为 locked/capabilityDoc/enabled，把 `sm_cap_*` 标为 capabilityExecDenied/默认未启用；保存与清理都不能移除锁定项；内置回退目录同样锁定。
+
+### 变更
+
+- 版本 1.3.2 → 1.3.3（patch：R55 行为/界面变更；存储域 `supermemory` version 1 不变，无破坏性存储变更）。
+- 角色守卫版本 3 → 4（`role-guard` meta 标记会随之刷新）。
+
+### 已知限制
+
+- 工具面隐藏依赖宿主的 `ToolRegistrationOptions.when`（DSH 0.2.x 支持）；不支持条件注册的旧宿主上，能力工具仍会出现在列表里，但**调用期守卫同样返回 `HUB_CAPABILITY_EXEC_DENIED`**，边界不丢失。
+- 中枢通过 PTC `run_code` 直接调用宿主/Node API 不受工具白名单约束（既有已知限制，见 DEV-NOTES §42/§43）；R55 只约束 `sm_cap_*` 工具面。
+- 升级后仍需**完全退出并重启 DSH Desktop**（不是禁用/启用插件、也不是刷新窗口），一次性合并与守卫版本才生效。
+
 ## [1.3.2] - 2026-11-26
 
 修复轮（R54）：修掉 R52 只读验收发现的 3 个 P2（版本元数据回退、健康统计口径矛盾、注入卡提示语用机器名），并为每一项补上回归断言。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。

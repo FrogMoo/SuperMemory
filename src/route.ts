@@ -32,7 +32,8 @@ export const CAPABILITY_ROUTING_RULES = '固化能力（capability）路由规�
   + '① 在能力适用范围（scope）内遇到高频事务（git 同步/提交/推送、构建、验证、测试、发布等）时，优先调用已固化能力（sm_cap_*，默认预演、写操作 confirm=true 确认真实执行），不要每次现敲命令；'
   + '② 重复工作先沉淀经验：判断型、易变的流程用 memory_toolize register 产出/更新能力知识面（描述写「何时用」，正文写触发条件/步骤/关键坑/验证；模型用 sm_cap_doc 按需读取，不要用宿主 skill 工具加载能力），不要满足于一次性工作；确实需要固定入口命令时才固化能力（入口命令 + 文档 + 适用范围）；'
   + '③ 能力执行连续失败、或文档与现状不符时，必须用 memory_toolize register 同名更新能力（version+1、changelog 记录原因），不要绕过它手敲命令；'
-  + '④ 用 memory_toolize refresh-builtin 刷新内置能力并查看差异报告与健康度（使用次数、成败分列、连续失败、文档/适用范围缺失、零使用），按信号决定更新还是停用。'
+  + '④ 用 memory_toolize refresh-builtin 刷新内置能力并查看差异报告与健康度（使用次数、成败分列、连续失败、文档/适用范围缺失、零使用），按信号决定更新还是停用；'
+  + '⑤ 职责边界（R55）：中枢只能只读检查——用 sm_cap_doc 读知识面判断是否适用，执行必须 memory_dispatch 派发到分支（sm_cap_* 在中枢被 HUB_CAPABILITY_EXEC_DENIED 拒绝）；分支才是执行者（默认预演，写操作 confirm=true）。'
 
 export interface RouteConfig {
   enabled: boolean

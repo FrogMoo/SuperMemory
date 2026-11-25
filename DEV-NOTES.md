@@ -4090,3 +4090,93 @@ PASS2   versionsReconciled=0 healthReconciled=0 movedDocs=0 changed=false | file
 - 统计折算是一次性的读数修正，不重算历史成功率之外的任何指标；`runCount` 首次会从 0 跳到 22。
 - GitHub 前端若被阻断，latest/稳定 URL 的 HEAD/GET 不可用，按 docs/git-sync.md §12 以 API 证据代替。
 
+## 68. R55：中枢只读检查固化能力 + 执行禁令 + v1.3.3 发布轮（2026-11-26）
+
+### 68.1 需求与设计
+
+R52 让知识面可以按需读取（`sm_cap_doc`），但 R36 的中枢白名单默认拒绝它，中枢反而读不到「能力是否适用」；同时 `sm_cap_*` 在中枢只得到泛化的「不在白名单」拒绝，模型容易误以为「去面板勾选就能执行」。R55 把职责边界做成**结构性**的：
+
+- **中枢 = 判断与派发**：`sm_cap_doc` 进入中枢默认允许并锁定（只读检查）；`sm_cap_*` 在中枢**不可执行**（专用错误码 + 工具面隐藏），执行必须 `memory_dispatch` 派发到分支。
+- **分支 = 执行者**：`sm_cap_doc` 与 `sm_cap_*` 均照常；scope/工作区闸门、默认预演、`writeConfirm` 需 `confirm=true`、超时/裁剪/统计全部沿用 R50。
+- **普通会话**（既非中枢也非分支）：`sm_cap_doc` 明确拒绝（`CAPABILITY_DOC_ROLE_DENIED`），不是 `UNKNOWN_TOOL`。
+
+### 68.2 实现位置与错误码
+
+| 关注点 | 位置 | 说明 |
+|---|---|---|
+| 锁定 + 默认允许 | `src/hub-policy.ts` `LOCKED_HUB_TOOLS` / `DEFAULT_HUB_TOOLS` | `sm_cap_doc` 与 `memory_dispatch` 同级；存盘行缺失也按锁定项放行 |
+| 执行判定 | `src/role-guard.ts` `roleGuardDecision` | `role === 'hub' && isCapabilityExecutionTool(name)` → `HUB_CAPABILITY_EXEC_DENIED`，**先于**白名单拒绝；`sm_cap_doc` 仅 hub/branch |
+| 错误码 | `GuardCode` | 新增 `HUB_CAPABILITY_EXEC_DENIED` / `CAPABILITY_DOC_ROLE_DENIED`；`ROLE_GUARD_VERSION` 3 → 4 |
+| 工具面隐藏 | `src/capability.ts` `capabilityVisibleToCaller` + `registerCapabilityTool` 的 `when` | 中枢 step 的 `ToolRegistrationOptions.when` 返回 false（宿主同时排除声明与分发）；`sm_cap_doc` 不受影响 |
+| 文案 | `src/hub-role-text.ts`（新模块）、`src/route.ts`、`src/capability.ts` footer、`src/tools.ts` | HUB_ROLE_TEXT 能力检查步骤；路由规则 ⑤；索引卡「中枢只读，执行需派发分支」 |
+| 面板 | `src/client/panel-page.tsx` / `locales.ts` | `noteKey: capabilityDoc` → 「只读路由，锁定」；`capabilityExecDenied` → 「中枢不可执行」 |
+
+错误码语义：
+
+- `HUB_CAPABILITY_EXEC_DENIED`：中枢调用了 `sm_cap_*`（含历史 `sm_composite_*`）。message 明确「中枢不能执行固化能力；请用 memory_dispatch 派发到分支，任务里写明能力名、是否先预演、写操作需 confirm=true」。没有面板开关能改变它。
+- `CAPABILITY_DOC_ROLE_DENIED`：非中枢/非分支会话调用 `sm_cap_doc`。工具仍在注册面（得到解释而不是「找不到工具」）。
+
+### 68.3 存储策略合并 / 锁定
+
+- 读取侧：`isHubAllowedTool` 先判 `LOCKED_HUB_TOOLS`，所以**旧工作区没有该项也生效**，不依赖用户勾选。
+- 写入侧：`writeHubPolicy` 早已把锁定项合并回存储行（R36），面板保存/清理都不会移除。
+- 一次性迁移：`mergeLockedHubPolicies(store)` 在启动时扫描 `hub_policies` 行，把缺失的锁定项合并写回；meta 行 `hub-policy-locked`（版本/时间/行数/更新数，字段已进 `schema.ts` 的 meta schema，避免被 strip）记录。二次启动命中标记直接返回 `already-done`；`ignoreMarker: true` 强制重扫，零改动（幂等）。合并失败只降级为告警，守卫仍按锁定项放行。
+
+### 68.4 工具面收敛与限制
+
+- 收敛可行：DSH 0.2.x 的 `ToolRegistrationOptions.when` 在 step 准备阶段求值，false 时**同时**从声明（模型可见工具列表）与分发中排除。能力工具注册时叠加 `capabilityVisibleToCaller`：hub → false，branch/普通会话/无 agent → true。
+- `sm_cap_doc` 在 `src/tools.ts` 无条件注册（不叠加执行面闸门），保证中枢只读检查始终可用。
+- 限制：极旧宿主若不支持条件注册，能力工具仍会出现在列表里，但**调用期守卫仍返回 `HUB_CAPABILITY_EXEC_DENIED`**；中枢通过 PTC `run_code` 直接调用 Node/宿主 API 不受工具白名单约束（既有 §42/§43 限制，R55 不改变）。
+
+### 68.5 路由文案
+
+- `HUB_ROLE_TEXT` 新增「能力检查（R55）」两步：① `memory_toolize` 看 units（名称/徽标/何时用/入口是否待验证），需要细节用 `sm_cap_doc` 读正文判断适用性；② 确认执行时不要自己调 `sm_cap_*`（会被 `HUB_CAPABILITY_EXEC_DENIED` 拒绝），`memory_dispatch` 派发到分支，任务文本带能力名 + 是否先预演 + 写操作 `confirm=true`，分支回报后只做汇总。
+- `HUB_ROLE_TEXT` 从 `src/index.ts` 抽到 `src/hub-role-text.ts`（index 不可在 host-free 进程导入，便于断言）。
+- `CAPABILITY_ROUTING_RULES` 增加 ⑤ 职责边界；索引卡 footer 与 `sm_cap_doc` 工具描述同步。
+
+### 68.6 测试（R55-1 ~ R55-4）
+
+- `capability-smoke`：R55-1 hub 读 `sm_cap_doc` 通过 + loadCount 1→2、普通 shell `CAPABILITY_DOC_ROLE_DENIED`、hub 调 `sm_cap_*`/`sm_composite_*` → `HUB_CAPABILITY_EXEC_DENIED`（文案含派发与 confirm）、branch 读取/执行通过；R55-2 hub step 的 `when`=false、branch/无 agent=true、branch 预演成功、`sm_cap_doc` 仍注册；R55-3 `HUB_ROLE_TEXT`/索引卡/路由规则/面板徽标源码与 locale。
+- `mechanism-smoke`：R55-4 一次性合并 + marker + 二次幂等 + 强制重扫零改动；面板服务 `sm_cap_doc` locked/capabilityDoc/enabled、`sm_cap_*` capabilityExecDenied/默认未启用；保存/清理不可移除锁定项；内置回退目录同样锁定。
+- 既有断言更新：`core-smoke` 白名单 25 项 / 锁定 7 项；mechanism 的 hub 角色文案断言改读 `src/hub-role-text.ts`。
+
+### 68.7 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 **13 文件 925.89 kB**（入口 `supermemory.js` 554.48 kB；`capability-DDRGb9hA.js`），client `lib/client.js` 181.81 kB，wrap 后 **175717 B**。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **112** / webui **35** / client-sim `SIM SMOKE OK` / capability **20** 组 / workspace-scope **6** 组 / skill **27** 组。
+
+### 68.8 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.3.zip` | 2,029,069 | `0e357361e02efb95cc7464efa9c2925d42acef9e5533ffa550cc08041caa44d2` |
+| `dsh-supermemory-1.3.3.tgz` | 814,368 | `cfc1ff93b6bb19dc94fad9eedd573f7cac6124dd7da88b18c25fd831206e180c` |
+| `dsh-supermemory.tgz`（稳定别名） | 814,368 | 同上（字节一致） |
+
+- tgz（npm-pack 结构）：**96 条目**；`package/package.json`（version=1.3.3）、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml` 齐全；**反斜杠路径 0**；含 `capability-DDRGb9hA.js`。
+- zip（手动安装）：**908 条目**、解压后 `package.json` = 1.3.3、`CHANGELOG.md` 含 `[1.3.3]`、`INSTALL.md` 含「升级到 1.3.3 后要做什么」；条目分隔符为反斜杠（Windows 手动安装专用）。
+- 安装自检：临时空目录 `pnpm add F:/10-SuperMemory/release/dsh-supermemory-1.3.3.tgz` → exit 0，安装版本 **1.3.3**，`main = lib/supermemory.js`，`lib/` 含新 chunk。
+
+### 68.9 提交、tag 与双推（按 docs/git-sync.md）
+
+- 单条提交（R55 源码 + 测试 + 版本号 + CHANGELOG/README/INSTALL/DEV-NOTES + `lib/` 构建产物；`release/` 二进制按 `.gitignore` 不入库），提交信息写文件后 `git commit -F`。
+- 附注 tag `v1.3.3`（标注：v1.3.3 — R55 中枢只读检查能力知识面 + 结构性执行禁令（HUB_CAPABILITY_EXEC_DENIED）+ 工具面收敛）。
+- 双推 `pnpm git:sync`（GitHub 首位 + Gitee）推 main 与 tag；逐端核验 **main commit + tag 对象 SHA + tag 指向 commit** 三者一致。GitHub git 面若被阻断，改用 `scripts/github-api-release.mjs` 走 API 补推与 Release。
+- Release：三资产（版本 zip、版本 tgz、稳定别名 tgz）上传，`state=uploaded`、`digest` 与本地 sha256 一致；核验 `/releases/latest` = v1.3.3、稳定 URL `HEAD/GET` 200 且 sha256 一致；前端被阻断时按 docs/git-sync.md §12 用 `api.github.com` 资产端点并注明。v1.3.0/v1.3.1/v1.3.2 的 tag 与 Release 资产不动。
+
+### 68.10 用户验收（必须完全退出并重启 DSH Desktop）
+
+1. 中枢会话里 `sm_cap_doc({ name: "git-sync-supermemory" })` 返回正文，固化能力面板该能力 `loadCount` +1；普通会话调用同一工具返回 `CAPABILITY_DOC_ROLE_DENIED`。
+2. 中枢会话直接调用 `sm_cap_git_sync_supermemory`：返回 `HUB_CAPABILITY_EXEC_DENIED`，文案提示用 `memory_dispatch` 派发到分支并写清预演/confirm；该工具也不再出现在中枢的工具列表里。
+3. 派发到分支后，分支调用 `sm_cap_git_sync_supermemory`（不传参）默认预演成功；写操作能力不传 `confirm=true` 返回 `needs-confirm`。
+4. 面板「中枢权限」页签：`sm_cap_doc` 勾选且锁定、徽标「只读路由，锁定」；`sm_cap_*` 徽标「中枢不可执行」，勾选也不能让中枢执行。
+5. 旧工作区升级后第一次启动日志出现「merged locked hub policy entries into N workspace row(s)」；第二次启动不再出现（幂等）。
+
+### 68.11 剩余风险
+
+- 工具面隐藏依赖宿主 `when` 条件注册；不支持时只有调用期拦截，边界仍在但模型会先看到一个会被拒绝的工具。
+- `mergeLockedHubPolicies` 以 meta 标记做一次性判断；手工恢复旧数据库且保留新 meta 时不会自动重扫（可用 `ignoreMarker` 或面板任意保存触发合并）。
+- 普通会话的 `sm_cap_doc` 拒绝会同时影响「非中枢/非分支但确实想读能力正文」的场景；按 R55 需求这是预期行为，正文可在中枢/分支读取。
+
+

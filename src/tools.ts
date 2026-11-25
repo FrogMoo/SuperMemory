@@ -2057,6 +2057,8 @@ ${listText}` : listText
     description: '按需读取一个固化能力的知识面正文（SuperMemory 单能力：知识面 + 执行面 sm_cap_*）。'
       + '仅在中枢/分支会话需要具体步骤、判断标准或失败坑时调用；能力索引卡里的 name 直接填进来。'
       + '可选 section 只返回某个「## 小节」。只返回 enabled 且可读取的能力；停用/不存在会明确报错。'
+      + 'R55 职责边界：本工具对中枢只读（判断能力是否适用）；执行面 sm_cap_* 在中枢被 HUB_CAPABILITY_EXEC_DENIED 拒绝，'
+      + '要用 memory_dispatch 派发到分支执行。普通会话（非中枢/非分支）调用会被明确拒绝。'
       + '不要用宿主 skill 工具加载固化能力——第三方 skill 才走 skill 目录。成功加载会给该能力 loadCount+1。',
     parameters: {
       name: { type: 'string', required: true, description: '能力逻辑名（如 git-sync-supermemory），或 sm_cap_* / sm-* 形式' },

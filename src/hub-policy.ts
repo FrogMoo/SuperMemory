@@ -46,9 +46,23 @@ import { workspaceKeyOf } from './store.ts'
 export const HUB_POLICY_VERSION = 1
 
 /**
+ * R55: the READ-ONLY knowledge-face tool. A hub may load a capability's body to
+ * judge whether it applies, but never runs it: execution is dispatched to a
+ * branch (role-guard code `HUB_CAPABILITY_EXEC_DENIED`).
+ */
+export const CAPABILITY_DOC_TOOL = 'sm_cap_doc'
+
+/** R55: the capability EXECUTION surface shares this prefix. */
+export const CAPABILITY_EXEC_PREFIX = 'sm_cap_'
+
+/** R55: historical capability tools (read-side mapping only; R50 never registers them). */
+export const CAPABILITY_EXEC_LEGACY_PREFIX = 'sm_composite_'
+
+/**
  * Core locked entries — always allowed, and the panel cannot uncheck them.
- * These are the dispatch/relay spine plus the two ways a hub talks to the user
- * and to its branches; without them a hub cannot do its job at all.
+ * These are the dispatch/relay spine, the two ways a hub talks to the user and
+ * to its branches, and (R55) the read-only capability knowledge face; without
+ * them a hub cannot do its job at all.
  */
 export const LOCKED_HUB_TOOLS: readonly string[] = Object.freeze([
   'memory_dispatch',
@@ -57,6 +71,9 @@ export const LOCKED_HUB_TOOLS: readonly string[] = Object.freeze([
   'ask_user_question',
   'send_message',
   'run_code',
+  // R55: read-only routing — the hub reads the knowledge face to decide, then
+  // dispatches the execution. Locked so a stored row can never hide it.
+  'sm_cap_doc',
 ])
 
 /**
@@ -80,6 +97,8 @@ export const DEFAULT_HUB_TOOLS: readonly string[] = Object.freeze([
   'memory_scan',
   'memory_set_model',
   'memory_toolize',
+  // 固化能力（R55：只读知识面；执行面 sm_cap_* 在中枢被结构性拒绝）
+  'sm_cap_doc',
   // 沟通
   'ask_user_question',
   'send_message',
@@ -162,6 +181,29 @@ export function isHubAllowedTool(
 /** True for an entry the panel must render as locked (cannot be unchecked). */
 export function isLockedHubTool(toolName: string): boolean {
   return LOCKED_HUB_TOOLS.includes(toolName)
+}
+
+/**
+ * R55: is this name the capability EXECUTION surface (a concrete `sm_cap_*`
+ * tool, legacy `sm_composite_*` read the same way)? `sm_cap_doc` is the
+ * knowledge face, never execution.
+ */
+export function isCapabilityExecutionTool(toolName: string): boolean {
+  const name = String(toolName ?? '').trim()
+  if (!name || name === CAPABILITY_DOC_TOOL) return false
+  return name.startsWith(CAPABILITY_EXEC_PREFIX) || name.startsWith(CAPABILITY_EXEC_LEGACY_PREFIX)
+}
+
+/**
+ * R55: the panel badge a catalog row carries. `capabilityDoc` = read-only
+ * routing locked on; `capabilityExecDenied` = a hub must dispatch the execution
+ * instead of calling it. Undefined keeps the pre-R55 rendering.
+ */
+export function hubCapabilityNoteKey(toolName: string): 'capabilityDoc' | 'capabilityExecDenied' | undefined {
+  const name = String(toolName ?? '').trim()
+  if (name === CAPABILITY_DOC_TOOL) return 'capabilityDoc'
+  if (isCapabilityExecutionTool(name)) return 'capabilityExecDenied'
+  return undefined
 }
 
 /** De-duplicate, trim and drop empties; keeps the stored list canonical. */
@@ -256,6 +298,80 @@ export async function resetHubPolicy(store: Store, workspaceKey: string): Promis
   if (!rowId) return false
   await table.delete(rowId)
   return true
+}
+
+/** Bump when the locked-entry merge rules change; an older marker re-runs. */
+export const HUB_POLICY_LOCKED_MERGE_VERSION = 1
+
+/** The meta-table row key of the one-time locked-entry merge marker. */
+const LOCKED_MERGE_MARKER = 'hub-policy-locked'
+
+/** Result of {@link mergeLockedHubPolicies}. */
+export interface HubPolicyLockedMergeResult {
+  status: 'merged' | 'already-done' | 'no-store'
+  /** Stored policy rows scanned this run. */
+  rows: number
+  /** Rows rewritten because they were missing a locked entry. */
+  updated: number
+  /** Locked names that were added (deduplicated). */
+  added: string[]
+}
+
+/**
+ * R55 one-time migration: merge {@link LOCKED_HUB_TOOLS} into every STORED
+ * workspace policy row. The guard already allows locked entries regardless of
+ * the row ({@link isHubAllowedTool}), so this is not a permission change — it
+ * makes the durable row tell the truth (the panel reads it back as checked),
+ * and it is the documented upgrade step for rows written before R55.
+ *
+ * Idempotent: after the first pass no row is missing a locked entry, so a
+ * second call reports `already-done` and writes nothing. A marker row records
+ * the check; `ignoreMarker` forces a re-scan (tests / restored backups).
+ */
+export async function mergeLockedHubPolicies(
+  store: Store | undefined,
+  options: { now?: number; ignoreMarker?: boolean } = {},
+): Promise<HubPolicyLockedMergeResult> {
+  const empty = (status: HubPolicyLockedMergeResult['status']): HubPolicyLockedMergeResult =>
+    ({ status, rows: 0, updated: 0, added: [] })
+  if (!store) return empty('no-store')
+  const table = (store as { hubPolicies?: Store['hubPolicies'] }).hubPolicies
+  if (!table || typeof table.entries !== 'function') return empty('no-store')
+  const now = Number.isFinite(Number(options.now)) && Number(options.now) > 0 ? Number(options.now) : Date.now()
+  try {
+    if (!options.ignoreMarker) {
+      const marker = (await store.meta?.get?.(LOCKED_MERGE_MARKER)) as { hubPolicyLockedVersion?: number } | undefined
+      if (Number(marker?.hubPolicyLockedVersion ?? 0) >= HUB_POLICY_LOCKED_MERGE_VERSION) {
+        return { ...empty('already-done'), status: 'already-done' }
+      }
+    }
+    let rows = 0
+    let updated = 0
+    const added = new Set<string>()
+    for (const [id, row] of table.entries()) {
+      rows += 1
+      const tools = normalizePolicyList(row?.tools ?? [])
+      const missing = LOCKED_HUB_TOOLS.filter((name) => !tools.includes(name))
+      if (missing.length === 0) continue
+      const nextTools = normalizePolicyList([...tools, ...missing])
+      await table.update(id, (current) => ({ ...current, tools: nextTools, updatedAt: now }))
+      updated += 1
+      for (const name of missing) added.add(name)
+    }
+    try {
+      await store.meta?.put?.(LOCKED_MERGE_MARKER, {
+        hubPolicyLockedVersion: HUB_POLICY_LOCKED_MERGE_VERSION,
+        hubPolicyLockedMergedAt: now,
+        hubPolicyLockedRows: rows,
+        hubPolicyLockedUpdated: updated,
+      })
+    } catch { /* the migrated rows are the fact; the marker is advisory */ }
+    return { status: updated > 0 ? 'merged' : 'already-done', rows, updated, added: [...added] }
+  } catch {
+    // Never break the boot for a policy merge: the guard allows locked entries
+    // without the row, so a failed merge only loses the audit wording.
+    return empty('no-store')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -658,6 +774,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
     const source = inferHubToolSource(name, declared)
     sources.set(name, source)
     const description = summarizeHubToolDescription(raw?.description)
+    const noteKey = hubCapabilityNoteKey(name)
     runtime.set(name, {
       name,
       ...(description ? { description } : {}),
@@ -666,6 +783,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
       source: source.id,
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(HUB_EXECUTION_TOOLS.includes(name) ? { risk: true } : {}),
+      ...(noteKey ? { noteKey } : {}),
     })
   }
   // R40: supplement the GLOBAL view with the explicit host/session surface.
@@ -684,6 +802,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
       synthetic: true,
       source: HOST_SESSION_SOURCE.id,
       ...(name === 'plugin_manager' ? { noteKey: 'pluginManager' } : {}),
+      ...(hubCapabilityNoteKey(name) ? { noteKey: hubCapabilityNoteKey(name) } : {}),
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(HUB_EXECUTION_TOOLS.includes(name) ? { risk: true } : {}),
     })
@@ -724,6 +843,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
       source: source.id,
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(HUB_EXECUTION_TOOLS.includes(name) ? { risk: true } : {}),
+      ...(hubCapabilityNoteKey(name) ? { noteKey: hubCapabilityNoteKey(name) } : {}),
     })
   }
   for (const prefix of prefixes) {
@@ -788,7 +908,9 @@ export function buildFallbackHubCatalog(input: HubFallbackInput): HubCatalogSnap
           ? { noteKey: entry.noteKey }
           : hostSession && entry.name === 'plugin_manager'
             ? { noteKey: 'pluginManager' }
-            : {}),
+            : hubCapabilityNoteKey(entry.name)
+              ? { noteKey: hubCapabilityNoteKey(entry.name) }
+              : {}),
         enabled: entry.prefix ? prefixes.includes(entry.name) : isHubAllowedTool(entry.name, policy),
         source: source.id,
       }, source)
@@ -809,7 +931,11 @@ export function buildFallbackHubCatalog(input: HubFallbackInput): HubCatalogSnap
         : '白名单条目（内置回退：运行时是否存在未核验）',
       ...(hostSession ? { available: true, synthetic: true } : {}),
       ...(isLockedHubTool(name) ? { locked: true } : {}),
-      ...(hostSession && name === 'plugin_manager' ? { noteKey: 'pluginManager' } : {}),
+      ...(hostSession && name === 'plugin_manager'
+        ? { noteKey: 'pluginManager' }
+        : hubCapabilityNoteKey(name)
+          ? { noteKey: hubCapabilityNoteKey(name) }
+          : {}),
       enabled: true,
       source: source.id,
     }, source)
@@ -901,6 +1027,9 @@ export const BUILTIN_HUB_CATALOG: readonly HubBuiltinGroup[] = Object.freeze([
       item('memory_toolize'),
       item('memory_ui'),
       item('memory_raise_question'),
+      // R55: the knowledge face alone — the execution surface is never
+      // synthesized here (a concrete sm_cap_* tool appears when registered).
+      item('sm_cap_doc', { locked: true, noteKey: 'capabilityDoc' }),
     ],
   },
   {

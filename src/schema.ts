@@ -436,6 +436,13 @@ export async function buildSchemas() {
     roleGuardFailedAt: z.number().int().optional(),
     roleGuardVersion: z.number().int().optional(),
     roleGuardError: z.string().optional(),
+    // R55 marker (meta row 'hub-policy-locked'): the one-time merge of the
+    // locked hub entries (sm_cap_doc) into stored hub_policies rows. Declared
+    // here because the meta schema strips unknown marker keys on load.
+    hubPolicyLockedVersion: z.number().int().optional(),
+    hubPolicyLockedMergedAt: z.number().int().optional(),
+    hubPolicyLockedRows: z.number().int().optional(),
+    hubPolicyLockedUpdated: z.number().int().optional(),
   })
 
   return {

@@ -45,13 +45,13 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.2.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.3.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.2`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.3.2`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.3`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.3.3`
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
@@ -85,6 +85,16 @@ node scripts/install-into-dsh.mjs
 
 下载新版本 Release 包 → 解压到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向更新到新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
 
+### 升级到 1.3.3 后要做什么（R55：中枢只读检查 + 执行禁令）
+
+1. **完全退出并重启 DSH Desktop**（不是禁用/启用插件，也不是刷新窗口）：启动时会把 `sm_cap_doc` 合并进已存的「中枢权限」白名单行（一次性、幂等；即使不迁移，锁定项也一直按内置规则生效）。
+2. **中枢可以读能力知识面**：中枢会话里 `sm_cap_doc({ name })` 正常返回正文并给该能力 `loadCount+1`；普通会话（既不是中枢也不是分支）调用会被明确拒绝（`CAPABILITY_DOC_ROLE_DENIED`），而不是「找不到工具」。
+3. **中枢不能执行能力**：中枢调用 `sm_cap_*` 返回 `HUB_CAPABILITY_EXEC_DENIED`，提示「请用 memory_dispatch 派发到分支，任务里写明能力名、是否先预演、写操作需 confirm=true」；`sm_cap_*` 也不再出现在中枢的工具列表里。分支会话照常执行（默认预演，写操作 `confirm=true`）。
+4. **面板标注**：SuperMemory 面板「中枢权限」页签把 `sm_cap_doc` 显示为**锁定**的「只读路由，锁定」项（不可取消），`sm_cap_*` 标注「中枢不可执行」；勾选 `sm_cap_*` 不会让中枢获得执行权。
+5. 验证：中枢新开一个对话，让模型读一次 `sm_cap_doc`（应成功）、再让它直接执行 `sm_cap_*`（应被 `HUB_CAPABILITY_EXEC_DENIED` 拒绝并提示派发）；派发到分支后执行应正常。
+
+> 本版无存储结构变更（存储域 `supermemory` version 1 不变）；新增的 `hub_policies` 白名单合并在启动时执行一次，回滚只需重装旧版包并重启。
+
 ### 升级到 1.3.2 后要做什么（R54：版本/统计/卡片修复）
 
 1. **仍然必须完全退出并重启 DSH Desktop**（不是禁用/启用插件，也不是刷新窗口）：三项修复都在插件启动时的迁移里执行。
@@ -116,6 +126,8 @@ node scripts/install-into-dsh.mjs
 |---|---|
 | 插件页看不到插件 | 确认已跑过 `install-into-dsh.mjs` 且自检全 PASS；刷新插件页（实时读盘）；仍没有 → 重启 DSH |
 | 重启后不生效 | 必须**完全重启** DSH Desktop（不是刷新窗口） |
+| 中枢调用 `sm_cap_*` 被拒（`HUB_CAPABILITY_EXEC_DENIED`） | 这是设计行为：中枢只做判断与派发。用 `memory_dispatch` 把任务派发到分支，任务里写清能力名、是否先预演、写操作 `confirm=true` |
+| 中枢读 `sm_cap_doc` 被拒（`CAPABILITY_DOC_ROLE_DENIED`） | 当前会话既不是中枢也不是分支。请在话题集的中枢/分支会话中读取，或先让中枢派发分支调查 |
 | 报缺少 `@deepseek-ai/schemastery` | 发布包 `node_modules/` 被解压工具丢弃（部分工具默认跳过点目录/链接）→ 用支持完整解压的工具重新解压，勿删 `node_modules` |
 | 换机器/换目录 | 重跑一次 `node scripts/install-into-dsh.mjs` 即可，link 自动跟随新路径 |
 | 插件面板报“找不到插件 / invalid spec” | 不要填裸 `FrogMoo/SuperMemory`、release 页面或 zip 资产；按方式 A 填完整 git URL 或 `.tgz` 直链 |
