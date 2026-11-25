@@ -4179,4 +4179,131 @@ R52 让知识面可以按需读取（`sm_cap_doc`），但 R36 的中枢白名�
 - `mergeLockedHubPolicies` 以 meta 标记做一次性判断；手工恢复旧数据库且保留新 meta 时不会自动重扫（可用 `ignoreMarker` 或面板任意保存触发合并）。
 - 普通会话的 `sm_cap_doc` 拒绝会同时影响「非中枢/非分支但确实想读能力正文」的场景；按 R55 需求这是预期行为，正文可在中枢/分支读取。
 
+## 69. R56：上下文注入卡标题统一 + 「新增注入必须登记」约定 + v1.3.4 发布轮（2026-11-26）
+
+### 69.1 需求与设计
+
+用户要求四类注入卡改名，并把「以后新增的上下文注入卡也按同类格式命名」固化成约定。R56 的落法不是逐处替换字符串，而是**把标题变成唯一来源**：新增 `src/injection-titles.ts` 注册表，渲染处只调用 `injectionTitle(kind)`；测试同时锁「标题正确」与「渲染处没有手写标题」，避免下一轮再散落。
+
+命名约定（写进 `src/injection-titles.ts` 模块注释，R56-2 断言锁定）：
+
+1. 所有上下文注入卡标题以 `supermemory-` 开头；
+2. 相关内容类用 `supermemory-相关<主题>`（话题 / 记忆 / 分支会话 / 能力 …）；
+3. 功能性卡用 `supermemory-<功能>`（小写 kebab、ASCII：hub-role / plugin-prompt / notice）；
+4. 禁止在渲染处手写标题字符串（一律 `injectionTitle(kind)`，枚举用 `injectionTitles()`）；
+5. 新增注入卡必须先登记（常量 + kind），再渲染、再测试、最后写文档——「登记 → 渲染 → 测试 → 文档」。
+
+约定正则：`^\[supermemory-(相关.+|[a-z][a-z-]*)\]$`（`INJECTION_TITLE_PATTERN`）。
+
+### 69.2 relay / 消息前缀例外（明确不改）
+
+下列前缀是**会话之间传输的消息头**，携带 id 或载荷、由 relay/派发管线解析；改名会破坏回送，因此不经注册表、保持原样：
+
+| 前缀 | 产生处 | 用途 |
+|---|---|---|
+| `[supermemory-relay <branch>]` | `observe.ts` / `reconcile.ts` | 分支 relay 回送 |
+| `[supermemory-group-relay <group>]` | `group.ts` | 并行组汇总 |
+| `[supermemory-dispatch <id>]` | `script-delegation.ts` / `reconcile.ts` | 派发首条消息 |
+| `[supermemory-resume <id>]` | `resume.ts` | 续跑唤醒 |
+| `[supermemory-questions]` | `questions.ts` | 分支问题上交 |
+| `[supermemory-panel-reply]` | `panel.ts` | 管理台回复 |
+| `[supermemory-topic-set]` | `panel.ts` | 激活话题集回执 |
+
+R56-4 把这份白名单写进断言：渲染处除这 7 类传输前缀外，不允许出现任何手写 `[supermemory-…]` 卡片标题。
+
+### 69.3 注册表位置
+
+| 位置 | 内容 |
+|---|---|
+| `src/injection-titles.ts:1` | 模块注释：命名约定 + relay 例外 + 四步流程 |
+| `src/injection-titles.ts:42` | `INJECTION_TITLES`：9 个 kind 的裸名（topic / topicCandidate / memory / memoryRepeat / branch / capability / hubRole / pluginPrompt / notice） |
+| `src/injection-titles.ts:67` | `INJECTION_TITLE_PATTERN`：约定正则 |
+| `src/injection-titles.ts:70` | `injectionTitle(kind)`：带方括号标题 |
+| `src/injection-titles.ts:75` | `injectionTitles()`：注册表快照（kind → title，声明顺序） |
+
+### 69.4 新旧标题对照
+
+| 卡 | 旧标题 | 新标题 |
+|---|---|---|
+| 话题集注入 | `[SuperMemory 话题集]` | `[supermemory-相关话题]` |
+| 相关记忆注入 | `[SuperMemory 相关记忆]` | `[supermemory-相关记忆]` |
+| 关联分支注入 | `[supermemory 关联分支]` | `[supermemory-相关分支会话]` |
+| 可用能力注入 | `[SuperMemory 可用能力]` | `[supermemory-相关能力]` |
+| 话题候选（相关话题族子卡） | `[SuperMemory 话题提示]` | `[supermemory-相关话题候选]` |
+| 过程内补充 | `[SuperMemory 相关记忆 · 过程内补充]` | `[supermemory-相关记忆补充]` |
+| 中枢角色提示 | `[SuperMemory 中枢会话]` | `[supermemory-hub-role]` |
+| 插件提示 | `[SuperMemory 记忆]` | `[supermemory-plugin-prompt]` |
+| 中断公告 | `[SuperMemory] 检测到 …` | `[supermemory-notice] 检测到 …` |
+
+旧标题残留 grep（源码与构建产物，测试自身期望字符串与 CHANGELOG/文档历史除外）：
+
+- `grep -rn '\[SuperMemory' src/ lib/` → **0**
+- `grep -rn '\[supermemory 关联分支' src/ lib/` → **0**
+- scripts/ 中仅 `mechanism-smoke.mjs` 的 R56-4 负向期望串（`OLD_TITLES` 数组）保留旧标题字面量，属断言本身，不参与产品 grep。
+
+### 69.5 渲染接线（文件:行）
+
+| 文件:行 | 卡片 |
+|---|---|
+| `src/route.ts:162` | 相关话题候选 |
+| `src/route.ts:187` | 相关话题 |
+| `src/recall.ts:221 / 223 / 240` | 相关记忆（plain / gentle / 极小预算降级） |
+| `src/inrequest.ts:264 / 265 / 276` | 相关记忆补充 |
+| `src/hub-branches.ts:384` | 相关分支会话 |
+| `src/capability.ts:1299` | 相关能力 |
+| `src/hub-role-text.ts:18 / 33 / 38` | 中枢角色提示 + 卡名引用 |
+| `src/index.ts:216 / 230 / 231` | 插件提示 + 卡名引用 |
+| `src/resume.ts:539` | 中断公告 |
+
+导入点：`route.ts:15` / `recall.ts:12` / `inrequest.ts:30` / `hub-branches.ts:34` / `capability.ts:40` / `hub-role-text.ts:15` / `index.ts:36` / `resume.ts:28`。
+
+### 69.6 测试（R56-1 ~ R56-4）
+
+- **R56-1**（mechanism）：四张卡标题精确匹配（含方括号）+ 话题候选归入相关话题族。
+- **R56-2**（mechanism）：注册表全部标题匹配约定正则、互不重复、裸名无方括号。
+- **R56-3**（mechanism）：六类卡 + 中枢角色提示 + 中断公告的渲染首行都是注册标题；极小预算（80 字）降级态仍保留注册标题且 ≤ 预算（与 R47 预算断言共存）。
+- **R56-4**（mechanism）：递归扫描 `src/`（ts/tsx）无旧标题；渲染处禁止手写卡片标题（7 类传输前缀白名单）；8 个渲染文件必须 import 注册表并调用 `injectionTitle`；扫描 `lib/*.js` 无旧标题且带四张新卡标题。
+- 既有断言更新：`core-smoke` 关联分支卡头；`mechanism-smoke` 话题提示卡头、过程内补充卡可区分性（原「过程内补充」字样断言改为注册标题）。
+- R47 注入预算/裁剪断言（core R47-1..6、mechanism R47-8、capability R52-2）全部仍绿。
+
+### 69.7 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 **13 文件 929.67 kB**；client `lib/client.js` 181.81 kB，wrap 后 **175717 B**。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **116** / webui **35** / client-sim `SIM SMOKE OK` / capability **20** 组 / workspace-scope **6** 组 / skill **27** 组。
+
+### 69.8 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.4.zip` | 2,032,974 | `3b47b1a25e8701a71788f762f10fb9c420b267e3ecc01bf6fb2ff520d8273319` |
+| `dsh-supermemory-1.3.4.tgz` | 818,349 | `8d50afcb7acb4674bdf558dab7b3b4208b060b13b079833d71af6311701f5707` |
+| `dsh-supermemory.tgz`（稳定别名） | 818,349 | 同上（字节一致） |
+
+- tgz（npm-pack 结构）：**97 条目**；`package/package.json`（version=1.3.4）、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml` 齐全；**反斜杠路径 0**；新增 `package/src/injection-titles.ts`。
+- zip（手动安装）：**908 条目**（staging 906 文件）、解压后 `package.json`=1.3.4、`CHANGELOG.md` 含 `[1.3.4]`、`INSTALL.md` 含 1.3.4；条目分隔符为反斜杠（Windows 手动安装专用）。
+- 安装自检：临时空目录 `pnpm add F:/10-SuperMemory/release/dsh-supermemory-1.3.4.tgz` → exit 0，安装版本 **1.3.4**，`main=lib/supermemory.js`，`lib/` 内已含新标题。
+
+### 69.9 提交、tag 与双推（按 docs/git-sync.md）
+
+- 单条提交（R56 源码 + 测试 + 版本号 + CHANGELOG/README/INSTALL/DEV-NOTES + `lib/` 构建产物；`release/` 二进制按 `.gitignore` 不入库），提交信息写文件后 `git commit -F`。
+- 附注 tag `v1.3.4`（标注：v1.3.4 — R56 上下文注入卡标题统一（supermemory- 注册表 + 命名约定））。
+- 双推 `pnpm git:sync`（GitHub 首位 + Gitee）推 main 与 tag；逐端核验 **main commit + tag 对象 SHA + tag 指向 commit** 三者一致。GitHub git 面被阻断时改用 `scripts/github-api-release.mjs` 走 API 补推与 Release。
+- Release：三资产（版本 zip、版本 tgz、稳定别名 tgz）上传，`state=uploaded`、`digest` 与本地 sha256 一致；核验 `/releases/latest` = v1.3.4、稳定 URL GET 200 且 sha256 一致；前端被阻断时按 docs/git-sync.md `12 用 `api.github.com` 资产端点并注明。v1.3.0–v1.3.3 的 tag 与 Release 资产不动。
+
+### 69.10 用户验收（必须完全退出并重启 DSH Desktop）
+
+1. 普通会话问一句与历史结论相关的话：注入卡首行应为 `[supermemory-相关记忆]`（同一请求内后补的卡为 `[supermemory-相关记忆补充]`）。
+2. 激活/命中话题集：上下文卡首行为 `[supermemory-相关话题]`；只提示不切换的候选卡为 `[supermemory-相关话题候选]`。
+3. 中枢会话派发过分支后：卡首行 `[supermemory-相关分支会话]`；能力目录非空时另有 `[supermemory-相关能力]`。
+4. 中枢会话角色提示首行 `[supermemory-hub-role]`；插件提示首行 `[supermemory-plugin-prompt]`；重启后若检测到被中断任务，公告首行 `[supermemory-notice]`。
+5. 全窗口搜索旧写法 `[SuperMemory ` 应为 0；relay 消息头 `[supermemory-relay …]` 等保持原样，属正常。
+
+### 69.11 剩余风险
+
+- 标题是纯文案：仓库外若有脚本/自定义提示硬编码旧标题匹配会失效（本仓库内已归零，relay 前缀未改）。
+- R56-4 的 `src/` 扫描是「渲染处禁止手写标题」的静态闸门，只覆盖本仓库源码；插件装好后的用户自定义脚本不受约束。
+- `lib/` 断言要求先 `build` 再 `smoke`（发布闸门顺序本就是 build → smoke）；只改源码直接跑 smoke 会得到明确的「run pnpm build first」提示。
+
+
 

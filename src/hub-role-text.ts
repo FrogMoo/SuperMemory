@@ -12,8 +12,10 @@
  * execution — a hub calling sm_cap_* is refused with HUB_CAPABILITY_EXEC_DENIED.
  * @module supermemory/hub-role-text
  */
+import { injectionTitle } from './injection-titles.ts'
+
 export const HUB_ROLE_TEXT = [
-  '[SuperMemory 中枢会话]',
+  injectionTitle('hubRole'),
   '- 你是中枢会话：只做判断、派发（memory_dispatch）与汇总（收到 relay 结果后转述给用户）。',
   '- 不要直接读改文件、执行命令、跑构建或长篇推理——这些操作交给分支会话完成；你的价值是定义清楚任务与边界，再整合结果。',
   // R36 需求①②: the runtime guard is a WHITELIST. Saying so in the role prompt
@@ -28,12 +30,12 @@ export const HUB_ROLE_TEXT = [
   '  每个任务一个独立分支，全部到达终态后只回送一次汇总，失败成员会单独标注；不要把一个可拆分的大任务塞进单个分支串行做。',
   '  并行组里的每个任务必须自包含（写清目标、范围、验收），彼此不要依赖同一文件的并发修改。',
   // R19 协同②③: hub sees its branches; branches belong to the set, not the hub.
-  '- 系统上下文会注入「[supermemory 关联分支]」卡：它列出你已拉起的分支（标题/标签/状态/话题集/是否被多个中枢共享），'
+  '- 系统上下文会注入「' + injectionTitle('branch') + '」卡：它列出你已拉起的分支（标题/标签/状态/话题集/是否被多个中枢共享），'
   + '本轮 recall 命中话题集时还带出该话题集下的分支清单（标题/标签/状态/最后活动）；先看它再决定派发。',
   '- 分支归属话题集，可被同一话题集下的其他中枢复用/共享：继续同一条分支用 mode=continue（忙则排队），新任务用 mode=auto（复用空闲分支，否则新建）。',
   '- 不要为同一件工作反复新建分支造成重复/分裂；已完成或空闲的分支优先续派。',
   // R30 需求⑤: 每次对话的检索路由——记忆 → 话题集 → 分支会话 → 复用/新建。
-  '- 系统上下文会注入「[SuperMemory 可用能力]」卡（仅中枢/分支会话）：只列能力名、何时用与徽标；'
+  '- 系统上下文会注入「' + injectionTitle('capability') + '」卡（仅中枢/分支会话）：只列能力名、何时用与徽标；'
   + '需要具体步骤/坑时调用 sm_cap_doc（name 即卡里的能力名），不要用宿主 skill 工具加载固化能力。'
   + '第三方 skill（ego-browser/office 等）仍走宿主 skill 目录。',
   '- 每轮对话按这条路由检索再动手：① 先读 recall 卡里的相关记忆（历史结论/约定/构建命令/文件用途）；'

@@ -2,6 +2,31 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.3.4] - 2026-11-26
+
+发布轮（R56）：统一**上下文注入卡标题**命名并固化成约定。四类注入卡改名，全部标题改由注册表 `src/injection-titles.ts` 产出——渲染处不再手写标题字符串，新增注入卡必须「登记 → 渲染 → 测试 → 文档」。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 变更（R56：注入卡标题统一）
+
+- **四张卡改名**（用户要求）：话题集注入 `[SuperMemory 话题集]` → `[supermemory-相关话题]`；相关记忆注入 `[SuperMemory 相关记忆]` → `[supermemory-相关记忆]`；关联分支注入 `[supermemory 关联分支]` → `[supermemory-相关分支会话]`；可用能力注入 `[SuperMemory 可用能力]` → `[supermemory-相关能力]`。
+- **同族/同规则卡一并收口**：话题候选 `[SuperMemory 话题提示]` → `[supermemory-相关话题候选]`（相关话题族子卡）；过程内补充 `[SuperMemory 相关记忆 · 过程内补充]` → `[supermemory-相关记忆补充]`；中枢角色提示 `[SuperMemory 中枢会话]` → `[supermemory-hub-role]`；插件记忆使用约定 `[SuperMemory 记忆]` → `[supermemory-plugin-prompt]`；中断任务公告 `[SuperMemory] 检测到…` → `[supermemory-notice] 检测到…`。
+- **注册表**（新增 `src/injection-titles.ts`）：`INJECTION_TITLES`（9 个 kind 的裸名）、`injectionTitle(kind)`（带方括号标题）、`injectionTitles()`（注册表快照）、`INJECTION_TITLE_PATTERN`（约定正则）。约定写进模块注释：① 所有注入卡以 `supermemory-` 开头；② 相关内容类用 `supermemory-相关<主题>`；③ 功能性卡用 `supermemory-<功能>`（小写 kebab、ASCII）；④ 禁止在渲染处手写标题字符串；⑤ 新增卡必须先登记，再渲染、测试、写文档。
+- **relay 前缀例外（明确不改）**：`[supermemory-relay <branch>]`、`[supermemory-group-relay <group>]`、`[supermemory-dispatch <id>]`、`[supermemory-resume <id>]`、`[supermemory-questions]`、`[supermemory-panel-reply]`、`[supermemory-topic-set]` 是会话间**消息头**（携带 id，relay/派发管线解析），不属于上下文注入卡；改名会破坏回送，保持原样。
+- **接线（全部改走注册表）**：`src/route.ts`（相关话题 / 相关话题候选）、`src/recall.ts`（相关记忆）、`src/inrequest.ts`（相关记忆补充）、`src/hub-branches.ts`（相关分支会话）、`src/capability.ts`（相关能力）、`src/hub-role-text.ts`（中枢角色提示 + 卡名引用）、`src/index.ts`（插件提示 + 卡名引用）、`src/resume.ts`（中断公告）。
+
+### 测试（R56 新增断言）
+
+- **R56-1** 四张注入卡标题精确匹配（含方括号）+ 话题候选归入相关话题族。
+- **R56-2** 注册表内所有标题匹配 `^\[supermemory-(相关.+|[a-z][a-z-]*)\]$`、互不重复、裸名不带方括号。
+- **R56-3** 渲染路径断言：六类卡（相关话题 / 相关记忆 / 相关记忆补充 / 相关分支会话 / 相关能力 / 相关话题候选）+ 中枢角色提示 + 中断公告的首行都是注册标题；极小预算降级态仍保留注册标题且不破预算。
+- **R56-4** 旧标题归零：递归扫描 `src/`（ts/tsx）无旧标题字面量；渲染处禁止手写 `[supermemory-` 卡片标题（仅允许 relay 等 7 类传输前缀白名单）；八个渲染文件必须 import 注册表并使用 `injectionTitle`；构建产物 `lib/*.js` 同样无旧标题且带新标题。
+- 既有断言更新：`core-smoke` 关联分支卡头、`mechanism-smoke` 话题提示卡头与过程内补充卡可区分性；R47 注入预算/裁剪断言全部仍绿。
+
+### 变更（版本）
+
+- 版本 1.3.3 → 1.3.4（patch：标题/文案变更，无行为变更与存储结构变更；存储域 `supermemory` version 1 不变）。
+- 升级后需**完全退出并重启 DSH Desktop**（不是禁用/启用插件、也不是刷新窗口）才能看到新标题。
+
 ## [1.3.3] - 2026-11-26
 
 发布轮（R55）：把「中枢 = 判断与派发、分支 = 执行」从软提示升级为**结构性边界**。中枢现在可以**只读**检查固化能力的知识面（`sm_cap_doc`，默认允许且锁定），但**不能执行** `sm_cap_*`：中枢调用返回专用错误码 `HUB_CAPABILITY_EXEC_DENIED` 并提示派发分支，执行面同时从中枢可见工具列表中隐藏。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。

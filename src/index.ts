@@ -33,6 +33,7 @@ import { attachTools, type ToolsDeps } from './tools.ts'
 import { attachWebui } from './webui.ts'
 import { isHubSession } from './hub-branches.ts'
 import { HUB_ROLE_TEXT } from './hub-role-text.ts'
+import { injectionTitle } from './injection-titles.ts'
 import { backfillHubRecords } from './role.ts'
 import { ROLE_GUARD_VERSION, roleGuardDecision } from './role-guard.ts'
 import { mergeLockedHubPolicies } from './hub-policy.ts'
@@ -212,7 +213,7 @@ export const Config: Schema<Config> = Schema.object({
   }).description('Web 管理台参数').default({}),
 }).description('SuperMemory 记忆插件配置').default({})
 
-const PROMPT_TEXT = [  '[SuperMemory 记忆]',
+const PROMPT_TEXT = [  injectionTitle('pluginPrompt'),
   '- 涉及历史结论、约定、构建命令、文件用途、"之前说过/做过什么"时，先调用 memory_recall 检索再作答。',
   '- 用户明确要求记住某事、或某事实值得跨会话保留时，调用 memory_remember 写入（按工作区隔离）：',
   '  只写结论性、可复用的事实/决策/约定（标题 + 标签 + 正文），禁止把过程流水账、临时步骤、工具调用日志写进记忆。',
@@ -226,8 +227,8 @@ const PROMPT_TEXT = [  '[SuperMemory 记忆]',
   '  纯问答、简单确认、记忆检索类问题不要派发。',
   '- 用户要求可视化管理记忆/打开记忆面板时：SuperMemory 面板已内置在左侧边栏（插件/自动化任务下方的"超级记忆"入口），',
   '  直接提示用户点击该入口即可；memory_ui 返回的浏览器管理台链接仅在用户明确要求外部链接时给出。',
-  '- 对话中可能出现 [SuperMemory 相关记忆] / [SuperMemory 话题集] / [SuperMemory 话题提示] 注入卡片：仅供参考，',
-  '  与用户当前指令冲突时以当前指令为准；[SuperMemory 话题提示] 只是候选列表，不代表已切换话题。',
+  '- 对话中可能出现 ' + injectionTitle('memory') + ' / ' + injectionTitle('topic') + ' / ' + injectionTitle('topicCandidate') + ' 注入卡片：仅供参考，',
+  '  与用户当前指令冲突时以当前指令为准；' + injectionTitle('topicCandidate') + ' 只是候选列表，不代表已切换话题。',
 ].join('\n')
 
 export async function apply(ctx: Context, config: Config) {

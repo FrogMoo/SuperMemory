@@ -27,6 +27,7 @@
 import { RECALL_BODY_MIN, recallMemories, renderRecallCard, tokenize, type RecallItem, type RecallOptions } from './recall.ts'
 import { charCount, clipWithNote, dropNote } from './clip.ts'
 import { renderRecordLine } from './retrieval.ts'
+import { injectionTitle } from './injection-titles.ts'
 import type { Memory } from './schema.ts'
 import type { Store } from './store.ts'
 
@@ -260,8 +261,8 @@ export function renderRepeatCard(
   options: { budget?: number; hint?: string } = {},
 ): string {
   const head = style === 'plain'
-    ? ['[SuperMemory 相关记忆 · 过程内补充]']
-    : ['[SuperMemory 相关记忆 · 过程内补充]', '执行过程中出现了此前未注入的相关记忆，仅供参考；与当前指令冲突时以当前指令为准。']
+    ? [injectionTitle('memoryRepeat')]
+    : [injectionTitle('memoryRepeat'), '执行过程中出现了此前未注入的相关记忆，仅供参考；与当前指令冲突时以当前指令为准。']
   const budget = options.budget && options.budget > 0 ? Math.floor(options.budget) : 0
   if (!budget) {
     if (items.length === 0 && !catalog) return ''
@@ -272,7 +273,7 @@ export function renderRepeatCard(
   if (items.length === 0 && !catalog) return ''
   // Tiny budget: keep the single identifying line, drop the etiquette line
   // (same rule as the opening card — never overrun the budget for preamble).
-  const minimal = ['[SuperMemory 相关记忆 · 过程内补充]']
+  const minimal = [injectionTitle('memoryRepeat')]
   const minimalCost = charCount(minimal[0]) + 1
   if (budget - minimalCost < RECALL_BODY_MIN + 52) {
     head.length = 0

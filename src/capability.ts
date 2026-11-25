@@ -37,6 +37,7 @@ import type { ToolMemory } from './schema.ts'
 import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
 import { charCount, clipAtBoundary } from './clip.ts'
+import { injectionTitle } from './injection-titles.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import { resolveRole } from './role.ts'
 import {
@@ -1295,7 +1296,7 @@ export function renderCapabilityIndex(rows: CapabilityIndexInput[], options: {
     .filter((row) => row.enabled !== false && row.status !== 'retired' && row.kind !== 'proposal')
     .sort((left, right) => left.name.localeCompare(right.name))
   if (eligible.length === 0) return { text: '', included: 0, omitted: 0, truncated: false }
-  const header = '[SuperMemory 可用能力]（仅中枢/分支会话注入；正文按需读取）'
+  const header = injectionTitle('capability') + '（仅中枢/分支会话注入；正文按需读取）'
   // R55: the hub reads this card to DECIDE, then dispatches the execution; the
   // footer states the boundary so the model never tries sm_cap_* from a hub.
   const footer = '正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；中枢只读，执行需派发分支；第三方 skill 仍走宿主 skill 目录。'

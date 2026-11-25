@@ -144,9 +144,11 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 
 {
   const items = [{ memoryId: 'm1', text: '构建命令是 pnpm build', score: 2, createdAt: now, keywords: [] }]
-  const hintBlock = '[SuperMemory 提示]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
+  const hintBlock = '[supermemory-相关能力]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
   const text = renderRepeatCard(items, 'gentle', hintBlock)
-  assert.ok(text.includes('过程内补充'), 'repeat card must be distinguishable from the opening card')
+  assert.ok(text.startsWith('[supermemory-相关记忆补充]'),
+    'R56: the repeat card carries its own registered title')
+  assert.ok(!text.startsWith('[supermemory-相关记忆]'), 'the repeat card must be distinguishable from the opening card')
   assert.ok(text.includes('可用能力'), 'hint block must be present')
   assert.ok(text.includes('sm_cap_read_edit'), 'hint block names the capability')
   assert.ok(buildQuery({ baseQuery: 'a', toolText: 'b' }, 10) === 'a' + String.fromCharCode(10) + 'b')
@@ -161,7 +163,7 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 // above (A6) keeps rendering everything.
 {
   const { charCount } = await import('../src/clip.ts')
-  const catalog = '[SuperMemory 提示]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
+  const catalog = '[supermemory-相关能力]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
   const longText = '这条结论说明构建与发布流程的关键约束。'.repeat(30)
   const items = [
     { memoryId: 'r1', title: '结论甲', text: longText, score: 9, createdAt: now, keywords: ['构建', '闸门'] },
@@ -725,7 +727,7 @@ const fakeCtx = (services) => ({
   }
   const routeAgent = (id) => ({ id, session: { header: { cwd } } })
   const control = await routeBatch(undefined, routeDeps, routeAgent('session-route-plain'), 'session-route-plain', '构建命令发布')
-  assert.ok(control.card?.includes('[SuperMemory 话题提示]'),
+  assert.ok(control.card?.includes('[supermemory-相关话题候选]'),
     'an ordinary session still gets the silent topic hint')
   const branch = await routeBatch(undefined, routeDeps, routeAgent('session-route-branch'), 'session-route-branch', '构建命令发布')
   assert.deepEqual(branch, {},
@@ -3842,6 +3844,118 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
   assert.deepEqual(takePendingHubReceipt(), { id: 'session-c', message: '已创建中枢会话。', kind: 'hub' },
     'after the last listener unsubscribes a receipt is kept pending again')
   ok('R29-1 新会话回执信号：无监听时留待下次挂载、只消费一次、退订后回到 pending')
+}
+
+// ---- R56: 上下文注入卡标题统一（注册表 + 命名约定 + 旧标题归零） ----
+{
+  const { injectionTitle, injectionTitles, INJECTION_TITLES, INJECTION_TITLE_PATTERN } = await import('../src/injection-titles.ts')
+  const { renderCard } = await import('../src/route.ts')
+  const { renderRecallCard } = await import('../src/recall.ts')
+  const { renderRepeatCard } = await import('../src/inrequest.ts')
+  const { renderHubBranchesCard } = await import('../src/hub-branches.ts')
+  const { renderCapabilityIndex } = await import('../src/capability.ts')
+  const { HUB_ROLE_TEXT } = await import('../src/hub-role-text.ts')
+  const { charCount } = await import('../src/clip.ts')
+  const { readFileSync: readR56, readdirSync: readdirR56 } = await import('node:fs')
+  const { join: joinR56 } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+  const NL = String.fromCharCode(10)
+  const firstLine = (text) => String(text).split(NL)[0]
+
+  // R56-1 四张注入卡标题精确匹配（含方括号）；话题候选归入「相关话题」族
+  const EXPECTED = {
+    topic: '[supermemory-相关话题]',
+    memory: '[supermemory-相关记忆]',
+    branch: '[supermemory-相关分支会话]',
+    capability: '[supermemory-相关能力]',
+    topicCandidate: '[supermemory-相关话题候选]',
+  }
+  for (const kind of Object.keys(EXPECTED)) {
+    assert.equal(injectionTitle(kind), EXPECTED[kind], 'R56: ' + kind + ' renders the registered title')
+  }
+  assert.equal(injectionTitle('topicCandidate').startsWith(EXPECTED.topic.slice(0, -1)), true,
+    'R56: 相关话题候选 belongs to the 相关话题 family')
+  ok('R56-1 四张注入卡标题精确匹配：[supermemory-相关话题]/相关记忆/相关分支会话/相关能力（+ 相关话题候选子卡）')
+
+  // R56-2 注册表约定：全部标题匹配 ^[supermemory-(相关.+|[a-z][a-z-]*)]$、唯一、裸名无方括号
+  const registry = injectionTitles()
+  assert.ok(registry.length >= 9, 'R56: the registry covers every injection card (>= 9 kinds)')
+  assert.equal(new Set(registry.map((row) => row.title)).size, registry.length, 'R56: registered titles are unique')
+  for (const row of registry) {
+    assert.match(row.title, INJECTION_TITLE_PATTERN, 'R56: ' + row.title + ' follows the convention')
+    assert.equal(row.title.startsWith('[supermemory-') && row.title.endsWith(']'), true, 'R56: bracketed + prefixed')
+  }
+  for (const kind of Object.keys(INJECTION_TITLES)) {
+    const raw = INJECTION_TITLES[kind]
+    assert.equal(raw.includes('[') || raw.includes(']'), false, 'R56: the raw name carries no brackets: ' + kind)
+    assert.equal(injectionTitle(kind), '[' + raw + ']', 'R56: injectionTitle wraps the raw name: ' + kind)
+  }
+  ok('R56-2 注册表约定：所有标题匹配 ^[supermemory-(相关.+|[a-z][a-z-]*)]$、唯一、裸名无方括号')
+
+  // R56-3 渲染路径都通过 injectionTitle：产物首行就是注册标题（含极小预算降级态）
+  const item = { memoryId: 'm-r56', title: 'R56 结论', text: '构建走 pnpm build', score: 3, createdAt: 1, keywords: ['构建'] }
+  assert.equal(firstLine(renderCard({ title: '话题甲', summary: '梗概', members: [] })), injectionTitle('topic') + ' 话题甲')
+  assert.equal(firstLine(renderRecallCard([item], 'plain', [])), injectionTitle('memory'))
+  assert.equal(firstLine(renderRecallCard([item], 'gentle', [])), injectionTitle('memory'))
+  assert.equal(firstLine(renderRecallCard([item], 'gentle', [], { budget: 80 })), injectionTitle('memory'))
+  const repeatTiny = renderRepeatCard([item], 'gentle', '', { budget: 80 })
+  assert.equal(firstLine(renderRepeatCard([item], 'plain', '')), injectionTitle('memoryRepeat'))
+  assert.equal(firstLine(repeatTiny), injectionTitle('memoryRepeat'))
+  assert.ok(charCount(repeatTiny) <= 80, 'R56 x R47: the tiny repeat card stays inside its budget')
+  const branchRows = [{ branchSessionId: 'b-r56', title: '分支甲', status: 'working', topicSetTitle: '话题甲', lastActivityAt: 1, tags: [], hubs: ['h'], shared: false, dispatches: 1 }]
+  assert.equal(renderHubBranchesCard(branchRows, { now: 2 }).startsWith(injectionTitle('branch') + ' '), true)
+  const capCard = renderCapabilityIndex([{ name: 'r56-cap', title: 'R56 能力', description: '当需要 R56 时加载', entry: 'echo x', runnable: true, enabled: true, kind: 'capability', status: 'active' }], {})
+  assert.equal(capCard.text.startsWith(injectionTitle('capability')), true, 'R56: the capability index uses the registered title')
+  assert.equal(firstLine(HUB_ROLE_TEXT), injectionTitle('hubRole'), 'R56: the hub role prompt uses the registered title')
+  const resumeSrc = readR56(new URL('../src/resume.ts', import.meta.url), 'utf8')
+  assert.ok(resumeSrc.includes("injectionTitle('notice')"), 'R56: the interrupt notice uses the registered title')
+  ok('R56-3 渲染路径：六类卡 + 中枢角色提示 + 中断公告都从注册表取标题（含极小预算降级态）')
+
+  // R56-4 旧标题归零 + 禁止渲染处手写标题：扫描 src/ 与构建产物 lib/
+  const OLD_TITLES = [
+    '[SuperMemory 话题集]', '[SuperMemory 话题提示]', '[SuperMemory 相关记忆]',
+    '[SuperMemory 相关记忆 · 过程内补充]', '[SuperMemory 可用能力]',
+    '[supermemory 关联分支]', '[SuperMemory 中枢会话]', '[SuperMemory 记忆]', '[SuperMemory]',
+  ]
+  const TRANSPORT_PREFIXES = [
+    'supermemory-relay', 'supermemory-group-relay', 'supermemory-dispatch', 'supermemory-resume',
+    'supermemory-questions', 'supermemory-panel-reply', 'supermemory-topic-set',
+  ]
+  const walk = (dir) => readdirR56(dir, { withFileTypes: true })
+    .flatMap((entry) => entry.isDirectory() ? walk(joinR56(dir, entry.name)) : [joinR56(dir, entry.name)])
+  const srcRoot = fileURLToPath(new URL('../src/', import.meta.url))
+  const srcFiles = walk(srcRoot).filter((path) => path.endsWith('.ts') || path.endsWith('.tsx'))
+  for (const path of srcFiles) {
+    const text = readR56(path, 'utf8')
+    for (const old of OLD_TITLES) {
+      assert.equal(text.includes(old), false, 'R56: old title ' + old + ' was left in ' + path)
+    }
+    if (path.endsWith('injection-titles.ts')) continue // the registry names every title by definition
+    let at = text.indexOf('[supermemory-')
+    while (at >= 0) {
+      const close = text.indexOf(']', at)
+      const token = text.slice(at, close < 0 ? at + 48 : close + 1)
+      const allowed = TRANSPORT_PREFIXES.some((prefix) => token.startsWith('[' + prefix))
+      assert.equal(allowed, true, 'R56: hand-written card title is banned in ' + path + ': ' + token)
+      at = text.indexOf('[supermemory-', at + 1)
+    }
+  }
+  for (const name of ['route.ts', 'recall.ts', 'inrequest.ts', 'hub-branches.ts', 'capability.ts', 'hub-role-text.ts', 'index.ts', 'resume.ts']) {
+    const text = readR56(joinR56(srcRoot, name), 'utf8')
+    assert.ok(text.includes("from './injection-titles.ts'"), 'R56: ' + name + ' imports the title registry')
+    assert.ok(text.includes('injectionTitle('), 'R56: ' + name + ' renders through injectionTitle')
+  }
+  const libRoot = fileURLToPath(new URL('../lib/', import.meta.url))
+  const libFiles = walk(libRoot).filter((path) => path.endsWith('.js'))
+  assert.ok(libFiles.length > 0, 'R56: lib/ is built (run pnpm build before smoke)')
+  const libText = libFiles.map((path) => readR56(path, 'utf8')).join(NL)
+  for (const old of OLD_TITLES) {
+    assert.equal(libText.includes(old), false, 'R56: the built product still carries ' + old + ' — run pnpm build first')
+  }
+  for (const title of [injectionTitle('topic'), injectionTitle('memory'), injectionTitle('branch'), injectionTitle('capability')]) {
+    assert.equal(libText.includes(title), true, 'R56: the built product carries ' + title + ' — run pnpm build first')
+  }
+  ok('R56-4 旧标题归零：src/ 无旧标题、渲染处无手写 [supermemory- 标题（传输前缀白名单）、构建产物同步新标题')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

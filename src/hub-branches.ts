@@ -31,6 +31,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { Dispatch, TopicSet } from './schema.ts'
 import type { Store } from './store.ts'
 import { clipMarked } from './clip.ts'
+import { injectionTitle } from './injection-titles.ts'
 import { resolveRole } from './role.ts'
 
 /** One branch as a hub sees it. */
@@ -380,7 +381,7 @@ export function renderHubBranchesCard(
   if (rows.length > 0) {
     const working = rows.filter((row) => row.status === 'working').length
     const failed = rows.filter((row) => row.status === 'failed').length
-    lines.push('[supermemory 关联分支] 本会话在该话题集拉起的分支：')
+    lines.push(injectionTitle('branch') + ' 本会话在该话题集拉起的分支：')
     for (const row of rows.slice(0, maxItems)) {
       const status = row.status === 'working' ? '工作中' : row.status === 'failed' ? '失败待处理' : '空闲'
       const parts = [

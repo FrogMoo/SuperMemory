@@ -9,6 +9,7 @@
  */
 import { charCount, clipWithNote, dropNote } from './clip.ts'
 import { renderRecordLine } from './retrieval.ts'
+import { injectionTitle } from './injection-titles.ts'
 import type { Memory } from './schema.ts'
 
 export interface RecallItem {
@@ -217,9 +218,9 @@ export function renderRecallCard(
   if (items.length === 0) return ''
   const budget = options.budget && options.budget > 0 ? Math.floor(options.budget) : 0
   const header = style === 'plain'
-    ? ['[SuperMemory 相关记忆]']
+    ? [injectionTitle('memory')]
     : [
-        '[SuperMemory 相关记忆]',
+        injectionTitle('memory'),
         '以下记忆可能与本话题相关，仅供参考；与当前指令冲突时以当前指令为准。',
         '记忆只存结论性事实/决策（不是过程流水账）。',
       ]
@@ -236,7 +237,7 @@ export function renderRecallCard(
   // three-line gentle preamble AND one record. The card degrades to its single
   // identifying line instead of overrunning the budget: the records are the
   // context, the preamble is etiquette.
-  const minimal = ['[SuperMemory 相关记忆]']
+  const minimal = [injectionTitle('memory')]
   const minimalCost = minimal.reduce((sum, line) => sum + charCount(line) + 1, 0)
   if (budget - minimalCost < RECALL_BODY_MIN + 52) {
     header.length = 0

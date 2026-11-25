@@ -25,6 +25,7 @@ import { deliverRelay, type ObserveConfig, type ObserveDeps } from './observe.ts
 import { resolveCapabilities, type CapabilityProfile } from './capabilities.ts'
 import { isOpenDispatch, relativeAgo, taskExcerpt } from './hub-branches.ts'
 import { clipMarked } from './clip.ts'
+import { injectionTitle } from './injection-titles.ts'
 import { branchTagsFor, branchTitleFor } from './branch-meta.ts'
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
@@ -535,7 +536,7 @@ export async function notifyInterruptedDispatches(
       if (options.state.signatures.get(hubSessionId) === signature) continue
       options.state.signatures.set(hubSessionId, signature)
     }
-    const text = '[SuperMemory] 检测到 ' + rows.length + ' 个被中断的任务'
+    const text = injectionTitle('notice') + ' 检测到 ' + rows.length + ' 个被中断的任务'
       + '（插件重载/关闭或 DSH 退出导致；分支会话已保留，可选择继续）：\n'
       + rows.map((row, index) => index + 1 + '. ' + row.dispatchId
         + ' · 话题集「' + (row.topicSetTitle ?? '（未命名）') + '」'

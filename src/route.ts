@@ -12,6 +12,7 @@ import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { UserMessage, createUserMessage as CreateUserMessage } from '@deepseek-ai/dsh-llm'
 import { loadHostModule } from './host.ts'
 import { clipWithNote } from './clip.ts'
+import { injectionTitle } from './injection-titles.ts'
 import { tokenize } from './recall.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
@@ -158,7 +159,7 @@ export async function routeBatch(
   const lines = candidates.map((c) => `- 『${c.topicSet.title}』${c.topicSet.summary ? `：${clipWithNote(c.topicSet.summary, 80)}` : ''}`)
   return {
     card: [
-      '[SuperMemory 话题提示]',
+      injectionTitle('topicCandidate'),
       '检测到可能与当前对话相关的历史话题（未切换，当前对话继续）：',
       ...lines,
       '需要切换时：在消息里 @话题集名，或在 SuperMemory 面板中点击激活。',
@@ -183,7 +184,7 @@ function isBranchSession(store: Store, sessionId: string): boolean {
 export function renderCard(topicSet: TopicSet | undefined): string {
   if (!topicSet) return ''
   const lines = [
-    `[SuperMemory 话题集] ${topicSet.title}`,
+    `${injectionTitle('topic')} ${topicSet.title}`,
     topicSet.summary ? `梗概：${topicSet.summary}` : '梗概：（暂无，随对话滚动更新）',
   ]
   if (topicSet.defaultModel) {
