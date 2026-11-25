@@ -1211,14 +1211,54 @@ export async function persistTaskSkillForSignature(
 }
 
 /**
- * Legacy shell detection (R48 cleanup): an auto-generated skill whose NAME or
- * DESCRIPTION is just a tool order. Manual/capability skills never qualify.
+ * R51: names minted from a tool ORDER (R45 legacy): sm-flow-*, sm-tool-*,
+ * sm-ws<token>-flow-*. Accepts the logical form without the sm- prefix too,
+ * because capability records normalise names that way.
+ */
+export function isToolFlowName(name: string | undefined): boolean {
+  return /^(?:sm-)?(?:ws[a-z0-9]{4,10}-)?(?:flow|tool)(?:-|$)/.test(String(name ?? '').trim().toLowerCase())
+}
+
+/** R51: the R45 shell prose signature (tool order, no business object). */
+export function isToolOrderProse(text: string | undefined): boolean {
+  const value = String(text ?? '')
+  return /当任务需要按/.test(value) && /的顺序反复处理同类改动/.test(value)
+}
+
+/** R51: any identity shape that can identify a tool-order shell. */
+export interface ShellIdentity {
+  name?: string | undefined
+  description?: string | undefined
+  source?: string | undefined
+  /** SKILL.md body (catches capability faces rewritten by R50). */
+  body?: string | undefined
+}
+
+/**
+ * R51 shell identity — survives R50's knowledge-face rewrite.
+ *
+ * R50's migration refreshed EVERY migrated row's SKILL.md, overwriting
+ * `sm-source: sequence` with `sm-source: capability`; the old detector (source
+ * only) then treated the shell as a fresh knowledge unit. Detection therefore
+ * also keys on the generated name and the tool-order prose, both of which the
+ * rewrite preserves.
+ */
+export function isShellIdentity(identity: ShellIdentity): boolean {
+  if (String(identity.source ?? '') === 'sequence') return true
+  if (isToolFlowName(identity.name)) return true
+  if (isToolOrderProse(identity.description)) return true
+  return isToolOrderProse(identity.body)
+}
+
+/**
+ * Legacy shell detection (R48 cleanup, hardened in R51): an auto-generated
+ * skill whose NAME or DESCRIPTION is just a tool order. Human/manual skills are
+ * only reclassified when the NAME itself is a tool order — a body quote of the
+ * shell template never archives a human file.
  */
 export function isShellSkill(parsed: ParsedSkill): boolean {
-  if (parsed.source !== 'sequence') return false
-  if (/^sm-(?:ws[a-z0-9]{5}-)?flow(?:-|$)/.test(parsed.name)) return true
-  const description = String(parsed.description ?? '')
-  return /当任务需要按/.test(description) && /的顺序反复处理同类改动/.test(description)
+  if (parsed.source === 'manual' && !isToolFlowName(parsed.name) && !isToolOrderProse(parsed.description)) return false
+  return isShellIdentity({ name: parsed.name, description: parsed.description, source: parsed.source, body: parsed.body })
 }
 
 /** Archive directory is a SIBLING of the skill root: <root>-archive. */
@@ -1355,14 +1395,38 @@ export async function archiveShellSkills(options: {
   }
 }
 
-/** Retire the durable mirror row of an archived skill (best effort). */
+/** Skill path of a mirror row: dedicated column, legacy path entry, or JSON. */
+function skillPathOfMirrorRow(row: ToolMemory): string {
+  if (typeof row.skillPath === 'string' && row.skillPath) return row.skillPath
+  const entry = String(row.entry ?? '')
+  if (!entry.startsWith('{')) return entry
+  try {
+    const parsed = JSON.parse(entry) as Record<string, unknown>
+    const path = parsed.skillPath ?? parsed.entryPath
+    return typeof path === 'string' ? path : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Retire the durable mirror row of an archived skill (best effort).
+ *
+ * R51: also covers kind='knowledge' rows (R50 migrated shell rows) and the
+ * schema-JSON / skillPath column shapes — the old skill-only, entry-only check
+ * left adopted shells active and they were re-materialised on the next boot.
+ */
 async function retireSkillRow(store: Store, fromDir: string): Promise<void> {
   const marker = normalizeDir(fromDir) + '/'
+  const target = normalizeDir(join(fromDir, 'SKILL.md'))
   for (const [key, row] of store.toolMemory.entries()) {
-    if (row.kind !== 'skill') continue
-    const entry = normalizeDir(row.entry)
-    if (entry !== normalizeDir(join(fromDir, 'SKILL.md')) && !entry.startsWith(marker)) continue
-    try { await store.toolMemory.update(key, (record) => ({ ...record, status: 'retired' })) } catch { /* advisory */ }
+    if (row.kind !== 'skill' && row.kind !== 'knowledge') continue
+    const entry = normalizeDir(skillPathOfMirrorRow(row))
+    if (!entry) continue
+    if (entry !== target && !entry.startsWith(marker)) continue
+    try {
+      await store.toolMemory.update(key, (record) => ({ ...record, status: 'retired', enabled: false }))
+    } catch { /* advisory */ }
   }
 }
 

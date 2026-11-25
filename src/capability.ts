@@ -27,7 +27,8 @@
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
+import { homedir } from 'node:os'
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import type * as Tools from '@deepseek-ai/dsh-tools'
 import { loadHostModule } from './host.ts'
@@ -37,8 +38,8 @@ import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import {
-  archiveCapabilitySkill, bodyHashOf, buildCapabilitySkill, capabilitySkillNames,
-  findSkillFile, parseSkillMarkdown, readSkillFiles, resolveSkillRoot,
+  archiveCapabilitySkill, archiveShellSkills, bodyHashOf, buildCapabilitySkill, capabilitySkillNames,
+  findSkillFile, isShellIdentity, parseSkillMarkdown, readSkillFiles, resolveSkillRoot,
   splitFactsBlock, upsertCapabilitySkill, type CapabilityFacts,
 } from './skill-forge.ts'
 
@@ -433,14 +434,80 @@ export interface CapabilityMigrationReport {
   linkedSkills: number
   generatedSkills: number
   expiredProposals: number
+  /** R51: shell skill directories archived during this pass. */
+  archivedShells: number
+  /** R51: adopted shell units retired (knowledge rows that were shells). */
+  retiredShellUnits: number
+  /** R51: knowledge rows that merely mirrored an executable capability. */
+  dedupedKnowledge: number
   changed: boolean
 }
 
 /**
- * Lazy migration: convert every legacy row exactly once and keep it idempotent.
+ * R51: a unit that is really a legacy tool-order shell, even after R50 rewrote
+ * its SKILL.md face from `sm-source: sequence` to `sm-source: capability`.
+ * Executable capabilities are never shells — only knowledge-only units qualify.
+ */
+export function isShellUnit(record: Pick<CapabilityRecord, 'name' | 'description' | 'source' | 'kind' | 'entry' | 'draftBody'>): boolean {
+  if (record.kind === 'capability' && String(record.entry ?? '').trim()) return false
+  return isShellIdentity({
+    name: record.name,
+    description: record.description,
+    source: record.source,
+    body: record.draftBody,
+  })
+}
+
+/** Retire one unit row without deleting it (audit + rollback stay possible). */
+async function retireUnitRow(store: Store, id: string): Promise<void> {
+  await store.toolMemory.update(id, (row) => ({ ...row, status: 'retired', enabled: false }))
+}
+
+/**
+ * R51: idempotently retire every adopted tool-order shell unit.
+ * Used by migration, boot cleanup and `memory_toolize cleanup`; never deletes.
+ */
+export async function retireShellUnits(store: Store, options: { dryRun?: boolean } = {}): Promise<Array<{ id: string; name: string }>> {
+  const retired: Array<{ id: string; name: string }> = []
+  for (const entry of capabilityRows(store)) {
+    if (entry.record.kind === 'proposal') continue
+    if (entry.row.status === 'retired') continue
+    if (!isShellUnit(entry.record)) continue
+    retired.push({ id: entry.id, name: entry.record.name })
+    if (!options.dryRun) {
+      try { await retireUnitRow(store, entry.id) } catch { /* one broken row never blocks cleanup */ }
+    }
+  }
+  return retired
+}
+
+function normalizePathKey(path: string): string {
+  try { return resolve(path).replace(/\\/g, '/').toLowerCase() } catch { return String(path ?? '').replace(/\\/g, '/').toLowerCase() }
+}
+
+/**
+ * R51: workspace key of one skill root. `<project>/.dsh/skills` belongs to the
+ * project; the shared `<DSH_HOME>/skills` root belongs to no workspace. The old
+ * two-dirname-of-the-FILE derivation attributed files to `.dsh/skills` itself.
+ */
+function workspaceKeyForSkillRoot(root: string): string {
+  const resolved = resolve(root)
+  const homeSkills = resolve(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'skills')
+  if (resolved.toLowerCase() === homeSkills.toLowerCase()) return 'unknown'
+  if (basename(dirname(resolved)) === '.dsh') return workspaceKeyOf(dirname(dirname(resolved)))
+  return 'unknown'
+}
+
+/**
+ * Lazy, idempotent migration: convert every legacy row exactly once.
+ *
+ * R51 order is load-bearing: shell skills are ARCHIVED (and their mirror rows
+ * retired) before any row is turned into a unit. R50 refreshed every row's
+ * knowledge face, which re-created archived shells under their canonical path
+ * with `sm-source: capability` — the next scan then saw a brand-new unit.
  * Old sequence rows are retired (never registered); old capability rows become
  * executable capabilities; old skill rows become knowledge capabilities; skill
- * files without a row become migrated knowledge capabilities.
+ * files without a row become knowledge capabilities — unless they are shells.
  */
 export async function migrateCapabilities(store: Store, options: {
   root?: string
@@ -450,10 +517,30 @@ export async function migrateCapabilities(store: Store, options: {
   const now = options.now ?? Date.now()
   const report: CapabilityMigrationReport = {
     migratedCapabilities: 0, migratedKnowledge: 0, retiredComposites: 0,
-    linkedSkills: 0, generatedSkills: 0, expiredProposals: 0, changed: false,
+    linkedSkills: 0, generatedSkills: 0, expiredProposals: 0,
+    archivedShells: 0, retiredShellUnits: 0, dedupedKnowledge: 0, changed: false,
   }
+  // R51: archive shell skill directories before migrating rows. archiveShellSkills
+  // also retires their mirror rows (kind skill/knowledge) when a store is given.
+  const roots = new Set<string>()
+  if (options.root) roots.add(options.root)
+  for (const [, row] of store.toolMemory.entries()) {
+    // Only a REAL workspace directory may contribute a root: resolveSkillRoot()
+    // walks up to the nearest .git, so a synthetic key ("ws-r50") would point at
+    // the caller's own checkout. Never let a fixture touch a real skill root.
+    if (!row.workspaceKey || row.workspaceKey === 'unknown' || !isAbsolute(row.workspaceKey) || !existsSync(row.workspaceKey)) continue
+    try { roots.add(resolveSkillRoot(row.workspaceKey).root) } catch { /* no project root */ }
+  }
+  try {
+    const archived = await archiveShellSkills({ roots: [...roots], store, now })
+    report.archivedShells = archived.totalArchived
+    if (archived.totalArchived > 0) report.changed = true
+  } catch { /* archiving never blocks migration */ }
   const seen = new Map<string, string>()
   for (const [id, row] of [...store.toolMemory.entries()]) {
+    // R51: a retired row is audit history — never revive it (R50 turned retired
+    // shell rows into knowledge units and regenerated their SKILL.md).
+    if (row.status === 'retired' && (row.kind === 'skill' || row.kind === 'knowledge')) continue
     if (row.kind === 'composite' || row.kind === 'workflow') {
       let raw: Record<string, unknown> | undefined
       try { raw = JSON.parse(row.entry) as Record<string, unknown> } catch { raw = undefined }
@@ -492,6 +579,12 @@ export async function migrateCapabilities(store: Store, options: {
       const parsed = readCapabilityRow(row, id)
       if (!parsed) continue
       const record = parsed.record
+      if (isShellUnit(record)) {
+        await retireUnitRow(store, id)
+        report.retiredShellUnits += 1
+        report.changed = true
+        continue
+      }
       record.kind = 'knowledge'
       record.entry = ''
       record.runnable = false
@@ -507,6 +600,12 @@ export async function migrateCapabilities(store: Store, options: {
     if (row.kind === 'knowledge' || row.kind === 'capability') {
       const parsed = readCapabilityRow(row, id)
       if (!parsed) continue
+      if (isShellUnit(parsed.record)) {
+        await retireUnitRow(store, id)
+        report.retiredShellUnits += 1
+        report.changed = true
+        continue
+      }
       const key = (row.workspaceKey ?? 'global') + '|' + parsed.record.name
       if (seen.has(key)) continue
       seen.set(key, id)
@@ -521,22 +620,17 @@ export async function migrateCapabilities(store: Store, options: {
     }
   }
   // Link SKILL.md files that have no row (manual skills written before R50 or
-  // by hand) as knowledge capabilities. Never overwrites the file.
-  const roots = new Set<string>()
-  if (options.root) roots.add(options.root)
-  for (const [, row] of store.toolMemory.entries()) {
-    if (row.workspaceKey && row.workspaceKey !== 'unknown') {
-      try { roots.add(resolveSkillRoot(row.workspaceKey).root) } catch { /* no project root */ }
-    }
-  }
+  // by hand) as knowledge capabilities. Never overwrites the file and never
+  // adopts a shell (R51).
   for (const root of roots) {
     for (const file of readSkillFiles(root)) {
+      if (isShellIdentity({ name: file.name, description: file.parsed.description, source: file.parsed.source, body: file.parsed.body })) continue
       const known = [...store.toolMemory.entries()].some(([, row]) => {
         const path = row.skillPath ?? (row.entry && !row.entry.startsWith('{') ? row.entry : '')
         return Boolean(path) && resolve(path).toLowerCase() === resolve(file.path).toLowerCase()
       })
       if (known) continue
-      const workspaceKey = workspaceKeyOf(dirname(dirname(file.path)))
+      const workspaceKey = workspaceKeyForSkillRoot(root)
       const record = normalizeCapabilityRecord({
         schema: CAPABILITY_SCHEMA,
         name: file.name,
@@ -560,14 +654,39 @@ export async function migrateCapabilities(store: Store, options: {
       report.changed = true
     }
   }
+  // R51: one record, two faces. A knowledge row that mirrors the exact SKILL.md
+  // of an executable capability is a duplicate left by R50's row + file walks;
+  // retire it instead of listing it as a second unit.
+  const capabilityPaths = new Map<string, string>()
+  for (const entry of capabilityRows(store)) {
+    if (entry.record.kind !== 'capability' || !entry.record.skillPath) continue
+    capabilityPaths.set(normalizePathKey(entry.record.skillPath), entry.record.name)
+  }
+  for (const entry of capabilityRows(store)) {
+    if (entry.record.kind !== 'knowledge' || entry.row.status === 'retired' || !entry.record.skillPath) continue
+    if (!capabilityPaths.has(normalizePathKey(entry.record.skillPath))) continue
+    await retireUnitRow(store, entry.id)
+    report.dedupedKnowledge += 1
+    report.changed = true
+  }
   // Refresh/generate the knowledge face of every capability. For LINKED manual
   // skills (no markers yet) this is the first touch: only the facts block is
   // appended, the human prose stays byte-identical.
   for (const entry of capabilityRows(store)) {
     if (entry.record.kind === 'proposal') continue
+    // R51: retired rows stay untouched (no file regeneration), and a shell unit
+    // is retired instead of being given a fresh knowledge face.
+    if (entry.row.status === 'retired') continue
+    if (isShellUnit(entry.record)) {
+      await retireUnitRow(store, entry.id)
+      report.retiredShellUnits += 1
+      report.changed = true
+      continue
+    }
     let root = options.root
-    if (!root && entry.row.workspaceKey && entry.row.workspaceKey !== 'unknown') {
-      try { root = resolveSkillRoot(entry.row.workspaceKey).root } catch { root = undefined }
+    const owned = entry.row.workspaceKey
+    if (!root && owned && owned !== 'unknown' && isAbsolute(owned) && existsSync(owned)) {
+      try { root = resolveSkillRoot(owned).root } catch { root = undefined }
     }
     if (!root) continue
     try {
@@ -588,6 +707,9 @@ export async function syncCapabilitySkill(
 ): Promise<{ status: string; version: number; path?: string; bodyHash?: string; factsHash?: string; body?: string; factsBlock?: string } | undefined> {
   const record = entry.record
   if (record.kind === 'proposal') return undefined
+  // R51: never materialise a knowledge face for a tool-order shell — that is how
+  // an archived R45 shell came back as a brand-new unit under R50.
+  if (isShellUnit(record)) return undefined
   const input = {
     name: record.name,
     title: record.title,
@@ -970,7 +1092,7 @@ export function defaultCapabilityDeps(): CapabilityDeps {
 }
 
 async function ensureSkillFor(store: Store, entry: CapabilityRow, workspaceKey: string | undefined, options: { draftBody?: string; changelog?: string } = {}): Promise<CapabilityRow> {
-  if (!workspaceKey || workspaceKey === 'unknown') return entry
+  if (!workspaceKey || workspaceKey === 'unknown' || !isAbsolute(workspaceKey) || !existsSync(workspaceKey)) return entry
   let root: string
   try { root = resolveSkillRoot(workspaceKey).root } catch { return entry }
   try { await syncCapabilitySkill(store, entry, root, options) } catch { /* knowledge face is best-effort */ }
@@ -1286,7 +1408,7 @@ export async function rebuildCapabilities(
 ): Promise<number> {
   try {
     const migration = await migrateCapabilities(store, { ...(deps?.logger ? { logger: deps.logger } : {}) })
-    if (migration.changed) deps?.logger?.info('supermemory: capability migration — caps ' + migration.migratedCapabilities + ', knowledge ' + migration.migratedKnowledge + ', retired sequences ' + migration.retiredComposites + ', linked skills ' + migration.linkedSkills)
+    if (migration.changed) deps?.logger?.info('supermemory: capability migration — caps ' + migration.migratedCapabilities + ', knowledge ' + migration.migratedKnowledge + ', retired sequences ' + migration.retiredComposites + ', linked skills ' + migration.linkedSkills + ', archived shells ' + migration.archivedShells + ', retired shell units ' + migration.retiredShellUnits + ', deduped knowledge ' + migration.dedupedKnowledge)
   } catch (error) {
     deps?.logger?.warn?.('supermemory: capability migration failed: ' + String(error).slice(0, 160))
   }

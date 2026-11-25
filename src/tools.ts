@@ -1726,6 +1726,8 @@ ${listText}` : listText
           archived?: Array<{ name: string; root: string; archivePath: string }>
           archivedCount?: number
           archivedSkills?: number
+          retiredUnits?: number
+          retiredUnitNames?: string[]
           retiredComposites?: number
           clearedProposals?: number
           prunedSignals?: number
@@ -1766,6 +1768,7 @@ ${listText}` : listText
           const counts: string[] = []
           const skillCount = v.archivedSkills ?? v.archivedCount ?? archived.length
           if (skillCount > 0) counts.push('归档壳子 skill ' + skillCount + ' 个')
+          if ((v.retiredUnits ?? 0) > 0) counts.push('退役已收编壳子单元 ' + (v.retiredUnits ?? 0) + ' 个' + (v.retiredUnitNames?.length ? '（' + v.retiredUnitNames.join('、') + '）' : ''))
           if ((v.retiredComposites ?? 0) > 0) counts.push('退役历史工具序列行 ' + (v.retiredComposites ?? 0) + ' 个' + (v.retired?.length ? '（' + v.retired.join('、') + '）' : ''))
           if ((v.clearedProposals ?? 0) > 0) counts.push('清空待处理提案 ' + (v.clearedProposals ?? 0) + ' 条')
           if ((v.expiredProposals ?? 0) > 0) counts.push('过期提案 ' + (v.expiredProposals ?? 0) + ' 条')
@@ -1823,7 +1826,7 @@ ${listText}` : listText
       const cwd = exec.agent?.session?.header?.cwd
       const workspaceKey = cwd ? workspaceKeyOf(cwd) : undefined
       const {
-        capabilityRows, capabilityHealthOf, capabilityLogicalName, capabilityToolName,
+        capabilityRows, capabilityHealthOf, capabilityLogicalName, capabilityToolName, isShellUnit,
         mergeBuiltinCapabilities, registerCapability, registerCapabilityTool, liveCapabilityNames,
         setCapabilityEnabled, acceptProposal, declineProposal, pendingProposalsOf,
       } = await import('./capability.ts')
@@ -1891,6 +1894,8 @@ ${listText}` : listText
           archived: result.archived.map((entry) => ({ name: entry.name, root: entry.root, archivePath: entry.archivePath })),
           archivedCount: result.archivedCount,
           archivedSkills: result.archivedCount,
+          retiredUnits: result.retiredShellUnits,
+          retiredUnitNames: result.retiredShellNames,
           retiredComposites: result.retiredCount,
           clearedProposals: result.clearedProposals,
           prunedSignals: result.prunedSignals,
@@ -1938,7 +1943,9 @@ ${listText}` : listText
       }
       const pending = pendingProposalsOf(store, workspaceKey)
       if (!args.accept && !args.decline) {
-        const rows = capabilityRows(store, workspaceKey).filter((entry) => entry.record.kind !== 'proposal')
+        // R51: a legacy tool-order shell is never a unit in the model-visible
+        // catalog — even when a retired/adopted row still exists in storage.
+        const rows = capabilityRows(store, workspaceKey).filter((entry) => entry.record.kind !== 'proposal' && !isShellUnit(entry.record))
         const health = new Map(capabilityHealthOf(store, workspaceKey).map((row) => [row.id, row]))
         const unitOf = (entry: (typeof rows)[number]) => {
           const record = entry.record

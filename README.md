@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的跨会话记忆插件：把「结论性事实、话题集、派发归档、固化能力」持久化到存储域，让中枢/分支会话协同工作跨会话可续、可追溯、可召回。
 
-- **包名**：`dsh-supermemory`　**版本**：`1.2.1`（最新 Release，tag `v1.2.1`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
+- **包名**：`dsh-supermemory`　**版本**：`1.3.0`（最新 Release，tag `v1.3.0`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
 - **宿主要求**：DSH `>=0.2.0 <0.3.0`（见 `package.json` 的 `engines.dsh`）
 - **产物形态**：ESM。宿主半边 `lib/supermemory.js`，浏览器半边 `lib/client.js`（DSH 侧边栏/主区面板）
 - **存储**：DSH `storageDomain` 域 `supermemory`（version 1），表定义集中在 `src/schema.ts`；所有业务表按工作区隔离（`workspaceKey`，决策 D4）
@@ -27,7 +27,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 | 话题集 | 中枢/分支会话的分组：标题/梗概/标签/分支成员/默认模型；recall 命中记忆时一并给出相关话题集，便于把结论关联回会话上下文 |
 | 中枢/分支协同 | `memory_dispatch` 异步派发（单发/并行组）；分支问题上交 + 中枢统一提问；`memory_resume` 续跑中断任务；relay 按派发记录的 `hubSessionId` 回送；分支会话标题/标签（任务首行 + 话题集标签 + 轮次令牌） |
 | 过程内再召回 | pre-step 注入卡片：同一请求内可注入多张（去重 + 条数/字符预算），避免模型"失忆" |
-| 统一能力 | 一条记录、两个面：知识面 `SKILL.md`（正文事实源，自动维护只刷新 `<!-- sm:facts:start/end -->` 事实块）+ 执行面 `sm_cap_<name>`（固定入口，默认预演，`writeConfirm` 必须 `confirm=true`）；自动路径只产待接受知识提案（同任务≥3 次、≥2 会话、30 天；每根自动上限 8，接受才占额；pending 上限 20、30 天过期）；高置信入口只进 `entryDraft`（未验证，人工「启用执行」才 runnable）；`memory_toolize` 注册/接受/启停/刷新/清理；内置 `git-sync` 能力；统计分执行 `runCount`、加载 `loadCount`、转化率、成功率、连续失败 |
+| 统一能力 | 一条记录、两个面：知识面 `SKILL.md`（正文事实源，自动维护只刷新 `<!-- sm:facts:start/end -->` 事实块）+ 执行面 `sm_cap_<name>`（固定入口，默认预演，`writeConfirm` 必须 `confirm=true`）；自动路径只产待接受知识提案（同任务≥3 次、≥2 会话、30 天；每根自动上限 8，接受才占额；pending 上限 20、30 天过期）；高置信入口只进 `entryDraft`（未验证，人工「启用执行」才 runnable）；`memory_toolize` 注册/接受/启停/刷新/清理；内置 `git-sync` 能力；统计分执行 `runCount`、加载 `loadCount`、转化率、成功率、连续失败；历史工具序列壳子（含被 R50 改写过知识面的）一律先归档/退役，不进入能力目录（R51） |
 | 可视化管理 | DSH 内面板（话题集/记忆两级页/固化能力/中枢会话/派发卡）+ 独立 Web 管理台（`/memory ui`，带令牌链接） |
 | 维护循环 | 自动抽取事实与需求、任务提案与能力事实块刷新、记忆整理（正文哈希 + 标记守卫、默认 dry-run）、标题补正 |
 

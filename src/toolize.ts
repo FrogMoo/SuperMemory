@@ -22,7 +22,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import {
   capabilityRows, capabilitySkillName, createProposal, expireProposals, highConfidenceEntryDraft,
-  saveCapabilityRecord, setCapabilityEnabled, syncCapabilitySkill,
+  retireShellUnits, saveCapabilityRecord, setCapabilityEnabled, syncCapabilitySkill,
   type CapabilityFacts,
 } from './capability.ts'
 import type { Store } from './store.ts'
@@ -404,6 +404,9 @@ export interface ToolizeCleanupResult {
   archivedCount: number
   scannedSkills: number
   expiredProposals: number
+  /** R51: adopted shell units (knowledge rows) retired in this pass. */
+  retiredShellUnits: number
+  retiredShellNames: string[]
   dryRun: boolean
 }
 
@@ -434,6 +437,10 @@ export async function cleanupToolize(options: {
     archiveRoots = result.roots
     scannedSkills = result.totalScanned
   }
+  // R51: shell rows that were adopted as knowledge units but have no directory
+  // left to archive (e.g. the archive already happened on an earlier boot) are
+  // retired here; archiveShellSkills only retires rows whose directory it moved.
+  const shellUnits = await retireShellUnits(options.store, { dryRun })
   return {
     retired,
     retiredCount: retired.length,
@@ -446,6 +453,8 @@ export async function cleanupToolize(options: {
     archivedCount: archived.length,
     scannedSkills,
     expiredProposals,
+    retiredShellUnits: shellUnits.length,
+    retiredShellNames: shellUnits.map((item) => item.name),
     dryRun,
   }
 }

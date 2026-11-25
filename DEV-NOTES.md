@@ -3718,3 +3718,105 @@ tool_memory 记录 kind = capability | knowledge | proposal；行级镜像 skill
 - 旧 kind=composite 的序列行保留在库中但 status=retired，面板列为「历史工具序列（已退役，仅审计）」；不删除、可人工清理。
 - 删除能力只归档知识面目录（<skills 根>-archive + manifest），不硬删文件；行删除。
 - 测试会在临时目录创建 .git 夹具；内置能力播种仍指向插件仓库根（生产语义），因此仓库 .dsh/skills 下会出现 sm-git-sync-supermemory（插件自己生成的知识面，属工作区数据、已忽略）。
+## 64. R51：壳子被重新收编的修复 + v1.3.0 发布轮（2026-11-26）
+
+### 64.1 现象（实测）
+
+- R50 已上线运行：`memory_toolize` 返回 `units=13`、`skills=13`，目录里 13 个 skill 全是
+  `sm-flow-bash-bash-*` / `sm-flow-run-code-*` 等历史工具序列壳子 + `sm-git-sync-supermemory`；
+  能力只有 `sm_cap_git_sync_supermemory`。
+- 壳子的 frontmatter 已不是 `sm-source: sequence`，而是 `sm-source: capability`，正文也被替换成
+  「由 SuperMemory 固化为单一能力：本文件是知识面…」——即 R50 把它们当成了知识面并重写了文件。
+- 直接用线上 store 快照复算：工作区 F:\10-SuperMemory 下 `capabilityRows` = **13**（12 个壳子
+  knowledge + git-sync capability），其中 9 个 active、3 个 retired（retired 仍被列表列出）。
+
+### 64.2 根因（三条路径叠加 + 启动顺序）
+
+1. `migrateCapabilities` 处理 `kind='skill'` 行时只看名字/描述，不检查 `status` / `source` /
+   名字是否工具序列：R48 已退役的壳子行被重新转成 `kind='knowledge'`（`src/capability.ts`）。
+2. 迁移末尾「Refresh/generate the knowledge face of every capability」对所有行调用
+   `syncCapabilitySkill` → `upsertCapabilitySkill`：目标 SKILL.md 不存在就按
+   `<skills 根>/<capabilitySkillName>/SKILL.md` **新建**，frontmatter 写成 `sm-source: capability`。
+   R48 已把壳子目录移到 `<skills 根>-archive`，于是迁移把壳子「复活」到原路径，检测从此失效。
+3. 启动顺序上 boot 虽是「cleanup → rebuild」，但 cleanup 的 `retireSkillRow` 只处理
+   `kind='skill'` 且只认路径型 `entry`，管不到 `kind='knowledge'` 与 schema JSON / `skillPath` 行；
+   第二次启动时壳子文件已带 capability 面，`isShellSkill`（只看 `sm-source`）也识别不出来。
+
+### 64.3 修法
+
+- `src/skill-forge.ts`：新增 `isToolFlowName` / `isToolOrderProse` / `isShellIdentity`；
+  `isShellSkill` 改为「source=sequence 或 flow-/tool 名字或工具顺序描述或正文模板」——人工 skill
+  仅在名字本身是工具序列时才可能被归为壳子；`retireSkillRow` 扩到 `kind='skill'|'knowledge'`，
+  并用 `skillPath` 列 / schema JSON / 旧路径三种形态匹配。
+- `src/capability.ts`：`migrateCapabilities` **先调用 `archiveShellSkills`（含 retiring 镜像行）再迁移**；
+  retired 行永不复活；新增 `isShellUnit` / `retireShellUnits`，迁移、重建与 cleanup 共用；
+  `syncCapabilitySkill` 拒绝为壳子生成知识面；知识行与能力指向同一 SKILL.md 时去重（退役知识副本）；
+  链接无行 SKILL.md 时跳过壳子，并把 workspaceKey 归到 `<项目>`（旧实现归到 `.dsh/skills` 本身）。
+- 根目录解析加护栏：`workspaceKey` 必须是绝对路径且存在，才允许 `resolveSkillRoot`——
+  防止夹具里的 `ws-r50` 这类合成 key 顺着 `.git` 找到调用者自己的仓库（回归测试曾因此提前清到真实根）。
+- `src/toolize.ts`：cleanup 末尾调用 `retireShellUnits`，结果新增 `retiredShellUnits/retiredShellNames`；
+  `src/tools.ts` / `src/panel.ts` 的单元列表过滤壳子；`src/index.ts` 注释与日志写明「先归档再迁移/重建」。
+
+### 64.4 存量清理实证
+
+- 线上 store 快照 + 临时目录复算：清理前工作区可见单元 **13**，R51 boot（cleanup → migrate）后
+  **可见单元 1**（`git-sync-supermemory:capability`）；知识副本 `git-sync-supermemory`（workspaceKey
+  误记为 `.dsh/skills`）被去重退役；二次执行归档 0、退役 0。
+- 真实目录（本轮测试/迁移过程中已按 R51 语义执行，manifest 可回滚）：
+
+| skills 根 | 归档壳子数 | 归档目录 | manifest |
+|---|---|---|---|
+| `F:\10-SuperMemory\.dsh\skills` | 12 | `.dsh\skills-archive` | 33 条 |
+| `C:\Users\admin\.dsh\skills`（用户级） | 7 | `skills-archive` | 20 条 |
+| `F:\ProductManage\.dsh\skills` | 8 | `skills-archive` | 16 条 |
+
+  `sm-webui-registered`（人工）与 `sm-git-sync-supermemory`（能力知识面）保留；归档均为整目录移动，未删除。
+
+### 64.5 测试
+
+- capability-smoke 新增 **R51-1**（boot 先清理再迁移：`sm-source: sequence` 与 R50 改写过的壳子都被归档、
+  镜像行退役、人工知识与 git-sync 能力保留、二次启动幂等）与 **R51-2**（迁移自身先归档、已收编但目录已移走的
+  壳子被幂等退役）。
+- skill-smoke 新增 **R51-S1**（三种壳子形状识别、R50 改写面仍识别、manual/task 不误伤、二次归档 0）。
+- 回归结果：capability **11 组**、skill **27 组** 全绿。
+
+### 64.6 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 13 文件 **884.98 kB**（入口 `supermemory.js` 542.47 kB / gzip 146.18 kB），
+  `lib/client.js` 178.35 kB（wrap 后 172713 B）；**无 composite chunk**。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **111** / webui **35** / client-sim **SIM SMOKE OK** /
+  capability **11 组** / workspace-scope **6 组** / skill **27 组**。
+
+### 64.7 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.0.zip` | 2,009,067 | `d4ed78d3e779dc2e95382a935b2f4b9dabee9b161ae17d422fc6ff9bdd99ed15` |
+| `dsh-supermemory-1.3.0.tgz` | 784,270 | `156c67e0b1290d683420269484cbf202a8b8873c740622528f32651dd6692489` |
+| `dsh-supermemory.tgz`（稳定别名） | 784,270 | 同上（字节一致） |
+
+- tgz 结构：`package/package.json`（version=1.3.0）、`package/lib/supermemory.js`、`package/lib/client.js`、
+  `package/cordis.patch.yml` 均在；95 个条目；无反斜杠路径；无 composite chunk。
+- 安装自检：临时空目录 `pnpm add F:\10-SuperMemory\release\dsh-supermemory-1.3.0.tgz` → exit 0，
+  安装版本 **1.3.0**，`lib/supermemory.js`、`lib/client.js`、`cordis.patch.yml` 均存在。
+
+### 64.8 提交、推送与发布
+
+- 单条中文提交（R50 收口 + R51 修复 + 1.3.0 文档/资产生成脚本结果 + 闸门）+ 附注 tag `v1.3.0`；
+  lib/ 随提交，release 二进制按 `.gitignore` 不入库。
+- 双推按 `docs/git-sync.md`：GitHub 首位、Gitee 其次；GitHub git 端点阻断时用
+  `scripts/github-api-release.mjs` 以单提交快进 + tag 对象 + Release 三资产兜底；Gitea 用 API 补同口径 Release。
+- 三资产同步到 GitHub/Gitea；核验 `releases/latest` 指向 v1.3.0、稳定 URL
+  `.../releases/latest/download/dsh-supermemory.tgz` 的 HEAD/GET 与 sha256，并用下载文件再装一次。
+
+### 64.9 用户验收（必须完全重启）
+
+当前进程可能仍残留 R49 前注册的 `sm_composite_*`；R51 只改源码/数据路径，不能热卸载已注册工具。
+**完全退出并重启 DSH Desktop（不是仅禁用/启用插件）** 后：
+
+1. `memory_toolize({})`：units 只剩 `sm_cap_git_sync_supermemory` 等 `sm_cap_*` 与人工知识，无 `sm-flow-*`、无 `sm_composite_*`；
+2. 面板「固化能力」与 `.dsh/skills`：只剩 `sm-git-sync-supermemory`（人工/壳子已归档到 `skills-archive`，manifest 可回滚）；
+3. 对 `sm_cap_git_sync_supermemory` 跑一次预演（默认 `--dry-run`）再 `confirm=true`，确认统计与事实块正常。
+
+

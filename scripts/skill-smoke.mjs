@@ -27,6 +27,8 @@
  *   S21 阈值与衰减：≥3 次、≥2 会话、30 天内有发生才生成
  *   S22 存量清理：只归档自动 shell skill，manifest 可回滚，二次执行幂等
  *   S23 人工 register：清理不碰 manual，之后仍可正常升版
+ *   R51 壳子识别：sm-source=sequence / flow 名 / 工具顺序描述；R50 把壳子
+ *       改写成 capability 面后仍必须识别（否则重启即复活成知识单元）。
  *
  * Usage: node scripts/skill-smoke.mjs
  */
@@ -808,6 +810,35 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
   ok('R50-3 清理：历史序列行退役、待处理提案清空、宽泛信号清理；能力/知识行不动；幂等')
 }
 
+
+// ---- R51: shell detection no longer trusts sm-source alone ----
+{
+  const root = tempDir()
+  const write = (name, source, description, body = '## 何时用') => {
+    mkdirSync(join(root, name), { recursive: true })
+    writeFileSync(join(root, name, 'SKILL.md'), '---\nname: ' + name + '\ndescription: ' + JSON.stringify(description) + '\nsm-source: ' + JSON.stringify(source) + '\n---\n\n' + body)
+  }
+  const SHELL = '当任务需要按 bash → bash 的顺序反复处理同类改动时加载：含触发条件。'
+  write('sm-flow-bash-bash-1mso2t', 'sequence', SHELL)
+  // R50 refreshed every migrated row's knowledge face: sm-source becomes
+  // "capability" but the tool-order name/description/body survive.
+  write('sm-flow-run-code-run-code-1lwcpc', 'capability', SHELL, '# bash → bash 重复流程\n\n## 何时用（触发条件）\n\n- ' + SHELL)
+  write('sm-manual-notes', 'manual', '手工知识', '## 人工正文\n- 保留我')
+  write('sm-fix-skill', 'task', '当任务属于「修复 skill」这一类时加载')
+  const files = readSkillFiles(root)
+  const byName = (name) => files.find((entry) => entry.name === name).parsed
+  assert.equal(isShellSkill(byName('sm-flow-bash-bash-1mso2t')), true, 'sm-source: sequence is a shell')
+  assert.equal(isShellSkill(byName('sm-flow-run-code-run-code-1lwcpc')), true, 'R51: an R50-rewritten capability face is still a shell')
+  assert.equal(isShellSkill(byName('sm-manual-notes')), false, 'a human skill is never misclassified')
+  assert.equal(isShellSkill(byName('sm-fix-skill')), false, 'a task-level skill is never misclassified')
+  const result = await archiveShellSkills({ roots: [root], now: NOW })
+  assert.equal(result.totalArchived, 2, 'both shell shapes archived: ' + result.totalArchived)
+  assert.equal(result.roots[0].skippedManual, 1)
+  assert.ok(existsSync(join(root, 'sm-manual-notes', 'SKILL.md')), 'manual skill untouched')
+  assert.ok(existsSync(join(root, 'sm-fix-skill', 'SKILL.md')), 'task skill untouched')
+  assert.equal((await archiveShellSkills({ roots: [root], now: NOW + 1 })).totalArchived, 0, 'idempotent')
+  ok('R51-S1 壳子识别：source=sequence / flow 名 / 工具顺序描述都算；R50 改写后仍识别；人工与任务级不误伤')
+}
 
 for (const root of roots) { try { rmSync(root, { recursive: true, force: true }) } catch { /* best effort */ } }
 console.log('\nskill-smoke: ' + passed + ' 组断言通过')

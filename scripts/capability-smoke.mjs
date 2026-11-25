@@ -16,6 +16,9 @@
  * R50-7 上限与过期：pending ≤20、每 skills 根自动生成 ≤8、30 天过期。
  * R50-8 删除归档：知识面目录移到 <root>-archive，行删除，可回滚。
  * R50-9 描述：路由规则进入能力工具描述，命名只用 sm_cap_*。
+ * R51 壳子修复：boot 先归档壳子再迁移；source=sequence 或 flow-/tool 名字或
+ *      工具顺序描述的 SKILL.md 不进 units；已收编壳子幂等退役；人工知识/
+ *      人工能力不受影响；sm-git-sync-supermemory 保留。
  *
  * Usage: node scripts/capability-smoke.mjs
  */
@@ -361,6 +364,89 @@ const legacyCapSpec = {
   assert.equal(capability.capabilityToolName('git-sync-supermemory'), 'sm_cap_git_sync_supermemory')
   assert.equal(capability.capabilitySkillName('git-sync-supermemory'), 'sm-git-sync-supermemory')
   ok('R50-9 命名与描述：只有 sm_cap_*；路由规则进入能力描述')
+}
+
+// ---- R51 壳子修复：boot 先归档再迁移；已收编壳子幂等退役；人工/能力不受影响 ----
+{
+  const { cleanupToolize } = await import('../src/toolize.ts')
+  const project = join(root, 'r51-repo')
+  mkdirSync(join(project, '.git'), { recursive: true })
+  const skillsRoot = join(project, '.dsh', 'skills')
+  mkdirSync(skillsRoot, { recursive: true })
+  const wsR51 = workspaceKeyOf(project)
+  const SHELL_DESC = '当任务需要按 bash → bash 的顺序反复处理同类改动时加载：含触发条件、决策清单、步骤纲要、关键坑与验证方式（自动化沉淀的重复事务）。'
+  const shellFile = (name, source) => '---\nname: ' + name + '\ndescription: ' + JSON.stringify(SHELL_DESC)
+    + '\nsm-source: ' + JSON.stringify(source) + '\nsm-version: 1\nsm-occurrences: 7\n---\n\n# bash → bash 重复流程\n\n## 何时用（触发条件）\n\n- ' + SHELL_DESC + '\n'
+  const writeSkill = (name, text) => { mkdirSync(join(skillsRoot, name), { recursive: true }); writeFileSync(join(skillsRoot, name, 'SKILL.md'), text, 'utf8') }
+  const shellName = 'sm-flow-bash-bash-1mso2t'
+  const adoptedName = 'sm-flow-run-code-run-code-1lwcpc'
+  const manualName = 'sm-manual-notes'
+  writeSkill(shellName, shellFile(shellName, 'sequence'))
+  // R50 rewrote an archived shell's face to sm-source: capability; it must STILL be a shell.
+  writeSkill(adoptedName, shellFile(adoptedName, 'capability'))
+  writeSkill(manualName, '---\nname: ' + manualName + '\ndescription: "手工知识"\nsm-source: "manual"\n---\n\n# 人工正文\n\n保留我。\n')
+  const knowledgeEntry = (name, description, path) => JSON.stringify({
+    schema: 'sm.capability/1', name: name.replace(/^sm-/, ''), kind: 'knowledge', title: name, description,
+    tags: [], entry: '', entryDraft: '', entryVerified: false, doc: '', scope: '', runnable: false, enabled: true,
+    dryRunArg: '', writeConfirm: false, routeNote: '', source: 'manual', taskKey: '', version: 1, updatedAt: 1,
+    changelog: [], skillPath: path, bodyHash: '', factsHash: '',
+  })
+  const store = fakeStore({ toolMemory: [
+    ['tm-shell', { kind: 'skill', status: 'active', workspaceKey: wsR51, title: shellName, tags: [], trigger: 'skill/' + shellName, description: SHELL_DESC, entry: join(skillsRoot, shellName, 'SKILL.md'), useCount: 9, createdAt: 1 }],
+    ['tm-adopted', { kind: 'knowledge', status: 'active', workspaceKey: wsR51, title: adoptedName, tags: [], trigger: 'capability/' + adoptedName, description: SHELL_DESC, entry: knowledgeEntry(adoptedName, SHELL_DESC, join(skillsRoot, adoptedName, 'SKILL.md')), source: 'manual', createdAt: 1 }],
+    ['tm-manual', { kind: 'skill', status: 'active', workspaceKey: wsR51, title: manualName, tags: [], trigger: 'skill/' + manualName, description: '手工知识', entry: join(skillsRoot, manualName, 'SKILL.md'), useCount: 1, createdAt: 1 }],
+    ['tm-cap', { kind: 'composite', status: 'active', workspaceKey: wsR51, title: 'git 同步', tags: [], trigger: 'capability/git-sync-supermemory', description: 'git 同步', entry: JSON.stringify({ name: 'sm_composite_git_sync_supermemory', kind: 'capability', title: 'git 同步', description: 'git 同步', entry: 'pnpm git:sync', scope: project, runnable: true, dryRunArg: '--dry-run', writeConfirm: true, steps: [], parameters: [], version: 2 }), useCount: 3, createdAt: 1 }],
+  ] })
+  // Boot order per src/index.ts: cleanup (archive/retire) BEFORE migrate/rebuild.
+  const cleanup = await cleanupToolize({ store, roots: [skillsRoot], dropPending: false })
+  const migration = await capability.migrateCapabilities(store, { root: skillsRoot, now: 1000 })
+  assert.equal(cleanup.archivedCount, 2, 'two shells archived before migration')
+  assert.ok(!existsSync(join(skillsRoot, shellName)), 'sequence shell moved out of the skill root')
+  assert.ok(!existsSync(join(skillsRoot, adoptedName)), 'R50-rewritten shell moved out of the skill root')
+  assert.ok(existsSync(join(skillsRoot, manualName, 'SKILL.md')), 'manual knowledge stays on disk')
+  assert.equal(store.toolMemory.get('tm-shell').status, 'retired', 'legacy skill row retired, not migrated')
+  assert.equal(store.toolMemory.get('tm-adopted').status, 'retired', 'adopted shell unit retired, not migrated')
+  assert.equal(store.toolMemory.get('tm-manual').status, 'active', 'manual knowledge row stays active')
+  const rows = capability.capabilityRows(store, wsR51).filter((entry) => entry.record.kind !== 'proposal')
+  const unitNames = rows.filter((entry) => !capability.isShellUnit(entry.record)).map((entry) => entry.record.name).sort()
+  assert.deepEqual(unitNames, ['git-sync-supermemory', 'manual-notes'], 'only real units remain: ' + unitNames.join(','))
+  assert.equal(rows.filter((entry) => capability.isShellUnit(entry.record) && entry.row.status !== 'retired').length, 0, 'no ACTIVE shell unit survives')
+  assert.equal(migration.retiredShellUnits >= 0, true)
+  // Idempotent second boot: nothing re-archives, nothing revives.
+  const statuses = () => JSON.stringify([...store.toolMemory.entries()].map(([id, row]) => [id, row.status]))
+  const before = statuses()
+  const again = await cleanupToolize({ store, roots: [skillsRoot], dropPending: false })
+  await capability.migrateCapabilities(store, { root: skillsRoot, now: 2000 })
+  assert.equal(again.archivedCount, 0, 'second boot archives nothing')
+  assert.equal(again.retiredShellUnits, 0, 'second boot retires no unit')
+  assert.equal(statuses(), before, 'row statuses are stable (idempotent)')
+  ok('R51-1 壳子修复：boot 先归档再迁移；sequence 与 R50 改写过的壳子都不进 units；人工知识/能力保留；二次启动幂等')
+}
+
+// ---- R51-2 迁移自身先归档；已收编但目录已移走的壳子被幂等退役 ----
+{
+  const { cleanupToolize } = await import('../src/toolize.ts')
+  const project = join(root, 'r51-repo-2')
+  mkdirSync(join(project, '.git'), { recursive: true })
+  const skillsRoot = join(project, '.dsh', 'skills')
+  mkdirSync(skillsRoot, { recursive: true })
+  const wsR51 = workspaceKeyOf(project)
+  const name = 'sm-flow-edit-bash-y3ozif'
+  const desc = '当任务需要按 edit → bash 的顺序反复处理同类改动时加载：含触发条件。'
+  mkdirSync(join(skillsRoot, name), { recursive: true })
+  writeFileSync(join(skillsRoot, name, 'SKILL.md'), '---\nname: ' + name + '\ndescription: ' + JSON.stringify(desc) + '\nsm-source: "sequence"\n---\n\n# 壳子\n', 'utf8')
+  const orphanEntry = JSON.stringify({ schema: 'sm.capability/1', name: 'flow-edit-bash-y3ozif', kind: 'knowledge', title: name, description: desc, entry: '', runnable: false, source: 'manual', skillPath: join(skillsRoot, 'gone', 'SKILL.md'), enabled: true })
+  const store = fakeStore({ toolMemory: [
+    ['tm-adopted-orphan', { kind: 'knowledge', status: 'active', workspaceKey: wsR51, title: name, tags: [], trigger: 'capability/flow-edit-bash-y3ozif', description: desc, entry: orphanEntry, createdAt: 1 }],
+  ] })
+  // Migration alone must archive BEFORE deciding anything (defence in depth).
+  const report = await capability.migrateCapabilities(store, { root: skillsRoot, now: 1000 })
+  assert.ok(report.archivedShells >= 1, 'migration archived the shell itself: ' + report.archivedShells)
+  assert.ok(!existsSync(join(skillsRoot, name)), 'shell directory moved by migration')
+  assert.equal(store.toolMemory.get('tm-adopted-orphan').status, 'retired', 'an adopted shell with no directory left is retired')
+  const cleanup = await cleanupToolize({ store, dropPending: false })
+  assert.equal(cleanup.retiredShellUnits, 0, 'already retired → cleanup is idempotent')
+  ok('R51-2 迁移自身先归档；已收编但目录已移走的壳子被幂等退役')
 }
 
 rmSync(root, { recursive: true, force: true })

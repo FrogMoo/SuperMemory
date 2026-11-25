@@ -405,9 +405,11 @@ export async function apply(ctx: Context, config: Config) {
   }
   ctx.effect(() => attachRoute(ctx, routeDeps), 'supermemory: route')
 
-  // R49 boot order matters: cleanup runs BEFORE the rebuild, so a legacy
-  // auto-generated sequence composite is retired while it is still unregistered
-  // and rebuildCapabilities never brings it back. Idempotent — safe on every start.
+  // Boot order matters (R49 + R51): cleanup/ARCHIVE runs BEFORE migration and
+  // rebuild. Shell skills must be judged and moved out of the skill roots first;
+  // R50's migration refreshed every row's SKILL.md, which re-created an archived
+  // shell under its canonical path with `sm-source: capability` — the next scan
+  // then saw a new unit. Idempotent — safe on every start.
   if (store) {
     void (async () => {
       try {
@@ -419,7 +421,7 @@ export async function apply(ctx: Context, config: Config) {
         // 30-day expiry) — only the explicit memory_toolize cleanup clears them.
         const cleanup = await cleanupToolize({
           store,
-          roots: discoverSkillRoots({ store, cwd: process.cwd() }),
+          roots: discoverSkillRoots({ store, cwd: process.cwd(), dshHome: process.env.DSH_HOME }),
           dropPending: false,
         })
         if (cleanup.retiredCount > 0) {
@@ -433,6 +435,10 @@ export async function apply(ctx: Context, config: Config) {
         if (cleanup.archivedCount > 0) {
           logger.info('supermemory: archived ' + cleanup.archivedCount + ' legacy shell skill(s) under '
             + cleanup.archiveRoots.filter((root) => root.archived > 0).map((root) => root.root).join(', '))
+        }
+        if (cleanup.retiredShellUnits > 0) {
+          logger.info('supermemory: retired ' + cleanup.retiredShellUnits + ' adopted shell unit(s): '
+            + cleanup.retiredShellNames.join(', '))
         }
         // R50: durable TASK signatures that already crossed become pending
         // knowledge proposals (never files, never tools).

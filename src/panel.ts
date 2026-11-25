@@ -24,7 +24,7 @@ import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
   acceptProposal as acceptCapabilityProposal, bumpCapabilityRun, capabilityHealthOf, capabilityRows,
   capabilitySkillName, capabilityToolName, declineProposal as declineCapabilityProposal,
-  deleteCapability, editCapability, enableCapabilityEntryDraft, liveCapabilityToolNames,
+  deleteCapability, editCapability, enableCapabilityEntryDraft, isShellUnit, liveCapabilityToolNames,
   pendingProposalsOf, runCapability, setCapabilityEnabled, updateCapabilitySkillBody,
   type CapabilityRunResult,
 } from './capability.ts'
@@ -1760,6 +1760,9 @@ export class SupermemoryPanelService {
     const rows: ToolView[] = []
     for (const entry of capabilityRows(this.store, workspaceKey)) {
       const record = entry.record
+      // R51: legacy tool-order shells never surface as units (their directories
+      // are archived and their rows retired; keep the panel clean meanwhile).
+      if (isShellUnit(record)) continue
       const h = health.get(entry.id)
       const name = record.kind === 'capability' ? capabilityToolName(record.name) : ('sm-' + record.name)
       rows.push({
