@@ -150,6 +150,8 @@ export interface SkillRootInfo {
   scope: 'project' | 'user'
   /** user scope is shared by every workspace → names carry a workspace token. */
   shared: boolean
+  /** R52: workspace token when the capability root is under <DSH_HOME>/capabilities. */
+  token?: string
   note: string
 }
 
@@ -453,7 +455,7 @@ export function renderTaskSkillBody(
   lines.push('## 调用与命中统计')
   lines.push('')
   lines.push('- 任务出现次数：由插件写入 frontmatter 的 sm-occurrences（面板可见）。')
-  lines.push('- 模型加载次数：由插件在调用 skill 工具时累加（面板「设置 → 已生成的 skills」）。')
+  lines.push('- 模型加载次数：由宿主 skill 工具加载时累加。')
   lines.push('- 最近识别时间：见 frontmatter 的 sm-updated-at（插件更新，正文不随时间变化）。')
   return lines.join('\n')
 }
@@ -632,6 +634,110 @@ export function resolveSkillRoot(cwd?: string, dshHome?: string): SkillRootInfo 
   }
 }
 
+/**
+ * R52: capability KNOWLEDGE lives outside every skill provider root.
+ *
+ * Workspace: `<repo>/.dsh/capabilities/<name>.md` (never SKILL.md).
+ * No git root: `<DSH_HOME>/capabilities/<workspace-token>/<name>.md`, so the
+ * shared user root stays workspace-isolated without a skill-looking directory.
+ */
+export function resolveCapabilityRoot(workspaceKey: string | undefined, dshHome?: string): SkillRootInfo {
+  const key = String(workspaceKey ?? '').trim()
+  const home = dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const projectRoot = key ? findProjectRoot(key) : undefined
+  if (projectRoot) {
+    return {
+      root: join(projectRoot, '.dsh', 'capabilities'),
+      scope: 'project',
+      shared: false,
+      note: '工作区能力知识面（<仓库根>/.dsh/capabilities，不在任何 skill provider 扫描根内）',
+    }
+  }
+  const token = workspaceSkillToken(key || 'unknown')
+  return {
+    root: join(home, 'capabilities', token),
+    scope: 'user',
+    shared: false,
+    token,
+    note: '用户级能力知识面（<DSH_HOME>/capabilities/<workspace-token>；无 git 工作区按工作区隔离）',
+  }
+}
+
+/** File name of one capability's knowledge face (never SKILL.md). */
+export function capabilityDocFileName(name: string): string {
+  const slug = kebabCase(String(name ?? '').replace(/^sm_cap_|^sm_composite_|^sm-/, ''), 60) || 'capability'
+  return slug + '.md'
+}
+
+/** Absolute path of one capability knowledge file. */
+export function capabilityDocPath(root: string, name: string): string {
+  return join(root, capabilityDocFileName(name))
+}
+
+/** Find and parse one capability knowledge file (missing/invalid = undefined). */
+export function findCapabilityDoc(root: string, name: string): { path: string; parsed: ParsedSkill } | undefined {
+  const file = capabilityDocPath(root, name)
+  if (!existsSync(file)) return undefined
+  try {
+    const parsed = parseSkillMarkdown(readFileSync(file, 'utf8'), 'sm-' + capabilityDocFileName(name).slice(0, -3))
+    if (!parsed) return undefined
+    return { path: file, parsed }
+  } catch {
+    return undefined
+  }
+}
+
+/** Read one capability body (frontmatter stripped) for the panel editor. */
+export function readCapabilityDocBody(root: string, name: string): string | undefined {
+  return findCapabilityDoc(root, name)?.parsed.body
+}
+
+/**
+ * Archive one capability knowledge FILE (never hard-delete): move
+ * `<root>/<name>.md` to `<root>-archive/<name>.md` and append a manifest row.
+ * Idempotent: a missing file reports undefined; an existing target gets a suffix.
+ */
+export interface ArchivedCapabilityDoc {
+  root: string
+  name: string
+  from: string
+  archivePath: string
+  archivedAt: number
+  reason: string
+}
+
+export async function archiveCapabilityDoc(root: string, name: string, options: { now?: number; reason?: string } = {}): Promise<ArchivedCapabilityDoc | undefined> {
+  const from = capabilityDocPath(root, name)
+  if (!existsSync(from)) return undefined
+  const archiveDir = archiveDirForRoot(root)
+  mkdirSync(archiveDir, { recursive: true })
+  const now = options.now ?? Date.now()
+  let target = join(archiveDir, capabilityDocFileName(name))
+  if (existsSync(target)) target = join(archiveDir, capabilityDocFileName(name).replace(/\.md$/, '') + '-cap-' + shortHash(from + ':' + now, 4) + '.md')
+  try { renameSync(from, target) } catch { return undefined }
+  const record: ArchivedCapabilityDoc = {
+    root,
+    name,
+    from,
+    archivePath: target,
+    archivedAt: now,
+    reason: options.reason ?? '能力删除：知识面文件归档（可回滚，不硬删）',
+  }
+  const manifestFile = join(archiveDir, 'manifest.json')
+  const manifest = readArchiveManifest(manifestFile)
+  manifest.entries.push({
+    name,
+    archivePath: target,
+    version: 0,
+    description: '',
+    archivedAt: now,
+    reason: record.reason,
+    from,
+  })
+  try { writeFileAtomic(manifestFile, JSON.stringify({ version: 1, entries: manifest.entries.slice(-500) }, null, 2)) } catch { /* archive dir moved */ }
+  return record
+}
+
 /** Durable row key for one generated skill. */
 export function skillRowKey(workspaceKey: string, name: string): string {
   return 'ws/' + workspaceKey + '/skill/' + name
@@ -773,7 +879,7 @@ export function draftSkillFromCapability(
     '## 调用与命中统计',
     '',
     '- 能力执行次数：' + Math.max(1, useCount) + '。',
-    '- 模型加载次数：由插件在 skill 工具调用时累加。',
+    '- 模型加载次数：由 sm_cap_doc 成功加载时累加（转化率分母）。',
   ].join('\n')
   return {
     name: skillNameForCapability(name, options.sharedToken),
@@ -1736,6 +1842,8 @@ export function renderCapabilityProse(input: CapabilitySkillInput): string {
   lines.push('')
   lines.push('> 由 SuperMemory 固化为单一能力：本文件是知识面（何时用、怎么判断），执行面是 '
     + (input.runnable && input.entry ? '工具 `' + capabilitySkillNames(input.name).toolName + '`' : '未开放（仅知识）') + '。')
+  lines.push('>')
+  lines.push('> 本文件位于 `.dsh/capabilities/<name>.md`，不进入宿主 available_skills；模型在会话里按需调用 `sm_cap_doc` 读取。')
   lines.push('> 自动维护只刷新文末「事实」块；块外散文可以手工编辑，不会被自动覆盖。')
   lines.push('')
   lines.push('## 何时用（触发条件）')
@@ -1846,13 +1954,15 @@ export async function upsertCapabilitySkill(options: {
 }): Promise<SkillWriteResult & { bodyHash?: string; factsHash?: string; body?: string; factsBlock?: string }> {
   const now = options.now ?? Date.now()
   const bundle = buildCapabilitySkill(options.input)
-  const found = findSkillFile(options.root, bundle.name)
+  // R52: the knowledge face is `<capabilities root>/<logical>.md` — NOT a
+  // `<skills root>/sm-<name>/SKILL.md` directory the host would advertise.
+  const found = findCapabilityDoc(options.root, options.input.name)
   const factsBlock = bundle.factsBlock
   const nextProse = found ? splitFactsBlock(found.parsed.body).prose : String(options.draftBody ?? '').trim() || bundle.prose
   const bodyHash = bodyHashOf(nextProse)
   const nextBody = applyFactsBlock(nextProse, factsBlock)
   const description = clipDescription(options.input.description || bundle.description)
-  const path = join(options.root, bundle.name, 'SKILL.md')
+  const path = capabilityDocPath(options.root, options.input.name)
   const humanEdited = Boolean(found && options.previousBodyHash && bodyHashOf(found.parsed.body) !== options.previousBodyHash)
   if (found && found.parsed.body === nextBody && found.parsed.description === description) {
     return { status: 'unchanged', name: bundle.name, version: found.parsed.version, path, message: '内容与事实块均未变化，未升版。', bodyHash, factsHash: bundle.factsHash, body: nextBody, factsBlock }
@@ -1882,7 +1992,7 @@ export async function upsertCapabilitySkill(options: {
       factsHash: bundle.factsHash,
     }))
   } catch (error) {
-    return { status: 'error', name: bundle.name, version, path, message: '写入 SKILL.md 失败：' + String(error).slice(0, 160) }
+    return { status: 'error', name: bundle.name, version, path, message: '写入知识面文件失败：' + String(error).slice(0, 160) }
   }
   return {
     status: found ? (humanEdited ? 'preserved' : 'updated') : 'created',

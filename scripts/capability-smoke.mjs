@@ -24,7 +24,7 @@
  */
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
@@ -39,6 +39,7 @@ const capability = await import('../src/capability.ts')
 const { BUILTIN_CAPABILITIES } = await import('../src/builtin-capabilities.ts')
 const { CAPABILITY_ROUTING_RULES } = await import('../src/route.ts')
 const { workspaceKeyOf } = await import('../src/store.ts')
+const { charCount } = await import('../src/clip.ts')
 
 let passed = 0
 function ok(name) { passed += 1; console.log('ok - ' + name) }
@@ -108,8 +109,8 @@ const legacyCapSpec = {
   const knows = store.toolMemory.get('legacy-skill')
   assert.equal(JSON.parse(knows.entry).name, 'manual-one')
   assert.equal(capability.capabilitySkillName('manual-one'), 'sm-manual-one')
-  const skillFile = join(root, 'sm-git-sync-supermemory', 'SKILL.md')
-  assert.ok(existsSync(skillFile), 'knowledge face generated for the migrated capability')
+  const skillFile = join(ws, '.dsh', 'capabilities', 'git-sync-supermemory.md')
+  assert.ok(existsSync(skillFile), 'knowledge face generated under .dsh/capabilities')
   const text = readFileSync(skillFile, 'utf8')
   assert.ok(text.includes('<!-- sm:facts:start -->') && text.includes('<!-- sm:facts:end -->'), 'facts block present')
   assert.ok(text.includes('sm_cap_git_sync_supermemory') || text.includes('git 同步'), 'skill names the capability')
@@ -164,8 +165,8 @@ const legacyCapSpec = {
   const reg = await capability.registerCapability(ctx, store, {
     name: 'r50-facts', title: '事实块', description: '事实块测试', entry: 'echo facts', scope: ws,
   }, workspaceKey)
-  const skillFile = join(ws, '.dsh', 'skills', 'sm-r50-facts', 'SKILL.md')
-  assert.ok(existsSync(skillFile), 'SKILL.md written under the project skill root')
+  const skillFile = join(ws, '.dsh', 'capabilities', 'r50-facts.md')
+  assert.ok(existsSync(skillFile), 'knowledge file written under .dsh/capabilities')
   let text = readFileSync(skillFile, 'utf8')
   assert.ok(text.includes('## 何时用') && text.includes('## 决策清单') && text.includes('## 步骤纲要') && text.includes('## 关键坑') && text.includes('## 验证方式') && text.includes('## 反例'), 'six sections')
   assert.ok(text.includes('<!-- sm:facts:start -->'), 'facts block markers')
@@ -180,18 +181,19 @@ const legacyCapSpec = {
   assert.ok(rec.bodyHash, 'bodyHash stored')
   assert.ok(rec.factsHash, 'factsHash stored')
   assert.ok(text.includes('sm-body-hash:') && text.includes('sm-facts-hash:'), 'hashes also in frontmatter')
-  // Manual skill without markers: first auto touch appends facts only.
+  // R52: a manual DSH skill is NOT adopted as a capability and stays byte-identical.
   const manualDir = join(ws, '.dsh', 'skills', 'sm-r50-manual', 'SKILL.md')
   mkdirSync(join(ws, '.dsh', 'skills', 'sm-r50-manual'), { recursive: true })
   const manualBody = '---\nname: sm-r50-manual\ndescription: "手工"\n---\n\n# 手工正文\n\n不要改我。\n'
   writeFileSync(manualDir, manualBody, 'utf8')
   const manualStore = fakeStore()
   const migrated = await capability.migrateCapabilities(manualStore, { root: join(ws, '.dsh', 'skills') })
-  assert.ok(migrated.linkedSkills >= 1, 'a marker-less manual skill becomes a knowledge capability')
+  assert.equal(migrated.linkedSkills, 0, 'manual skills are not adopted as capabilities')
+  assert.equal(capability.capabilityRows(manualStore, workspaceKey).length, 0, 'no capability row for a third-party skill')
   const manualText = readFileSync(manualDir, 'utf8')
-  assert.ok(manualText.includes('不要改我。'), 'manual prose untouched')
-  assert.ok(manualText.includes('<!-- sm:facts:start -->'), 'facts block appended on first touch')
-  ok('R50-3 事实块：六节 + 事实块；自动刷新只改事实块；人工散文保留；无标记手工 skill 首触只追加事实块')
+  assert.equal(manualText, manualBody, 'manual skill file untouched')
+  assert.ok(!manualText.includes('<!-- sm:facts:start -->'), 'no facts block injected into a manual skill')
+  ok('R50-3 事实块：六节 + 事实块；自动刷新只改事实块；人工散文保留；人工/第三方 skill 不入编')
 }
 
 // ---- R50-4 统计 / 转化率 ----
@@ -274,14 +276,14 @@ const legacyCapSpec = {
   assert.equal(pending[0].record.runnable, false, 'auto proposal is never runnable')
 
   const { ctx, captured } = ctxOf()
-  const accepted = await capability.acceptProposal(ctx, store, pending[0].id, { root: join(ws, '.dsh', 'skills') })
+  const accepted = await capability.acceptProposal(ctx, store, pending[0].id, { root: join(ws, '.dsh', 'capabilities') })
   assert.equal(accepted.status, 'ok', accepted.message)
   const cap = capability.findCapabilityRow(store, { id: accepted.id })
   assert.equal(cap.record.kind, 'capability')
   assert.equal(cap.record.runnable, false, 'accepted draft stays non-runnable')
   assert.equal(cap.record.entryVerified, false)
   assert.equal(cap.record.entry, '', 'draft is not promoted to entry')
-  assert.ok(existsSync(join(ws, '.dsh', 'skills', 'sm-r50-proposal', 'SKILL.md')), 'acceptance generates the knowledge face')
+  assert.ok(existsSync(join(ws, '.dsh', 'capabilities', 'r50-proposal.md')), 'acceptance generates the knowledge file')
   assert.equal(captured.length, 0, 'acceptance never registers a tool')
   const enabled = await capability.enableCapabilityEntryDraft(ctx, store, cap.id)
   assert.equal(enabled.status, 'ok', enabled.message)
@@ -317,13 +319,12 @@ const legacyCapSpec = {
   assert.equal(oldRow.record.proposalStatus, 'declined')
   // per-root cap 8 at acceptance
   const capStore = fakeStore()
-  const rootSkills = join(root, 'cap-root', '.dsh', 'skills')
-  mkdirSync(rootSkills, { recursive: true })
+  const rootCaps = join(ws, '.dsh', 'capabilities')
+  mkdirSync(rootCaps, { recursive: true })
   for (let index = 0; index < 8; index += 1) {
     const built = capability.buildCapabilityRecord({ name: 'r50-auto-' + index, description: 'auto', entry: 'echo x' })
     built.record.source = 'auto'
-    built.record.skillPath = join(rootSkills, 'sm-r50-auto-' + index, 'SKILL.md')
-    mkdirSync(join(rootSkills, 'sm-r50-auto-' + index), { recursive: true })
+    built.record.skillPath = join(rootCaps, 'r50-auto-' + index + '.md')
     writeFileSync(built.record.skillPath, '---\nname: sm-r50-auto-' + index + '\ndescription: "x"\n---\n\n# x\n')
     await capability.saveCapabilityRecord(capStore, built.record, { workspaceKey })
   }
@@ -331,10 +332,10 @@ const legacyCapSpec = {
     workspaceKey, name: 'r50-ninth', title: '第九', description: 'ninth', body: '# x', source: 'auto',
   })
   const { ctx } = ctxOf()
-  const accepted = await capability.acceptProposal(ctx, capStore, ninth.id, { root: rootSkills })
+  const accepted = await capability.acceptProposal(ctx, capStore, ninth.id, { root: rootCaps })
   assert.equal(accepted.status, 'error', 'the 9th auto capability is refused')
   assert.match(accepted.message, /上限 8/)
-  ok('R50-7 上限：pending ≤20、每 skills 根自动生成 ≤8、30 天过期')
+  ok('R50-7 上限：pending ≤20、每知识面根自动生成 ≤8、30 天过期')
 }
 
 // ---- R50-8 删除归档 ----
@@ -344,14 +345,14 @@ const legacyCapSpec = {
   const reg = await capability.registerCapability(ctx, store, {
     name: 'r50-delete', description: '删除归档', entry: 'echo del', scope: ws,
   }, workspaceKey)
-  const skillFile = join(ws, '.dsh', 'skills', 'sm-r50-delete', 'SKILL.md')
+  const skillFile = join(ws, '.dsh', 'capabilities', 'r50-delete.md')
   assert.ok(existsSync(skillFile))
   const deleted = await capability.deleteCapability(ctx, store, reg.id)
   assert.equal(deleted.status, 'ok', deleted.message)
   assert.equal(store.toolMemory.get(reg.id), undefined, 'row removed')
-  assert.ok(deleted.archivePath && existsSync(deleted.archivePath), 'skill directory archived, not hard-deleted')
-  assert.ok(!existsSync(skillFile), 'original skill directory is gone (moved)')
-  ok('R50-8 删除：知识面归档到 <root>-archive，行删除，可回滚')
+  assert.ok(deleted.archivePath && existsSync(deleted.archivePath), 'knowledge file archived, not hard-deleted')
+  assert.ok(!existsSync(skillFile), 'original knowledge file is gone (moved)')
+  ok('R50-8 删除：知识面归档到 capabilities-archive，行删除，可回滚')
 }
 
 // ---- R50-9 描述与命名 ----
@@ -447,6 +448,119 @@ const legacyCapSpec = {
   const cleanup = await cleanupToolize({ store, dropPending: false })
   assert.equal(cleanup.retiredShellUnits, 0, 'already retired → cleanup is idempotent')
   ok('R51-2 迁移自身先归档；已收编但目录已移走的壳子被幂等退役')
+}
+
+// ---- R52 能力知识面搬离 skill 目录：路径、迁移、幂等、sm_cap_doc、第三方 skill ----
+{
+  const project = join(root, 'r52-repo')
+  mkdirSync(join(project, '.git'), { recursive: true })
+  const skillsRoot = join(project, '.dsh', 'skills')
+  mkdirSync(skillsRoot, { recursive: true })
+  const wsR52 = workspaceKeyOf(project)
+  const capRoot = join(project, '.dsh', 'capabilities')
+  const oldDir = join(skillsRoot, 'sm-r52-cap')
+  mkdirSync(oldDir, { recursive: true })
+  const oldFile = join(oldDir, 'SKILL.md')
+  const facts = '<!-- sm:facts:start -->\n## 事实（自动维护）\n\n- 入口：echo hi\n<!-- sm:facts:end -->'
+  const body = '# 迁移能力\n\n## 何时用\n\n- 做 R52 迁移测试时。\n\n## 关键坑\n\n- 旧目录必须移走。\n\n## 验证方式\n\n- 看新路径。\n\n' + facts
+  const oldText = '---\nname: sm-r52-cap\ndescription: "迁移测试"\ndisable-model-invocation: false\nsm-version: 3\nsm-updated-at: 1\nsm-source: "capability"\nsm-body-hash: "x"\nsm-facts-hash: "y"\n---\n\n' + body + '\n'
+  writeFileSync(oldFile, oldText, 'utf8')
+  const thirdDir = join(skillsRoot, 'third-party-skill')
+  mkdirSync(thirdDir, { recursive: true })
+  const thirdText = '---\nname: third-party-skill\ndescription: "第三方技能"\n---\n\n# 第三方\n\n不要动我。\n'
+  writeFileSync(join(thirdDir, 'SKILL.md'), thirdText, 'utf8')
+  const capRecord = {
+    schema: 'sm.capability/1', name: 'r52-cap', kind: 'capability', title: '迁移能力', description: '迁移测试',
+    tags: [], entry: 'echo hi', entryDraft: '', entryVerified: true, doc: '', scope: project, runnable: true,
+    enabled: true, dryRunArg: '', writeConfirm: false, routeNote: '', source: 'migrated', taskKey: '',
+    version: 3, updatedAt: 1, changelog: [], skillPath: oldFile, bodyHash: 'x', factsHash: 'y', facts: {},
+  }
+  const store = fakeStore({ toolMemory: [
+    ['tm-r52-cap', { kind: 'knowledge', status: 'active', workspaceKey: wsR52, title: '迁移能力', tags: [], description: '迁移测试', entry: JSON.stringify(capRecord), createdAt: 1 }],
+  ] })
+  const docs = await capability.migrateCapabilityDocs(store, { now: 1000 })
+  const newPath = join(capRoot, 'r52-cap.md')
+  assert.equal(docs.moved, 1, 'one capability knowledge file moved: ' + JSON.stringify(docs))
+  assert.ok(existsSync(newPath), 'new .dsh/capabilities/<name>.md exists')
+  assert.ok(!newPath.includes('/.dsh/skills/'), 'new path is outside every skill root')
+  assert.ok(capRoot.endsWith(join('.dsh', 'capabilities')), 'capability root is .dsh/capabilities')
+  assert.ok(!existsSync(oldDir), 'old sm-<name> skill directory is gone')
+  assert.equal(readFileSync(join(thirdDir, 'SKILL.md'), 'utf8'), thirdText, 'third-party skill untouched')
+  assert.equal(readdirSync(skillsRoot).filter((name) => name.startsWith('sm-')).length, 0, 'no sm-* directory remains under .dsh/skills')
+  const migratedRow = capability.readCapabilityRow(store.toolMemory.get('tm-r52-cap'), 'tm-r52-cap')
+  assert.equal(migratedRow.record.skillPath, newPath, 'row skillPath points at the new file')
+  const manifestFile = join(skillsRoot + '-archive', 'manifest.json')
+  assert.ok(existsSync(manifestFile), 'archive manifest records the move')
+  const manifest = JSON.parse(readFileSync(manifestFile, 'utf8'))
+  assert.ok(manifest.entries.some((entry) => entry.name === 'sm-r52-cap' && entry.from === oldDir), 'manifest has name/from/reason')
+  assert.ok(manifest.entries.some((entry) => entry.reason.includes('R52')), 'manifest reason mentions R52')
+  const again = await capability.migrateCapabilityDocs(store, { now: 2000 })
+  assert.equal(again.moved, 0, 'second migration is idempotent')
+  assert.equal(again.archivedDirs, 0, 'second migration archives nothing')
+
+  const loaded = await capability.loadCapabilityDoc(store, wsR52, 'r52-cap')
+  assert.equal(loaded.status, 'ok', loaded.message)
+  assert.ok(loaded.body.includes('## 关键坑'), 'sm_cap_doc returns the full body')
+  assert.ok(loaded.factsBlock.includes('sm:facts:start'), 'sm_cap_doc returns the facts block')
+  assert.equal(loaded.loadCount, 1, 'successful load increments loadCount')
+  const section = await capability.loadCapabilityDoc(store, wsR52, 'sm_cap_r52_cap', '关键坑')
+  assert.equal(section.status, 'ok', section.message)
+  assert.ok(section.body.startsWith('## 关键坑'), 'section load returns only that section')
+  assert.equal(section.loadCount, 2, 'section load also increments loadCount')
+  const edited = await capability.updateCapabilitySkillBody(store, 'tm-r52-cap', '## 何时用\n\n人工新正文。')
+  assert.equal(edited.status, 'ok', edited.message)
+  const editedText = readFileSync(newPath, 'utf8')
+  assert.ok(editedText.includes('人工新正文。'), 'panel body edit saves the prose')
+  assert.ok(editedText.includes('<!-- sm:facts:start -->') && editedText.includes('<!-- sm:facts:end -->'), 'panel body edit preserves the facts block')
+  const current = capability.readCapabilityRow(store.toolMemory.get('tm-r52-cap'), 'tm-r52-cap')
+  await capability.saveCapabilityRecord(store, { ...current.record, enabled: false }, { id: 'tm-r52-cap', workspaceKey: wsR52, createdAt: 1 })
+  const disabled = await capability.loadCapabilityDoc(store, wsR52, 'r52-cap')
+  assert.equal(disabled.status, 'error', 'disabled capability is not readable')
+  assert.match(disabled.message, /停用/)
+  const missing = await capability.loadCapabilityDoc(store, wsR52, 'no-such-cap')
+  assert.equal(missing.status, 'error', 'missing capability is an explicit error')
+  assert.match(missing.message, /不存在/)
+  ok('R52-1 迁移/路径/幂等：能力知识面移到 .dsh/capabilities；旧目录归档；第三方 skill 不动；sm_cap_doc 正例/停用/不存在/loadCount；正文编辑保留事实块')
+}
+
+// ---- R52-2 索引卡：最多 8 条、徽标、R47 预算与省略标记 ----
+{
+  const rows = Array.from({ length: 10 }, (_, index) => ({
+    name: 'cap-' + index,
+    title: '能力' + index,
+    description: '当任务需要处理第 ' + index + ' 类事务时加载（含步骤、坑与验证方式）',
+    entry: index % 3 === 0 ? 'echo x' : '',
+    runnable: index % 3 === 0,
+    ...(index === 0 ? { entryDraft: 'echo draft', entryVerified: false } : {}),
+    enabled: true,
+    kind: index % 2 === 0 ? 'capability' : 'knowledge',
+    status: 'active',
+  }))
+  const card = capability.renderCapabilityIndex(rows, { maxItems: 8, budget: 1600 })
+  assert.equal(card.included, 8, 'at most 8 capability rows are indexed')
+  assert.equal(card.omitted, 2, 'the rest are omitted with a count')
+  assert.ok(card.text.includes('sm_cap_doc'), 'the card points at sm_cap_doc')
+  assert.ok(card.text.includes('省略 2 条'), 'explicit omission marker')
+  assert.ok(charCount(card.text) <= 1600, 'card honors the character budget')
+  assert.ok(card.text.includes('入口待验证') && card.text.includes('仅知识') && card.text.includes('可执行'), 'three badges are rendered')
+  const tight = capability.renderCapabilityIndex(rows, { maxItems: 8, budget: 260 })
+  assert.ok(charCount(tight.text) <= 260, 'tight budget still bounded')
+  assert.ok(tight.text.includes('省略'), 'tight budget still says what was left out')
+  ok('R52-2 索引卡：最多 8 条；可执行/仅知识/入口待验证徽标；R47 预算与省略标记')
+}
+
+// ---- R52-3 接线：注入只给 hub/branch；工具声明为 sm_cap_doc；面板有正文编辑器 ----
+{
+  const { readFileSync: read } = await import('node:fs')
+  const prestepSrc = read(new URL('../src/prestep.ts', import.meta.url), 'utf8')
+  const toolsSrc = read(new URL('../src/tools.ts', import.meta.url), 'utf8')
+  const panelSrc = read(new URL('../src/client/panel-page.tsx', import.meta.url), 'utf8')
+  assert.ok(prestepSrc.includes("role.role === 'hub' || role.role === 'branch'"), 'capability index is gated to hub/branch roles')
+  assert.ok(prestepSrc.includes('renderCapabilityIndex') && prestepSrc.includes('capabilityIndex'), 'prestep wires the capability index')
+  assert.match(toolsSrc, /name: 'sm_cap_doc'/, 'sm_cap_doc is a registered tool')
+  assert.ok(toolsSrc.includes('loadCapabilityDoc'), 'sm_cap_doc executes the capability loader')
+  assert.ok(panelSrc.includes("tool.body.save") && panelSrc.includes('{ body: editingTool.body }'), 'panel has a body editor using editTool(id,{body})')
+  ok('R52-3 接线：能力索引仅 hub/branch；sm_cap_doc 已注册；面板正文编辑器走 editTool(id,{body})')
 }
 
 rmSync(root, { recursive: true, force: true })

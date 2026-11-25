@@ -14,7 +14,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 - 模型用 `memory_remember` 写结论、`memory_recall` 跨会话检索（回答"之前说过什么/做过什么"前先检索）；
 - 中枢用 `memory_dispatch` 把任务异步派发到分支会话，完成后结果经 relay 自动回送；
 - 分支不直接问用户——`memory_raise_question` 上交中枢，由中枢 `memory_questions` 汇总后一次提问；
-- 重复出现的**任务**只产生待接受的知识提案；接受后才创建「单一能力」——知识面 `SKILL.md`（何时用/决策/坑/验证）+ 执行面 `sm_cap_<name>`（固定入口，默认预演、写操作 `confirm=true`），R50 起组合工具机制已删除；
+- 重复出现的**任务**只产生待接受的知识提案；接受后才创建「单一能力」——知识面 `<仓库>/.dsh/capabilities/<name>.md`（何时用/决策/坑/验证）+ 执行面 `sm_cap_<name>`（固定入口，默认预演、写操作 `confirm=true`），R52 起知识面不进入宿主 `available_skills`，中枢/分支会话只注入精简索引，正文用 `sm_cap_doc` 按需读取；
 - 记忆带版本（同 key 就地更新升版、旧版本归档），结论的演变过程可溯源。
 
 ## 2. 功能特性
@@ -27,13 +27,13 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 | 话题集 | 中枢/分支会话的分组：标题/梗概/标签/分支成员/默认模型；recall 命中记忆时一并给出相关话题集，便于把结论关联回会话上下文 |
 | 中枢/分支协同 | `memory_dispatch` 异步派发（单发/并行组）；分支问题上交 + 中枢统一提问；`memory_resume` 续跑中断任务；relay 按派发记录的 `hubSessionId` 回送；分支会话标题/标签（任务首行 + 话题集标签 + 轮次令牌） |
 | 过程内再召回 | pre-step 注入卡片：同一请求内可注入多张（去重 + 条数/字符预算），避免模型"失忆" |
-| 统一能力 | 一条记录、两个面：知识面 `SKILL.md`（正文事实源，自动维护只刷新 `<!-- sm:facts:start/end -->` 事实块）+ 执行面 `sm_cap_<name>`（固定入口，默认预演，`writeConfirm` 必须 `confirm=true`）；自动路径只产待接受知识提案（同任务≥3 次、≥2 会话、30 天；每根自动上限 8，接受才占额；pending 上限 20、30 天过期）；高置信入口只进 `entryDraft`（未验证，人工「启用执行」才 runnable）；`memory_toolize` 注册/接受/启停/刷新/清理；内置 `git-sync` 能力；统计分执行 `runCount`、加载 `loadCount`、转化率、成功率、连续失败；历史工具序列壳子（含被 R50 改写过知识面的）一律先归档/退役，不进入能力目录（R51） |
+| 统一能力 | 一条记录、两个面：知识面 `.dsh/capabilities/<name>.md`（正文事实源，自动维护只刷新 `<!-- sm:facts:start/end -->` 事实块；不在任何宿主 skill 根，不进 `available_skills`）+ 执行面 `sm_cap_<name>`（固定入口，默认预演，`writeConfirm` 必须 `confirm=true`）；R52 起中枢/分支会话注入 ≤8 条「可用能力」索引卡，正文用 `sm_cap_doc` 加载（`loadCount` 计转化率），固化能力面板是唯一管理面；自动路径只产待接受知识提案（同任务≥3 次、≥2 会话、30 天；每根自动上限 8，接受才占额；pending 上限 20、30 天过期）；高置信入口只进 `entryDraft`（未验证，人工「启用执行」才 runnable）；`memory_toolize` 注册/接受/启停/刷新/清理；内置 `git-sync` 能力；统计分执行 `runCount`、加载 `loadCount`、转化率、成功率、连续失败；历史工具序列壳子（含被 R50 改写过知识面的）一律先归档/退役，不进入能力目录（R51） |
 | 可视化管理 | DSH 内面板（话题集/记忆两级页/固化能力/中枢会话/派发卡）+ 独立 Web 管理台（`/memory ui`，带令牌链接） |
 | 维护循环 | 自动抽取事实与需求、任务提案与能力事实块刷新、记忆整理（正文哈希 + 标记守卫、默认 dry-run）、标题补正 |
 
-### 2.1 模型可见工具（`src/tools.ts`，共 14 个）
+### 2.1 模型可见工具（`src/tools.ts`，共 15 个）
 
-`memory_remember`（写入，同 key 升版）· `memory_recall`（两级检索，输出版本号）· `memory_history`（版本溯源）· `memory_topicsets` / `memory_new_topicset` / `memory_set_model`（话题集）· `memory_dispatch` / `memory_resume`（派发与续跑）· `memory_raise_question` / `memory_questions`（分支问题上交与中枢汇总）· `memory_scan`（文件地图）· `memory_export`（导出 Markdown）· `memory_ui`（管理台链接）· `memory_toolize`（能力维护）。
+`memory_remember`（写入，同 key 升版）· `memory_recall`（两级检索，输出版本号）· `memory_history`（版本溯源）· `memory_topicsets` / `memory_new_topicset` / `memory_set_model`（话题集）· `memory_dispatch` / `memory_resume`（派发与续跑）· `memory_raise_question` / `memory_questions`（分支问题上交与中枢汇总）· `memory_scan`（文件地图）· `memory_export`（导出 Markdown）· `memory_ui`（管理台链接）· `memory_toolize`（能力维护）· `sm_cap_doc`（按需读取能力知识面正文）。
 
 ### 2.2 `/memory` 命令族（`src/commands.ts`）
 
@@ -49,7 +49,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 │   │                           #   memory_versions/episodes/requirements/filemap/tool_memory/signals/
 │   │                           #   dispatches/questions/outbox/routing/hotcache/meta
 │   ├── store.ts                # 存储域打开 + 类型化表访问器 + 工作区键解析（D4）
-│   ├── tools.ts                # 14 个 memory_* 工具定义与实现
+│   ├── tools.ts                # 15 个工具定义与实现（含 sm_cap_doc）
 │   ├── commands.ts             # /memory 命令族（16 个子命令）
 │   ├── panel.ts                # 宿主面板远程服务（typert 描述符 + 全部面板方法）
 │   ├── webui.ts                # 独立 Web 管理台（HTTP 载体 + JSON API + 静态资源）

@@ -26,7 +26,7 @@
  * @module supermemory/capability
  */
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -36,11 +36,13 @@ import type { TaskSample } from './task-signature.ts'
 import type { ToolMemory } from './schema.ts'
 import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
+import { charCount, clipAtBoundary } from './clip.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import {
-  archiveCapabilitySkill, archiveShellSkills, bodyHashOf, buildCapabilitySkill, capabilitySkillNames,
-  findSkillFile, isShellIdentity, parseSkillMarkdown, readSkillFiles, resolveSkillRoot,
-  splitFactsBlock, upsertCapabilitySkill, type CapabilityFacts,
+  archiveCapabilityDoc, archiveCapabilitySkill, archiveShellSkills, bodyHashOf, buildCapabilitySkill,
+  capabilityDocPath, capabilitySkillNames, isShellIdentity, parseSkillMarkdown,
+  resolveCapabilityRoot, resolveSkillRoot, splitFactsBlock, upsertCapabilitySkill,
+  type CapabilityFacts,
 } from './skill-forge.ts'
 
 export type { CapabilityFacts } from './skill-forge.ts'
@@ -440,6 +442,12 @@ export interface CapabilityMigrationReport {
   retiredShellUnits: number
   /** R51: knowledge rows that merely mirrored an executable capability. */
   dedupedKnowledge: number
+  /** R52: knowledge faces moved from a skill root into .dsh/capabilities. */
+  movedDocs: number
+  /** R52: old skill directories archived after their knowledge file moved. */
+  archivedDocDirs: number
+  /** R52: manual/third-party skill files deliberately left in the skill root. */
+  skippedManualDocs: number
   changed: boolean
 }
 
@@ -486,16 +494,112 @@ function normalizePathKey(path: string): string {
 }
 
 /**
- * R51: workspace key of one skill root. `<project>/.dsh/skills` belongs to the
- * project; the shared `<DSH_HOME>/skills` root belongs to no workspace. The old
- * two-dirname-of-the-FILE derivation attributed files to `.dsh/skills` itself.
+ * R52: move capability knowledge faces OUT of every host skill root.
+ *
+ * Only capability-owned files move. A manual/third-party skill (frontmatter
+ * source not `capability`) and a legacy tool-order shell are left alone; the
+ * shell is archived by R51's pass, not here. Moving is copy-then-archive, so a
+ * failed archive leaves the old path in the row and the next boot retries.
  */
-function workspaceKeyForSkillRoot(root: string): string {
-  const resolved = resolve(root)
-  const homeSkills = resolve(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'skills')
-  if (resolved.toLowerCase() === homeSkills.toLowerCase()) return 'unknown'
-  if (basename(dirname(resolved)) === '.dsh') return workspaceKeyOf(dirname(dirname(resolved)))
-  return 'unknown'
+export interface CapabilityDocMigrationReport {
+  moved: number
+  archivedDirs: number
+  skippedManual: number
+  skippedShells: number
+  changed: boolean
+  entries: Array<{ name: string; from: string; to: string; archivePath?: string }>
+}
+
+function skillRootOf(file: string): string | undefined {
+  try {
+    const normalized = resolve(file).replace(/\\/g, '/')
+    const lower = normalized.toLowerCase()
+    const marker = '/.dsh/skills/'
+    const index = lower.lastIndexOf(marker)
+    if (index >= 0) return resolve(normalized.slice(0, index + marker.length - 1))
+    const homeSkills = resolve(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'skills').replace(/\\/g, '/')
+    if (lower.startsWith(homeSkills.toLowerCase() + '/')) return resolve(homeSkills)
+  } catch { /* a broken path is not a skill root */ }
+  return undefined
+}
+
+export async function migrateCapabilityDocs(store: Store, options: {
+  capabilityRoot?: string
+  now?: number
+  logger?: { info: (msg: string) => void }
+} = {}): Promise<CapabilityDocMigrationReport> {
+  const now = options.now ?? Date.now()
+  const report: CapabilityDocMigrationReport = {
+    moved: 0, archivedDirs: 0, skippedManual: 0, skippedShells: 0, changed: false, entries: [],
+  }
+  for (const entry of capabilityRows(store)) {
+    const record = entry.record
+    if (record.kind === 'proposal' || entry.row.status === 'retired') continue
+    const oldPath = String(record.skillPath ?? '').trim()
+    if (!oldPath) continue
+    const oldRoot = skillRootOf(oldPath)
+    if (!oldRoot) continue
+    const owned = entry.row.workspaceKey ?? (record.scope ? workspaceKeyOf(record.scope) : undefined)
+    if (!owned || owned === 'unknown' || !isAbsolute(owned) || !existsSync(owned)) continue
+    const newRoot = options.capabilityRoot ?? resolveCapabilityRoot(owned).root
+    const newPath = capabilityDocPath(newRoot, record.name)
+    const oldExists = existsSync(oldPath)
+    const newExists = existsSync(newPath)
+    if (oldExists) {
+      let parsed: ReturnType<typeof parseSkillMarkdown>
+      try { parsed = parseSkillMarkdown(readFileSync(oldPath, 'utf8'), capabilitySkillName(record.name)) } catch { parsed = undefined }
+      if (!parsed) continue
+      if (parsed.source === 'sequence' || isShellIdentity({ name: parsed.name, description: parsed.description, source: parsed.source, body: parsed.body })) {
+        report.skippedShells += 1
+        continue
+      }
+      // A human/third-party skill is not capability property. `memory_toolize`
+      // manual capabilities write sm-source: capability, so they still migrate.
+      // Only files stamped `sm-source: capability` belong to the capability
+      // knowledge plane. Manual/third-party/task skills stay in the DSH catalog
+      // even when R50 adopted a row for them.
+      if (parsed.source !== 'capability') {
+        report.skippedManual += 1
+        continue
+      }
+      if (!newExists) {
+        try {
+          mkdirSync(newRoot, { recursive: true })
+          copyFileSync(oldPath, newPath)
+        } catch (error) {
+          options.logger?.info('supermemory: capability doc copy failed ' + oldPath + ': ' + String(error).slice(0, 120))
+          continue
+        }
+      }
+      const oldSkillRoot = dirname(dirname(oldPath))
+      const oldSkillName = basename(dirname(oldPath))
+      let archivePath: string | undefined
+      try {
+        const archived = await archiveCapabilitySkill(oldSkillRoot, oldSkillName, {
+          now,
+          reason: 'R52 能力知识面迁移：从宿主 skill 目录移出到 .dsh/capabilities（可回滚）',
+        })
+        archivePath = archived?.archivePath
+        if (archived) report.archivedDirs += 1
+      } catch { /* archive failure keeps the old row path for the next pass */ }
+      if (!archivePath) continue
+      const next: CapabilityRecord = { ...record, skillPath: newPath }
+      await saveCapabilityRecord(store, next, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
+      report.moved += 1
+      report.changed = true
+      report.entries.push({ name: record.name, from: oldPath, to: newPath, archivePath })
+      options.logger?.info('supermemory: capability doc moved ' + record.name + ' -> ' + newPath)
+      continue
+    }
+    if (newExists) {
+      const next: CapabilityRecord = { ...record, skillPath: newPath }
+      await saveCapabilityRecord(store, next, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
+      report.moved += 1
+      report.changed = true
+      report.entries.push({ name: record.name, from: oldPath, to: newPath })
+    }
+  }
+  return report
 }
 
 /**
@@ -510,7 +614,10 @@ function workspaceKeyForSkillRoot(root: string): string {
  * files without a row become knowledge capabilities — unless they are shells.
  */
 export async function migrateCapabilities(store: Store, options: {
+  /** Legacy skill root override (shell archiving only). */
   root?: string
+  /** R52: capability knowledge root override (defaults to resolveCapabilityRoot). */
+  capabilityRoot?: string
   now?: number
   logger?: { info: (msg: string) => void }
 } = {}): Promise<CapabilityMigrationReport> {
@@ -518,7 +625,8 @@ export async function migrateCapabilities(store: Store, options: {
   const report: CapabilityMigrationReport = {
     migratedCapabilities: 0, migratedKnowledge: 0, retiredComposites: 0,
     linkedSkills: 0, generatedSkills: 0, expiredProposals: 0,
-    archivedShells: 0, retiredShellUnits: 0, dedupedKnowledge: 0, changed: false,
+    archivedShells: 0, retiredShellUnits: 0, dedupedKnowledge: 0,
+    movedDocs: 0, archivedDocDirs: 0, skippedManualDocs: 0, changed: false,
   }
   // R51: archive shell skill directories before migrating rows. archiveShellSkills
   // also retires their mirror rows (kind skill/knowledge) when a store is given.
@@ -619,40 +727,17 @@ export async function migrateCapabilities(store: Store, options: {
       continue
     }
   }
-  // Link SKILL.md files that have no row (manual skills written before R50 or
-  // by hand) as knowledge capabilities. Never overwrites the file and never
-  // adopts a shell (R51).
-  for (const root of roots) {
-    for (const file of readSkillFiles(root)) {
-      if (isShellIdentity({ name: file.name, description: file.parsed.description, source: file.parsed.source, body: file.parsed.body })) continue
-      const known = [...store.toolMemory.entries()].some(([, row]) => {
-        const path = row.skillPath ?? (row.entry && !row.entry.startsWith('{') ? row.entry : '')
-        return Boolean(path) && resolve(path).toLowerCase() === resolve(file.path).toLowerCase()
-      })
-      if (known) continue
-      const workspaceKey = workspaceKeyForSkillRoot(root)
-      const record = normalizeCapabilityRecord({
-        schema: CAPABILITY_SCHEMA,
-        name: file.name,
-        kind: 'knowledge',
-        title: file.parsed.name,
-        description: file.parsed.description,
-        entry: '',
-        runnable: false,
-        source: file.parsed.source === 'manual' ? 'manual' : 'migrated',
-        taskKey: file.parsed.taskKey,
-        version: file.parsed.version,
-        changelog: file.parsed.changelog,
-        bodyHash: bodyHashOf(file.parsed.body),
-        factsHash: file.parsed.factsHash,
-        skillPath: file.path,
-        facts: { files: [file.path] },
-      })
-      const id = await saveCapabilityRecord(store, record, { workspaceKey })
-      seen.set(workspaceKey + '|' + record.name, id)
-      report.linkedSkills += 1
-      report.changed = true
-    }
+  // R52: capability knowledge leaves every host skill root. Manual and
+  // third-party skills keep living in the DSH skill catalog — this pass only
+  // moves files owned by a capability row (frontmatter sm-source: capability).
+  try {
+    const docs = await migrateCapabilityDocs(store, { now, ...(options.capabilityRoot ? { capabilityRoot: options.capabilityRoot } : {}), ...(options.logger ? { logger: options.logger } : {}) })
+    report.movedDocs = docs.moved
+    report.archivedDocDirs = docs.archivedDirs
+    report.skippedManualDocs = docs.skippedManual
+    if (docs.changed) report.changed = true
+  } catch (error) {
+    options.logger?.info('supermemory: capability doc migration failed: ' + String(error).slice(0, 160))
   }
   // R51: one record, two faces. A knowledge row that mirrors the exact SKILL.md
   // of an executable capability is a duplicate left by R50's row + file walks;
@@ -683,10 +768,10 @@ export async function migrateCapabilities(store: Store, options: {
       report.changed = true
       continue
     }
-    let root = options.root
+    let root = options.capabilityRoot
     const owned = entry.row.workspaceKey
     if (!root && owned && owned !== 'unknown' && isAbsolute(owned) && existsSync(owned)) {
-      try { root = resolveSkillRoot(owned).root } catch { root = undefined }
+      try { root = resolveCapabilityRoot(owned).root } catch { root = undefined }
     }
     if (!root) continue
     try {
@@ -939,6 +1024,188 @@ export function runCapability(record: CapabilityRecord, options: { dryRun?: bool
   }
 }
 
+/** R52: how many capabilities the pre-step index card may carry. */
+export const CAPABILITY_INDEX_MAX = 8
+
+/** R52: default character budget for the capability index card. */
+export const CAPABILITY_INDEX_BUDGET = 1600
+
+export interface CapabilityIndexInput {
+  name: string
+  title: string
+  description: string
+  whenToUse?: string
+  entry?: string
+  runnable?: boolean
+  entryDraft?: string
+  entryVerified?: boolean
+  enabled?: boolean
+  kind?: string
+  status?: string
+}
+
+/** 徽标：可执行 / 仅知识 / 入口待验证。 */
+export function capabilityIndexBadge(row: CapabilityIndexInput): string {
+  if (row.entryDraft && !row.entryVerified) return '入口待验证'
+  if (row.entry && row.runnable !== false) return '可执行'
+  return '仅知识'
+}
+
+/**
+ * R52: the compact capability index injected into hub/branch sessions. The body
+ * is NOT here — the model calls `sm_cap_doc` for it. Budget-aware (R47): rows
+ * degrade with an explicit omission note instead of being hard-sliced.
+ */
+export function renderCapabilityIndex(rows: CapabilityIndexInput[], options: {
+  maxItems?: number
+  budget?: number
+} = {}): { text: string; included: number; omitted: number; truncated: boolean } {
+  const maxItems = Math.max(1, Math.min(options.maxItems ?? CAPABILITY_INDEX_MAX, CAPABILITY_INDEX_MAX))
+  const budget = Math.max(160, options.budget ?? CAPABILITY_INDEX_BUDGET)
+  const eligible = rows
+    .filter((row) => row.enabled !== false && row.status !== 'retired' && row.kind !== 'proposal')
+    .sort((left, right) => left.name.localeCompare(right.name))
+  if (eligible.length === 0) return { text: '', included: 0, omitted: 0, truncated: false }
+  const header = '[SuperMemory 可用能力]（仅中枢/分支会话注入；正文按需读取）'
+  const footer = '正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；第三方 skill 仍走宿主 skill 目录。'
+  const lines = eligible.map((row) => {
+    const hint = String(row.whenToUse || row.description || '').replace(/\s+/g, ' ').trim()
+    const clipped = clipAtBoundary(hint, 80) || hint.slice(0, 80)
+    return '- ' + row.name + ' [' + capabilityIndexBadge(row) + ']：' + clipped
+  })
+  let kept = lines.slice(0, maxItems)
+  let omitted = lines.length - kept.length
+  const build = (): string => [
+    header,
+    ...kept,
+    ...(omitted > 0 ? ['… 省略 ' + omitted + ' 条（sm_cap_doc 可逐个读取）'] : []),
+    footer,
+  ].join('\n')
+  while (kept.length > 0 && charCount(build()) > budget) {
+    kept = kept.slice(0, -1)
+    omitted += 1
+  }
+  const text = build()
+  if (kept.length === 0 && charCount(text) > budget) {
+    return { text: clipAtBoundary(header + '…（预算不足，正文用 sm_cap_doc 读取）', budget), included: 0, omitted: lines.length, truncated: true }
+  }
+  return { text, included: kept.length, omitted, truncated: omitted > 0 }
+}
+
+/** Derive the "when to use" sentence for one capability. */
+export function capabilityWhenToUse(record: Pick<CapabilityRecord, 'title' | 'description' | 'scope'>): string {
+  if (record.scope) return '在 ' + record.scope + ' 内遇到「' + record.title + '」类任务时加载。'
+  return record.description
+}
+
+/** Extract one `## <section>` block from a capability body. */
+export function extractCapabilitySection(body: string, section: string): { text: string; headings: string[] } | undefined {
+  const wanted = String(section ?? '').trim().replace(/^#+\s*/, '').toLowerCase()
+  if (!wanted) return undefined
+  const lines = String(body ?? '').split(/\r?\n/)
+  const headings: string[] = []
+  let start = -1
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^##\s+(.+?)\s*$/.exec(lines[index] ?? '')
+    if (!match) continue
+    headings.push(match[1])
+    if (start < 0 && match[1].toLowerCase() === wanted) start = index
+  }
+  if (start < 0) return { text: '', headings }
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^##\s+/.test(lines[index] ?? '')) { end = index; break }
+  }
+  return { text: lines.slice(start, end).join('\n').trim(), headings }
+}
+
+export interface CapabilityDocLoad {
+  status: 'ok' | 'error'
+  message: string
+  name?: string
+  title?: string
+  body?: string
+  factsBlock?: string
+  entry?: string
+  scope?: string
+  dryRunArg?: string
+  writeConfirm?: boolean
+  whenToUse?: string
+  headings?: string[]
+  loadCount?: number
+}
+
+/**
+ * R52: load one capability knowledge body on demand (the `sm_cap_doc` tool's
+ * single source of truth). Only enabled, non-retired units whose file exists are
+ * readable; a successful load increments loadCount (conversion-rate denominator).
+ */
+export async function loadCapabilityDoc(store: Store, workspaceKey: string | undefined, rawName: string, section?: string): Promise<CapabilityDocLoad> {
+  const raw = String(rawName ?? '').trim()
+  if (!raw) return { status: 'error', message: '缺少能力名。' }
+  const logical = capabilityLogicalName(raw)
+  const rows = capabilityRows(store, workspaceKey)
+  const entry = rows.find((row) => row.record.name === logical)
+    ?? rows.find((row) => capabilityToolName(row.record.name) === raw)
+    ?? rows.find((row) => capabilitySkillName(row.record.name) === raw)
+  if (!entry) return { status: 'error', message: '能力不存在：' + raw + '（可在「固化能力」面板查看可用能力）。' }
+  const record = entry.record
+  if (record.kind === 'proposal') return { status: 'error', message: '能力「' + record.name + '」还是待接受提案，尚未生成知识面。' }
+  if (record.enabled === false || entry.row.status === 'retired') return { status: 'error', message: '能力「' + record.name + '」已停用：不加载知识面。' }
+  if (record.kind === 'capability' && record.runnable === false) return { status: 'error', message: '能力「' + record.name + '」的执行面尚未启用（入口待验证）：先人工启用执行。' }
+  const path = String(record.skillPath ?? '').trim()
+  if (!path || !existsSync(path)) return { status: 'error', message: '能力「' + record.name + '」的知识面文件缺失：' + (path || '（未生成）') + '；在面板保存正文可重建。' }
+  let parsed: ReturnType<typeof parseSkillMarkdown>
+  try { parsed = parseSkillMarkdown(readFileSync(path, 'utf8'), capabilitySkillName(record.name)) } catch { parsed = undefined }
+  if (!parsed) return { status: 'error', message: '能力「' + record.name + '」的知识面文件解析失败：' + path }
+  const fullBody = parsed.body
+  let body = fullBody
+  let headings: string[] | undefined
+  if (section !== undefined && String(section).trim() !== '') {
+    const found = extractCapabilitySection(fullBody, section)
+    if (!found) {
+      headings = extractCapabilitySection(fullBody, '__none__')?.headings ?? []
+      return { status: 'error', message: '知识面没有小节「' + String(section).trim() + '」；可用小节：' + (headings.join('、') || '（无二级标题）'), headings }
+    }
+    if (!found.text) {
+      headings = found.headings
+      return { status: 'error', message: '知识面没有小节「' + String(section).trim() + '」；可用小节：' + (found.headings.join('、') || '（无二级标题）'), headings: found.headings }
+    }
+    body = found.text
+    headings = found.headings
+  }
+  const next: CapabilityRecord = { ...record, loadCount: record.loadCount + 1 }
+  try {
+    await saveCapabilityRecord(store, next, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
+  } catch { /* the readable body is more important than one counter */ }
+  return {
+    status: 'ok',
+    message: '已加载能力「' + record.name + '」的知识面（sm_cap_doc）。',
+    name: record.name,
+    title: record.title,
+    body,
+    factsBlock: splitFactsBlock(fullBody).facts,
+    entry: record.entry,
+    scope: record.scope,
+    dryRunArg: record.dryRunArg,
+    writeConfirm: Boolean(record.writeConfirm),
+    whenToUse: capabilityWhenToUse(record),
+    ...(headings ? { headings } : {}),
+    loadCount: next.loadCount,
+  }
+}
+
+/** R52: current knowledge-face body (frontmatter stripped) for the panel editor. */
+export function capabilityBodyOf(record: Pick<CapabilityRecord, 'name' | 'skillPath'>): string {
+  const path = String(record.skillPath ?? '').trim()
+  if (!path || !existsSync(path)) return ''
+  try {
+    return parseSkillMarkdown(readFileSync(path, 'utf8'), capabilitySkillName(record.name))?.body ?? ''
+  } catch {
+    return ''
+  }
+}
+
 /** Model-visible description of one capability (routing note + semantics + rules). */
 export function capabilityToolDescription(record: CapabilityRecord): string {
   const semantics = '（能力：在适用范围 ' + (record.scope || '当前目录') + ' 内执行入口命令 ' + record.entry + ' 的固定入口；'
@@ -1094,7 +1361,7 @@ export function defaultCapabilityDeps(): CapabilityDeps {
 async function ensureSkillFor(store: Store, entry: CapabilityRow, workspaceKey: string | undefined, options: { draftBody?: string; changelog?: string } = {}): Promise<CapabilityRow> {
   if (!workspaceKey || workspaceKey === 'unknown' || !isAbsolute(workspaceKey) || !existsSync(workspaceKey)) return entry
   let root: string
-  try { root = resolveSkillRoot(workspaceKey).root } catch { return entry }
+  try { root = resolveCapabilityRoot(workspaceKey).root } catch { return entry }
   try { await syncCapabilitySkill(store, entry, root, options) } catch { /* knowledge face is best-effort */ }
   return readCapabilityRow(store.toolMemory.get(entry.id), entry.id) ?? entry
 }
@@ -1285,12 +1552,12 @@ export async function editCapability(
 export async function updateCapabilitySkillBody(store: Store, id: string, body: string): Promise<{ status: 'ok' | 'error'; message: string }> {
   const entry = readCapabilityRow(store.toolMemory.get(id), id)
   if (!entry) return { status: 'error', message: '能力不存在。' }
-  if (!entry.record.skillPath) return { status: 'error', message: '该能力还没有 SKILL.md。' }
+  if (!entry.record.skillPath) return { status: 'error', message: '该能力还没有知识面文件。' }
   try {
     const { writeFileSync } = await import('node:fs')
     const text = readFileSync(entry.record.skillPath, 'utf8')
     const parsed = parseSkillMarkdown(text, capabilitySkillName(entry.record.name))
-    if (!parsed) return { status: 'error', message: 'SKILL.md 解析失败，未修改。' }
+    if (!parsed) return { status: 'error', message: '知识面文件解析失败，未修改。' }
     const endOfFrontmatter = text.indexOf(parsed.body)
     const frontmatter = endOfFrontmatter >= 0 ? text.slice(0, endOfFrontmatter) : ''
     const split = splitFactsBlock(parsed.body)
@@ -1310,16 +1577,22 @@ export async function updateCapabilitySkillBody(store: Store, id: string, body: 
   }
 }
 
-/** Delete one capability: archive its skill directory (never hard-delete), unregister, drop row. */
+/** Delete one capability: archive its knowledge file (never hard-delete), unregister, drop row. */
 export async function deleteCapability(ctx: Context | undefined, store: Store, id: string): Promise<{ status: 'ok' | 'error'; message: string; archivePath?: string }> {
   const entry = readCapabilityRow(store.toolMemory.get(id), id)
   if (!entry) return { status: 'error', message: '能力不存在。' }
   disposeCapabilityTool(capabilityToolName(entry.record.name))
   let archivePath: string | undefined
   if (entry.record.skillPath) {
-    const root = dirname(dirname(entry.record.skillPath))
-    const archived = await archiveCapabilitySkill(root, capabilitySkillName(entry.record.name), { reason: '能力删除：知识面归档' })
-    archivePath = archived?.archivePath
+    if (/\.md$/i.test(entry.record.skillPath)) {
+      const archived = await archiveCapabilityDoc(dirname(entry.record.skillPath), entry.record.name, { reason: '能力删除：知识面归档' })
+      archivePath = archived?.archivePath
+    } else {
+      // Pre-R52 row still pointing at a skill directory: archive the directory.
+      const root = dirname(dirname(entry.record.skillPath))
+      const archived = await archiveCapabilitySkill(root, capabilitySkillName(entry.record.name), { reason: '能力删除：知识面归档' })
+      archivePath = archived?.archivePath
+    }
   }
   await store.toolMemory.delete(id)
   return { status: 'ok', message: '已删除能力 ' + entry.record.name + (archivePath ? '（知识面已归档到 ' + archivePath + '，可回滚）' : '') + '。', ...(archivePath ? { archivePath } : {}) }
@@ -1612,9 +1885,10 @@ export async function acceptProposal(
   if (!proposal || proposal.record.kind !== 'proposal') return { status: 'error', message: '提案不存在。' }
   if (proposal.record.proposalStatus !== 'pending') return { status: 'error', message: '提案已处理（不是待接受状态）。' }
   const workspaceKey = proposal.row.workspaceKey ?? 'unknown'
+  // R52: options.root is the capability knowledge root (not the old skill root).
   let root = options.root
   if (!root && workspaceKey !== 'unknown') {
-    try { root = resolveSkillRoot(workspaceKey).root } catch { root = undefined }
+    try { root = resolveCapabilityRoot(workspaceKey).root } catch { root = undefined }
   }
   if (root) {
     const autoCount = capabilityRows(store).filter((entry) => entry.record.source === 'auto'

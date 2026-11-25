@@ -22,7 +22,7 @@ import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSess
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
-  acceptProposal as acceptCapabilityProposal, bumpCapabilityRun, capabilityHealthOf, capabilityRows,
+  acceptProposal as acceptCapabilityProposal, bumpCapabilityRun, capabilityBodyOf, capabilityHealthOf, capabilityRows,
   capabilitySkillName, capabilityToolName, declineProposal as declineCapabilityProposal,
   deleteCapability, editCapability, enableCapabilityEntryDraft, isShellUnit, liveCapabilityToolNames,
   pendingProposalsOf, runCapability, setCapabilityEnabled, updateCapabilitySkillBody,
@@ -221,6 +221,8 @@ export interface ToolView {
   lastDryRun?: boolean
   lastSummary?: string
   skillPath?: string
+  /** R52: knowledge-face body (frontmatter stripped) for the panel editor. */
+  body?: string
   source?: string
   taskKey?: string
   proposalStatus?: 'pending' | 'accepted' | 'declined'
@@ -1800,6 +1802,7 @@ export class SupermemoryPanelService {
         ...(record.lastDryRun !== undefined ? { lastDryRun: record.lastDryRun } : {}),
         ...(record.lastSummary ? { lastSummary: record.lastSummary } : {}),
         skillPath: record.skillPath,
+        body: capabilityBodyOf(record),
         source: record.source,
         ...(record.taskKey ? { taskKey: record.taskKey } : {}),
         routeNote: record.routeNote,

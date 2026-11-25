@@ -79,7 +79,7 @@ node scripts/install-into-dsh.mjs
 
 1. 完全退出并重启 DSH Desktop（客户端 bundle 图仅在启动时构建，必须重启）；
 2. 「侧边栏 → 插件」页应出现 `dsh-supermemory` 且为**启用**态（列表实时读盘，刷新页面即可见）；
-3. 侧边栏出现 SuperMemory 面板入口；新会话中模型可见 14 个 `memory_*` 工具。
+3. 侧边栏出现 SuperMemory 面板入口；新会话中模型可见 14 个 `memory_*` 工具与 `sm_cap_doc`（按需读取能力知识面正文；能力知识面不会出现在 `available_skills` 里）。
 
 ## 升级
 

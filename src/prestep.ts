@@ -34,6 +34,8 @@ import './services.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
 import { isHubSession, listHubBranches, listTopicSetBranches, renderHubBranchesCard } from './hub-branches.ts'
+import { capabilityRows, renderCapabilityIndex } from './capability.ts'
+import { resolveRole } from './role.ts'
 
 export interface PreStepConfig {
   enabled: boolean
@@ -42,6 +44,12 @@ export interface PreStepConfig {
   halfLifeDays: number
   maxChars: number
   injectStyle: 'gentle' | 'plain'
+  /** R52: compact capability index (hub/branch sessions only). */
+  capabilityIndex: {
+    enabled: boolean
+    maxItems: number
+    maxChars: number
+  }
   repeat: RepeatConfig
   tracker: Tracker
 }
@@ -163,7 +171,39 @@ export function attachPreStep(
             logger.warn('supermemory: hub branch card skipped: ' + String(error).slice(0, 160))
           }
         }
-        if (!card && !branchesCard) return decision
+        // R52: hub/branch sessions also get a compact CAPABILITY index. The body
+        // is never injected — it is loaded on demand with sm_cap_doc. Ordinary
+        // shell sessions (role 'other') receive nothing.
+        let capabilityCard = ''
+        if (config.capabilityIndex.enabled) {
+          try {
+            const role = resolveRole(activeStore, agent)
+            if (role.role === 'hub' || role.role === 'branch') {
+              const rows = workspaceKey ? capabilityRows(activeStore, workspaceKey) : []
+              capabilityCard = renderCapabilityIndex(rows.map((entry) => ({
+                name: entry.record.name,
+                title: entry.record.title,
+                description: entry.record.description,
+                ...(entry.record.scope
+                  ? { whenToUse: '在 ' + entry.record.scope + ' 内遇到「' + entry.record.title + '」类任务时加载。' }
+                  : {}),
+                entry: entry.record.entry,
+                runnable: entry.record.runnable,
+                entryDraft: entry.record.entryDraft,
+                entryVerified: entry.record.entryVerified,
+                enabled: entry.record.enabled,
+                kind: entry.record.kind,
+                status: entry.row.status,
+              })), {
+                maxItems: config.capabilityIndex.maxItems,
+                budget: Math.min(config.capabilityIndex.maxChars, config.maxChars),
+              }).text
+            }
+          } catch (error) {
+            logger.warn('supermemory: capability index card skipped: ' + String(error).slice(0, 160))
+          }
+        }
+        if (!card && !branchesCard && !capabilityCard) return decision
         const appended = []
         if (card) {
           const message = await build(card)
@@ -172,6 +212,7 @@ export function attachPreStep(
           appended.push(message)
         }
         if (branchesCard) appended.push(await buildNotice(branchesCard))
+        if (capabilityCard) appended.push(await buildNotice(capabilityCard))
         return { ...decision, messages: [...messages, ...appended] }
       }
       // Tool continuation: requirement A repeat path.

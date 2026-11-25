@@ -243,6 +243,8 @@ export interface ToolView {
   lastDryRun?: boolean
   lastSummary?: string
   skillPath?: string
+  /** R52: knowledge-face body (frontmatter stripped) for the panel editor. */
+  body?: string
   source?: string
   taskKey?: string
   proposalStatus?: 'pending' | 'accepted' | 'declined'
@@ -962,7 +964,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
   const [summaryTagsDraft, setSummaryTagsDraft] = useState<string[] | undefined>()
   const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string; key?: string } | undefined>()
-  const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string } | undefined>()
+  const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string; body: string } | undefined>()
   const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
   // R22 需求③: 固化能力可展开看完整定义（入口/文档/适用范围/路由/执行方式/健康度）。
   const [expandedTool, setExpandedTool] = useState<string | undefined>()
@@ -2413,12 +2415,22 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                       key: 'input', className: 'sm-textarea', value: editingTool.description,
                       onChange: (event: { target: { value: string } }) => setEditingTool({ ...editingTool, description: event.target.value }),
                     }),
+                    h('div', { className: 'sm-form-label' }, t('tool.body.label')),
+                    h('textarea', {
+                      key: 'body', className: 'sm-textarea', value: editingTool.body, rows: 12,
+                      placeholder: t('tool.body.placeholder'),
+                      onChange: (event: { target: { value: string } }) => setEditingTool({ ...editingTool, body: event.target.value }),
+                    }),
                     h('div', { className: 'sm-actions' },
                       h(Button, {
                         key: 'save', variant: 'primary', label: t('tool.desc.save'),
                         onClick: () => void run(async () => api.editTool(tool.id, {
                           title: editingTool.title, tags: editingTool.tags, description: editingTool.description,
                         }), () => { setEditingTool(undefined); void refreshTools() }),
+                      }),
+                      h(Button, {
+                        key: 'saveBody', label: t('tool.body.save'),
+                        onClick: () => void run(async () => api.editTool(tool.id, { body: editingTool.body }), () => { setEditingTool(undefined); void refreshTools() }),
                       }),
                       h(Button, { key: 'cancel', label: t('memory.cancel'), onClick: () => setEditingTool(undefined) }),
                     ),
@@ -2458,7 +2470,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                       tool.kind !== 'proposal'
                         ? h(Button, {
                             key: 'edit', label: t('tool.desc.edit'),
-                            onClick: () => setEditingTool({ id: tool.id, title: tool.title, tags: tool.tags, description: tool.description }),
+                            onClick: () => setEditingTool({ id: tool.id, title: tool.title, tags: tool.tags, description: tool.description, body: tool.body ?? '' }),
                           })
                         : null,
                       tool.kind !== 'proposal'

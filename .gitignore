@@ -30,6 +30,8 @@ lib/dev-*.js
 # plugin runtime state (auto-generated task skills / archive / cleanup journal)
 .dsh/skills/
 .dsh/skills-archive/
+.dsh/capabilities/
+.dsh/capabilities-archive/
 .dsh/r48-delayed-cleanup-*.json
 
 # release binaries are uploaded as Release assets, not committed (scripts/package-release.mjs)

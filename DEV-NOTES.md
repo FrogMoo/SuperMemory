@@ -3820,3 +3820,90 @@ tool_memory 记录 kind = capability | knowledge | proposal；行级镜像 skill
 3. 对 `sm_cap_git_sync_supermemory` 跑一次预演（默认 `--dry-run`）再 `confirm=true`，确认统计与事实块正常。
 
 
+
+---
+
+## 65. R52：能力知识面移出 skill 目录 + 索引注入 + sm_cap_doc（2026-11-26）
+
+### 65.1 背景与决定
+
+R50/R51 的「单一能力」把知识面写成 `<skills 根>/sm-<name>/SKILL.md`，宿主 skill provider 会把它当技能
+目录扫描并塞进 `available_skills`——用户明确要求能力只由「固化能力」面板管理，不进入公用 skill 列表。
+用户拍板：**插件注入精简索引 + 按需读取**，而不是继续暴露 SKILL.md。
+
+### 65.2 新存储路径与迁移
+
+| 场景 | 知识面路径 |
+|---|---|
+| 有 git 根的工作区 | `<仓库根>/.dsh/capabilities/<name>.md`（不是 SKILL.md，不在 `.dsh/skills`） |
+| 无 git 根 | `<DSH_HOME>/capabilities/<workspace-token>/<name>.md`（token = `ws<hash5>`） |
+
+- 启动惰性迁移 `migrateCapabilityDocs()`（在 `migrateCapabilities` 内、壳子归档/行迁移之后）：
+  只处理带 `sm-source: capability` 的旧 `<skills 根>/sm-<name>/SKILL.md`；先 copy 到新路径，
+  再把旧目录整体移到 `<skills 根>-archive/sm-<name>` 并写 manifest（原名/from/时间/R52 原因，可回滚），
+  最后把行里的 `skillPath` 指向新文件。
+- 人工/第三方/task skill（frontmatter 不是 `sm-source: capability`）一律不动；旧壳子由 R51 先归档，
+  R52 的迁移与 R51 幂等共存（第二次迁移 moved=0/archived=0）。
+- `.gitignore` 增加 `.dsh/capabilities/` 与 `.dsh/capabilities-archive/`（运行期知识面不入库）。
+
+### 65.3 发现面收口
+
+- `.dsh/capabilities` 不在任何 host skill provider 的扫描根内（provider 只认 `.dsh/skills`）；文件名是
+  `<name>.md`，不是 `SKILL.md`。
+- 迁移后 `.dsh/skills` 下不再有 `sm-*` 目录；第三方便携 skill 原样保留。
+- 代价：能力不再出现在 `available_skills`；改由 65.4 的索引卡告诉模型「有哪些能力、何时用」。
+
+### 65.4 注入索引（pre-step，仅中枢/分支）
+
+- 仅当 `resolveRole(store, agent).role` 为 `hub` 或 `branch` 时注入；普通 shell 会话（role=other）不注入。
+- 开关 `recall.capabilityIndex.enabled`（默认 true）、`maxItems`（默认 8，硬上限 8）、`maxChars`（默认 1600）。
+- 每行：`- <name> [可执行|仅知识|入口待验证]：<何时用/description 截断 80>`；末尾固定提示
+  `正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；第三方 skill 仍走宿主 skill 目录。`
+- 遵守 R47：先保 header/徽标，超预算按行降级并写 `… 省略 N 条`；总字符数不超 `min(capabilityIndex.maxChars, recall.maxChars)`。
+
+### 65.5 `sm_cap_doc`（按需读取）
+
+- 入参 `name`（逻辑名 / `sm_cap_*` / `sm-*` 均可）+ 可选 `section`（只取某个 `## 小节`）。
+- 返回：知识面正文、事实块、`entry/scope/dryRunArg/writeConfirm/whenToUse`、`headings`、`loadCount`。
+- 只返回 `enabled` 且未 retired 的能力；可执行能力还要求 `runnable=true`（入口未验证会明确拒绝）；
+  不存在/停用/提案/文件缺失/解析失败都是结构化错误，不返回半截正文。
+- 每次成功加载 `loadCount+1`（沿用转化率统计）；section 不存在时列出可用二级标题。
+- 不再用宿主 `skill` 工具加载固化能力；第三方 skill 仍走宿主 skill 目录。
+
+### 65.6 面板与文案
+
+- 「固化能力」页签是唯一管理面：列表行新增知识面正文编辑器（`editTool(id,{body})` →
+  `updateCapabilitySkillBody`，按事实块规则保留 `<!-- sm:facts:start/end -->`），路径展示指向
+  `.dsh/capabilities/<name>.md`；改描述/启停/预演/删除归档不变。
+- `HUB_ROLE_TEXT`、`CAPABILITY_ROUTING_RULES`、README、INSTALL、locales 中「用 skill 工具加载能力」的说法
+  改为 `sm_cap_doc`；示例版本与工具数（14 → 15）同步。
+
+### 65.7 闸门与测试
+
+- `pnpm typecheck`：双工程 0 错。
+- `pnpm build`：exit 0；宿主 **13 文件 903.30 kB**（入口 `supermemory.js` + capability/toolize chunk），client
+  `lib/client.js` 179.66 kB（wrap 后 173927 B）。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **111** / webui **35** / client-sim **OK** /
+  capability **14** / workspace-scope **6** / skill **27**。
+- R52 新断言（`scripts/capability-smoke.mjs`）：
+  - R52-1：能力文件从 skills 根迁移到 `.dsh/capabilities/<name>.md`、旧目录归档、manifest 可回滚、
+    二次迁移幂等、`.dsh/skills` 无 `sm-*`、第三方 skill 字节不动；`sm_cap_doc` 正例/停用/不存在、
+    `loadCount` 递增、正文编辑保留事实块。
+  - R52-2：索引卡最多 8 条、三种徽标、1600/260 预算下不超限且带省略标记。
+  - R52-3：索引仅 hub/branch；`sm_cap_doc` 已注册；面板正文编辑器走 `editTool(id,{body})`。
+
+### 65.8 风险
+
+- 旧 `sm-*` 知识面若 frontmatter 不是 `sm-source: capability`（历史上手工改过），迁移会跳过并在
+  `.dsh/skills` 保留；需要人工在面板保存正文或手动迁移。
+- 索引卡只给名称/何时用，模型必须多一次 `sm_cap_doc` 调用才能看到正文；加载次数即转化率分母。
+- 分支不能重载插件；R52 生效需完全退出并重启 DSH Desktop。
+
+### 65.9 用户验收（完全重启后）
+
+1. 新会话的 `available_skills` 不再出现任何 `sm-*` 能力（ego-browser/office 等第三方不受影响）；
+   `.dsh/skills` 下无 `sm-*`，能力正文在 `.dsh/capabilities/<name>.md`。
+2. 中枢/分支会话能看到「[SuperMemory 可用能力]」卡（≤8 条）；对其中一个能力调用
+   `sm_cap_doc({name:"<能力名>"})` 能拿到正文，面板该能力的 loadCount +1。
+3. 面板「固化能力」展开任一能力，改正文并「保存正文」：散文更新、事实块仍在、version+1。
+

@@ -1480,9 +1480,9 @@ ${listText}` : listText
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
-    description: '重复工作的固化入口（R50 单一能力：知识面 SKILL.md + 执行面 sm_cap_<name>）：'
+    description: '重复工作的固化入口（R50/R52 单一能力：知识面 .dsh/capabilities/<name>.md + 执行面 sm_cap_<name>）：'
       + '① 列出待接受提案、能力与仅知识草稿；② accept/decline 处理提案（接受后创建能力；高置信入口草稿必须人工「启用执行」才会 runnable）；'
-      + '③ register 注册/更新能力：给 entry 产可执行能力（固定入口，默认预演、写操作 confirm=true），不给 entry 则仅知识（六节 SKILL.md，事实块自动维护）；'
+      + '③ register 注册/更新能力：给 entry 产可执行能力（固定入口，默认预演、写操作 confirm=true），不给 entry 则仅知识（六节知识面文件，事实块自动维护；会话里用 sm_cap_doc 读取）；'
       + '④ enabled + name 同时启停知识面与执行面；⑤ refresh-builtin 刷新内置能力与健康度；⑥ cleanup 清理历史工具序列行/待处理提案/宽泛序列信号并归档工具序列壳子 skill（幂等、可回滚）。'
       + '执行面绝不自动执行；能力连续失败时更新事实块/文档而不是绕过闸门。'
       + CAPABILITY_ROUTING_RULES,
@@ -1494,7 +1494,7 @@ ${listText}` : listText
       body: { type: 'string', description: '知识面正文（Markdown 六节）；缺省生成骨架。事实块由插件自动维护，块外散文保留' },
       whenToUse: { type: 'string', description: '保留参数（R48 兼容）：知识面何时加载由 description 表达' },
       enabled: { type: 'boolean', description: '配合 name：同时启用/停用知识面与执行面' },
-      name: { type: 'string', description: '逻辑名（字母/数字/-/_，如 git-sync-supermemory）：工具名派生 sm_cap_git_sync_supermemory，skill 名派生 sm-git-sync-supermemory' },
+      name: { type: 'string', description: '逻辑名（字母/数字/-/_，如 git-sync-supermemory）：工具名派生 sm_cap_git_sync_supermemory，知识面文件派生 <名称>.md' },
       title: { type: 'string', description: '标题（人类可读）' },
       description: { type: 'string', description: '路由描述（知识面/执行面共用）：写清「何时用/何时优先用它」，这是模型路由依据，短而具体' },
       entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（固定入口，不接受任意参数透传）' },
@@ -2049,6 +2049,84 @@ ${listText}` : listText
       return { status: 'accepted' as const, ...(result.name ? { tool: result.name } : {}), message: result.message, entryDraft: Boolean(result.entryDraft) }
     },
   })))
+
+  // R52: capability knowledge is loaded ON DEMAND — never through the host's
+  // skill tool. The model sees a compact index card; this tool returns the body.
+  disposers.push(ctx.tools.register(tools.defineTool({
+    name: 'sm_cap_doc',
+    description: '按需读取一个固化能力的知识面正文（SuperMemory 单能力：知识面 + 执行面 sm_cap_*）。'
+      + '仅在中枢/分支会话需要具体步骤、判断标准或失败坑时调用；能力索引卡里的 name 直接填进来。'
+      + '可选 section 只返回某个「## 小节」。只返回 enabled 且可读取的能力；停用/不存在会明确报错。'
+      + '不要用宿主 skill 工具加载固化能力——第三方 skill 才走 skill 目录。成功加载会给该能力 loadCount+1。',
+    parameters: {
+      name: { type: 'string', required: true, description: '能力逻辑名（如 git-sync-supermemory），或 sm_cap_* / sm-* 形式' },
+      section: { type: 'string', description: '可选：只取某个二级小节（如「关键坑」「验证方式」）' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          status: { type: 'string', enum: ['ok', 'error'], required: true },
+          message: { type: 'string', required: true },
+          name: { type: 'string' },
+          title: { type: 'string' },
+          body: { type: 'string' },
+          factsBlock: { type: 'string' },
+          entry: { type: 'string' },
+          scope: { type: 'string' },
+          dryRunArg: { type: 'string' },
+          writeConfirm: { type: 'boolean' },
+          whenToUse: { type: 'string' },
+          loadCount: { type: 'integer' },
+          headings: { type: 'array', items: { type: 'string' } },
+        },
+        additionalProperties: false,
+      },
+      render: (_args: unknown, value: unknown) => {
+        const v = value as { status?: string; message?: string; body?: string; factsBlock?: string; entry?: string; whenToUse?: string; name?: string; title?: string }
+        if (v.status === 'error') return [{ type: 'text', text: '能力加载失败：' + String(v.message ?? '未知错误') }]
+        const head = '能力：' + (v.name ?? '') + (v.title ? '（' + v.title + '）' : '') + '\n'
+          + (v.whenToUse ? '何时用：' + v.whenToUse + '\n' : '')
+          + (v.entry ? '执行面：' + v.entry + '\n' : '执行面：仅知识\n')
+        const facts = v.factsBlock ? '\n\n' + v.factsBlock : ''
+        return [{ type: 'text', text: head + '\n' + String(v.body ?? '') + facts }]
+      },
+    },
+    async execute(args: Record<string, unknown>, exec: ToolExec) {
+      const cwd = exec.agent?.session?.header?.cwd
+      const workspaceKey = cwd ? workspaceKeyOf(cwd) : undefined
+      const { loadCapabilityDoc } = await import('./capability.ts')
+      const result = await loadCapabilityDoc(
+        store,
+        workspaceKey,
+        String(args.name ?? ''),
+        typeof args.section === 'string' && args.section.trim() ? args.section : undefined,
+      )
+      if (result.status === 'error') {
+        return {
+          status: 'error' as const,
+          message: result.message,
+          ...(result.headings ? { headings: result.headings } : {}),
+        }
+      }
+      return {
+        status: 'ok' as const,
+        message: result.message,
+        name: result.name,
+        title: result.title,
+        body: result.body,
+        factsBlock: result.factsBlock,
+        entry: result.entry,
+        scope: result.scope,
+        dryRunArg: result.dryRunArg,
+        writeConfirm: result.writeConfirm,
+        whenToUse: result.whenToUse,
+        loadCount: result.loadCount,
+        ...(result.headings ? { headings: result.headings } : {}),
+      }
+    },
+  })))
+
 
   return () => {
     for (const dispose of disposers) dispose()

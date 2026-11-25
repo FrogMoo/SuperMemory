@@ -203,7 +203,7 @@ export async function buildSchemas() {
     createdAt: z.number().int().optional(),
     /**
      * R50 统一能力记录：capability = 可执行能力（知识面 + 执行面），knowledge =
-     * 仅知识能力（SKILL.md，无入口命令），proposal = 待接受的自动知识草稿。
+     * 仅知识能力（知识面文件，无入口命令），proposal = 待接受的自动知识草稿。
      * composite / skill / workflow 是 R50 之前的历史 kind，只由惰性迁移读取：
      * 旧 capability（kind='composite' + spec.kind='capability'）迁为 capability，
      * 旧 skill 行迁为 knowledge，旧的工具序列行退役（status='retired'）。
@@ -224,11 +224,11 @@ export async function buildSchemas() {
     useCount: z.number().int().nonnegative().default(0),
     status: z.enum(['active', 'retired']).default('active'),
     // ---- R50 统一能力的行级镜像字段（旧介质读作缺省值，降级安全）----
-    /** SKILL.md 绝对路径（知识面文件；旧 kind='skill' 行迁移时从 entry 取出）。 */
+    /** 知识面文件绝对路径（R52：.dsh/capabilities/<name>.md；旧 kind='skill' 行迁移时从 entry 取出）。 */
     skillPath: z.string().optional(),
     /** 启用/停用同时作用于知识面（disable-model-invocation）与执行面（工具注册）。 */
     enabled: z.boolean().default(true),
-    /** 模型经 skill 工具加载本能力知识面的次数（转化率分母）。 */
+    /** 模型经 sm_cap_doc 加载本能力知识面的次数（转化率分母）。 */
     loadCount: z.number().int().nonnegative().default(0),
     /** 执行面（sm_cap_* 工具 / 面板 / memory_toolize）实际执行次数（转化率分子）。 */
     runCount: z.number().int().nonnegative().default(0),

@@ -57,6 +57,12 @@ export interface Config {
     halfLifeDays: number
     maxChars: number
     injectStyle: 'gentle' | 'plain'
+    /** R52: compact capability index card for hub/branch sessions. */
+    capabilityIndex: {
+      enabled: boolean
+      maxItems: number
+      maxChars: number
+    }
     repeat: {
       enabled: boolean
       everySteps: number
@@ -147,6 +153,11 @@ export const Config: Schema<Config> = Schema.object({
     maxChars: Schema.natural().description('recall 卡片字符上限').default(2400),
     injectStyle: Schema.union([Schema.const('gentle'), Schema.const('plain')])
       .description('注入语气：gentle 温和起步 / plain 直陈').default('gentle'),
+    capabilityIndex: Schema.object({
+      enabled: Schema.boolean().description('R52：中枢/分支会话注入「可用能力」索引卡（默认开；正文用 sm_cap_doc 按需读取，不进入 available_skills）').default(true),
+      maxItems: Schema.natural().description('能力索引卡最多几条（默认 8，硬上限 8）').default(8),
+      maxChars: Schema.natural().description('能力索引卡字符预算（遵守 R47 裁剪与省略标记）').default(1600),
+    }).description('可用能力索引卡参数').default({}),
     repeat: Schema.object({
       enabled: Schema.boolean().description('过程内再召回开关（需求 A：同一请求执行过程中继续召回，不只在开头注入一次）').default(true),
       everySteps: Schema.natural().description('自上次召回后又执行了多少次工具调用才再次召回（默认 3，保守；每次召回后计数清零）').default(3),
@@ -229,6 +240,9 @@ const HUB_ROLE_TEXT = [
   '- 分支归属话题集，可被同一话题集下的其他中枢复用/共享：继续同一条分支用 mode=continue（忙则排队），新任务用 mode=auto（复用空闲分支，否则新建）。',
   '- 不要为同一件工作反复新建分支造成重复/分裂；已完成或空闲的分支优先续派。',
   // R30 需求⑤: 每次对话的检索路由——记忆 → 话题集 → 分支会话 → 复用/新建。
+  '- 系统上下文会注入「[SuperMemory 可用能力]」卡（仅中枢/分支会话）：只列能力名、何时用与徽标；'
+  + '需要具体步骤/坑时调用 sm_cap_doc（name 即卡里的能力名），不要用宿主 skill 工具加载固化能力。'
+  + '第三方 skill（ego-browser/office 等）仍走宿主 skill 目录。',
   '- 每轮对话按这条路由检索再动手：① 先读 recall 卡里的相关记忆（历史结论/约定/构建命令/文件用途）；'
   + '② 列出并匹配话题集（注入卡带出命中话题集的标题/标签）；'
   + '③ 按话题集检索其下分支会话（标题/标签/状态/最后活动——注入卡已带出，面板/管理台可看全部）；'
@@ -380,6 +394,7 @@ export async function apply(ctx: Context, config: Config) {
     halfLifeDays: config.recall.halfLifeDays,
     maxChars: config.recall.maxChars,
     injectStyle: config.recall.injectStyle,
+    capabilityIndex: config.recall.capabilityIndex,
     repeat: config.recall.repeat,
     tracker,
   }, logger), 'supermemory: pre-step')
