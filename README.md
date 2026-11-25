@@ -78,7 +78,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 │   ├── git-sync.md             # git 同步/提交/推送流程（双远程、凭据、坑与退出码）
 │   └── notes/                  # 历史轮次设计/复盘笔记（4 篇）
 ├── scripts/
-│   ├── *-smoke.mjs             # 6 套冒烟：core / mechanism / webui / client-sim / capability / workspace-scope
+│   ├── *-smoke.mjs             # 7 套冒烟：core / mechanism / webui / client-sim / capability / workspace-scope / skill
 │   ├── git-sync-push.sh        # git 同步唯一实现（.mjs 只是 bash 启动器）
 │   ├── install-into-dsh.mjs    # 安装为 DSH profile bundle
 │   ├── dev-load.sh             # 开发期武装带时间戳入口（规避 ESM 同 URL 缓存）
@@ -102,10 +102,10 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 pnpm install        # 安装依赖
 pnpm typecheck      # tsc 双配置：宿主（tsconfig.json）+ 客户端（tsconfig.client.json），目标 0 错
 pnpm build          # tsdown 宿主 + tsdown 客户端 + wrap-client（产物落 lib/）
-pnpm smoke          # 6 套冒烟一次跑完（见下）
+pnpm smoke          # 7 套冒烟一次跑完（见下）
 ```
 
-冒烟可单独跑：`pnpm smoke:core`（宿主纯逻辑）、`pnpm smoke:webui`（管理台宿主侧集成）。其余四套（`mechanism` / `client-sim` / `capability` / `workspace-scope`）用 `node scripts/<名>-smoke.mjs` 直接跑。
+冒烟可单独跑：`pnpm smoke:core`（宿主纯逻辑）、`pnpm smoke:webui`（管理台宿主侧集成）、`pnpm smoke:skill`（技能固化）。其余四套（`mechanism` / `client-sim` / `capability` / `workspace-scope`）用 `node scripts/<名>-smoke.mjs` 直接跑。
 
 | 套件 | 覆盖 |
 |---|---|
@@ -114,13 +114,19 @@ pnpm smoke          # 6 套冒烟一次跑完（见下）
 | `webui` | 管理台：认证、路由、记忆/需求/话题集 CRUD、能力执行 |
 | `client-sim` | 对**构建产物**跑客户端 apply()，校验每个 slot 注册成功 |
 | `capability` | 固化能力持续维护：计数、register 同名更新、内置播种、执行门禁 |
+| `skill` | 技能固化（R45）：草稿/落盘/frontmatter/幂等升版/人工编辑保护/启停/面板/运行时接线 |
 | `workspace-scope` | 工作区隔离：话题集/分支/能力按工作区过滤与门禁 |
 
 ## 5. 在 DSH 中安装与重载
 
-### 5.1 用户安装（从 Release，推荐）
+### 5.1 用户安装（DSH 插件面板 / Release，推荐）
 
-普通用户**不需要克隆仓库、不需要构建**：到 [GitHub Releases](https://github.com/FrogMoo/SuperMemory/releases)（或仓库 `release/` 目录）下载 `dsh-supermemory-<版本>.zip`，解压后进入目录执行 `node scripts/install-into-dsh.mjs`，重启 DSH Desktop 即可。发布包已内置预构建产物 `lib/` 与生产依赖 `node_modules/`，全程无需外网。完整步骤、升级与卸载见 [INSTALL.md](INSTALL.md)。
+普通用户**不需要克隆仓库、不需要构建**，两种方式任选：
+
+- **DSH 插件面板（需能访问 GitHub）**：在「插件 → 安装插件」填 `https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz`（稳定 tgz 别名），或填 Git 仓库地址 `https://github.com/FrogMoo/SuperMemory`。**不要填** release 页面 URL 或 `.zip` 资产——DSH 安装器只接受 git 仓库或 `.tgz/.tar.gz` 直链。
+- **手动 Release 包（离线/内网）**：到 [GitHub Releases](https://github.com/FrogMoo/SuperMemory/releases)（或仓库 `release/` 目录）下载 `dsh-supermemory-<版本>.zip`，解压后进入目录执行 `node scripts/install-into-dsh.mjs`，重启 DSH Desktop。发布包内置 `lib/` 与生产依赖 `node_modules/`，安装无需外网。
+
+完整规则、升级与卸载见 [INSTALL.md](INSTALL.md)。
 
 ### 5.2 开发期安装（源码工作区）
 

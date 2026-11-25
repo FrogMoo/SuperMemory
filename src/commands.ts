@@ -21,6 +21,7 @@ import { openRequirements } from './requirements.ts'
 import { listInterruptedDispatches, renderInterruptedList, resumeDispatch } from './resume.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, firstLine } from './title.ts'
+import { clipMarked } from './clip.ts'
 import { migrateTruncatedTitles, renderTitlesMigrationReport } from './title-migration.ts'
 import { mergeTopicSets, renderMergeReport } from './topicset-merge.ts'
 import { applyMemoryOrganize, previewMemoryOrganize, renderMemoryOrganizeReport } from './memory-organize.ts'
@@ -278,9 +279,11 @@ async function runMemory(
       const bits: string[] = []
       if (topicSet.summary) bits.push(topicSet.summary)
       for (const [, episode] of store.episodes.entries()) {
-        if (episode.topicSetId === active && episode.summary) bits.push(episode.summary.slice(0, 120))
+        if (episode.topicSetId === active && episode.summary) bits.push(clipMarked(episode.summary, 120))
       }
-      const summary = bits.slice(-6).join(' / ').slice(0, 500)
+      // Stored summary: clip at a sentence boundary WITH the marker (a hard
+      // slice here persisted a half-sentence into the topic set forever).
+      const summary = clipMarked(bits.slice(-6).join(' / '), 500)
       await updateTopicSetSummary(store, active, summary || topicSet.summary)
       return { kind: 'success', text: `已更新话题集梗概：\n${summary || '（暂无素材）'}` }
     }

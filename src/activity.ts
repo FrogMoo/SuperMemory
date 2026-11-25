@@ -118,15 +118,34 @@ export function attachToolActivity(
         isError: Boolean((result as { isError?: boolean }).isError),
       }
       tracker.observe(sessionId, observation, config.repeat, activeStore.memories.entries(), memoryCap)
+      // R45: 调用/命中统计——模型每次用 skill 工具加载我们生成的 sm-* 技能就计数，
+      // 面板「设置 → 已生成的 skills」据此判断路由是否真的生效。
+      if (name === 'skill') {
+        const loaded = typeof observation.args.name === 'string' ? observation.args.name : ''
+        if (loaded.startsWith('sm-')) {
+          try {
+            const { bumpSkillUse } = await import('./skill-forge.ts')
+            await bumpSkillUse(activeStore, workspaceKey, loaded)
+          } catch { /* statistics are advisory */ }
+        }
+      }
       const state = tracker.get(sessionId)
       if (!state) return decision
       const recent = state.recent.map((entry) => entry.name)
       const match = pickCompositeMatch(recent, activeComposites(activeStore))
       if (match && match.hits >= 2) recordNearMiss(activeStore, workspaceKey, match, logger)
-      if (config.toolize.enabled) {
-        const repeat = repeatedWindow(state, config.toolize)
-        if (repeat) {
-          await autoToolizeFromSequence(ctx, activeStore, workspaceKey, repeat.tools, repeat.samples, config.toolize, logger, deps)
+      const repeat = config.toolize.enabled || config.toolize.autoSkill ? repeatedWindow(state, config.toolize) : undefined
+      if (repeat && config.toolize.enabled) {
+        await autoToolizeFromSequence(ctx, activeStore, workspaceKey, repeat.tools, repeat.samples, config.toolize, logger, deps)
+      }
+      // R45: 一次请求内就重复的窗口是「重复事务」的强信号——即使组合工具关闭，
+      // 也把它沉淀成 skill（技能比流水线更容易被下一次任务路由到）。
+      if (repeat && config.toolize.autoSkill) {
+        try {
+          const { persistSequenceSkill } = await import('./skill-forge.ts')
+          await persistSequenceSkill(activeStore, workspaceKey, repeat.tools, repeat.samples, repeat.count)
+        } catch (error) {
+          logger.warn('supermemory: skill draft (in-request) failed: ' + String(error).slice(0, 160))
         }
       }
       if (!config.nearMissHint || !match || match.hits < 2) return decision

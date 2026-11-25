@@ -64,6 +64,26 @@ const short = (id) => {
   if (s.length <= 14) return esc(s)
   return esc(s.slice(0, 8) + '…' + s.slice(-6))
 }
+// R47: display excerpts cut at a sentence/clause boundary and SAY they were cut
+// (the old raw `.slice(0, 48)` ended mid-word with no marker, so a memory that
+// had no title looked like a different record than it was).
+const CLIP_END = new Set(['。', '！', '？', '!', '?', '；', ';', '…', '，', ',', '、', '：', ':'])
+const clipText = (value, max) => {
+  const chars = Array.from(String(value == null ? '' : value))
+  const budget = Math.floor(max)
+  if (!Number.isFinite(budget) || budget <= 0) return ''
+  if (chars.length <= budget) return chars.join('')
+  if (budget === 1) return '…'
+  const window = chars.slice(0, budget - 1)
+  const from = Math.max(0, Math.ceil(window.length * 0.6) - 1)
+  for (let index = window.length - 1; index >= from; index -= 1) {
+    if (CLIP_END.has(window[index]) || /\s/.test(window[index])) {
+      return window.slice(0, index + 1).join('').replace(/\s+$/, '') + '…'
+    }
+  }
+  return window.join('') + '…'
+}
+
 const kwHtml = (kws) => (kws || []).map((k) => `<span class="kw">${esc(k)}</span>`).join(' ')
 
 /**
@@ -364,10 +384,10 @@ function renderMemoryDetail(d) {
   const head = `
   <div class="toolbar">
     <button class="btn" type="button" data-action="mem-detail-back">← 返回${esc(collectionTitle)}</button>
-    <span class="muted">记忆 / ${esc(collectionTitle)} / ${esc(m.title || (m.text || '').slice(0, 48))}</span>
+    <span class="muted">记忆 / ${esc(collectionTitle)} / ${esc(m.title || clipText(m.text || '', 48))}</span>
   </div>`
   const detail = `
-  <div class="panel"><header>${esc(m.title || (m.text || '').slice(0, 48))}</header><div class="body">
+  <div class="panel"><header>${esc(m.title || clipText(m.text || '', 48))}</header><div class="body">
     <div class="row-meta" style="margin-bottom:8px">
       ${badge(m.status)}
       <span class="badge">v${m.version == null ? 1 : m.version}</span>
@@ -413,7 +433,7 @@ function memoryRow(m) {
   <div class="row" data-id="${m.id}">
     <div class="row-main">
       <div class="row-text">
-          <div class="row-title"><a href="javascript:void(0)" data-action="mem-open" data-id="${m.id}" title="打开详情与历史版本">${esc(m.title || (m.text || '').slice(0, 48))}</a>
+          <div class="row-title"><a href="javascript:void(0)" data-action="mem-open" data-id="${m.id}" title="打开详情与历史版本">${esc(m.title || clipText(m.text || '', 48))}</a>
             <span class="badge">v${m.version == null ? 1 : m.version}</span>
           </div>
         <div class="clamp" title="点击展开/收起">${esc(m.text)}</div>
@@ -496,7 +516,7 @@ function renderRequirements(d) {
 
 function renderDispatch(d) {
   const tsTitle = (id) => { const t = d.topicsets.find((x) => x.id === id); return t ? t.title : '—' }
-  const task = (x) => esc(x.task.length > 90 ? x.task.slice(0, 90) + '…' : x.task)
+  const task = (x) => esc(clipText(x.task, 90))
   const rows = d.dispatches.length
     ? d.dispatches.map((x) => `
       <div class="list-card">

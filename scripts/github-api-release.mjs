@@ -15,14 +15,18 @@
 //   - 令牌只从 GCM 读，不打印、不落盘。
 //
 // 用法：
-//   node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]]
+//   node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]
 //   node scripts/github-api-release.mjs 4509e3c                                  # 只推提交
 //   node scripts/github-api-release.mjs 4509e3c --tag v1.0.0 --notes notes.md    # 提交+tag+Release
-//                                                                                 # 资产默认 release/dsh-supermemory-<版本>.zip
+//                                                                                 # 资产默认释放 zip + tgz：
+//                                                                                 # release/dsh-supermemory-<版本>.zip
+//                                                                                 # release/dsh-supermemory-<版本>.tgz
+// 说明：DSH 插件面板只接受 git 仓库或 .tgz/.tar.gz 直链；zip 仅用于手动解压安装。
 // 退出码：0 成功 / 1 失败（含任一 SHA 校验不符）。
 // 背景与实测记录见 docs/git-sync.md §11。
 import { execFileSync, execSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { basename, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 
 const REPO = 'FrogMoo/SuperMemory'
@@ -38,14 +42,31 @@ const fail = (...a) => { console.error('[gh-api] FATAL:', ...a); process.exit(1)
 // ---------- 参数 ----------
 const argv = process.argv.slice(2)
 const commitish = argv[0]
-if (!commitish || commitish.startsWith('--')) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]]')
+if (!commitish || commitish.startsWith('--')) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]')
 function argValue(name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined }
 const tagName = argValue('--tag')
 const notesFile = argValue('--notes')
-let assetPath = argValue('--asset')
+const assetPaths = []
+for (let i = 1; i < argv.length; i += 1) {
+  if (argv[i] !== '--asset') continue
+  const value = argv[i + 1]
+  if (!value || value.startsWith('--')) fail('--asset 需要一个资产路径')
+  assetPaths.push(value)
+  i += 1
+}
 if (tagName && !notesFile) fail('--tag 需要同时给 --notes <release 正文文件>')
-if (tagName && !assetPath) {
-  assetPath = 'release/dsh-supermemory-' + tagName.replace(/^v/, '') + '.zip'
+if (tagName && assetPaths.length === 0) {
+  const base = 'release/dsh-supermemory-' + tagName.replace(/^v/, '')
+  // Assets: the zip for manual unzip/install, the versioned tgz for auditing,
+  // and the version-less tgz that backs the stable
+  // /releases/latest/download/dsh-supermemory.tgz URL the docs give the panel.
+  assetPaths.push(base + '.zip', base + '.tgz', resolve(ROOT, 'release', 'dsh-supermemory.tgz'))
+}
+const releaseAssets = tagName === undefined
+  ? []
+  : assetPaths.map((path) => ({ path, file: resolve(ROOT, path), name: basename(path) }))
+for (const asset of releaseAssets) {
+  if (!existsSync(asset.file)) fail('资产不存在: ' + asset.file + '（先跑 node scripts/package-release.mjs）')
 }
 
 // ---------- 令牌（GCM，不打印） ----------
@@ -225,28 +246,32 @@ if (tag) {
     })
     log('Release 已创建:', release.html_url)
   }
-  const assets = await api('GET', '/repos/' + REPO + '/releases/' + release.id + '/assets')
-  for (const a of assets) {
-    if (a.name === assetPath.split('/').pop()) {
+  const existingAssets = await api('GET', '/repos/' + REPO + '/releases/' + release.id + '/assets')
+  const uploading = new Set(releaseAssets.map((asset) => asset.name))
+  for (const a of existingAssets) {
+    if (uploading.has(a.name)) {
       await api('DELETE', '/repos/' + REPO + '/releases/' + release.id + '/assets/' + a.id)
       log('删除旧资产', a.name)
     }
   }
-  const zip = readFileSync(ROOT + '/' + assetPath)
-  const uploadUrl = release.upload_url.replace('{?name,label}', '?name=' + assetPath.split('/').pop())
-  const assetRes = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      Authorization: 'Bearer ' + token,
-      Accept: 'application/vnd.github+Json',
-      'Content-Type': 'application/zip',
-      'User-Agent': 'sm-github-api-release',
-    },
-    body: zip,
-  })
-  const assetJson = await assetRes.json()
-  if (!assetRes.ok) fail('资产上传失败 ' + assetRes.status + ' ' + JSON.stringify(assetJson).slice(0, 400))
-  log('资产已上传:', assetJson.name, (assetJson.size / 1024 / 1024).toFixed(2) + 'MB state=' + assetJson.state)
+  for (const asset of releaseAssets) {
+    const content = readFileSync(asset.file)
+    const contentType = /\.(?:tgz|tar\.gz)$/i.test(asset.name) ? 'application/gzip' : 'application/zip'
+    const uploadUrl = release.upload_url.replace('{?name,label}', '?name=' + encodeURIComponent(asset.name))
+    const assetRes = await fetch(uploadUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: 'Bearer ' + token,
+        Accept: 'application/vnd.github+Json',
+        'Content-Type': contentType,
+        'User-Agent': 'sm-github-api-release',
+      },
+      body: content,
+    })
+    const assetJson = await assetRes.json()
+    if (!assetRes.ok) fail('资产上传失败 ' + asset.name + ' ' + assetRes.status + ' ' + JSON.stringify(assetJson).slice(0, 400))
+    log('资产已上传:', assetJson.name, (assetJson.size / 1024 / 1024).toFixed(2) + 'MB state=' + assetJson.state)
+  }
   log('完成。Release:', release.html_url)
 } else {
   log('完成（仅提交快进，未建 tag/Release）')

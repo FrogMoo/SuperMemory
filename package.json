@@ -49,7 +49,8 @@
     "build:client": "tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
     "smoke:webui": "node scripts/webui-smoke.mjs",
     "smoke:core": "node scripts/core-smoke.mjs",
-    "smoke": "node scripts/core-smoke.mjs && node scripts/mechanism-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs && node scripts/capability-smoke.mjs && node scripts/workspace-scope-smoke.mjs"
+    "smoke:skill": "node scripts/skill-smoke.mjs",
+    "smoke": "node scripts/core-smoke.mjs && node scripts/mechanism-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs && node scripts/capability-smoke.mjs && node scripts/workspace-scope-smoke.mjs && node scripts/skill-smoke.mjs"
   },
   "dsh": {
     "bundle": {

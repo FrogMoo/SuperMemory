@@ -1,14 +1,18 @@
 #!/usr/bin/env node
-// package-release.mjs — 制作面向用户的预构建发布包（自包含 zip）。
+// package-release.mjs — 制作面向用户的两份发布产物。
 //
-// 产物：release/dsh-supermemory-<version>.zip
-//   内含：lib/（预构建产物）+ node_modules/（hoisted 生产依赖，解压即用、无需外网）
-//         + package.json / cordis.patch.yml / scripts/install-into-dsh.mjs
-//         + README.md / CHANGELOG.md / INSTALL.md / LICENSE / .npmrc
+// 产物（release/）：
+//   1. dsh-supermemory-<version>.zip — 手动安装包（自包含：lib/ + node_modules/
+//      + package.json / cordis.patch.yml / scripts/install-into-dsh.mjs + 文档）；
+//   2. dsh-supermemory-<version>.tgz — DSH 插件面板安装包（npm-pack 结构，
+//      package/ 根）；另复制稳定别名 dsh-supermemory.tgz，供
+//      https://github.com/<owner>/<repo>/releases/latest/download/dsh-supermemory.tgz 使用。
 //
 // 用法：
-//   node scripts/package-release.mjs            # 按 package.json version 打包
-//   node scripts/package-release.mjs --skip-install   # 跳过依赖安装（复用已有 staging）
+//   node scripts/package-release.mjs                    # 两份都做
+//   node scripts/package-release.mjs --skip-install     # 跳过依赖安装（复用已有 staging）
+//   node scripts/package-release.mjs --tarball-only     # 只做/校验 .tgz，不碰 zip
+//   node scripts/package-release.mjs --tarball-only --out <dir>   # 输出到别处（dry-run）
 // 前置：先 pnpm build 刷新 lib/（本脚本不构建）。
 // 退出码：0 成功 / 1 失败。
 import { spawnSync } from 'node:child_process'
@@ -17,24 +21,38 @@ import {
   cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
   rmSync, statSync, symlink, unlinkSync, writeFileSync,
 } from 'node:fs'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
 const version = pkg.version
 const bundleName = 'dsh-supermemory-' + version
-const releaseDir = join(root, 'release')
+const outIndex = process.argv.indexOf('--out')
+const releaseDir = outIndex >= 0 && process.argv[outIndex + 1] !== undefined
+  ? resolve(process.argv[outIndex + 1])
+  : join(root, 'release')
 const stageDir = join(releaseDir, bundleName)
 const zipPath = join(releaseDir, bundleName + '.zip')
 
 const skipInstall = process.argv.includes('--skip-install')
+// Only (re)build the panel tarball: no staging, no zip, no dependency install.
+// Used to validate an existing build without touching the manual release zip.
+const tarballOnly = process.argv.includes('--tarball-only')
 const log = (...a) => console.log('[package-release]', ...a)
 const fail = (...a) => { console.error('[package-release] ERROR:', ...a); process.exit(1) }
 
 // ---------- 1. 前置检查 ----------
 for (const f of ['lib/supermemory.js', 'lib/client.js', 'cordis.patch.yml', 'scripts/install-into-dsh.mjs', 'README.md', 'CHANGELOG.md', 'INSTALL.md', 'LICENSE']) {
   if (!existsSync(join(root, f))) fail('缺少文件: ' + f + '（先 pnpm build？）')
+}
+if (tarballOnly) {
+  const panel = packPanelTarball()
+  log('仅 tarball 模式完成：', panel.tgzPath)
+  log('  体积: ' + (panel.bytes.length / 1024).toFixed(1) + ' kB')
+  log('  sha256: ' + panel.sha256)
+  log('  稳定别名：', panel.stableTgzPath)
+  process.exit(0)
 }
 if (existsSync(join(stageDir, 'node_modules')) && !skipInstall) {
   log('清理旧 staging:', stageDir)
@@ -93,6 +111,9 @@ let dereferenced = 0
 log('去符号链接:', dereferenced, '个')
 
 // ---------- 5. 打包 zip（PowerShell Compress-Archive，失败回退 tar.gz） ----------
+// The zip is for the manual "unzip -> install-into-dsh.mjs" path only. It is
+// NOT installable from the DSH plugin panel: the host accepts a git repository
+// or a .tgz/.tar.gz tarball, never a .zip release asset.
 rmSync(zipPath, { force: true })
 let artifact = zipPath
 const ps = spawnSync('powershell.exe', [
@@ -108,16 +129,66 @@ if (ps.error || ps.status !== 0) {
 }
 if (!existsSync(artifact)) fail('产物不存在: ' + artifact)
 
+// ---------- 5b. npm 安装包 .tgz（DSH 插件面板唯一能直接消费的发布资产） ----------
+// The DSH plugin manager (0.2.2-rc.5) parses an install spec as a registry
+// package, a git repository, or a .tgz/.tar.gz URL/path. A GitHub release page
+// and a .zip asset are both refused before pnpm runs, so the release must
+// carry an npm-pack-shaped tarball next to the manual zip.
+const panel = packPanelTarball()
+const tgzPath = panel.tgzPath
+const stableTgzPath = panel.stableTgzPath
+
 // ---------- 6. 摘要 ----------
 const buf = readFileSync(artifact)
 const sha256 = createHash('sha256').update(buf).digest('hex')
+const tgz = panel.bytes
+const tgzSha = panel.sha256
 const files = countFiles(stageDir)
 log('')
 log('完成：', artifact)
 log('  体积: ' + (buf.length / 1024 / 1024).toFixed(2) + ' MB')
 log('  文件数: ' + files)
 log('  sha256: ' + sha256)
-log('  安装方式: 解压 -> 进入目录 -> node scripts/install-into-dsh.mjs -> 重启 DSH')
+log('完成：', tgzPath)
+log('  体积: ' + (tgz.length / 1024).toFixed(1) + ' kB')
+log('  sha256: ' + tgzSha)
+log('稳定别名：', stableTgzPath, '（对应 releases/latest/download/dsh-supermemory.tgz）')
+log('  安装方式（手动）: 解压 zip -> 进入目录 -> node scripts/install-into-dsh.mjs -> 重启 DSH')
+log('  安装方式（插件面板）: 填 .tgz 直链或本机绝对路径；release 页 URL / .zip 资产不被宿主接受')
+
+/**
+ * Build and validate the npm-pack tarball the DSH plugin panel installs.
+ * @returns The versioned tarball, its stable alias, bytes and digest.
+ */
+function packPanelTarball() {
+  mkdirSync(releaseDir, { recursive: true })
+  const tgzPath = join(releaseDir, bundleName + '.tgz')
+  rmSync(tgzPath, { force: true })
+  log('生成插件面板安装包（pnpm pack -> npm tarball）…')
+  const packed = spawnSync('pnpm', ['pack', '--pack-destination', releaseDir], {
+    cwd: root, stdio: 'inherit', shell: process.platform === 'win32',
+  })
+  if (packed.error || packed.status !== 0) fail('pnpm pack 失败（DSH 插件面板需要 .tgz 资产）')
+  if (!existsSync(tgzPath)) fail('pnpm pack 未产出 ' + tgzPath + '（检查 package.json 的 version/files）')
+  // cwd + basename avoids GNU tar reading a Windows drive letter as a remote host.
+  const listing = spawnSync('tar', ['-tzf', basename(tgzPath)], { cwd: releaseDir, encoding: 'utf8' })
+  if (listing.error || listing.status !== 0) {
+    fail('无法校验 .tgz 目录结构：' + String(listing.stderr || listing.error).slice(0, 300))
+  }
+  const entries = new Set(String(listing.stdout).split(/\r?\n/).filter(Boolean))
+  for (const required of ['package/package.json', 'package/lib/supermemory.js', 'package/lib/client.js', 'package/cordis.patch.yml']) {
+    if (!entries.has(required)) fail('.tgz 缺少 ' + required + '（npm tarball 必须以 package/ 为根）')
+  }
+  const badEntry = [...entries].find((entry) => entry.includes(String.fromCharCode(92)))
+  if (badEntry !== undefined) fail('.tgz 含反斜杠路径（跨平台解压会坏）：' + badEntry)
+  // Stable alias for the plugin panel: GitHub serves
+  // /releases/latest/download/<asset> only for an exact asset name, so a
+  // version-less copy lets one documented URL survive every release.
+  const stableTgzPath = join(releaseDir, 'dsh-supermemory.tgz')
+  cpSync(tgzPath, stableTgzPath)
+  const bytes = readFileSync(tgzPath)
+  return { tgzPath, stableTgzPath, bytes, sha256: createHash('sha256').update(bytes).digest('hex') }
+}
 
 function countFiles(dir) {
   let n = 0

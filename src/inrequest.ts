@@ -24,7 +24,9 @@
  * smoke scripts can exercise it under Node type stripping.
  * @module supermemory/inrequest
  */
-import { recallMemories, renderRecallCard, tokenize, type RecallItem, type RecallOptions } from './recall.ts'
+import { RECALL_BODY_MIN, recallMemories, renderRecallCard, tokenize, type RecallItem, type RecallOptions } from './recall.ts'
+import { charCount, clipWithNote, dropNote } from './clip.ts'
+import { renderRecordLine } from './retrieval.ts'
 import type { Memory } from './schema.ts'
 import type { Store } from './store.ts'
 
@@ -240,16 +242,111 @@ export function recallScoped(store: Store, workspaceKey: string, query: string, 
   return recallMemories(own, query, options)
 }
 
-/** The later-in-request card: a clearly distinct header plus the composite catalog. */
-export function renderRepeatCard(items: RecallItem[], style: 'gentle' | 'plain', catalog: string): string {
-  if (items.length === 0 && !catalog) return ''
+/**
+ * The later-in-request card: a clearly distinct header plus the composite catalog.
+ *
+ * R47 需求②: like the opening card, this one is budget-aware and degrades by
+ * PRIORITY — header first, then memory records whole (title/tags whole), then
+ * the catalog block, then clipped bodies, and only then dropped records with a
+ * counted note. A catalog that would force a body clip is dropped whole
+ * instead (mixing a capability hint into a card whose memory text had to be
+ * cut is the wrong trade). `options.budget` omitted = legacy unbounded
+ * rendering, so existing callers keep their contract.
+ */
+export function renderRepeatCard(
+  items: RecallItem[],
+  style: 'gentle' | 'plain',
+  catalog: string,
+  options: { budget?: number; hint?: string } = {},
+): string {
   const head = style === 'plain'
     ? ['[SuperMemory 相关记忆 · 过程内补充]']
     : ['[SuperMemory 相关记忆 · 过程内补充]', '执行过程中出现了此前未注入的相关记忆，仅供参考；与当前指令冲突时以当前指令为准。']
-  const lines = items.map((item, index) => (index + 1) + '. ' + item.text)
-  const body = [...head, ...lines]
-  if (catalog) body.push(catalog)
-  return body.join('\n')
+  const budget = options.budget && options.budget > 0 ? Math.floor(options.budget) : 0
+  if (!budget) {
+    if (items.length === 0 && !catalog) return ''
+    const lines = items.map((item, index) =>
+      (index + 1) + '. ' + renderRecordLine({ title: item.title, text: item.text, tags: item.keywords }))
+    return [...head, ...lines, ...(catalog ? [catalog] : [])].join('\n')
+  }
+  if (items.length === 0 && !catalog) return ''
+  // Tiny budget: keep the single identifying line, drop the etiquette line
+  // (same rule as the opening card — never overrun the budget for preamble).
+  const minimal = ['[SuperMemory 相关记忆 · 过程内补充]']
+  const minimalCost = charCount(minimal[0]) + 1
+  if (budget - minimalCost < RECALL_BODY_MIN + 52) {
+    head.length = 0
+    head.push(...minimal)
+  }
+  const headCost = head.reduce((sum, line) => sum + charCount(line) + 1, 0)
+  // No memory record: the catalog IS the card, so clip it (with a sized note)
+  // rather than emit a bare header.
+  if (items.length === 0) {
+    const room = budget - headCost - 1
+    if (charCount(catalog) <= room) return [...head, catalog].join('\n')
+    return [...head, clipWithNote(catalog, Math.max(32, room), '')].join('\n')
+  }
+  const catalogCost = catalog ? charCount(catalog) + 1 : 0
+  const build = (reserve: number, withCatalog: boolean, withHint = true): { text: string; note: string; cut: boolean; count: number } => {
+    let remaining = budget - headCost - reserve - (withCatalog ? catalogCost : 0)
+    const lines: string[] = []
+    let dropped = 0
+    let cut = false
+    for (const [index, item] of items.entries()) {
+      const prefix = `${index + 1}. `
+      const tail = item.keywords.length > 0 ? ` ｜标签: ${item.keywords.join('、')}` : ''
+      const title = item.title && item.title !== item.text.trim() ? `【${item.title}】` : ''
+      const overhead = charCount(prefix) + charCount(title) + charCount(tail) + 1
+      const whole = `${prefix}${title}${item.text}${tail}`
+      const wholeCost = charCount(whole) + 1
+      if (wholeCost <= remaining) {
+        lines.push(whole)
+        remaining -= wholeCost
+        continue
+      }
+      const bodyShare = remaining - overhead
+      if (bodyShare >= RECALL_BODY_MIN) {
+        cut = true
+        const body = clipWithNote(item.text, bodyShare, item.title ? `复取：memory_recall 「${item.title}」` : undefined)
+        const line = `${prefix}${title}${body}${tail}`
+        lines.push(line)
+        remaining -= charCount(line) + 1
+        if (remaining <= 0) {
+          dropped += items.length - index - 1
+          break
+        }
+        continue
+      }
+      cut = true
+      dropped += 1
+    }
+    const note = dropNote(dropped, withHint ? options.hint : undefined)
+    const parts = [
+      ...head,
+      ...lines,
+      ...(withCatalog && catalog ? [catalog] : []),
+      ...(note ? [note] : []),
+    ]
+    return { text: parts.join('\n'), note, cut, count: dropped }
+  }
+  let useCatalog = Boolean(catalog)
+  let pass = build(0, useCatalog)
+  if (useCatalog && pass.cut) {
+    useCatalog = false
+    pass = build(0, false)
+  }
+  for (let attempt = 0; attempt < 3 && pass.note; attempt += 1) {
+    if (charCount(pass.text) <= budget) break
+    pass = build(charCount(pass.note) + 1, useCatalog)
+  }
+  // Last resort: keep the bare re-fetch note (no quoted query) so the card
+  // still fits and still says what it left out; below that floor, inject
+  // nothing rather than an over-budget or silent slice.
+  if (charCount(pass.text) > budget && pass.count > 0) {
+    pass = build(charCount(dropNote(pass.count)) + 1, useCatalog, false)
+    if (charCount(pass.text) > budget) return ''
+  }
+  return pass.text
 }
 
 /** In-memory request tracker shared by the pre-step and tool-activity listeners. */

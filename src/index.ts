@@ -91,7 +91,12 @@ export interface Config {
     enabled: boolean
     signalsThreshold: number
     summaryEveryTurns: number
+    /** R45 legacy switch: auto-register composite tools (off by default). */
     autoToolize: boolean
+    /** R45: auto-register composite tools (the legacy one-click entrance). */
+    autoComposite: boolean
+    /** R45: repeated work becomes a DSH skill (the default path). */
+    autoSkill: boolean
     toolizeCooldownMs: number
     toolizeMax: number
     toolizeMinSteps: number
@@ -112,7 +117,11 @@ export interface Config {
  */
 export function toolizeConfig(config: Config): ToolizeConfig {
   return {
-    enabled: config.maintenance.autoToolize,
+    // R45: the legacy autoToolize flag keeps working for anyone who set it
+    // explicitly; composite auto-registration is otherwise off, because the
+    // primary fixation path is now a skill.
+    enabled: config.maintenance.autoComposite || config.maintenance.autoToolize,
+    autoSkill: config.maintenance.autoSkill,
     threshold: config.maintenance.signalsThreshold,
     cooldownMs: config.maintenance.toolizeCooldownMs,
     maxActive: config.maintenance.toolizeMax,
@@ -164,7 +173,9 @@ export const Config: Schema<Config> = Schema.object({
     enabled: Schema.boolean().description('维护循环开关').default(true),
     signalsThreshold: Schema.natural().description('工具化序列阈值（同一短流程出现次数）').default(3),
     summaryEveryTurns: Schema.natural().description('话题集梗概滚动更新间隔（轮）').default(10),
-    autoToolize: Schema.boolean().description('需求 B：达到阈值自动固化为组合工具（不再等用户确认）；关闭时保留原有人工确认路径').default(true),
+    autoSkill: Schema.boolean().description('R45：重复事务自动沉淀为 DSH skill（写入 <仓库>/.dsh/skills，模型目录可路由；默认开）').default(true),
+    autoComposite: Schema.boolean().description('R45：重复事务自动固化为组合工具（旧的一键入口；默认关）。组合工具仍可通过 memory_toolize accept 手工生成').default(false),
+    autoToolize: Schema.boolean().description('需求 B 的旧开关（向后兼容）：显式 true 仍会生成组合工具；新安装请用 autoComposite').default(false),
     toolizeCooldownMs: Schema.natural().description('自动固化冷却毫秒数（同一工作区两次固化之间的最小间隔，防止无限增长）').default(60000),
     toolizeMax: Schema.natural().description('组合工具数量上限（达到后不再自动新增）').default(8),
     toolizeMinSteps: Schema.natural().description('自动固化的最少步数（默认 2）').default(2),
@@ -479,6 +490,10 @@ export async function apply(ctx: Context, config: Config) {
         // are fixated at boot; zero-use composites are audited there as well.
         const sweepCreated = await sweepAutoToolize(ctx, store, toolizeConfig(config), logger)
         if (sweepCreated > 0) logger.info('supermemory: auto-toolized ' + sweepCreated + ' composite(s) at boot')
+        // R45: durable repetitions that crossed the threshold before skills
+        // existed are fixated as skills at boot (files survive restarts).
+        const { sweepSkillDrafts } = await import('./toolize.ts')
+        await sweepSkillDrafts(store, toolizeConfig(config), logger)
       } catch (error) {
         logger.warn(`supermemory: composite rebuild failed: ${String(error).slice(0, 200)}`)
       }
@@ -502,7 +517,8 @@ export async function apply(ctx: Context, config: Config) {
     enabled: config.maintenance.enabled,
     signalsThreshold: config.maintenance.signalsThreshold,
     summaryEveryTurns: config.maintenance.summaryEveryTurns,
-    autoToolize: config.maintenance.autoToolize,
+    autoToolize: config.maintenance.autoComposite || config.maintenance.autoToolize,
+    autoSkill: config.maintenance.autoSkill,
     toolizeCooldownMs: config.maintenance.toolizeCooldownMs,
     toolizeMax: config.maintenance.toolizeMax,
     toolizeMinSteps: config.maintenance.toolizeMinSteps,

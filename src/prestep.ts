@@ -18,7 +18,6 @@ import { loadHostModule } from './host.ts'
 import {
   buildQuery,
   canInjectCard,
-  clampText,
   commitCard,
   commitScan,
   freshItems,
@@ -29,6 +28,7 @@ import {
   type RepeatConfig,
   type Tracker,
 } from './inrequest.ts'
+import { charCount, clipAtBoundary } from './clip.ts'
 import { matchTopicSets, renderRecallCard, type RecallOptions } from './recall.ts'
 import './services.ts'
 import type { Store } from './store.ts'
@@ -58,6 +58,17 @@ function textOf(message: UserMessage): string {
 /** Options shared by the opening recall and every repeat recall. */
 function recallOptions(config: PreStepConfig): RecallOptions {
   return { limit: config.maxItems, minScore: config.minScore, halfLifeDays: config.halfLifeDays, now: Date.now() }
+}
+
+/**
+ * R47: the re-fetch clue carried by every omission note. The user's own words
+ * are the best `memory_recall` query, so the note quotes a short, cleaned
+ * slice of them — long enough to be a real query, short enough to stay a hint.
+ */
+function clipQueryHint(userText: string): string {
+  const clean = String(userText ?? '').replace(/\s+/g, ' ').trim()
+  const clipped = clipAtBoundary(clean, 24) || clean.slice(0, 24)
+  return `「${clipped}」`
 }
 
 /** Attach the recall-injecting pre-step listener. Returns the effect disposer. */
@@ -123,7 +134,11 @@ export function attachPreStep(
         // R19 需求⑧: the opening card also names the topic set the matched
         // conclusions belong to, so the hub can answer/activate immediately.
         const topicSets = matchTopicSets([...activeStore.topicsets.entries()], userText, 3)
-        const card = renderRecallCard(items, config.injectStyle, topicSets).slice(0, config.maxChars)
+        // R47: the card is rendered WITH its budget (degradation by priority,
+        // omission notes) instead of being hard-sliced at maxChars afterwards —
+        // the old `.slice(0, maxChars)` cut mid-sentence/mid-tag with no sign.
+        const recallHint = `复取：memory_recall ${clipQueryHint(userText)}`
+        const card = renderRecallCard(items, config.injectStyle, topicSets, { budget: config.maxChars, hint: recallHint })
         // R19 协同②: a hub also gets a compact statement of the branches it has
         // started (title / state / owning set / shared-with-N-hubs), so "which
         // branches do I have?" is answerable from context instead of guesswork.
@@ -153,7 +168,8 @@ export function attachPreStep(
         const appended = []
         if (card) {
           const message = await build(card)
-          commitCard(state, step, items, card.length)
+          // Code points, the same unit the card budget counts in.
+          commitCard(state, step, items, charCount(card))
           appended.push(message)
         }
         if (branchesCard) appended.push(await buildNotice(branchesCard))
@@ -175,18 +191,19 @@ export function attachPreStep(
       const entries = catalogFor(recent, activeComposites(activeStore), undefined, 3)
       const strong = entries.some((entry) => entry.hits >= 2)
       const catalog = renderCatalog(entries)
-      const text = renderRepeatCard(items, config.injectStyle, catalog)
+      // R47: budget-aware repeat card (priority: header > records > catalog >
+      // omission note). The old `clampText(text, …)` hard-sliced the assembled
+      // card; now the renderer itself degrades and says what it left out.
+      const text = renderRepeatCard(items, config.injectStyle, catalog, {
+        budget: Math.min(config.maxChars, remainingChars(state, config.repeat)),
+        hint: `复取：memory_recall ${clipQueryHint(query)}`,
+      })
       if (!text || (items.length === 0 && !strong)) {
         commitScan(state, step)
         return decision
       }
-      const capped = clampText(text, Math.min(config.maxChars, remainingChars(state, config.repeat)))
-      if (!capped) {
-        commitScan(state, step)
-        return decision
-      }
-      const message = await build(capped)
-      commitCard(state, step, items, capped.length)
+      const message = await build(text)
+      commitCard(state, step, items, charCount(text))
       return { ...decision, messages: [...messages, message] }
     } catch (error) {
       // Hard constraint: the hub is never blocked by the memory plugin.

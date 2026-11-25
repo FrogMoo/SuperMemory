@@ -1,6 +1,6 @@
 # SuperMemory 安装指南（用户版）
 
-面向 DSH 最终用户：不需要克隆仓库、不需要构建，下载 Release 包 → 一条命令挂载 → 重启 DSH。
+面向 DSH 最终用户：不需要克隆仓库、不需要构建。可以**在 DSH 插件面板直接安装**（方式 A），也可以下载 Release 包手动挂载（方式 B）。
 
 ## 环境要求
 
@@ -11,7 +11,37 @@
 | pnpm | 随 Node 安装或独立安装（`npm i -g pnpm`） |
 | 网络 | 挂载步骤默认**不需要**外网（发布包已内置生产依赖）；仅首次 `pnpm install` 建软链时走本地缓存 |
 
-## 安装步骤
+## 方式 A：在 DSH 插件面板安装（推荐，需能访问 GitHub）
+
+打开「侧边栏 → 插件 → 安装插件」，在「包名或地址」填以下**之一**：
+
+1. **发布 tarball（最稳，安装器直接消费）**：
+   `https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz`
+   （每个新 Release 都会带这个稳定别名；也可填某个版本的具体资产
+   `.../releases/download/v<版本>/dsh-supermemory-<版本>.tgz`。）
+2. **Git 仓库地址（安装 main 最新源码）**：
+   `https://github.com/FrogMoo/SuperMemory`
+3. **本机绝对路径**（已下载/解压 tarball 时）：
+   例如 `F:\10-SuperMemory\release\dsh-supermemory.tgz`。
+
+安装开始后等它完成；若提示重启，**完全退出并重启 DSH Desktop**。
+
+### 安装器规则（DSH 0.2.2-rc.5，务必按此填写）
+
+DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表，也不接受 zip；它只认四类输入：
+
+| 输入 | 是否接受 | 说明 |
+|---|---|---|
+| npm 包名（如 `dsh-plugin-xxx`） | ✅ | 本插件未发布 npm，不适用 |
+| Git 仓库 URL / `github:owner/repo` | ✅ | 会 clone 默认分支；安装前有 5 秒 GitHub 连接检查，网络慢会超时 |
+| `.tgz` / `.tar.gz` 直链或绝对路径 | ✅ | **发布面板安装请用这个** |
+| `FrogMoo/SuperMemory`（裸 owner/repo） | ❌ | 会被当成 npm 包名，报 invalid spec |
+| `.../releases` 页面 URL | ❌ | 报 “a URL must point at a git repository or a tarball” |
+| Release 里的 `.zip` 资产 | ❌ | 同上；zip 只用于下面的手动安装 |
+
+> 当前 `v1.2.0` Release 如果还没有 `.tgz` 资产，稳定别名 URL 会 404：请改用上面的 Git 地址，或按方式 B 手动安装。补齐 tgz 的发布清单见 `DEV-NOTES` 对应章节。
+
+## 方式 B：手动下载 Release 包（离线/内网）
 
 ### 1. 下载并解压 Release 包
 
@@ -70,3 +100,6 @@ node scripts/install-into-dsh.mjs
 | 重启后不生效 | 必须**完全重启** DSH Desktop（不是刷新窗口） |
 | 报缺少 `@deepseek-ai/schemastery` | 发布包 `node_modules/` 被解压工具丢弃（部分工具默认跳过点目录/链接）→ 用支持完整解压的工具重新解压，勿删 `node_modules` |
 | 换机器/换目录 | 重跑一次 `node scripts/install-into-dsh.mjs` 即可，link 自动跟随新路径 |
+| 插件面板报“找不到插件 / invalid spec” | 不要填裸 `FrogMoo/SuperMemory`、release 页面或 zip 资产；按方式 A 填完整 git URL 或 `.tgz` 直链 |
+| 插件面板报“无法访问 GitHub / 连接超时” | 安装器对 GitHub 有 5 秒连接检查；网络慢时改用 `.tgz` 直链/本机路径，或走方式 B 手动安装 |
+| 插件面板安装 `.tgz` 后没反应 | 完全退出并重启 DSH Desktop；到插件页确认 `dsh-supermemory` 已启用 |

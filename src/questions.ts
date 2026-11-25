@@ -21,6 +21,7 @@
  */
 import type { Dispatch, Question } from './schema.ts'
 import type { Store } from './store.ts'
+import { clipMarked, clipWithNote } from './clip.ts'
 import { newId } from './store.ts'
 import { topicSetIdsOf } from './topicsets.ts'
 
@@ -161,8 +162,24 @@ function normalizeSeverity(raw: unknown): QuestionSeverity {
   return raw === 'low' || raw === 'high' ? raw : 'medium'
 }
 
+/**
+ * Normalise one stored string to its budget.
+ *
+ * R47: the LONG fields (question / progress / defaultPlan / answer) are clipped
+ * at a sentence boundary with an omission note instead of a raw `slice` — the
+ * hub reads these verbatim in the relay block, and a mid-sentence cut hid the
+ * fact that anything was missing. Short label fields keep the plain clip (a
+ * note would overwhelm them). Stored notes carry no re-fetch clue (`hint: ''`):
+ * a question is not a memory.
+ */
 function clip(raw: unknown, max: number): string {
   return String(raw ?? '').trim().slice(0, max)
+}
+
+function clipLong(raw: unknown, max: number): string {
+  const text = String(raw ?? '').trim()
+  if (Array.from(text).length <= max) return text
+  return clipWithNote(text, max, '')
 }
 
 /**
@@ -191,10 +208,10 @@ export async function raiseQuestion(
   }
   const [dispatchId, dispatch] = found
   const title = clip(input.title, 80)
-  const text = clip(input.question, 2000)
+  const text = clipLong(input.question, 2000)
   if (!title) return { status: 'error', message: 'title 不能为空：给出一句可扫读的问题标题。' }
   if (!text) return { status: 'error', message: 'question 不能为空：写清要用户裁决什么。' }
-  const options = (input.options ?? []).map((option) => clip(option, 120)).filter(Boolean).slice(0, 8)
+  const options = (input.options ?? []).map((option) => clipMarked(option, 120)).filter(Boolean).slice(0, 8)
   const blocking = input.blocking === true
   const now = Date.now()
   const questionId = newId('q')
@@ -204,14 +221,14 @@ export async function raiseQuestion(
     ...(dispatch.topicSetId ? { topicSetId: dispatch.topicSetId } : {}),
     branchSessionId,
     ...(dispatch.hubSessionId ? { hubSessionId: dispatch.hubSessionId } : {}),
-    branchTask: clip(dispatch.task, 200),
+    branchTask: clipMarked(dispatch.task, 200),
     title,
     question: text,
     options,
     severity: normalizeSeverity(input.severity),
     blocking,
-    progress: clip(input.progress, 1500),
-    defaultPlan: clip(input.defaultPlan, 1000),
+    progress: clipLong(input.progress, 1500),
+    defaultPlan: clipLong(input.defaultPlan, 1000),
     status: 'open',
     createdAt: now,
     updatedAt: now,
@@ -238,7 +255,7 @@ export async function resolveQuestions(
   const table = questionsOf(store)
   if (!table) return 0
   let resolved = 0
-  const takenAnswer = clip(answer, 2000)
+  const takenAnswer = clipLong(answer, 2000)
   for (const id of ids) {
     const row = table.get(id)
     if (!row || row.status === 'resolved') continue
@@ -286,7 +303,7 @@ export function renderQuestionList(rows: readonly QuestionRow[]): string {
   const lines = [`待处理问题 ${rows.length} 个（阻塞 ${blocking} / 非阻塞 ${rows.length - blocking}）：`]
   for (const row of rows) {
     const question = row.question
-    const task = question.branchTask ? ` · 分支任务「${question.branchTask.slice(0, 40)}」` : ''
+    const task = question.branchTask ? ` · 分支任务「${clipMarked(question.branchTask, 40)}」` : ''
     lines.push(`${question.blocking ? '⛔' : '•'} ${question.title}（${question.branchSessionId}${task}）`)
     lines.push(`  ${question.question}`)
     if (question.options.length > 0) lines.push(`  可选：${question.options.join(' / ')}`)

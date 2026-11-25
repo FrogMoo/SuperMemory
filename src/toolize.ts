@@ -6,9 +6,11 @@
  * Two trigger sources feed one mechanism:
  * 1. Durable per-turn sequences (maintenance, after turn/end): sliding windows of
  *    2..4 tool calls plus the whole short turn sequence. Crossing the threshold
- *    auto-registers the composite (maintenance.autoToolize, default true) under a
- *    per-workspace cooldown and an active cap; with auto off, the old pending
- *    proposal + memory_toolize confirmation path stays intact.
+ *    fixates the repeated work as a DSH skill (maintenance.autoSkill, default
+ *    true); composite auto-registration is the legacy one-click entrance
+ *    (maintenance.autoComposite, default false) with a per-workspace cooldown and
+ *    an active cap; with both off, the pending proposal + memory_toolize
+ *    confirmation path stays intact.
  * 2. Request-local repetition (activity, on tools/post-execute): the same window
  *    seen threshold times inside ONE request is already a hard signal, so it
  *    auto-registers immediately, with no user turn required.
@@ -33,6 +35,7 @@ import {
 import type { Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import type { RequestState } from './inrequest.ts'
+import { persistSequenceSkill } from './skill-forge.ts'
 
 /** Tool-ization knobs (all surfaced in the plugin Config schema). */
 export interface ToolizeConfig {
@@ -44,6 +47,11 @@ export interface ToolizeConfig {
   minDistinctTools: number
   nearMissHint: boolean
   recycleIdleDays: number
+  /**
+   * R45: 重复事务同时沉淀为 DSH skill（默认路径）。缺省 false，保持旧调用点的
+   * 行为不变（只生成组合工具）；真实配置由 index.ts 显式打开。
+   */
+  autoSkill?: boolean
 }
 
 /** Injectable seam so unit tests can drive auto-toolization without a host. */
@@ -245,6 +253,9 @@ export async function autoToolizeFromSequence(
   deps?: ToolizeDeps,
 ): Promise<AutoToolizeOutcome> {
   const seam = deps ?? defaultToolizeDeps()
+  // 关闭时不做任何宿主探测（recordTurnSequences 在 autoSkill 打开、组合工具关闭
+  // 时仍会走到这里；默认 seam 的 toolExists 需要真实 ctx.tools，不能白碰）。
+  if (!config.enabled) return { action: 'disabled', name: compositeNameOf(tools), reason: 'autoToolize 关闭' }
   const candidates = activeComposites(store)
   const existingNames = new Set(candidates.map((candidate) => candidate.spec.name))
   const registered = new Set<string>()
@@ -364,6 +375,18 @@ export async function recordTurnSequences(
       proposalStatus: crossed ? 'pending' : existing?.proposalStatus,
     }
     await store.signals.put(signalKey, signal)
+    // R45: 跨过阈值 = 重复事务确认。默认把它沉淀成可路由的 skill（文件），
+    // 组合工具仍是可选的一键入口（见 autoToolizeFromSequence）。
+    if (crossed && config.autoSkill) {
+      try {
+        const written = await persistSequenceSkill(store, workspaceKey, job.tools, parseSamples(samples), count)
+        if (written && written.status !== 'unchanged' && written.status !== 'preserved') {
+          logger.info('supermemory: skill ' + written.name + ' ' + written.status + ' (v' + written.version + ')')
+        }
+      } catch (error) {
+        logger.warn('supermemory: skill draft failed: ' + String(error).slice(0, 160))
+      }
+    }
     if (!crossed) continue
     const outcome = await autoToolizeFromSequence(ctx, store, workspaceKey, job.tools, parseSamples(samples), config, logger, deps)
     if (outcome.action === 'create' || outcome.action === 'duplicate') {
@@ -404,6 +427,45 @@ export async function sweepAutoToolize(
   const idle = activeComposites(store).filter((entry) => entry.useCount === 0).length
   if (idle > 0) logger.info('supermemory: ' + idle + ' composite tool(s) have zero recorded use')
   if (created > 0) logger.info('supermemory: startup sweep auto-toolized ' + created + ' sequence(s)')
+  return created
+}
+
+/**
+ * R45 boot sweep: turn every durable repetition that already crossed the
+ * threshold into a skill (upgrade path for signals recorded before skills
+ * existed). Grouped per workspace so each lands in its own project skill root;
+ * an unknown workspace is skipped rather than writing into the current cwd.
+ */
+export async function sweepSkillDrafts(
+  store: Store,
+  config: ToolizeConfig,
+  logger: { info: (msg: string) => void; warn: (msg: string) => void },
+): Promise<number> {
+  if (!config.autoSkill) return 0
+  const threshold = Math.max(1, config.threshold)
+  const workspaces = new Set<string>()
+  for (const [, signal] of store.signals.entries()) {
+    if (signal.count < threshold) continue
+    if ((signal.sequence ?? []).length < Math.max(2, config.minSteps)) continue
+    if (!signal.workspaceKey || signal.workspaceKey === 'unknown') continue
+    workspaces.add(signal.workspaceKey)
+  }
+  if (workspaces.size === 0) return 0
+  const { resolveSkillRoot, syncRepeatedTransactions } = await import('./skill-forge.ts')
+  let created = 0
+  for (const workspaceKey of workspaces) {
+    try {
+      const scope = resolveSkillRoot(workspaceKey)
+      const { results } = await syncRepeatedTransactions(store, workspaceKey, scope, { threshold })
+      for (const result of results) {
+        if (result.status === 'created') created += 1
+        else if (result.status === 'error') logger.warn('supermemory: skill sweep failed for ' + result.name + ': ' + result.message)
+      }
+    } catch (error) {
+      logger.warn('supermemory: skill sweep failed for ' + workspaceKey + ': ' + String(error).slice(0, 160))
+    }
+  }
+  if (created > 0) logger.info('supermemory: skill sweep created ' + created + ' skill(s)')
   return created
 }
 

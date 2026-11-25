@@ -29,6 +29,8 @@ export interface MaintenanceConfig {
   signalsThreshold: number
   summaryEveryTurns: number
   autoToolize: boolean
+  /** R45: 重复事务同时沉淀为 skill（默认开）。 */
+  autoSkill: boolean
   toolizeCooldownMs: number
   toolizeMax: number
   toolizeMinSteps: number
@@ -335,6 +337,7 @@ async function countSequenceSignal(
   const { recordTurnSequences, recycleIdleComposites } = await import('./toolize.ts')
   const toolize = {
     enabled: config.autoToolize,
+    autoSkill: config.autoSkill,
     threshold: config.signalsThreshold,
     cooldownMs: config.toolizeCooldownMs,
     maxActive: config.toolizeMax,

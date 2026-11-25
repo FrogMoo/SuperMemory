@@ -1161,5 +1161,256 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   ok('R33-3 双向卡片契约：两向同字段（任务/话题集/能力/回执）+ 标题回退 + 普通消息不误伤')
 }
 
+// ---- R44 需求①②③: 面板页签结构 + i18n 对齐 ----
+{
+  const { readFileSync } = await import('node:fs')
+  const { zh, en } = await import('../src/client/locales.ts')
+  const pageSrc = readFileSync('src/client/panel-page.tsx', 'utf8')
+
+  // ① 「中枢会话」页签不再渲染「全部话题集」「全部分支会话」两张卡（连同样式/
+  //    空态/远程调用）；宿主方法保留（话题集页签与派发卡仍在用）。
+  assert.ok(!pageSrc.includes("key: 'allSets'"), 'R44①: the 全部话题集 card is gone from the hub tab')
+  assert.ok(!pageSrc.includes("key: 'allBranches'"), 'R44①: the 全部分支会话 card is gone from the hub tab')
+  assert.ok(!pageSrc.includes("key: 'new', className: 'sm-form-col'"),
+    'R44③: the 增加记忆 form is gone from the memories tab')
+  assert.ok(!pageSrc.includes('fillMemoryShape') && !pageSrc.includes('setNewMemory('),
+    'R44③: the add-memory state and its blur auto-fill helper are removed with the form')
+
+  // ② 「分支会话」页签存在，且 body/tab 开关都接上了同一 View 类型。
+  assert.ok(pageSrc.includes("| { kind: 'branches' }"), 'R44②: the branches View exists')
+  assert.ok(pageSrc.includes("kind === 'branches' ? branchesView"), 'R44②: the body switch renders the branches view')
+  assert.ok(pageSrc.includes("...tabProps('branches')"), 'R44②: the tab row renders the branches tab')
+  assert.ok(pageSrc.includes('const branchesView: ReactNode'), 'R44②: the branches view is defined')
+  // 关键字搜索 + 话题集筛选都在本地做，listAllBranches 仍是数据来源。
+  assert.ok(pageSrc.includes('setBranchQuery'), 'R44②: the keyword search state exists')
+  assert.ok(pageSrc.includes('api.listAllBranches(cwd)'), 'R44②: the data still comes from the host listAllBranches')
+  // 点击沿用现有分支行交互（openChat）。
+  assert.ok(/branchesView[\s\S]*openChat\(row\.branchSessionId\)/.test(pageSrc),
+    'R44②: a branch row click reuses the existing openChat interaction')
+
+  // ③ 「增加记忆」的 i18n 文案一并清理（中英对称，不残留死键）。
+  for (const key of ['memory.new', 'memory.add', 'memory.new.placeholder', 'memory.title.placeholder',
+    'memory.tags.placeholder', 'memory.shape.hint', 'memory.shape.auto', 'hub.allSets',
+    'hub.allSets.hint', 'hub.allSets.new']) {
+    assert.equal(zh[key], undefined, 'zh drops the removed key: ' + key)
+    assert.equal(en[key], undefined, 'en drops the removed key: ' + key)
+  }
+
+  // 页签顺序：中枢会话 | 话题集 | 分支会话 | 记忆 | 设置（tools 在其后）。
+  const tabStart = pageSrc.indexOf("h('div', { key: 'tabs'")
+  const tabEnd = pageSrc.indexOf('bodyScroll', tabStart)
+  assert.ok(tabStart >= 0 && tabEnd > tabStart, 'the tab row is found in the panel source')
+  const tabRow = pageSrc.slice(tabStart, tabEnd)
+  const order = ['tab.hub', 'tab.sets', 'tab.branches', 'tab.memories', 'tab.tools', 'tab.settings']
+    .map((key) => ({ key, at: tabRow.indexOf(key) }))
+    .filter((row) => row.at >= 0)
+  assert.deepEqual(order.map((row) => row.key), ['tab.hub', 'tab.sets', 'tab.branches', 'tab.memories', 'tab.tools', 'tab.settings'],
+    'R44④: tab order is 中枢会话 | 话题集 | 分支会话 | 记忆 | (固化能力) | 设置')
+
+  // 新键中英齐全（缺键会让标签显示成 raw key）。
+  for (const key of ['tab.branches', 'branches.search', 'branches.stats', 'hub.allBranches',
+    'hub.allBranches.filter', 'hub.allBranches.allSets', 'hub.allBranches.empty', 'hub.allBranches.hint']) {
+    assert.equal(typeof zh[key], 'string', 'zh keeps the branches-tab key: ' + key)
+    assert.equal(typeof en[key], 'string', 'en keeps the branches-tab key: ' + key)
+  }
+  assert.equal(zh['tab.branches'], '分支会话')
+  assert.equal(en['tab.branches'], 'Branches')
+  assert.equal(zh['branches.stats'], '显示 {shown} / {total} 个分支会话')
+  assert.equal(en['branches.stats'], 'Showing {shown} of {total} branch sessions')
+  ok('R44-1 面板页签结构：中枢页签去掉两张管理卡 + 新增「分支会话」页签（跨话题集/筛选/搜索/沿用行交互）+ 记忆页签去掉增加入口（i18n 同步清理）+ 页签顺序断言')
+}
+
+// ---- R46: release artifacts the DSH plugin panel can actually install ----
+// The host's installer reads a spec as registry name / git repository /
+// .tgz-or-.tar.gz URL or path; it never queries GitHub Releases and refuses a
+// release page or a .zip asset. The release tooling must keep producing an
+// npm-pack tarball (and a version-less alias) next to the manual zip, and the
+// docs must point users at an accepted input.
+{
+  const { readFileSync } = await import('node:fs')
+  const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
+  const packSrc = readFileSync('scripts/package-release.mjs', 'utf8')
+  const ghSrc = readFileSync('scripts/github-api-release.mjs', 'utf8')
+  const installDoc = readFileSync('INSTALL.md', 'utf8')
+  const readme = readFileSync('README.md', 'utf8')
+
+  assert.ok(packSrc.includes("'pack', '--pack-destination'"),
+    'R46①: package-release builds an npm-pack tarball (pnpm pack) beside the zip')
+  assert.ok(packSrc.includes('package/lib/supermemory.js') && packSrc.includes('package/cordis.patch.yml'),
+    'R46①: the tarball layout is validated against package/ root files')
+  assert.ok(packSrc.includes("'dsh-supermemory.tgz'"),
+    'R46①: a version-less dsh-supermemory.tgz alias is produced for the stable latest URL')
+  assert.ok(packSrc.includes('String.fromCharCode(92)'),
+    'R46①: backslash tar entries are rejected (portable archive)')
+  assert.ok(packSrc.includes("'--tarball-only'") && packSrc.includes("'--out'"),
+    'R46①: a dry-run mode can rebuild only the tarball without touching the manual zip')
+
+  assert.ok(ghSrc.includes("base + '.zip', base + '.tgz'"),
+    'R46②: the release uploader uploads both the manual zip and the panel tgz')
+  assert.ok(ghSrc.includes("'release', 'dsh-supermemory.tgz'"),
+    'R46②: the stable alias is uploaded with each release')
+  assert.ok(ghSrc.includes("'application/gzip'"),
+    'R46②: the tgz asset is uploaded with a tarball content type')
+
+  const stableUrl = 'https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz'
+  assert.ok(installDoc.includes(stableUrl), 'R46③: INSTALL documents the stable panel tarball URL')
+  assert.ok(readme.includes(stableUrl), 'R46③: README documents the stable panel tarball URL')
+  assert.ok(installDoc.includes('a URL must point at a git repository or a tarball'),
+    'R46③: INSTALL quotes the host rule that refuses a release page / .zip asset')
+  assert.ok(installDoc.includes('FrogMoo/SuperMemory') && /裸 owner\/repo|会被当成 npm 包名/.test(installDoc),
+    'R46③: INSTALL warns that a bare owner/repo is read as an npm package name')
+  assert.ok(installDoc.includes('.tgz') && installDoc.includes('.zip'),
+    'R46③: the two artifact roles (panel tgz vs manual zip) are distinguished')
+  assert.equal(pkg.name, 'dsh-supermemory', 'R46: the package keeps its plugin name')
+}
+ok('R46-1 发布资产：zip 之外产出 npm-pack .tgz + 稳定别名，GitHub 上传双资产，文档只给安装器可接受的输入（git 仓库 / .tgz），并说明 zip 与 release 页不接受')
+
+// ---- R47 需求②③: 注入/展示路径的截断修复（预算化 + 显式省略 + 复取线索）----
+// 旧病：中枢 prestep 把整张记忆卡 `.slice(0, maxChars)`、各列表行 `.slice(0, N)`，
+// 半句/半标签/无标记；超预算时既不说明省略也不给复取线索。这里用超长正文与多
+// 卡片把「不越界 / 不半句 / 不半标签 / 显式省略 + 复取 / 预算内完整」钉住。
+{
+  const { renderRecallCard } = await import('../src/recall.ts')
+  const { renderRepeatCard } = await import('../src/inrequest.ts')
+  const { clipAtBoundary, clipMarked, clipWithNote, charCount } = await import('../src/clip.ts')
+  const { readFileSync } = await import('node:fs')
+
+  const sentence = '这条结论说明构建与发布流程的关键约束。'
+  const longBody = sentence.repeat(20) // 380 字，句句有句号 → 只能落在句界
+  const record = (index, text = longBody, tags = ['构建', '闸门']) => ({
+    memoryId: 'm' + index, title: '结论标题' + index, text, score: 10 - index, createdAt: 1, keywords: tags,
+  })
+  const HINT = '复取：memory_recall 「构建命令」'
+  const NOTE_REFETCH = /…（原文 \d+ 字，已省略 \d+ 字，复取：memory_recall 「[^」]+」）/
+
+  // R47-1 裁剪原语：句界 / 标记 / 带注三种都不越上限，正文不半句，标签不半截。
+  const sentenceCut = clipAtBoundary(longBody + '尾巴', 120)
+  assert.ok(charCount(sentenceCut) <= 120, 'clipAtBoundary must respect its cap')
+  assert.ok(/[。！？；;.!?]$/.test(sentenceCut), 'a body clip must land on a sentence boundary: …' + sentenceCut.slice(-6))
+  const marked = clipMarked('提交第 3 个分支的完整任务描述并验证闸门', 20)
+  assert.ok(charCount(marked) <= 20 && marked.endsWith('…'), 'a label clip keeps the … marker inside the cap')
+  assert.equal(clipMarked('短任务：校验', 40), '短任务：校验', 'a label under the cap is never touched')
+  const noted = clipWithNote(longBody, 200, '复取：memory_recall 「结论标题」')
+  assert.ok(charCount(noted) <= 200, 'clipWithNote must respect its cap including the note')
+  assert.ok(noted.includes('已省略') && noted.includes('memory_recall'), 'the note names the omission and the re-fetch clue')
+  const emoji = '结论😀很关键。'.repeat(30)
+  for (const budget of [60, 101, 200]) {
+    const out = clipWithNote(emoji, budget, '')
+    assert.ok(charCount(out) <= budget, 'surrogate-pair text must respect the cap (' + budget + ')')
+    assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out) && !/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(out),
+      'a clip must never split a surrogate pair')
+  }
+  ok('R47-1 裁剪原语：句界裁剪 / 标记裁剪 / 带注裁剪都不越界，正文不半句、标签不半截、代理对不劈开')
+
+  // R47-2 超预算记忆卡：整卡 ≤ 预算；标题/标签完整；正文句界裁剪 + 省略量 + 复取线索；
+  //        丢掉的记录按整卡计数（不是从正文中段挖空）。
+  const over = renderRecallCard([record(1), record(2)], 'gentle', [], { budget: 400, hint: HINT })
+  assert.ok(charCount(over) <= 400, 'the recall card must stay inside its budget (' + charCount(over) + ')')
+  assert.ok(over.includes('【结论标题1】'), 'the top record keeps its whole title')
+  assert.ok(over.includes('｜标签: 构建、闸门'), 'a tags join is rendered whole, never half a tag')
+  assert.ok(!/｜标签: [^\n]*、\s*…/.test(over), 'no half tag may survive a clip')
+  assert.ok(NOTE_REFETCH.test(over), 'a clipped body reports its original size, the omission and how to re-fetch')
+  assert.ok(/…（已省略 1 项，复取：memory_recall 「构建命令」）/.test(over), 'the dropped record is counted on the card')
+  const clippedLine = over.split(String.fromCharCode(10)).find((line) => line.includes('原文'))
+  assert.ok(/[。！？；;.!?]\s+…（原文/.test(clippedLine), 'a clipped body must not stop mid-sentence: ' + clippedLine)
+  ok('R47-2 超预算记忆卡：预算内 + 标题标签完整 + 正文句界省略（字数/复取线索）+ 丢卡计数')
+
+  // R47-3 预算内记忆卡：内容一字不少、没有省略标记（修复不能把正常卡片也削掉）。
+  const within = renderRecallCard(
+    [record(1, '短结论一：用 pnpm build。'), record(2, '短结论二：先 Gitee 后 GitHub。', ['推送'])],
+    'gentle', [{ id: 'ts', title: 'R30 记忆版本', tags: [], score: 3 }], { budget: 2400, hint: HINT })
+  assert.ok(charCount(within) <= 2400)
+  assert.ok(within.includes('短结论一：用 pnpm build。') && within.includes('短结论二：先 Gitee 后 GitHub。'),
+    'a card inside its budget renders every body whole')
+  assert.ok(!within.includes('已省略') && !within.includes('原文'), 'no omission marker when nothing was omitted')
+  assert.ok(within.includes('相关话题集：R30 记忆版本'), 'the topic-set hint is paid for before the records')
+  ok('R47-3 预算内记忆卡：正文完整、无省略标记、话题集提示保留')
+
+  // R47-4 多卡超预算：按优先级丢整卡并计数；被留下的记录仍整条（标题+标签）可读。
+  const many = Array.from({ length: 6 }, (_, index) => record(index + 1))
+  const dense = renderRecallCard(many, 'plain', [], { budget: 600, hint: HINT })
+  const present = many.filter((item) => dense.includes('【' + item.title + '】')).length
+  assert.ok(charCount(dense) <= 600, 'six long records still fit the budget (' + charCount(dense) + ')')
+  assert.ok(present >= 1 && present < 6, 'some whole cards are shed instead of hollowing a body')
+  assert.ok(new RegExp('…（已省略 ' + (6 - present) + ' 项').test(dense),
+    'the shed count matches the missing records (' + (6 - present) + ')')
+  ok('R47-4 多卡超预算：丢整卡 + 计数与缺失条数一致，不从正文中段挖空')
+
+  // R47-5 预算扫描：任意预算下都不越界、不出现半个标签、丢卡必定有计数。
+  const tagSets = [record(1).keywords.join('、'), ['短标签'].join('、')]
+  let swept = 0
+  for (let budget = 200; budget <= 2400; budget += 37) {
+    for (const count of [1, 2, 4, 6]) {
+      const items = Array.from({ length: count }, (_, index) =>
+        record(index + 1, longBody, index % 2 === 0 ? record(1).keywords : ['短标签']))
+      const card = renderRecallCard(items, 'gentle', [{ id: 'ts', title: '话题集', tags: [], score: 3 }], { budget, hint: HINT })
+      assert.ok(charCount(card) === 0 || charCount(card) <= budget, 'budget ' + budget + ' never overruns (' + charCount(card) + ')')
+      if (charCount(card) === 0) continue
+      const kept = items.filter((item) => card.includes('【' + item.title + '】')).length
+      if (kept < count) {
+        assert.ok(new RegExp('…（已省略 ' + (count - kept) + ' 项').test(card), 'a dropped card is always counted (budget ' + budget + ')')
+      }
+      for (const tailText of card.split('｜标签: ').slice(1)) {
+        const tailLine = tailText.split(String.fromCharCode(10))[0]
+        assert.ok(tagSets.includes(tailLine), 'a tags join is never cut in half: ' + tailLine.slice(0, 24))
+      }
+      swept += 1
+    }
+  }
+  assert.ok(swept >= 200, 'the budget sweep must actually run (' + swept + ' cards)')
+  ok('R47-5 预算扫描（200–2400 × 1/2/4/6 条）：不越界、无半标签、丢卡必有计数')
+
+  // R47-6 过程内补充卡优先级：目录块先于正文被牺牲；留得住时目录原样出现；整卡 ≤ 预算。
+  const catalog = '可用组合工具（按命中次数）：' + String.fromCharCode(10) + '- sm_composite_read_edit（read → edit）'
+  const loose = renderRepeatCard([record(1, '短结论：构建走 pnpm。')], 'gentle', catalog, { budget: 900, hint: HINT })
+  assert.ok(loose.includes('可用组合工具') && loose.includes('sm_composite_read_edit'), 'the catalog rides along when there is room')
+  assert.ok(charCount(loose) <= 900)
+  const tight = renderRepeatCard([record(1), record(2)], 'gentle', catalog, { budget: 420, hint: HINT })
+  assert.ok(charCount(tight) <= 420, 'the repeat card must stay inside its budget (' + charCount(tight) + ')')
+  assert.ok(/…（原文 \d+ 字，已省略 \d+ 字，复取：memory_recall/.test(tight), 'a clipped repeat body carries the same explicit note')
+  assert.ok(tight.includes('【结论标题1】') && tight.includes('｜标签: 构建、闸门'))
+  const catalogOnly = renderRepeatCard([], 'plain', '可用组合工具：' + 'x'.repeat(900), { budget: 300 })
+  assert.ok(charCount(catalogOnly) <= 300 && catalogOnly.includes('已省略'), 'a catalog-only card is clipped with a sized note, not silently')
+  ok('R47-6 过程内补充卡：目录先于正文牺牲、留得住时原样出现、目录单卡也被显式裁剪')
+
+  // R47-7 源守卫：所有注入/展示路径都不再裸 slice 内容字段，改用共享裁剪并带标记。
+  const source = (path) => readFileSync(path, 'utf8')
+  const prestep = source('src/prestep.ts')
+  assert.ok(!/\.slice\(0, config\.maxChars\)/.test(prestep), 'prestep must not hard-slice the assembled card')
+  assert.ok(prestep.includes('budget: config.maxChars')
+    && prestep.includes('budget: Math.min(config.maxChars, remainingChars(state, config.repeat))'),
+    'both prestep cards pass a budget into the renderer instead of slicing afterwards')
+  const inrequest = source('src/inrequest.ts')
+  assert.ok(!/return clampText\(text,/.test(inrequest) && !/card\.slice\(0,/.test(inrequest),
+    'the in-request path no longer clamps/slices the assembled card')
+  const toolsSrc = source('src/tools.ts')
+  for (const gone of ['row.text.slice(0, 80)', 'i.summary.slice(0, 80)', 'row.task.slice(0, 40)']) {
+    assert.ok(!toolsSrc.includes(gone), 'tools.ts drops the raw cut: ' + gone)
+  }
+  assert.ok(toolsSrc.includes("clipMarked(String(row.text ?? ''), 80)")
+    && toolsSrc.includes('clipMarked(i.summary, 80)')
+    && toolsSrc.includes("clipMarked(String(row.task ?? ''), 40)"), 'tools.ts excerpts go through clipMarked')
+  const questionsSrc = source('src/questions.ts')
+  assert.ok(!questionsSrc.includes('question.branchTask.slice(0, 40)')
+    && questionsSrc.includes('clipMarked(question.branchTask, 40)'), 'the hub question digest marks its task excerpt')
+  const resumeSrc = source('src/resume.ts')
+  assert.ok(!resumeSrc.includes('view.partial.slice(0, 160)') && !resumeSrc.includes('row.partial.slice(0, 120)'),
+    'resume receipts no longer cut the completed part mid-sentence')
+  assert.ok(resumeSrc.includes('clipMarked(view.partial, 160)') && resumeSrc.includes('clipMarked(row.partial, 120)'))
+  assert.ok(source('src/panel.ts').includes('return clipMarked(text, maxChars)'),
+    'the panel chat preview clips at a boundary')
+  const commandsSrc = source('src/commands.ts')
+  assert.ok(!commandsSrc.includes('episode.summary.slice(0, 120)')
+    && commandsSrc.includes("clipMarked(bits.slice(-6).join(' / '), 500)"),
+    '/memory wrap stores a boundary-clipped summary, not a half sentence')
+  assert.ok(!source('src/topicset-merge.ts').includes('cluster.summaryAfter.slice(0, 120)'), 'the merge preview marks its clip')
+  const webApp = source('src/web/app.js')
+  assert.ok(webApp.includes('const clipText =') && !webApp.includes('x.task.slice(0, 90)')
+    && !webApp.includes("(m.text || '').slice(0, 48)"), 'the web console clips row excerpts at a boundary')
+  assert.ok(!source('src/relay-text.ts').includes('text.slice(0, RELAY_RESULT_MAX_CHARS)'),
+    'the relay valve no longer cuts mid-sentence')
+  ok('R47-7 源守卫：prestep / inrequest / tools / questions / resume / panel / commands / 合并预览 / 管理台 / relay 全走共享裁剪')
+}
+
 console.log(String.fromCharCode(10) + passed + ' checks passed')
 process.exit(0)

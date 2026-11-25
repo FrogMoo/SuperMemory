@@ -59,6 +59,9 @@ export const PANEL_REMOTE = Object.freeze({
     // R41 需求①b: 设置页签的默认模型（中枢/分支，按工作区）。
     method('getModelDefaults', [param('cwd')]),
     method('setModelDefaults', [param('cwd'), param('patch')]),
+    // R45: 设置页签「已生成的 skills」——快照 / 启用停用 / 改路由描述。
+    method('listSkills', [param('cwd')]),
+    method('updateSkill', [param('cwd'), param('name'), param('patch')]),
     method('createTopicSet', [param('cwd'), param('title'), param('tags', true), param('summary', true)]),
     method('suggestMemoryShape', [param('text')]),
     method('listHubSessions', [param('cwd')]),

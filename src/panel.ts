@@ -26,6 +26,7 @@ import {
 } from './composite.ts'
 import { enumerateModels, type ModelSelection } from './model.ts'
 import { tokenize } from './recall.ts'
+import { clipMarked } from './clip.ts'
 // R22 需求⑤: 面板新建记忆与 memory_remember 共用同一套集合归属判定。
 import { collectionTierNote, listCollections, resolveCollectionForEntry, touchCollection } from './memory-collections.ts'
 // R30 需求①: 面板写路径与 memory_remember 共用同一套版本化更新（不允许绕过）。
@@ -50,6 +51,10 @@ import { latestBranchMeta } from './branch-meta.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import { recordHubSession } from './role.ts'
 import { defaultModelFor, readModelDefaults, writeModelDefaults, type ModelDefaultsView } from './model-defaults.ts'
+// R45: 已生成 skills 的面板读写（文件是事实来源，tool_memory 行仅镜像统计）。
+import {
+  listSkills as listSkillViews, resolveSkillRoot, setSkillEnabled, updateSkillDescription, type SkillView,
+} from './skill-forge.ts'
 
 export interface TopicSetView {
   id: string
@@ -434,7 +439,7 @@ export function chatBlockText(block: unknown): string {
 export function chatMessageText(content: unknown, maxChars = 1200): string {
   if (!Array.isArray(content)) return ''
   const text = content.map(chatBlockText).filter(Boolean).join('\n').trim()
-  return text.length > maxChars ? `${text.slice(0, maxChars - 1)}…` : text
+  return clipMarked(text, maxChars)
 }
 
 /**
@@ -1825,6 +1830,33 @@ export class SupermemoryPanelService {
   }
 
   /**
+   * R45: 已生成的 skills（设置页签）：名称/路由描述/版本/加载次数/启用状态。
+   * 文件是事实来源，重启后仍在；宿主 skill 目录会自动发现它们。
+   */
+  listSkills(cwd: string): SkillView[] {
+    return listSkillViews(this.store, this.wk(cwd), resolveSkillRoot(cwd))
+  }
+
+  /**
+   * R45: 启用/停用或修改 skill 的路由描述。写文件（升版 + changelog），不碰正文。
+   */
+  async updateSkill(cwd: string, name: string, patch: { enabled?: boolean; description?: string }): Promise<MutationResult> {
+    const workspaceKey = this.wk(cwd)
+    const scope = resolveSkillRoot(cwd)
+    const trimmed = String(name ?? '').trim()
+    if (!trimmed) return { status: 'error', message: '缺少 skill 名。' }
+    if (typeof patch?.description === 'string') {
+      const result = await updateSkillDescription(this.store, workspaceKey, scope, trimmed, patch.description)
+      if (result.status === 'error') return { status: 'error', message: result.message }
+    }
+    if (typeof patch?.enabled === 'boolean') {
+      const result = await setSkillEnabled(this.store, workspaceKey, scope, trimmed, patch.enabled)
+      if (result.status === 'error') return { status: 'error', message: result.message }
+    }
+    return { status: 'ok', message: '已更新 skill（文件已升版，changelog 已保留）。' }
+  }
+
+  /**
    * R22: run one capability tool (its entry command inside its scope directory).
    * Dry-run is the default (dryRunArg appended); a writeConfirm capability
    * refuses a real run without an explicit confirm and answers
@@ -2104,6 +2136,27 @@ const PANEL_DESCRIPTORS = Object.freeze([
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#ModelDefaultsPatch', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R45: 设置页签「已生成的 skills」——快照 + 启用/停用/改描述。
+    id: 'dsh-supermemory#supermemoryPanel/listSkills',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'listSkills',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#SkillViews', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/updateSkill',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'updateSkill',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'name', wire: 'name', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SkillName', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'patch', wire: 'patch', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#SkillPatch', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

@@ -9,6 +9,7 @@ import type { Store } from './store.ts'
 import type { Dispatch } from './schema.ts'
 import { newId } from './store.ts'
 import { openQuestionsOfGroup, renderQuestionsBlock } from './questions.ts'
+import { clipMarked } from './clip.ts'
 import { clipRelayResult, episodeResult } from './relay-text.ts'
 
 /** Members of one group, in creation order. */
@@ -48,7 +49,9 @@ export function groupRelayText(store: Store, groupId: string, episodes: Map<stri
   let failed = 0
   let interrupted = 0
   members.forEach(([, record], index) => {
-    const label = record.task.slice(0, 40)
+    // R47: the one-line label is clipped at a boundary and SAYS so — the old
+    // `.slice(0, 40)` cut the task mid-word with no marker.
+    const label = clipMarked(record.task, 40)
     if (record.status === 'delivered') {
       ok++
       const summary = episodes.get(record.branchSessionId) ?? '（已完成）'

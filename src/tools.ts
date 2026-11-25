@@ -26,6 +26,7 @@ import {
 // R27 需求④.2: 一条写入整形为 1..N 条原子记忆（无模型时保持 1 条）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
+import { clipMarked } from './clip.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, renderRecordLine, tagsOfBody } from './retrieval.ts'
 import { fillTopicShapeOnCreate, noteTopicSetActivated } from './topic-shape.ts'
 import type { Episode, FileMapEntry, Memory, Requirement, Signal } from './schema.ts'
@@ -678,7 +679,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
       const title = memory.title ?? ''
       const noHistory = memoryVersionsSupported(store) ? '' : '（当前存储域没有 memory_versions 表，无法提供历史）'
       const lines = versions.map((row) =>
-        `v${row.version}（${new Date(row.updatedAt).toLocaleString('zh-CN', { hour12: false })}，${row.changeType}）${row.title ? ` ${row.title}` : ''}：${row.text.slice(0, 80)}${row.text.length > 80 ? '…' : ''}`)
+        `v${row.version}（${new Date(row.updatedAt).toLocaleString('zh-CN', { hour12: false })}，${row.changeType}）${row.title ? ` ${row.title}` : ''}：${clipMarked(String(row.text ?? ''), 80)}`)
       return {
         memoryId: id,
         title,
@@ -732,7 +733,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           text: items.map((i) => {
             const count = i.sessions ?? i.branches ?? 0
             const tags = i.tags && i.tags.length > 0 ? ` ｜标签: ${i.tags.join('、')}` : ''
-            return `- 【${i.title}】${count} 个会话${i.model ? ' · ' + i.model : ''}${tags}${i.summary ? '：' + i.summary.slice(0, 80) : ''}`
+            return `- 【${i.title}】${count} 个会话${i.model ? ' · ' + i.model : ''}${tags}${i.summary ? '：' + clipMarked(i.summary, 80) : ''}`
           }).join('\n'),
         }]
       },
@@ -967,7 +968,7 @@ export async function attachTools(ctx: Context, deps: ToolsDeps, config: ToolsCo
           if (v.branches && v.branches.length > 0) {
             lines.push('分支清单：')
             v.branches.forEach((row, index) => {
-              lines.push(`${index + 1}. ${row.status === 'dispatched' ? '✅' : '❌'} ${row.task.slice(0, 40)}`
+              lines.push(`${index + 1}. ${row.status === 'dispatched' ? '✅' : '❌'} ${clipMarked(String(row.task ?? ''), 40)}`
                 + `${row.branchSessionId ? ` → ${row.branchSessionId}` : ''}`)
             })
           }
@@ -1479,19 +1480,24 @@ ${listText}` : listText
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
-    description: '工具化（P3）：① 列出待处理的组合工具提议（重复流程达阈值后产生）与已注册的能力；'
-      + '② 接受/拒绝某个提议；③ register 注册或更新一个"能力"（capability）——入口命令 + 文档 + 适用范围 + 路由描述 + 可一键执行（默认预演，写操作需 confirm=true）；'
-      + '④ refresh-builtin 刷新内置能力（store 缺失则播种、旧于内置版本则升级、现场更新保留）并返回差异报告与各能力健康度（使用次数/成败分列/连续失败/文档与适用范围缺失/零使用）。'
-      + '接受提议会把记录到的工具序列编译成组合工具（一次调用完成确定性子序列）并持久化，重启后仍可用。'
-      + 'register 同名能力 = 原地更新（version+1、changelog 记录原因），不会报错也不会重复建行；register 的能力同样落库（tool_memory），重启后 rebuildComposites 重建注册；仅适用于本仓库范围内注册（scope 指向本仓库目录）。'
+    description: '重复工作的固化入口（R45 起以 skill 为主）：① 列出待处理提议、已注册能力与已生成的 skill；'
+      + '② 接受/拒绝提议（accept 仍是旧的一键入口：把序列编译成组合工具，向后兼容）；'
+      + '③ register 注册重复工作的经验——不给 entry 时产出 DSH skill（name/title/description/whenToUse/body，写入 <仓库>/.dsh/skills，同名更新 version+1 并保留 changelog，模型目录可路由）；给 entry 时仍注册"能力"（capability：入口命令 + 文档 + 适用范围 + 默认预演/写操作确认，向后兼容）；'
+      + '④ name + enabled 启用/停用已生成的 skill；⑤ refresh-builtin 刷新内置能力并返回差异报告与健康度。'
+      + '为什么用 skill：技能正文讲「何时用/怎么判断/有哪些坑」，比固定流水线更容易在同类任务里被模型想起来；组合工具只保留给固定短子序列的一次调用。'
+      + 'skill 文件是事实来源（重启后仍在，由宿主 skill 目录发现），tool_memory 行只镜像版本/使用计数/启用状态。'
       + CAPABILITY_ROUTING_RULES,
     parameters: {
       accept: { type: 'boolean', description: '接受第一个待处理提议并生成组合工具' },
       decline: { type: 'boolean', description: '拒绝（不再提示）第一个待处理提议' },
-      register: { type: 'boolean', description: '注册一个能力（入口命令 + 文档 + 适用范围 + 路由描述，可一键执行）' },
-      name: { type: 'string', description: '能力逻辑名（字母/数字/-/_，如 git-sync-supermemory；工具名派生为 sm_composite_<name>）' },
-      title: { type: 'string', description: '能力标题（人类可读）' },
-      description: { type: 'string', description: '能力描述 + 路由：何时优先用它、关键坑是什么（模型据此路由）' },
+      register: { type: 'boolean', description: '注册重复工作的经验：缺省产出 skill；同时给 entry 时产出可执行能力' },
+      skill: { type: 'boolean', description: 'register 时强制产出 skill（即使提供了 entry）；false 则强制走能力注册' },
+      body: { type: 'string', description: 'skill 正文（Markdown）：触发条件/决策清单/步骤/关键坑/验证/反例；缺省生成同名骨架' },
+      whenToUse: { type: 'string', description: 'skill 的额外路由提示（何时加载它；短而具体）' },
+      enabled: { type: 'boolean', description: '配合 name：启用/停用已生成的 skill（不传其他字段时生效）' },
+      name: { type: 'string', description: '逻辑名（字母/数字/-/_，如 git-sync-supermemory）：skill 名派生为 sm-<name>，能力工具名派生为 sm_composite_<name>' },
+      title: { type: 'string', description: '标题（人类可读）' },
+      description: { type: 'string', description: '路由描述（skill/capability 共用）：写清「何时用/何时优先用它」，这是模型路由依据，短而具体' },
       entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（在 scope 目录内经 shell 执行）' },
       doc: { type: 'string', description: '文档路径（相对仓库根），如 "docs/git-sync.md"' },
       scope: { type: 'string', description: '适用范围：入口命令的执行目录，如 "F:\\10-SuperMemory"（通常是仓库根）' },
@@ -1542,6 +1548,25 @@ ${listText}` : listText
               additionalProperties: false,
             },
           },
+          skills: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                title: { type: 'string' },
+                description: { type: 'string', required: true },
+                version: { type: 'integer' },
+                useCount: { type: 'integer' },
+                enabled: { type: 'boolean' },
+                status: { type: 'string' },
+                path: { type: 'string' },
+                source: { type: 'string' },
+                occurrences: { type: 'integer' },
+              },
+              additionalProperties: false,
+            },
+          },
           builtin: {
             type: 'object',
             properties: {
@@ -1586,6 +1611,7 @@ ${listText}` : listText
           tool?: string
           message?: string
           capabilities?: Array<{ name: string; title?: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string }>
+          skills?: Array<{ name: string; title?: string; description: string; version?: number; useCount?: number; enabled?: boolean; status?: string; path?: string; source?: string; occurrences?: number }>
           builtin?: {
             seeded: string[]
             upgraded: string[]
@@ -1628,10 +1654,13 @@ ${listText}` : listText
           const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
           const caps = (v.capabilities ?? []).map((c) =>
             `- ${c.name}：${c.entry}${c.dryRunArg ? `（默认预演 ${c.dryRunArg}）` : ''}${c.writeConfirm ? '（写操作需 confirm=true）' : ''}${c.status === 'retired' ? '（已停用）' : ''}`).join('\n')
+          const skills = (v.skills ?? []).map((s) =>
+            `- ${s.name}（v${s.version ?? 1}，加载 ${s.useCount ?? 0} 次，${s.enabled === false ? '已停用' : '启用中'}）：${s.description}`).join('\n')
           const parts: string[] = []
           if (list) parts.push(`待处理提议：\n${list}`)
           if (caps) parts.push(`已注册能力：\n${caps}`)
-          return [{ type: 'text', text: parts.length > 0 ? parts.join('\n\n') : '（没有待处理的工具化提议，也没有已注册的能力）' }]
+          if (skills) parts.push(`已生成 skills：\n${skills}`)
+          return [{ type: 'text', text: parts.length > 0 ? parts.join('\n\n') : '（没有待处理的工具化提议，也没有已注册的能力或 skill）' }]
         }
         if (v.status === 'accepted') return [{ type: 'text', text: `已固化为组合工具 ${v.tool}。` }]
         if (v.status === 'registered') return [{ type: 'text', text: v.message ?? `已注册能力 ${v.tool}。` }]
@@ -1645,6 +1674,10 @@ ${listText}` : listText
         accept?: boolean
         decline?: boolean
         register?: boolean
+        skill?: boolean
+        body?: string
+        whenToUse?: string
+        enabled?: boolean
         name?: string
         title?: string
         description?: string
@@ -1699,8 +1732,48 @@ ${listText}` : listText
           },
         }
       }
-      // R22 能力注册：入口命令 + 文档 + 适用范围 + 路由描述，落库后可一键执行。
+      // R45: 启用/停用已生成的 skill（只给 name + enabled，不动定义）。
+      if (args.enabled !== undefined && args.name && !args.register && !args.accept && !args.decline && !args.refreshBuiltin
+        && !args.body && !args.description && !args.entry && !args.skill) {
+        const { resolveSkillRoot, setSkillEnabled } = await import('./skill-forge.ts')
+        const scope = resolveSkillRoot(cwd)
+        const result = await setSkillEnabled(store, workspaceKey ?? 'unknown', scope, String(args.name), Boolean(args.enabled))
+        if (result.status === 'error') return { status: 'error' as const, message: result.message }
+        deps.logger.info('supermemory: skill ' + result.name + (args.enabled ? ' enabled' : ' disabled'))
+        return { status: 'registered' as const, tool: result.name, message: result.message + '（文件：' + (result.path ?? '') + '）' }
+      }
+      // R45: register 默认产出 skill（重复工作的经验），只有显式给 entry 且未强制
+      // skill 时才走旧的能力注册——后者保持向后兼容（git-sync 等可执行入口）。
       if (args.register) {
+        const wantSkill = args.skill === true || (args.skill !== false && !args.entry)
+        if (wantSkill) {
+          if (!args.name || !args.description) {
+            return { status: 'error' as const, message: 'register skill 需要 name 与 description（description 是模型路由依据，写清「何时用」）。' }
+          }
+          const { draftSkillFromManual, persistSkillDraft, resolveSkillRoot, workspaceSkillToken } = await import('./skill-forge.ts')
+          const scope = resolveSkillRoot(cwd)
+          const wsKey = workspaceKey ?? workspaceKeyOf(cwd)
+          const draft = draftSkillFromManual({
+            name: String(args.name),
+            title: args.title,
+            description: String(args.description),
+            whenToUse: args.whenToUse,
+            body: args.body,
+            tags: args.tags,
+          }, scope.shared ? { sharedToken: workspaceSkillToken(wsKey) } : {})
+          const result = await persistSkillDraft(store, wsKey, draft, {
+            root: scope.root,
+            ...(args.changelog ? { changelog: String(args.changelog) } : {}),
+          })
+          if (result.status === 'error') return { status: 'error' as const, message: result.message }
+          deps.logger.info('supermemory: skill ' + draft.name + ' registered via memory_toolize (' + result.status + ', v' + result.version + ')')
+          return {
+            status: 'registered' as const,
+            tool: draft.name,
+            message: '已' + (result.status === 'created' ? '生成' : result.status === 'unchanged' ? '确认' : '更新') + ' skill '
+              + draft.name + ' v' + result.version + '（' + scope.note + '）：' + (result.path ?? ''),
+          }
+        }
         const { registerCapability } = await import('./composite.ts')
         const ws = workspaceKey ?? (args.scope ? workspaceKeyOf(args.scope) : undefined)
         const result = await registerCapability(ctx, store, {
@@ -1726,6 +1799,9 @@ ${listText}` : listText
       }
       if (!args.accept && !args.decline) {
         const { capabilityRecordsOf, liveCompositeSpecs } = await import('./composite.ts')
+        const { listSkills, resolveSkillRoot } = await import('./skill-forge.ts')
+        const scope = resolveSkillRoot(cwd)
+        const skillScope = workspaceKey ? scope : { ...scope, shared: false }
         // A3: 只列出适用于当前工作区的能力（行级归属或 scope 推导）。
         return {
           status: 'listed' as const,
@@ -1744,6 +1820,18 @@ ${listText}` : listText
             ...(typeof c.spec.version === 'number' ? { version: c.spec.version } : {}),
             ...(c.spec.usage?.lastStatus ? { lastStatus: c.spec.usage.lastStatus } : {}),
             live: liveCompositeSpecs.has(c.spec.name),
+          })),
+          skills: listSkills(store, workspaceKey ?? 'unknown', skillScope).map((s) => ({
+            name: s.name,
+            title: s.title,
+            description: s.description,
+            version: s.version,
+            useCount: s.useCount,
+            enabled: s.enabled,
+            status: s.status,
+            path: s.path,
+            ...(s.source ? { source: s.source } : {}),
+            occurrences: s.occurrences,
           })),
         }
       }

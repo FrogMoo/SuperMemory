@@ -3047,3 +3047,384 @@ v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pend
 ### 备注
 
 - 本轮提交作者身份为 FogFrost <88362780+FrogMoo@users.noreply.github.com>（repo-local config；--global 未设置）。
+
+
+---
+
+## 55. R45：重复工作固化为技能（skill）——替代流程型组合工具（2026-11-25）
+
+对应需求 D：`memory_toolize` 把重复流程编译成 `sm_composite_*` 组合工具（固定入口 + 预演 + confirm），
+生成后几乎不被调用，等于没有效果。本轮把「重复工作的沉淀」改到 DSH 的 skill 机制：**检测重复事务 → 生成给模型看的技能**
+（何时用/决策清单/步骤/坑/验证/反例），组合工具保留为向后兼容的一键入口，可执行能力（capability）不变。
+
+### 55.1 设计结论（分工与落点）
+
+- **skill（主路径）**：判断型、易变的重复工作。落盘到 `<项目根>/.dsh/skills/<name>/SKILL.md`
+  （项目根 = 最近含 `.git` 的祖先；宿主本地 provider 的最高优先级 rank 100，天然按工作区隔离）。
+  无 git 工作区回退 `<DSH_HOME>/skills`，名字带 `sm-ws<token>-` 前缀做命名空间隔离。
+- **组合工具（兼容）**：固定短子序列的一次调用；`memory_toolize accept` 仍生成组合工具。
+  自动生成开关默认关闭（`maintenance.autoComposite=false`；旧 `autoToolize` 显式 true 仍生效）。
+- **capability（不变）**：可执行入口命令（默认预演 + 写操作 confirm）。
+- **为什么更可能被调用**：skill 的 name+description 每步都在会话的 available_skills 目录里（宿主持久注入），
+  description 写成「何时用」的短句；正文按需由 skill 工具加载。组合工具是注册表里的一个工具，模型没有「该用它」的目录提示。
+
+### 55.2 改动文件
+
+- `src/skill-forge.ts`（新增，约 950 行）：草稿生成（信号/能力/手工）、SKILL.md 渲染与解析、
+  项目根/用户根解析、幂等写入（同名 version+1 + changelog，人工编辑保留正文，仅统计更新不升版）、
+  启停/改描述、`tool_memory` kind='skill' 镜像行、`detectRepeatedTransactions`、`syncRepeatedTransactions`、`bumpSkillUse`。
+- `src/toolize.ts`：`ToolizeConfig.autoSkill`；`recordTurnSequences` 跨阈值时同步落 skill；新增 `sweepSkillDrafts` 启动扫尾。
+- `src/activity.ts`：一次请求内的重复窗口也沉淀 skill；`skill` 工具加载 `sm-*` 时累加使用计数。
+- `src/index.ts`：新增 `maintenance.autoSkill`（默认 true）/ `autoComposite`（默认 false），旧 `autoToolize` 默认 false；
+  boot 时 `sweepSkillDrafts`。
+- `src/maintenance.ts`：把 `autoSkill` 透传给序列记录。
+- `src/tools.ts`：`memory_toolize` 新行为——`register` 未给 entry 时产出 skill（name/title/description/whenToUse/body/tags），
+  显式 entry 仍走 capability；`name + enabled` 启停；list 输出新增 `skills`；工具描述改成「skill 为主、组合工具兼容」。
+- `src/panel.ts` + `src/client/remote.ts` + `src/client/index.ts` + `src/client/panel-page.tsx` + `src/client/locales.ts`：
+  设置页签最小插入「已生成的 skills」卡片（名称/版本/加载次数/启用状态/行内改路由描述/启停），
+  新增远程方法 `listSkills` / `updateSkill`（两端 descriptor 同步，parity 断言仍成立）。未改动既有页签结构。
+- `scripts/skill-smoke.mjs`（新增，13 组）+ `package.json`（`smoke:skill`，并加入 `pnpm smoke` 链）。
+- `DEV-NOTES.md` 本节。
+
+### 55.3 检测与幂等规则
+
+- 输入：durable `signals`（滑动窗口序列，阈值 = `maintenance.signalsThreshold`，排除 nearmiss/capability 行）
+  + `tool_memory` 中 `useCount` 达阈值的能力行（重复「任务类型」）。命令/文件/检索模式从真实 samples 提取。
+- 输出草稿：可读标题、≤500 字（宿主目录上限）的路由描述、whenToUse、正文六节；名字 kebab-case 且稳定（流程 hash 后缀）。
+- 幂等：定义（description+body）完全一致 → `unchanged`，只刷新 `sm-occurrences`/updatedAt，不升版；
+  定义变化 → `version+1`，changelog 最新在前；检测到人工编辑（正文哈希 ≠ 上次生成哈希）→ `preserved`，只更新统计，
+  绝不覆盖人工正文。正文不嵌入时间戳/计数，避免「每次 tick 都升版」。
+- 文件是事实来源（重启后仍在）；`tool_memory` 行只镜像 title/tags/description/path/useCount/status（schema 无 version 字段，
+  zod 会剥掉未知键，因此版本/变更史只写 frontmatter）。
+
+### 55.4 验证（本轮实测）
+
+- **真实宿主端到端发现**：用真实代码在 `F:/10-SuperMemory/.dsh/skills/` 生成一个 skill 文件后，
+  会话的 available_skills 目录下一次 step 即出现该条（name+description）；再调用真实 `skill` 工具，
+  provider=filesystem、resourceBase 指向该目录、正文六节完整返回。删除文件后目录同样即时消失——
+  证明「写盘即可被 skill 工具发现」与重启存活（文件持久、无内存注册）。
+  验证后已删除该合成样本，工作区不残留演示 skill。
+- `node scripts/skill-smoke.mjs`：16/16 通过（R45-S1..S16：草稿/落盘/frontmatter 可解析/幂等/升版/人工编辑保护/启停/改描述/识别/隔离/面板/兼容/手工登记/运行时接线/启动扫尾/自动增长上限）。
+- `node scripts/capability-smoke.mjs`：12/12 通过（旧能力注册与路由未回归）。
+- `node scripts/client-sim-smoke.mjs`：通过（descriptor parity + 客户端注册未破坏）。
+- `npx tsc -p tsconfig.client.json`：0 错。
+- **未完成/外部阻塞**：`pnpm typecheck`（host 工程）被并行分支在 `src/prestep.ts` 的半成品编辑阻塞
+  （`Cannot find name 'clipAtBoundary'`，非本轮文件）；core/mechanism/workspace-scope 同样因并行分支
+  `hub-branches.ts` 的 `clipMarked is not defined` 失败，webui 因分支行投影断言失败。按并行约束记录后继续，未触碰他分支文件。
+- 未跑 `pnpm build`（并行分支共用 lib 产物，任务约束禁止）；面板改动仅经 client 工程类型检查 + client-sim，**未做 GUI 视觉验收**。
+
+### 55.5 已知限制
+
+- 草稿是确定性模板（从工具序列/样本生成），不调用 LLM 写「经验」；正文质量取决于样本里的命令/文件，完全没样本时只有骨架。
+- 能力型 skill 的触发阈值复用 signalsThreshold；能力 useCount 很高但定义已过时的场景只给提示，不自动改能力。
+- 共享用户目录（无 git 工作区）靠 `sm-ws<token>-` 前缀隔离；若用户手工改名前缀，会从该工作区列表里消失（文件仍在）。
+- 自动路径每个 skill 根最多生成 12 个（`SKILL_MAX_PER_ROOT`，防滑动窗口在启动扫尾时刷爆目录）；手工 register 不受此限。
+- 面板卡片是设置页签的追加块；任务 B 若改动设置页签布局，需要 review 合并（本轮只做最小插入）。
+- 使用计数依赖 `tools/post-execute` 观察到 `skill` 工具调用；宿主若不经该事件（替代 UI）加载技能则不计。
+
+### 55.6 用户三步验收
+
+1. 让同类流程自然重复 `signalsThreshold` 次（默认 3），或直接 `memory_toolize register` 一个 skill；
+   打开 设置 → 「已生成的 skills」应看到名称/版本/加载次数，并可启停/改描述。
+2. 新会话里看 available_skills 是否出现该 skill（name + 「何时用」描述），让模型做同类任务，确认它调用 skill 工具加载正文。
+3. 检查 `<仓库>/.dsh/skills/<name>/SKILL.md`：frontmatter 含 name/description/disable-model-invocation/version/changelog；
+   手动改正文后再触发一次生成，确认正文被保留（status=preserved）且 changelog 记录统计更新。
+
+
+---
+
+## 56. R46：发布资产补漏——DSH 插件面板装不上（GitHub release 只有 zip）→ 补 .tgz 资产与稳定别名（2026-11-25）
+
+对应问题：在 DSH「插件 → 安装插件」里填 GitHub 仓库后，安装器报找不到可用 release 包/无法安装。排查同时覆盖宿主解析规则、GitHub 实际发布状态与本仓库的发布脚本。
+
+### 56.1 证据链（只读查证 + 实测）
+
+**A. 宿主安装器没有「找 GitHub release」这一步。**
+
+- `@deepseek-ai/dsh-plugin-manager/src/install-spec.ts:70-93`：安装输入只解析为 4 类——npm 包名、git 仓库（`github:`/git URL/hosted repo URL）、`.tgz`/`.tar.gz`（URL 或绝对路径）、绝对本地目录。
+- 同文件 `:25` 的 hosted-repo 正则只匹配 `host/owner/repo`；`:31` 的 tarball 正则只认 `.tgz`/`.tar.gz`。
+- 在 DSH 0.2.2-rc.5 的 `dshx` 源码里 grep `/releases`、`releases/latest`、`api.github.com`、`zipball`、`codeload`：**0 命中**。宿主从不读 GitHub Releases 列表，也不下载 release 资产。
+- 用编译后的真实解析器（`dsh-plugin-manager/lib/types/install-spec.js`）逐条验证：
+
+  | 输入 | 解析结果 |
+  |---|---|
+  | `https://github.com/FrogMoo/SuperMemory` | `{kind:'git', host:'github.com'}` ✅ |
+  | `github:FrogMoo/SuperMemory` | `{kind:'git'}` ✅ |
+  | `FrogMoo/SuperMemory`（裸 owner/repo） | ❌ `not a package name the registry accepts` |
+  | `.../releases/latest` | ❌ `a URL must point at a git repository or a tarball` |
+  | `.../releases/download/v1.2.0/dsh-supermemory-1.2.0.zip` | ❌ 同上 |
+  | `.../releases/download/v1.2.0/dsh-supermemory-1.2.0.tgz` | `{kind:'tarball', host:'github.com'}` ✅ |
+  | `.../archive/refs/tags/v1.2.0.tar.gz` | `{kind:'tarball'}`（但这不是 npm-pack 目录结构，见下） |
+
+- `dsh-plugin-manager/src/github-connection.ts:38-45`：git 仓库安装前先跑 `git ls-remote`，默认 5 秒超时（`index.ts:330`），只对 `kind:'git'` 生效；tarball 直链不走这个检查，由 pnpm 自己取。
+
+**B. 本仓库 GitHub 发布状态（API 实测，2026-11-25）。**
+
+- `GET /repos/FrogMoo/SuperMemory` → 200，`private=false`、`default_branch=main`、`pushed_at=2026-11-24T16:13:24Z`，仓库名大小写正确，未被归档/禁用。
+- `GET /releases` → 4 条非 draft、非 prerelease：`v1.0.0`、`v1.0.1`、`v1.1.0`、`v1.2.0`；`/releases/latest` → `v1.2.0`。
+- 每个 release 仅有一个资产：`dsh-supermemory-<版本>.zip`（v1.2.0：1,960,695 B，`application/zip`）。**没有任何 `.tgz` 资产。**
+- 仓库无 `.github/workflows`；发布由本地 `scripts/github-api-release.mjs` 创建 tag/Release/上传资产，因此不存在「CI 自动补资产」的兜底。
+
+**C. 发布包本体的结构问题（二次证据）。**
+
+- `release/dsh-supermemory-1.2.0.zip` 内是手动安装目录：顶层 `dsh-supermemory-1.2.0\`，包含 `package.json`/`lib`/`node_modules`/`scripts/install-into-dsh.mjs`；它不是 npm tarball（npm tarball 必须以 `package/` 为根），且当前 Compress-Archive 在 zip 里写入了反斜杠路径（Windows 可用，跨平台解压有风险）。
+- 用 `pnpm pack` 生成的 `.tgz` 是 `package/package.json`、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml` 结构；在临时目录 `pnpm add <tgz>` 实测 exit 0（首次 9.8s / 缓存 263ms，+5 包，安装后 `node_modules/dsh-supermemory` 含 `lib` 与 `cordis.patch.yml`）。
+
+**D. 网络旁证。**
+
+- `github.com` HEAD 约 19.08s；release zip 下载 30s 只到 0.85MB/1.96MB；`git ls-remote` 1.4s 可通过 5s 预检，但 `pnpm add https://github.com/FrogMoo/SuperMemory` 在本机 >5 分钟未完成（已终止）。因此「git 仓库地址」这条路在本机不稳定；`.tgz` 更小且绕过 git clone/预检，是更可靠的路径。
+- 本机 profile 日志旁证：`C:/Users/admin/.dsh/profiles/desktop/.plugin-manager/logs` 下**没有本次 dsh-supermemory 的 operation 日志**（没有 pnpm 运行记录），只有一条 2026-10-17 的空 `github-connection-l0iPj0/git.log`。说明这次输入在 `inspect` 解析阶段就被拒绝，根本没走到 pnpm；与「填了 release 页 / zip 资产 / 裸 owner-repo」的情形一致。
+
+### 56.2 根因判定
+
+1. **主因（本仓库发布资产缺口）**：DSH 插件面板只接受 git 仓库或 `.tgz/.tar.gz`，而本仓库的 release 只有 `.zip`。用户按「Release 包」的直觉去填 release 页/zip，宿主在 pnpm 之前就拒绝；即使填 git 仓库，本机到 github.com 的大文件传输也很慢。
+2. **次因（文档缺口）**：INSTALL/README 只写了「下载 zip 解压 + install-into-dsh.mjs」的手动路径，没有给出插件面板可填写的输入形式，也没有说明裸 `FrogMoo/SuperMemory`、release 页、zip 都会报什么错。
+3. **非原因**：release/tag 缺失、仓库私有、大小写/重命名、API 限流、资产名含空格/非 ASCII——均已逐项排除；宿主版本本身也没有解析 release 的能力（不是「找不到某一个资产」，而是「根本不查资产」）。
+
+### 56.3 修复改动
+
+- `scripts/package-release.mjs`
+  - 新增 5b 步：`pnpm pack --pack-destination release` 生成 `release/dsh-supermemory-<版本>.tgz`（npm-pack 结构），并复制稳定别名 `release/dsh-supermemory.tgz`。
+  - 校验 tarball：必须有 `package/package.json`、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml`；拒绝反斜杠路径（`tar` 校验用 `cwd + basename`，避免 Windows 盘符被 GNU tar 当远端主机）。
+  - 新增 `--tarball-only`（不重建 zip/staging，仅校验面板包）与 `--out <dir>`（输出目录），用于无副作用 dry-run。
+- `scripts/github-api-release.mjs`
+  - `--asset` 改为可重复；默认资产 = 版本化 zip + 版本化 tgz + `release/dsh-supermemory.tgz` 稳定别名。
+  - 上传前按文件名删除同 release 的旧资产；tgz 用 `application/gzip`，zip 用 `application/zip`。
+- `INSTALL.md`
+  - 新增「方式 A：在 DSH 插件面板安装」，给出稳定 tgz URL、git URL、本机绝对路径三种可接受输入；
+  - 新增「安装器规则」表：裸 owner/repo、release 页、zip 资产均明确标 ❌ 及宿主原文报错；
+  - 故障排查补「找不到插件 / invalid spec」「无法访问 GitHub / 超时」「安装后没反应」三行。
+- `README.md` §5.1：面板安装与手动 zip 两条路径并列，明确 zip 只用于手动安装。
+- `scripts/core-smoke.mjs`：新增 `R46-1`，回归断言发布脚本产出 tgz + 稳定别名、GitHub 双资产上传、文档只给安装器可接受的输入。
+- 本地验证产物（未提交）：`release/dsh-supermemory-1.2.0.tgz`、`release/dsh-supermemory.tgz`，用于当前 v1.2.0 的临时面板安装。
+
+### 56.4 验证（本轮实测）
+
+- `node scripts/package-release.mjs --tarball-only --out /tmp/sm-release-check` → exit 0；tarball 695.9 kB；sha256 已打印；稳定别名生成；结构校验通过。
+- 用该 tarball 在临时目录 `pnpm add /tmp/sm-release-check/dsh-supermemory.tgz` → exit 0（263ms 缓存命中，+5 包），安装目录含 `lib/client.js`、`lib/supermemory.js`、`cordis.patch.yml`。
+- 真实 DSH 解析器逐条输入验证见 56.1 A 表（git ✅ / 裸 owner-repo ❌ / release 页 ❌ / zip ❌ / tgz ✅）。
+- `node --check scripts/package-release.mjs`、`node --check scripts/github-api-release.mjs` → OK。
+- `node scripts/core-smoke.mjs` → 36 checks passed（含 R46-1）。
+- `pnpm typecheck`：本轮只改 `.mjs` 与文档，未触及 TS；如并行分支的 TS 半成品未收敛，按并行约束记录、不修改他人文件。
+
+### 56.5 发布 v1.2.1 清单（本轮不执行）
+
+1. 版本收口：`package.json` version 1.2.1，README 版本号/CHANGELOG 同步；
+2. 构建：`pnpm build`（本分支按约束未跑，需由协调分支/中枢执行）；
+3. 打包：`node scripts/package-release.mjs` → 生成 zip、版本化 tgz、稳定别名 tgz；
+4. 提交 + 打 tag `v1.2.1`（不 push/不发布，本轮禁止）；
+5. `node scripts/github-api-release.mjs <commit> --tag v1.2.1 --notes <notes.md>`（会同时上传 3 个资产）；
+6. 验收：`GET /releases/latest` 的 assets 含 `dsh-supermemory.tgz`；`HEAD https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz` 返回 200；
+7. 在一个**可丢弃**的 DSH profile 里用稳定 URL 安装一次，确认插件启用、重启后 `memory_*` 工具出现，再交付用户。
+
+### 56.6 用户三步验收（当前 v1.2.0 即可先做）
+
+1. 打开 DSH「侧边栏 → 插件 → 安装插件」，输入本机绝对路径 `F:\10-SuperMemory\release\dsh-supermemory.tgz`（已由本轮生成；也可等 v1.2.1 发布后填稳定 URL `https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz`）。
+2. 等安装完成，**完全退出并重启** DSH Desktop；插件页确认 `dsh-supermemory` 为启用态。
+3. 新开会话，确认侧边栏 SuperMemory 面板出现、模型可见 `memory_*` 工具；若失败，把安装对话框的日志全文（pnpm/git 输出）留下，按 INSTALL 故障排查表定位。
+
+### 56.7 已知限制 / 未做
+
+- **未发布新 release**：GitHub 上 v1.2.0 仍然只有 zip；稳定 tgz URL 在 v1.2.1 发布前会 404。本轮只生成并通过本地路径验证。
+- **未跑完整 build**（并行约束）：本地 tarball 使用当前 `lib/`（v1.2.0 已提交产物）；若其他分支的源码改动要进入发布包，必须先由协调方统一 build 再打包。
+- **宿主侧格式未改**：DSH 仍不接受 zip/release 页；本轮用「补 tgz 资产 + 文档说清」绕过，未改宿主（只读查证）。若上游愿意支持 zip/自动 release 解析，可另提 issue。
+- **zip 跨平台**：Compress-Archive 的反斜杠路径未改（只影响手动 zip 在非 Windows 解压；tgz 已校验无反斜杠）。若要彻底修，可改用 tar/7z 生成 zip，但会改变现有手动安装包格式，留待发布轮评估。
+- 本地 `release/*.tgz` 为**未暂存**产物；按本轮禁止 `git add`，是否纳入仓库/Release 由协调方决定。
+
+
+---
+
+## 57. R44：面板页签结构——中枢页签去管理卡 / 新增「分支会话」页签 / 记忆页签去增加入口（2026-11-25）
+
+并行组 grp-mww38ga9-3kcte4 的「面板 UI 三项」。只改 client 侧（panel-page.tsx / locales.ts）+ core-smoke 断言；
+宿主远程方法与 webui 路由未动（方法仍被别处使用，按需求保留）。
+
+### 57.1 ① 「中枢会话」页签删除两张管理卡
+
+- 删除「全部话题集」卡（`key:'allSets'`）与「全部分支会话」卡（`key:'allBranches'`）整块渲染，
+  连同只服务它们的 `allSetForm`/`allSetTitle` 状态、`createAllSet()`（无调用者后一并移除）与
+  `hub.allSets*` 三组中英文案。
+- 宿主 `listAllTopicSets` / `listAllBranches` **保留**：前者仍被快速启动的话题集 chips 与话题集页签使用，
+  后者迁往新页签；`refreshHub` 仍同路刷新两份数据（切页签即有新数据）。
+- 中枢页签现在只剩：派发卡 + 回执 + 本中枢的分支（BranchList）+ 当前会话。
+
+### 57.2 ② 新增「分支会话」页签（跨话题集全量分支）
+
+- `View` 增 `{kind:'branches'}`；`tabProps` / `body` / 页签行三处接通，顺序为
+  **中枢会话 | 话题集 | 分支会话 | 记忆 |（固化能力）| 设置**（core-smoke 对页签顺序做断言）。
+- 行内容与原卡一致：分支标题、状态徽标、共享中枢数、并行组标记、所属话题集 + 最后活动 + 派发次数、
+  标签 chips、分支 id；点击沿用 `openChat(branchSessionId)`（与原有分支行交互相同）。
+- 筛选：话题集下拉（与 `allSets` 共用）+ **关键字搜索**（标题/标签/分支 id/所属话题集，本地过滤），
+  带计数行「显示 {shown} / {total} 个分支会话」与清空按钮；空态/加载沿用既有 EmptyState 与 refreshHub。
+- 冷启动兜底：首次进入页签且 `allBranches` 为空时按需 `api.listAllBranches(cwd)`（宿主方法不变）。
+
+### 57.3 ③ 「记忆」页签删除「增加记忆」入口
+
+- 删除整个表单块（标题/标签/正文三个输入 + 「记住」按钮 + 失焦自动补全提示 + `sm-form-col` 容器），
+  以及只为它服务的 `newMemory/newMemoryTitle/newMemoryTags/shapeAuto` 四个 state 与
+  `fillMemoryShape()`（其唯一调用点是该表单的 onBlur）。
+- i18n 同步清理中英各 8 个死键（`memory.new` / `memory.add` / `memory.new.placeholder` /
+  `memory.title.placeholder` / `memory.tags.placeholder` / `memory.shape.hint` / `memory.shape.auto` /
+  `hub.allSets*`），记忆空态 hint 改为「记忆由中枢/分支在会话中写入，这里只浏览与管理」。
+- `suggestMemoryShape` 远程方法与 `splitTags` 工具函数**保留**：前者是稳定 API（mechanism-smoke 有断言），
+  后者仍被记忆编辑器与工具编辑器使用；管理台 `/memory/create` 路由不属于面板，未动。
+
+### 57.4 断言与闸门
+
+- core-smoke **R44-1**（35 项，+1）：两张卡与增加表单确已不在（源码级）、branches View/body/tabProps/
+  branchesView/openChat 均已接通、搜索状态存在、`listAllBranches` 仍是数据源、死键中英对称清零、
+  页签顺序断言、新键中英齐全。
+- 闸门（本线，禁完整 build 以免与并行分支的 lib 交错）：`pnpm typecheck` 双工程 0 错；
+  core **35** / mechanism **113** / webui **35** / capability **12** / workspace-scope **9** 全绿；
+  client-sim 用**临时目录隔离构建**（`npx tsdown -c tsdown.client.config.ts --outDir <tmp>` + 手工 wrap）
+  跑通 `SIM SMOKE OK`，未触碰 lib/。
+
+## 58. R47：注入截断修复——预算化裁剪、显式省略与复取线索（2026-11-25）
+
+**症状**：中枢每一步注入的记忆卡、过程内补充卡、relay 结果、以及面板/管理台/工具回执里的
+摘要行，都是用裸 `slice(0, N)` 截的。卡片在 2400 字处突然停在半句；标签可能只剩半截
+（`｜标签: 构建、闸`）；被切掉的部分既没有字数也没有任何「怎么补看」的线索，中枢于是
+按半句结论回答，用户还以为那就是全部。多卡超预算时也无法判断到底丢了几条。
+
+**定位（位置 → 旧上限 → 旧截断方式 → 用户可见症状）**
+
+| 位置 | 上限 | 旧写法 | 症状 |
+| --- | --- | --- | --- |
+| `src/prestep.ts:141` 开局记忆卡 | 2400（`recall.maxChars`） | 整卡 `.slice(0, maxChars)` | 半句/半标签，无省略说明 |
+| `src/prestep.ts:197` 过程内补充卡 | 6000（每请求） | 拼好后 `clampText` 硬切 | 同上，且目录块被切一半 |
+| `src/recall.ts` `renderRecallCard` | — | 无预算，交给调用方切 | 截断点落在卡片之外 |
+| `src/inrequest.ts` `renderRepeatCard` | — | 无预算 | 同上 |
+| `src/retrieval.ts:131` `renderRecordLine` | — | 无预算（按设计） | 工具结果/面板详情整条展示，不动 |
+| `src/relay-text.ts:40` relay 安全阀 | 65536 | `slice` 硬切 | 分支结果停在半句 |
+| `src/route.ts:157` 话题提示 | 80 | `summary.slice` | 话题集梗概半句 |
+| `src/questions.ts:179/214/224/306` | 2000/1500/1000/120/200/40 | `clip()` 硬切 + 列表二次 40 硬切 | 问题正文/进度/分支任务半句 |
+| `src/group.ts:54` 并行组标签 | 40 | `task.slice` | 任务名半词，无标记 |
+| `src/hub-branches.ts:105` 分支标题回退 | 32（旧调用 20）/48 | 字符 `slice` + `…` | 分支名半词 |
+| `src/tools.ts:682/736/971` | 80/80/40 | `slice` + `…` | 版本摘要、话题集梗概、派发清单半句 |
+| `src/resume.ts:209/545` | 160/120 | `partial.slice` | 「已完成部分」半句 |
+| `src/panel.ts:442` 面板对话预览 | 1200 | `slice(0, maxChars-1)+…` | 会话消息半句 |
+| `src/commands.ts:282/286` `/memory wrap` | 120/500 | `slice` | 梗概以半句**写入库**（持久化） |
+| `src/topicset-merge.ts:764` | 120 | `slice+…` | 合并预览半句 |
+| `src/web/app.js:387/390/436/519` 管理台 | 48/90 | `slice` | 记忆行、派发卡半句 |
+
+**修法：一个共享裁剪模块 + 预算由渲染器自己管**
+
+- 新增 `src/clip.ts`（此前一轮中途失败留下的半成品，本轮补全并接管所有调用点）：
+  `clipAtBoundary(text, max, minRatio=0.4)` 句界裁剪（句号/问号/分号/换行/省略号 → 逗号顿号 →
+  空白 → 最后才硬切，代理对不劈开）；`clipWithNote(text, max, hint)` 句界裁剪 + 显式省略注
+  （`…（原文 N 字，已省略 M 字，复取：memory_recall 「标题」）`，注本身算进预算，≤6 次收敛）；
+  `clipMarked(text, max)` 标签/短字段用（0.6 窗口 + `…`）；`dropNote(k)` 整卡计数；
+  `charCount()` 统一按码点计数。
+- `src/recall.ts:211` `renderRecallCard` 与 `src/inrequest.ts:254` `renderRepeatCard` 改为
+  **按优先级降级**：头部（+话题集提示）先付钱 → 整条记录 → （补充卡）组合目录 → 正文句界裁剪
+  + 省略注 → 整条丢弃 + 计数。预算按码点、每行预留一个换行，**整卡保证不越界**；溢出时用真实
+  省略注长度重排（≤3 次）；极端小预算再退回「无引文短注」，仍放不下就整卡不注入（宁可无卡，
+  不注入半截卡）。`prestep.ts` 两处改为 `{ budget: config.maxChars }` /
+  `{ budget: Math.min(config.maxChars, remainingChars(...)) }`，并删掉整卡 `.slice`。
+- 预算常量与理由：`RECALL_BODY_MIN = 64`（正文+省略注低于 64 字时，切成「…（原文…）」后
+  几乎不剩结论，不如整条丢掉并计数）；`HINT_MIN_ROOM = 96`（话题集提示不得把记录挤没，
+  否则卡片只剩前言）；`clipWithNote` 预留 48 字 ≈ 最短省略注（收敛起点）；`clipMarked` 的
+  0.6 窗口（40 字预算若从 40% 处切只剩十几个字，标签就认不出了）；卡片预算来自既有配置
+  `recall.maxChars=2400`、`recall.repeat.maxCharsPerRequest=6000`（`src/index.ts:141/148`），
+  `canInjectCard` 的 200 字地板不变。relay 安全阀 65536 只换裁剪点，题注会略超上限（安全阀
+  不是内容策略，原设计如此）。
+- 其余展示/回执路径统一改走 `clipMarked`：`tools.ts` 版本摘要/话题集梗概/派发清单、
+  `questions.ts` 中枢问题清单的分支任务、`resume.ts` 两处「已完成部分」、`panel.ts` 面板对话
+  预览、`commands.ts` `/memory wrap`（写入库前就按句界切，避免半句持久化）、
+  `topicset-merge.ts` 合并预览；管理台 `src/web/app.js` 新增浏览器侧 `clipText`（同语义，
+  静态资源按请求读取，无需构建）。`prestep.ts` 的 `commitCard` 也改成码点计数，与卡片预算同单位。
+
+**回归（core-smoke 新增 R47-1…R47-7、mechanism-smoke 新增 R47-8）**
+
+- R47-1 裁剪原语：三种裁剪都不越上限、正文落句界、标签带 `…`、代理对不劈开。
+- R47-2 超预算记忆卡（380 字正文 × 2 条，预算 400）：整卡 ≤ 400、标题/标签完整、
+  正文带「原文/已省略/复取」、丢卡计数为 1、被切正文以句号收尾再接注。
+- R47-3 预算内记忆卡：正文一字不少、无任何省略标记、话题集提示保留。
+- R47-4 多卡超预算（6 条 × 380 字，预算 600）：丢整卡且计数 = 缺失条数。
+- R47-5 预算扫描（200→2400 步长 37 × 1/2/4/6 条 = 248 张卡）：不越界、无半标签、丢卡必有计数。
+- R47-6 过程内补充卡：目录块先于正文牺牲、有空间时原样出现、只有目录时也被显式裁剪。
+- R47-7 源守卫：prestep/inrequest/tools/questions/resume/panel/commands/合并预览/管理台/relay
+  不再裸切内容字段（源码级断言，防回退）。
+- R47-8（mechanism）：`renderRepeatCard` 带预算时整卡 ≤ 预算、目录先牺牲、省略注带复取线索；
+  不带预算的旧调用（A6）行为不变。
+
+**闸门（本轮实测，未跑完整 build / 未重载插件）**
+
+- `pnpm typecheck` 双工程 **0 错**；core **43**（36→43，+R47-1…R47-7）、
+  mechanism **114**（113→114，+R47-8）、webui **35**、client-sim **OK**、capability **12**、
+  workspace-scope **9** 全绿。
+- 未做：`pnpm build`（并行分支在收尾，lib 产物会交错）、插件重载、git add/commit/push。
+
+**遗留与假设**
+
+- `lib/` 未重建：本轮的修复要生效需在收尾轮 build + 重载插件（源码与测试先行）。
+- 标题类字段（`deriveTitle`/`clipEllipsis`）仍是字符级裁剪：标题在写入时就已封顶 48/60 字，
+  改它会牵动 R41/R42 的会话命名语义，本轮不动。
+- `src/topic-shape.ts:159` 给 LLM 的 `dispatch.task.slice(0, 160)` 仍是硬切：那是提示材料，
+  不是用户可见输出，未改以免影响话题集生成。
+- 管理台的 `clipText` 与宿主 `clipMarked` 是两份实现（浏览器侧不能 import TS），语义一致；
+  若日后改宿主语义，管理台需同步。
+- 预算极低（< 头部+最短注，约 110 字）时卡片整体不注入——假设「不注入」优于「注入越界/半截卡」。
+- `memory_recall` 工具结果本身不裁剪（整条正文就是它的契约），只修了其中的列表摘要行。
+
+**用户三步验收（收尾轮重载插件后）**
+
+1. 在中枢问一个能命中长记忆的问题：注入卡里应能看到 `…（原文 N 字，已省略 M 字，复取：memory_recall 「标题」）`，
+   标题与 `｜标签: …` 完整；若丢卡，末行是 `…（已省略 k 项…）`——数一下丢的条数对不对。
+2. 把 `recall.maxChars` 调到 400 再问同一问题：卡片仍在 400 字内、没有半句、丢卡计数正确。
+3. 打开面板「记忆」详情/管理台记忆列表、跑一次 `memory_history`、再 `/memory wrap`：
+   摘要行都以句读收尾并带 `…`，话题集梗概不再以半句入库。
+
+
+---
+
+## 59. R44–R47 集成收口轮：四线合并 + 轮次归一 + 全量闸门（2026-11-25）
+
+四条并行分支（面板页签 / 技能化 / 发布资产 / 注入截断）在同一工作树里合并为一次可交付提交。
+本轮**不发布 release、不打 tag**（用户已选「先集成验收，再发 v1.2.1」）。
+
+### 59.1 轮次映射（归一后）
+
+| 轮次 | 主题 | DEV-NOTES |
+|---|---|---|
+| R44 | 面板页签结构：中枢去两张管理卡 / 新增「分支会话」页签 / 记忆页签去「增加记忆」 | §57 |
+| R45 | 重复工作固化为 DSH skill（组合工具退为兼容入口） | §55 |
+| R46 | 发布资产补漏：npm-pack .tgz + 稳定别名 + 文档只给安装器可接受的输入（**原误记 R56**，本轮全部改名） | §56 |
+| R47 | 注入/展示路径截断修复：预算化裁剪、显式省略与复取线索 | §58 |
+
+- 归一动作：scripts/core-smoke.mjs 的 R56①②③ 断言标签与 R56-1 汇总行、DEV-NOTES §56 的两处引用与标题
+  全部改为 R46；全仓再无 R56 残留。§55/§57/§58 的既有小节编号未动。
+- 复核时未见「R44 用于预算裁剪」一类的轮次串味措辞；预算/裁剪相关断言与叙述都已在 R47（§58）名下，
+  故无需改写语义，只补 §56 的轮次标签。
+
+### 59.2 合并复核与修复
+
+- 四条线均在：面板页签（panel-page / locales / core-smoke R44-1）、技能化（skill-forge / toolize / activity /
+  panel / tools / skill-smoke）、发布资产（package-release / github-api-release / INSTALL / README / core-smoke R46-1）、
+  注入截断（clip + 8 个调用点 + core-smoke R47-1..7 + mechanism R47-8）。
+- 无冲突标记、无重复声明与重复 ok() 标签、package.json 可解析且无重复键、locales 中英键数一致（273/273）。
+- 修掉的集成残留：
+  1. src/clip.ts 开头有一段重复的 /**（上一轮中途失败留下的半成品痕迹）→ 删除；
+  2. src/clip.ts / src/recall.ts / src/inrequest.ts 缺文件末尾换行 → 补回；
+  3. src/tools.ts 在 HEAD 是 CRLF、工作树是 LF：Git 的 core.autocrlf=input 会把提交内容统一成 LF，
+     故本次提交里该文件表现为整文件 EOL 归一（实际逻辑改动 +102/−14，git diff --ignore-cr-at-eol 可见）；
+     src/prestep.ts 工作树的 CRLF 同样由 git 归一为 LF（无 diff 噪声）。
+- src/clip.ts 是新增的**未跟踪**文件，已纳入同一提交（漏 add 会直接 build 失败）。
+- release/*.tgz（1.2.0 版本化包 + 稳定别名）为本地验证产物，**未纳入本次提交**，发布轮重建。
+
+### 59.3 闸门（全部真跑，非临时目录）
+
+- pnpm typecheck：宿主 + client 双工程 **0 错**（exit 0）。
+- pnpm build：exit 0；宿主 12 文件 809.47 kB（新增 clip-* 与 skill-forge-* chunk，入口 supermemory.js 545.05 kB），
+  client lib/client.js 175.74 kB（wrap 后 170340 B）；lib/ 产物已更新且 chunk 引用无悬挂。
+- pnpm smoke：七套全绿——core **43** / mechanism **114** / webui **35** / client-sim **OK** /
+  capability **12** / workspace-scope **9** / skill **16**。
+- 单跑复核：node scripts/skill-smoke.mjs → 16 组通过；node scripts/webui-smoke.mjs → 35 passed。
+- 打包脚本 dry-run：node scripts/package-release.mjs --tarball-only --out <临时目录> → exit 0，
+  tarball 716.8 kB、结构校验通过、稳定别名生成（产物写临时目录，未污染 release/）。
+
+### 59.4 提交与推送
+
+- 单条集成提交（中文提交信息列出四条线 + 轮次 + 闸门结果），含源码、断言、文档与 lib/ 产物；
+  提交后按 docs/git-sync.md 双推（origin 首位 GitHub、次 Gitee；fetch 走 Gitee），本地/Gitee/GitHub 核验同一 SHA。
+- 遗留：R47 的修复要生效需重载插件（本轮执行）；面板页签 / 省略标记 / 设置页签 skills 三项由用户点开验收。

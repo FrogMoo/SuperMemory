@@ -184,6 +184,23 @@ export interface ModelDefaultsView {
   source: 'stored' | 'default'
 }
 
+/** R45: 设置页签「已生成的 skills」快照（宿主 listSkills 的投影）。 */
+export interface SkillView {
+  name: string
+  title: string
+  description: string
+  whenToUse?: string
+  version: number
+  useCount: number
+  enabled: boolean
+  status: 'active' | 'retired'
+  path: string
+  source?: string
+  occurrences: number
+  updatedAt: number
+  changelog: string[]
+}
+
 export interface ToolView {
   id: string
   name: string
@@ -457,6 +474,9 @@ export interface PanelApi {
   // R41 需求①b: 设置页签的默认模型（中枢会话 / 分支会话，按工作区）。
   getModelDefaults(cwd: string): Promise<ModelDefaultsView>
   setModelDefaults(cwd: string, patch: { hub?: ModelSelectionView | null; branch?: ModelSelectionView | null; reset?: boolean }): Promise<MutationResult>
+  // R45: 设置页签「已生成的 skills」——快照 / 启用停用 / 改路由描述。
+  listSkills(cwd: string): Promise<SkillView[]>
+  updateSkill(cwd: string, name: string, patch: { enabled?: boolean; description?: string }): Promise<MutationResult>
   createMemory(cwd: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   updateMemory(cwd: string, id: string, text: string, key?: string, title?: string, tags?: string[]): Promise<MutationResult>
   deleteMemory(cwd: string, id: string): Promise<MutationResult>
@@ -505,6 +525,9 @@ type View =
   | { kind: 'hub' }
   | { kind: 'sets' }
   | { kind: 'topic'; id: string }
+  // R44 需求②: 全部分支会话（跨话题集）独立页签——原「中枢会话」页签里的
+  // 「全部分支会话」卡移到这里，避免中枢页签塞满管理视图。
+  | { kind: 'branches' }
   | { kind: 'memories' }
   // R30 需求②: 记忆两级页——集合内条目 / 单条记忆详情（含历史版本）。
   | { kind: 'memory-collection'; id: string }
@@ -865,6 +888,9 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // R41 需求①b: 设置页签的默认模型（"provider/model" 文本，''=跟随默认）。
   const [modelDefaults, setModelDefaults] = useState<ModelDefaultsView | undefined>()
   const [hubModelDraft, setHubModelDraft] = useState('')
+  // R45: 设置页签的 skills 快照 + 每条描述的行内草稿。
+  const [skills, setSkills] = useState<SkillView[]>([])
+  const [skillDrafts, setSkillDrafts] = useState<Record<string, string>>({})
   const [branchModelDraft, setBranchModelDraft] = useState('')
   const [tools, setTools] = useState<ToolView[]>([])
   const [loading, setLoading] = useState(false)
@@ -877,9 +903,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // R11: the 话题集 tab filters on title + tags (never on every body), so a
   // workspace with many topic sets stays searchable by index.
   const [setsQuery, setSetsQuery] = useState('')
-  const [newMemory, setNewMemory] = useState('')
-  const [newMemoryTitle, setNewMemoryTitle] = useState('')
-  const [newMemoryTags, setNewMemoryTags] = useState('')
   const [reply, setReply] = useState('')
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
   const [summaryTagsDraft, setSummaryTagsDraft] = useState<string[] | undefined>()
@@ -924,18 +947,16 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // surfaces answer "which branches did this hub start?".
   const [hubBranches, setHubBranches] = useState<HubBranchView[]>([])
   const [chatBranches, setChatBranches] = useState<HubBranchView[]>([])
-  // R30 需求③: the hub manages EVERY topic set (archived included) and views
-  // every branch across sets (filterable by set). Same refresh path as the rail.
+  // R30 需求③ / R44 需求②: the hub manages EVERY topic set (archived included)
+  // and views every branch across sets. `allSets` still feeds the topic-set
+  // pickers (launch chips, topic view); `allBranches` now belongs to the
+  // dedicated 「分支会话」 tab, with its own set filter + keyword search.
   const [allSets, setAllSets] = useState<TopicSetView[]>([])
   const [allBranches, setAllBranches] = useState<HubBranchView[]>([])
   const [branchFilter, setBranchFilter] = useState('')
-  // R30 需求③: 「全部话题集」卡内联创建入口（与快速启动区的新建互不干扰）。
-  const [allSetForm, setAllSetForm] = useState(false)
-  const [allSetTitle, setAllSetTitle] = useState('')
+  const [branchQuery, setBranchQuery] = useState('')
   // R18 需求②: the topic set just created (title + auto tags must be visible).
   const [createdSet, setCreatedSet] = useState<{ title: string; tags: string[] } | undefined>()
-  // Whether the memory editor auto-filled title/tags from the body.
-  const [shapeAuto, setShapeAuto] = useState(false)
   // R19 需求⑤: the in-panel conversation (no navigation to the shell session).
   const [chatData, setChatData] = useState<SessionChatView | undefined>()
   const [chatDraft, setChatDraft] = useState('')
@@ -1027,7 +1048,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       // R18 需求①: the rail rides the same refresh — hub sessions are created by
       // this very page, so a stale rail would hide the session just started.
       // R19 协同②: the current hub's branch list rides it too.
-      // R30 需求③: 全部话题集 + 全部分支会话（中枢的管理视图）同路刷新。
+      // R30 需求③ / R44 需求②: 全部话题集（话题集筛选下拉与快速启动 chips 共用）
+      // 与全部分支会话（「分支会话」页签）仍同路刷新，切页签即有新数据。
       const [state, hubRows, branchRows, setRows, allBranchRows] = await Promise.all([
         api.loadHub(cwd, sessionId),
         api.listHubSessions(cwd).then((rows) => rows, () => [] as HubSessionView[]),
@@ -1089,6 +1111,18 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       setModelDefaults(view)
       setHubModelDraft(view.hub ? `${view.hub.provider}/${view.hub.model}` : '')
       setBranchModelDraft(view.branch ? `${view.branch.provider}/${view.branch.model}` : '')
+    } catch (loadError) {
+      setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
+    }
+  }, [api, cwd, t])
+
+  // R45: 设置页签的已生成 skills；草稿只在拉到快照时重置，输入中不被覆盖。
+  const refreshSkills = useCallback(async () => {
+    if (!cwd) return
+    try {
+      const rows = await api.listSkills(cwd)
+      setSkills(rows)
+      setSkillDrafts(Object.fromEntries(rows.map((row) => [row.name, row.description])))
     } catch (loadError) {
       setError(`${t('error.load')}: ${String(loadError instanceof Error ? loadError.message : loadError)}`)
     }
@@ -1166,9 +1200,17 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     if (view.kind === 'settings') {
       void refreshHubPolicy()
       void refreshModelDefaults()
+      void refreshSkills()
     }
-  }, [view, refreshHubPolicy])
+  }, [view, refreshHubPolicy, refreshSkills])
   useEffect(() => { if (view.kind === 'tools') void refreshTools() }, [view, refreshTools])
+  // R44 需求②: 「分支会话」页签按需拉全量分支（首次进入或 cwd 变化时；refreshHub
+  // 已在创建/派发后刷新，这里只兜「直接点进页签」的冷启动）。
+  useEffect(() => {
+    if (view.kind !== 'branches' || !cwd) return
+    if (allBranches.length > 0) return
+    void api.listAllBranches(cwd).then(setAllBranches, () => [] as HubBranchView[])
+  }, [view, cwd, api, allBranches.length])
 
   // 需求①: the shell's 新建会话 click CREATES a hub session and publishes its
   // receipt here. The panel may be parked on another tab, so a receipt always
@@ -1272,22 +1314,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     return () => { alive = false }
   }, [api, cwd])
 
-  // R18 需求②: title + tags are never left for the user to invent. On blur the
-  // host derives them from the body (same rules as the write path) and fills
-  // whichever field is still empty; typed values are never overwritten.
-  const fillMemoryShape = useCallback(async () => {
-    const body = newMemory.trim()
-    if (!body) return
-    if (newMemoryTitle.trim() && newMemoryTags.trim()) return
-    try {
-      const shape = await api.suggestMemoryShape(body)
-      let filled = false
-      if (!newMemoryTitle.trim() && shape.title) { setNewMemoryTitle(shape.title); filled = true }
-      if (!newMemoryTags.trim() && shape.tags.length > 0) { setNewMemoryTags(shape.tags.join('，')); filled = true }
-      if (filled) setShapeAuto(true)
-    } catch { /* a convenience: a failed suggestion never blocks the form */ }
-  }, [api, newMemory, newMemoryTags, newMemoryTitle])
-
   const launchCwd = cwd
 
   const launchCreateSet = async (): Promise<void> => {
@@ -1346,31 +1372,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }, [api, launchCwd, refreshHub, t])
 
-  /**
-   * R30 需求③: 「全部话题集」卡的内联创建入口（同一 host 路径，与快速启动区
-   * 的新建话题集等价）；创建后刷新管理列表并保持表单打开以便连续新建。
-   */
-  const createAllSet = async (): Promise<void> => {
-    const title = allSetTitle.trim()
-    if (!title || !launchCwd) return
-    setError(undefined)
-    try {
-      const created = await api.createTopicSet(launchCwd, title)
-      if (created.status !== 'ok' || !created.id) { setError(created.message); return }
-      setAllSetTitle('')
-      const [rows, branchRows] = await Promise.all([
-        api.listAllTopicSets(launchCwd),
-        api.listAllBranches(launchCwd).then((list) => list, () => [] as HubBranchView[]),
-      ])
-      setAllSets(rows)
-      setAllBranches(branchRows)
-      setCreatedSet({ title: created.message, tags: [] })
-      void refreshHub()
-    } catch (createError) {
-      setError(`${t('error.generic')}: ${String(createError instanceof Error ? createError.message : createError)}`)
-    }
-  }
-
   const startLaunch = async (mode: 'chat' | 'bare' = 'chat'): Promise<void> => {
     if (!launchCwd) { setError(t('launch.needWorkspace')); return }
     const text = composerText.trim()
@@ -1407,12 +1408,21 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }
 
-  // R30 需求③: 全部分支会话（跨话题集）按话题集筛选——筛选在本地做，切换即
-  // 生效（宿主 listAllBranches 也支持按集过滤，这里保留即时体验）。
-  const filteredAllBranches = useMemo(() => {
-    if (!branchFilter) return allBranches
-    return allBranches.filter((row) => row.topicSetId === branchFilter)
-  }, [allBranches, branchFilter])
+  // R44 需求②: 「分支会话」页签的本地筛选——话题集过滤 + 关键字搜索（标题/
+  // 标签/分支 id/所属话题集），切换即生效（宿主 listAllBranches 也支持按集
+  // 过滤，这里保留即时体验）。
+  const filteredBranchRows = useMemo(() => {
+    const needle = branchQuery.trim().toLowerCase()
+    return allBranches.filter((row) => {
+      if (branchFilter && row.topicSetId !== branchFilter) return false
+      if (!needle) return true
+      const haystack = [
+        row.title, row.branchSessionId, row.topicSetTitle ?? '',
+        ...(row.tags ?? []),
+      ].join(' ').toLowerCase()
+      return haystack.includes(needle)
+    })
+  }, [allBranches, branchFilter, branchQuery])
 
   const filteredSets = useMemo(() => {
     const needle = setsQuery.trim().toLowerCase()
@@ -1467,9 +1477,10 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     onClick: () => setView(
       kind === 'hub' ? { kind: 'hub' }
         : kind === 'sets' ? { kind: 'sets' }
-          : kind === 'memories' ? { kind: 'memories' }
-            : kind === 'settings' ? { kind: 'settings' }
-              : { kind: 'tools' },
+          : kind === 'branches' ? { kind: 'branches' }
+            : kind === 'memories' ? { kind: 'memories' }
+              : kind === 'settings' ? { kind: 'settings' }
+                : { kind: 'tools' },
     ),
   })
 
@@ -1643,105 +1654,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     receiptView,
     // R19 协同②: the current hub's own delegates, with state / set / sharing.
     BranchList({ rows: hubBranches, t, onOpen: openChat }),
-    // R30 需求③: 全部话题集（含归档）——中枢在这里管理工作区的每一个话题集：
-    // 标题/标签/会话数/在线数一览，点进行内详情（标签编辑在那里），行内即建入口。
-    h('div', { key: 'allSets', className: 'sm-card' },
-      h('div', { key: 'head', className: 'sm-row' },
-        h('h3', { key: 'title' }, t('hub.allSets')),
-        h('span', { key: 'count', className: 'sm-badge' }, String(allSets.length)),
-        h(Button, {
-          key: 'new', size: 'sm', label: t('hub.allSets.new'),
-          disabled: !launchCwd,
-          onClick: () => setAllSetForm((value) => !value),
-        }),
-      ),
-      allSetForm
-        ? h('div', { key: 'newForm', className: 'sm-form', style: { marginTop: 8, marginBottom: 0 } },
-            h('input', {
-              key: 'input', className: 'sm-input', value: allSetTitle,
-              placeholder: t('newSession.create'),
-              onChange: (event: { target: { value: string } }) => setAllSetTitle(event.target.value),
-            }),
-            h(Button, {
-              key: 'add', label: t('topic.create'), disabled: !allSetTitle.trim() || !launchCwd,
-              onClick: () => void createAllSet(),
-            }),
-          )
-        : null,
-      allSets.length === 0
-        ? h(EmptyState, { key: 'empty', label: t('sets.empty'), hint: t('hub.allSets.hint') })
-        : h('div', { key: 'list', className: 'sm-list' },
-            allSets.map((topicSet) =>
-              h('div', {
-                key: topicSet.id, className: 'sm-item', 'data-clickable': 'true',
-                title: `${topicSet.title} · ${topicSet.id}`,
-                onClick: () => {
-                  setView({ kind: 'topic', id: topicSet.id })
-                  setSummaryDraft(undefined)
-                  setSummaryTagsDraft(undefined)
-                  setReply('')
-                },
-              },
-                h('div', { key: 'row', className: 'sm-row' },
-                  h('span', { key: 'title', className: 'sm-title' }, topicSet.title),
-                  hub?.activeTopicSetId === topicSet.id ? h('span', { key: 'a', className: 'sm-badge' }, t('hub.active')) : null,
-                  topicSet.status === 'archived' ? h('span', { key: 'arch', className: 'sm-badge' }, t('sets.archived')) : null,
-                  h('span', { key: 'n', className: 'sm-badge' }, t('sets.sessions', { count: topicSet.sessions })),
-                  topicSet.live > 0 ? h('span', { key: 'l', className: 'sm-badge' }, t('sets.live', { count: topicSet.live })) : null,
-                  topicSet.model ? h('span', { key: 'm', className: 'sm-badge' }, topicSet.model) : null,
-                ),
-                tagChips(topicSet.tags),
-                h('div', { key: 'summary', className: 'sm-body-text' }, topicSet.summary || t('sets.noBody')),
-              ),
-            ),
-          ),
-    ),
-    // R30 需求③: 全部分支会话（跨话题集）——按话题集筛选，行内打开任一分支。
-    h('div', { key: 'allBranches', className: 'sm-card' },
-      h('div', { key: 'head', className: 'sm-row' },
-        h('h3', { key: 'title' }, t('hub.allBranches')),
-        h('span', { key: 'count', className: 'sm-badge' }, String(filteredAllBranches.length)),
-      ),
-      h('div', { key: 'filter', className: 'sm-form' },
-        h('label', { key: 'label', className: 'sm-opt' },
-          h('span', { key: 'text', className: 'sm-opt-label' }, t('hub.allBranches.filter')),
-          h('select', {
-            key: 'select', className: 'sm-opt-select', value: branchFilter,
-            onChange: (event: { target: { value: string } }) => setBranchFilter(event.target.value),
-          },
-            h('option', { key: 'all', value: '' }, t('hub.allBranches.allSets')),
-            allSets.map((topicSet) =>
-              h('option', { key: topicSet.id, value: topicSet.id }, topicSet.title)),
-          ),
-        ),
-      ),
-      filteredAllBranches.length === 0
-        ? h(EmptyState, { key: 'empty', label: t('hub.allBranches.empty'), hint: t('hub.allBranches.hint') })
-        : h('div', { key: 'list', className: 'sm-list' },
-            filteredAllBranches.map((row) =>
-              h('div', {
-                key: row.branchSessionId, className: 'sm-item', 'data-clickable': 'true',
-                title: `${row.title} · ${row.branchSessionId}`,
-                onClick: () => openChat(row.branchSessionId),
-              },
-                h('div', { key: 'row', className: 'sm-row' },
-                  h('span', { key: 'title', className: 'sm-title' }, row.title),
-                  h('span', { key: 'state', className: 'sm-badge', 'data-state': row.status }, t(`branches.${row.status}`)),
-                  row.shared
-                    ? h('span', { key: 'shared', className: 'sm-badge', title: row.hubs.join('、') }, t('branches.shared', { count: row.hubs.length - 1 }))
-                    : null,
-                  row.groupId ? h('span', { key: 'grp', className: 'sm-badge' }, t('branches.group')) : null,
-                ),
-                h('div', { key: 'meta', className: 'sm-sub' },
-                  `${row.topicSetTitle ? t('branches.set', { title: row.topicSetTitle }) : t('branches.noSet')} · `
-                  + `${branchAgo(row.lastActivityAt, t)} · ${t('branches.dispatches', { count: row.dispatches })}`,
-                ),
-                row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
-                h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
-              ),
-            ),
-          ),
-    ),
     // R22 需求⑦: 中枢会话页签只留「派发 + 回执 + 本中枢的分支 + 当前会话」。
     // 话题集列表、激活话题集、会话数/在线数统计都属于话题集页签，这里不再
     // 重复展示——用户已明确「这部分都在话题集页签里看」。
@@ -1751,6 +1663,64 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         h('span', { className: 'sm-muted' }, sessionId || '—'),
         h(Button, { key: 'refresh', label: t('hub.refresh'), onClick: () => void refreshHub() }),
       ),
+    ),
+  ]
+
+  // R44 需求②: 「分支会话」页签——全部分支（跨话题集）。原「中枢会话」页签的
+  // 「全部分支会话」卡移到这里：中枢页签只留派发/回执/本中枢分支/当前会话，
+  // 跨话题集的管理视图独立成页签。筛选（话题集）与关键字搜索都在本地做，
+  // 数据来自宿主 listAllBranches（与话题集筛选下拉共用 allSets）。
+  const branchesView: ReactNode = [
+    h('div', { key: 'filters', className: 'sm-form' },
+      h('label', { key: 'set', className: 'sm-opt' },
+        h('span', { key: 'text', className: 'sm-opt-label' }, t('hub.allBranches.filter')),
+        h('select', {
+          key: 'select', className: 'sm-opt-select', value: branchFilter,
+          onChange: (event: { target: { value: string } }) => setBranchFilter(event.target.value),
+        },
+          h('option', { key: 'all', value: '' }, t('hub.allBranches.allSets')),
+          allSets.map((topicSet) =>
+            h('option', { key: topicSet.id, value: topicSet.id }, topicSet.title)),
+        ),
+      ),
+      h('input', {
+        key: 'search', className: 'sm-input', value: branchQuery,
+        placeholder: t('branches.search'),
+        onChange: (event: { target: { value: string } }) => setBranchQuery(event.target.value),
+      }),
+      h(Button, {
+        key: 'clear', label: t('sets.clear'),
+        onClick: () => { setBranchFilter(''); setBranchQuery('') },
+      }),
+    ),
+    h('div', { key: 'stats', className: 'sm-muted' }, t('branches.stats', {
+      shown: filteredBranchRows.length, total: allBranches.length,
+    })),
+    h('div', { key: 'list', className: 'sm-list' },
+      filteredBranchRows.length === 0
+        ? h(EmptyState, { key: 'empty', label: t('hub.allBranches.empty'), hint: t('hub.allBranches.hint') })
+        : filteredBranchRows.map((row) =>
+            h('div', {
+              key: row.branchSessionId, className: 'sm-item', 'data-clickable': 'true',
+              title: `${row.title} · ${row.branchSessionId}`,
+              onClick: () => openChat(row.branchSessionId),
+            },
+              h('div', { key: 'row', className: 'sm-row' },
+                h('span', { key: 'title', className: 'sm-title' }, row.title),
+                h('span', { key: 'state', className: 'sm-badge', 'data-state': row.status }, t(`branches.${row.status}`)),
+                row.shared
+                  ? h('span', { key: 'shared', className: 'sm-badge', title: row.hubs.join('、') }, t('branches.shared', { count: row.hubs.length - 1 }))
+                  : null,
+                row.groupId ? h('span', { key: 'grp', className: 'sm-badge' }, t('branches.group')) : null,
+              ),
+              h('div', { key: 'meta', className: 'sm-sub' },
+                `${row.topicSetTitle ? t('branches.set', { title: row.topicSetTitle }) : t('branches.noSet')} · `
+                + `${branchAgo(row.lastActivityAt, t)} · ${t('branches.dispatches', { count: row.dispatches })}`,
+              ),
+              row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
+              h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
+            ),
+          ),
     ),
   ]
 
@@ -2337,40 +2307,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       }),
       h(Button, { key: 'go', label: t('hub.refresh'), onClick: () => void refreshMemoryCollections() }),
     ),
-    h('div', { key: 'new', className: 'sm-form-col' },
-      h('div', { key: 'title', className: 'sm-form-row' },
-        h('input', {
-          key: 't', className: 'sm-input', value: newMemoryTitle, placeholder: t('memory.title.placeholder'),
-          onChange: (event: { target: { value: string } }) => setNewMemoryTitle(event.target.value),
-        }),
-        h('input', {
-          key: 'tags', className: 'sm-input', value: newMemoryTags, placeholder: t('memory.tags.placeholder'),
-          onChange: (event: { target: { value: string } }) => setNewMemoryTags(event.target.value),
-        }),
-      ),
-      h('textarea', {
-        key: 'body', className: 'sm-textarea', value: newMemory, placeholder: t('memory.new.placeholder'),
-        onChange: (event: { target: { value: string } }) => setNewMemory(event.target.value),
-        onBlur: () => { void fillMemoryShape() },
-      }),
-      shapeAuto ? h('div', { key: 'shape', className: 'sm-shape-hint' }, t('memory.shape.auto')) : null,
-      h('div', { key: 'actions', className: 'sm-actions' },
-        h(Button, {
-          key: 'add', variant: 'primary', label: t('memory.add'), disabled: !newMemory.trim(),
-          onClick: () => void run(async () => api.createMemory(
-            cwd, newMemory.trim(), undefined, newMemoryTitle.trim() || undefined, splitTags(newMemoryTags),
-          ), () => {
-            setNewMemory('')
-            setNewMemoryTitle('')
-            setNewMemoryTags('')
-            setShapeAuto(false)
-            void refreshMemoryViews()
-            void refreshHub()
-          }),
-        }),
-        h('span', { key: 'hint', className: 'sm-muted' }, t('memory.shape.hint')),
-      ),
-    ),
     collectionList,
   ]
 
@@ -2603,8 +2539,44 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     )
   }
 
+  // R45 需求④: 最小插入——在设置页签追加「已生成的 skills」，不改动既有的
+  // 默认模型/中枢权限卡片结构（任务 B 正在改的页签布局保持原样）。
+  const skillsCard = (): ReactNode => h('div', { key: 'skills', className: 'sm-card' },
+    h('div', { key: 'head', className: 'sm-row' },
+      h('h3', { key: 'title' }, t('settings.skills.title')),
+      h('span', { key: 'count', className: 'sm-badge' }, String(skills.length)),
+    ),
+    h('div', { key: 'hint', className: 'sm-muted' }, t('settings.skills.hint')),
+    skills.length === 0
+      ? h('div', { key: 'empty', className: 'sm-muted' }, t('settings.skills.empty'))
+      : h('div', { key: 'list', className: 'sm-form' },
+          skills.map((skill) => h('div', { key: skill.name, className: 'sm-form-row' },
+            h('div', { key: 'meta', className: 'sm-desc' },
+              h('strong', null, skill.name), ' ',
+              h('span', { key: 'ver', className: 'sm-badge' }, 'v' + skill.version), ' ',
+              h('span', { key: 'uses', className: 'sm-muted' }, t('settings.skills.uses', { count: skill.useCount })),
+              skill.enabled ? null : h('span', { key: 'off', className: 'sm-badge' }, t('settings.skills.disabled')),
+            ),
+            h('input', {
+              key: 'desc', className: 'sm-input',
+              value: skillDrafts[skill.name] ?? skill.description,
+              onChange: (event: { target: { value: string } }) => setSkillDrafts((draft) => ({ ...draft, [skill.name]: String(event.target.value) })),
+            }),
+            h(Button, {
+              key: 'save', label: t('settings.skills.save'), disabled: !cwd,
+              onClick: () => void run(async () => api.updateSkill(cwd, skill.name, { description: skillDrafts[skill.name] ?? skill.description }), () => void refreshSkills()),
+            }),
+            h(Button, {
+              key: 'toggle', label: skill.enabled ? t('settings.skills.disable') : t('settings.skills.enable'), disabled: !cwd,
+              onClick: () => void run(async () => api.updateSkill(cwd, skill.name, { enabled: !skill.enabled }), () => void refreshSkills()),
+            }),
+          )),
+        ),
+  )
+
   const settingsView: ReactNode = h('div', { key: 'settings' },
     modelDefaultsCard(),
+    skillsCard(),
     h('div', { key: 'policyTitle', className: 'sm-section-title' }, t('settings.policy.title')),
     hubPolicyView,
   )
@@ -2612,12 +2584,13 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const body = view.kind === 'hub' ? hubView
     : view.kind === 'sets' ? setsView
       : view.kind === 'topic' ? topicView
-        : view.kind === 'memories' ? memoriesView
-          : view.kind === 'memory-collection' ? memoryCollectionView
-            : view.kind === 'memory-detail' ? memoryDetailView
-              : view.kind === 'settings' ? settingsView
-                : view.kind === 'chat' ? chatView
-                  : toolsView
+        : view.kind === 'branches' ? branchesView
+          : view.kind === 'memories' ? memoriesView
+            : view.kind === 'memory-collection' ? memoryCollectionView
+              : view.kind === 'memory-detail' ? memoryDetailView
+                : view.kind === 'settings' ? settingsView
+                  : view.kind === 'chat' ? chatView
+                    : toolsView
 
   // R18 需求①: the panel is a two-column shell — a hub-session rail on the
   // left and the active view on the right. Under 760px the rail folds into a
@@ -2761,6 +2734,8 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     h('div', { key: 'tabs', className: 'sm-tabs' },
       h('button', { key: 'hub', ...tabProps('hub') }, t('tab.hub')),
       h('button', { key: 'sets', ...tabProps('sets') }, t('tab.sets')),
+      // R44 需求②: 分支会话独立页签（原中枢页签的「全部分支会话」卡）。
+      h('button', { key: 'branches', ...tabProps('branches') }, t('tab.branches')),
       h('button', { key: 'memories', ...tabProps('memories') }, t('tab.memories')),
       h('button', { key: 'tools', ...tabProps('tools') }, t('tab.tools')),
       h('button', { key: 'settings', ...tabProps('settings') }, t('tab.settings')),

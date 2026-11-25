@@ -11,6 +11,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { UserMessage, createUserMessage as CreateUserMessage } from '@deepseek-ai/dsh-llm'
 import { loadHostModule } from './host.ts'
+import { clipWithNote } from './clip.ts'
 import { tokenize } from './recall.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
@@ -29,7 +30,7 @@ import type { TopicSet } from './schema.ts'
  */
 export const CAPABILITY_ROUTING_RULES = '固化能力（capability）路由规则：'
   + '① 在能力适用范围（scope）内遇到高频事务（git 同步/提交/推送、构建、验证、测试、发布等）时，优先调用已固化能力（sm_composite_*，默认预演、写操作 confirm=true 确认真实执行），不要每次现敲命令；'
-  + '② 没有现成能力时，用 memory_toolize register 固化一个（入口命令 + 文档 + 适用范围 + 路由描述），不要满足于一次性命令；'
+  + '② 重复工作先沉淀经验：判断型、易变的流程用 memory_toolize register 产出/更新 skill（描述写「何时用」，正文写触发条件/步骤/关键坑/验证），不要满足于一次性劳动；确实需要固定入口命令时才固化能力（入口命令 + 文档 + 适用范围）；'
   + '③ 能力执行连续失败、或文档与现状不符时，必须用 memory_toolize register 同名更新能力（version+1、changelog 记录原因），不要绕过它手敲命令；'
   + '④ 用 memory_toolize refresh-builtin 刷新内置能力并查看差异报告与健康度（使用次数、成败分列、连续失败、文档/适用范围缺失、零使用），按信号决定更新还是停用。'
 
@@ -151,7 +152,9 @@ export async function routeBatch(
     .slice(0, 3)
 
   if (candidates.length === 0) return {}
-  const lines = candidates.map((c) => `- 『${c.topicSet.title}』${c.topicSet.summary ? `：${c.topicSet.summary.slice(0, 80)}` : ''}`)
+  // R47: the summary is clipped at a sentence boundary WITH an omission note —
+  // the old `.slice(0, 80)` stopped mid-sentence and the hub could not tell.
+  const lines = candidates.map((c) => `- 『${c.topicSet.title}』${c.topicSet.summary ? `：${clipWithNote(c.topicSet.summary, 80)}` : ''}`)
   return {
     card: [
       '[SuperMemory 话题提示]',

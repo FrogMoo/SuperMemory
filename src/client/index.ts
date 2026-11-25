@@ -16,7 +16,7 @@ import { PANEL_REMOTE } from './remote.ts'
 import { en, NS, zh } from './locales.ts'
 import { SupermemoryIcon } from './icon.tsx'
 import { SupermemoryPanelPage } from './panel-page.tsx'
-import type { HubBranchView, HubPolicyView, HubSessionView, MemoryCollectionView, MemoryDetailView, MemoryShape, MemoryView, ModelDefaultsView, MutationResult, PanelApi, SessionBadge, SessionChatView, TopicSetView } from './panel-page.tsx'
+import type { HubBranchView, HubPolicyView, HubSessionView, MemoryCollectionView, MemoryDetailView, MemoryShape, MemoryView, ModelDefaultsView, MutationResult, PanelApi, SessionBadge, SessionChatView, SkillView, TopicSetView } from './panel-page.tsx'
 import { NewSessionChoice } from './new-session.tsx'
 import { SupermemorySessionBadge, invalidateBadge } from './session-badge.tsx'
 import { attachChatCards } from './chat-card.tsx'
@@ -73,6 +73,9 @@ function buildApi(ctx: Context): PanelApi | undefined {
     // R41 需求①b: 设置页签的默认模型（中枢会话 / 分支会话）。
     getModelDefaults: (cwd) => call<ModelDefaultsView>('getModelDefaults', cwd),
     setModelDefaults: (cwd, patch) => call<MutationResult>('setModelDefaults', cwd, patch),
+    // R45: 设置页签「已生成的 skills」——快照 / 启用停用 / 改路由描述。
+    listSkills: (cwd) => call<SkillView[]>('listSkills', cwd),
+    updateSkill: (cwd, name, patch) => call<MutationResult>('updateSkill', cwd, name, patch),
     createTopicSet: (cwd, title, tags, summary) => call('createTopicSet', cwd, title, tags, summary),
     listHubSessions: (cwd) => call<HubSessionView[]>('listHubSessions', cwd),
     // R19 协同②: the hub's branch association (read model over dispatches).

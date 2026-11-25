@@ -24,6 +24,7 @@ import { branchHandles, compositionSetup, hubComposition, runDispatch } from './
 import { deliverRelay, type ObserveConfig, type ObserveDeps } from './observe.ts'
 import { resolveCapabilities, type CapabilityProfile } from './capabilities.ts'
 import { isOpenDispatch, relativeAgo, taskExcerpt } from './hub-branches.ts'
+import { clipMarked } from './clip.ts'
 import { branchTagsFor, branchTitleFor } from './branch-meta.ts'
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
@@ -205,7 +206,7 @@ export function renderInterruptedList(views: readonly InterruptedDispatchView[],
       + ' · 中断于 ' + relativeAgo(view.interruptedAt, now)
       + (view.groupId ? ' · 原属并行组 ' + view.groupId : '')
       + (view.resumeOf ? ' · 续跑自 ' + view.resumeOf : ''))
-    if (view.partial) lines.push('   已完成部分：' + view.partial.slice(0, 160))
+    if (view.partial) lines.push('   已完成部分：' + clipMarked(view.partial, 160))
   })
   lines.push('用 memory_resume 带 dispatchId 续跑（可多选），或 /memory resume <dispatchId>。')
   return lines.join('\n')
@@ -541,7 +542,7 @@ export async function notifyInterruptedDispatches(
         + ' · 任务：' + taskExcerpt(row.task, 40)
         + ' · 分支 ' + row.branchSessionId
         + ' · 中断于 ' + relativeAgo(row.interruptedAt, now)
-        + (row.partial ? '\n   已完成部分：' + row.partial.slice(0, 120) : '')).join('\n')
+        + (row.partial ? '\n   已完成部分：' + clipMarked(row.partial, 120) : '')).join('\n')
       + '\n\n用 memory_resume 查看并续跑（无参=清单；带 dispatchId=继续指定任务，可多选），或 /memory resume <dispatchId>。'
     try {
       // deliverRelay 只消费 ctx/store/logger（config 不参与投递），这里结构上转过去。

@@ -153,6 +153,32 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   ok('A6 卡片标题/结构化目录/查询拼接/路径与重合度工具函数')
 }
 
+// R47: the repeat card is budget-aware — the assembled card (catalog included)
+// never exceeds its budget, and when records must be clipped the catalog is
+// shed FIRST and the card says what it left out. The legacy no-budget call
+// above (A6) keeps rendering everything.
+{
+  const { charCount } = await import('../src/clip.ts')
+  const catalog = renderCatalog([{ name: 'sm_composite_read_edit', steps: ['read', 'edit'], description: 'd', parameters: ['p0_path'], hits: 2 }])
+  const longText = '这条结论说明构建与发布流程的关键约束。'.repeat(30)
+  const items = [
+    { memoryId: 'r1', title: '结论甲', text: longText, score: 9, createdAt: now, keywords: ['构建', '闸门'] },
+    { memoryId: 'r2', title: '结论乙', text: longText, score: 8, createdAt: now, keywords: ['发布'] },
+  ]
+  const hint = '复取：memory_recall 「构建命令」'
+  const tight = renderRepeatCard(items, 'gentle', catalog, { budget: 420, hint })
+  assert.ok(charCount(tight) <= 420, 'R47: the repeat card must stay inside its budget (' + charCount(tight) + ')')
+  assert.ok(!tight.includes('sm_composite_read_edit'), 'R47: the catalog is shed before a memory body is cut')
+  assert.ok(tight.includes('【结论甲】') && tight.includes('｜标签: 构建、闸门'), 'R47: title and tags stay whole')
+  assert.ok(/…（原文 \d+ 字，已省略 \d+ 字，复取：memory_recall 「结论甲」）/.test(tight),
+    'R47: a clipped body names its size and how to re-fetch it')
+  assert.ok(/…（已省略 \d+ 项/.test(tight), 'R47: the shed records are counted')
+  const roomy = renderRepeatCard([{ memoryId: 'r3', title: '结论丙', text: '短结论：构建走 pnpm。', score: 9, createdAt: now, keywords: [] }], 'gentle', catalog, { budget: 900, hint })
+  assert.ok(roomy.includes('sm_composite_read_edit') && charCount(roomy) <= 900,
+    'R47: the catalog still rides along when the budget has room')
+  ok('R47-8 过程内补充卡预算化：整卡 ≤ 预算、目录先于正文牺牲、正文句界省略带复取线索、丢卡计数')
+}
+
 // ---- requirement B: auto tool-ization + catalog ----
 const scenarios = () => [
   { tools: ['read', 'edit'], args: [{ path: 'a.ts' }, { old: 'x' }] },

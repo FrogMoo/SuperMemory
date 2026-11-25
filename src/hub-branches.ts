@@ -30,6 +30,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Dispatch, TopicSet } from './schema.ts'
 import type { Store } from './store.ts'
+import { clipMarked } from './clip.ts'
 import { resolveRole } from './role.ts'
 
 /** One branch as a hub sees it. */
@@ -91,11 +92,17 @@ function memberOf(store: Store, branchSessionId: string): {
   return undefined
 }
 
-/** A one-line task excerpt (the branch has no title yet / not a member). */
+/**
+ * A one-line task excerpt (the branch has no title yet / not a member).
+ *
+ * R47: delegates to the shared {@link clipMarked} so the cut lands on a
+ * sentence boundary (the old char-`slice` could stop mid-word) and always
+ * carries the `…` marker. The empty-text fallback is preserved.
+ */
 export function taskExcerpt(task: string, max = 32): string {
   const text = String(task ?? '').replace(/\s+/g, ' ').trim()
   if (!text) return '（无任务描述）'
-  return Array.from(text).length > max ? `${Array.from(text).slice(0, max).join('')}…` : text
+  return clipMarked(text, max)
 }
 
 /**

@@ -7,6 +7,7 @@
  * there is no LLM in it.
  * @module supermemory/recall
  */
+import { charCount, clipWithNote, dropNote } from './clip.ts'
 import { renderRecordLine } from './retrieval.ts'
 import type { Memory } from './schema.ts'
 
@@ -181,24 +182,121 @@ export function matchTopicSets(
   return matches.slice(0, Math.max(1, Math.min(limit, 8)))
 }
 
-/** Build the model-facing recall card text (温和起步, injectStyle 可配置). */
-export function renderRecallCard(items: RecallItem[], style: 'gentle' | 'plain', topicSets: readonly TopicSetMatch[] = []): string {
+/** A clipped body needs at least this much room for body + omission note. */
+export const RECALL_BODY_MIN = 64
+
+/** The topic-set hint is kept only while this much room remains for records. */
+const HINT_MIN_ROOM = 96
+
+/** Build the model-facing recall card text (温和起步, injectStyle 可配置).
+ *
+ * R47 需求②: `options.budget` makes the card budget-aware instead of letting
+ * the caller hard-`slice` it (the old `.slice(0, maxChars)` in prestep.ts cut
+ * mid-sentence, mid-tag, with no sign that anything was missing). Degradation
+ * is by PRIORITY, never mid-body:
+ *   1. the header is paid for first; the topic-set hint is kept only while it
+ *      still leaves room for a record — a card must not become all preamble;
+ *   2. records are kept whole while they fit (score order = relevance order);
+ *   3. a record that no longer fits whole has its BODY clipped at a sentence
+ *      boundary with an explicit omission note (title/tags stay whole);
+ *   4. a record whose remaining share cannot hold a meaningful body
+ *      (`RECALL_BODY_MIN`) is dropped WHOLE, and a later, smaller record may
+ *      still take its place;
+ *   5. the card ends with `…（已省略 k 项…）` when anything was dropped.
+ *
+ * Accounting counts CODE POINTS and reserves one newline per line, so the
+ * assembled card never exceeds `options.budget`; the note is budgeted too (an
+ * overflow retries with the note's real length reserved, bounded attempts).
+ */
+export function renderRecallCard(
+  items: RecallItem[],
+  style: 'gentle' | 'plain',
+  topicSets: readonly TopicSetMatch[] = [],
+  options: { budget?: number; hint?: string } = {},
+): string {
   if (items.length === 0) return ''
-  // Title + tags + body, so an injected card is scannable without reading
-  // every memory's prose (R10).
-  const lines = items.map((item, index) =>
-    `${index + 1}. ${renderRecordLine({ title: item.title, text: item.text, tags: item.keywords })}`)
+  const budget = options.budget && options.budget > 0 ? Math.floor(options.budget) : 0
+  const header = style === 'plain'
+    ? ['[SuperMemory 相关记忆]']
+    : [
+        '[SuperMemory 相关记忆]',
+        '以下记忆可能与本话题相关，仅供参考；与当前指令冲突时以当前指令为准。',
+        '记忆只存结论性事实/决策（不是过程流水账）。',
+      ]
   const hints = topicSets.length > 0
     ? [`相关话题集：${topicSets.map((topicSet) => topicSet.title).join('、')}（命中记忆时可直接激活或派发到该集）`]
     : []
-  if (style === 'plain') {
-    return ['[SuperMemory 相关记忆]', ...lines, ...hints].join('\n')
+  // No budget: the legacy behaviour — every record whole, caller decides.
+  if (!budget) {
+    const lines = items.map((item, index) =>
+      `${index + 1}. ${renderRecordLine({ title: item.title, text: item.text, tags: item.keywords })}`)
+    return [...header, ...lines, ...hints].join('\n')
   }
-  return [
-    '[SuperMemory 相关记忆]',
-    '以下记忆可能与本话题相关，仅供参考；与当前指令冲突时以当前指令为准。',
-    '记忆只存结论性事实/决策（不是过程流水账）。',
-    ...lines,
-    ...hints,
-  ].join('\n')
+  // A tiny budget (a user can set recall.maxChars very low) cannot pay for the
+  // three-line gentle preamble AND one record. The card degrades to its single
+  // identifying line instead of overrunning the budget: the records are the
+  // context, the preamble is etiquette.
+  const minimal = ['[SuperMemory 相关记忆]']
+  const minimalCost = minimal.reduce((sum, line) => sum + charCount(line) + 1, 0)
+  if (budget - minimalCost < RECALL_BODY_MIN + 52) {
+    header.length = 0
+    header.push(...minimal)
+  }
+  const headerCost = header.reduce((sum, line) => sum + charCount(line) + 1, 0)
+  const hintCostAll = hints.reduce((sum, line) => sum + charCount(line) + 1, 0)
+  const compose = (reserve: number, withHint = true): { text: string; note: string; count: number } => {
+    // A hint that would leave less than one record's room is dropped whole
+    // (never clipped): the routing aid is worth less than the context itself.
+    const hintLines = budget - headerCost - hintCostAll - reserve >= HINT_MIN_ROOM ? hints : []
+    const hintCost = hintLines.reduce((sum, line) => sum + charCount(line) + 1, 0)
+    let remaining = budget - headerCost - hintCost - reserve
+    const lines: string[] = []
+    let dropped = 0
+    for (const [index, item] of items.entries()) {
+      const prefix = `${index + 1}. `
+      const tail = item.keywords.length > 0 ? ` ｜标签: ${item.keywords.join('、')}` : ''
+      const head = item.title && item.title !== item.text.trim() ? `【${item.title}】` : ''
+      // Cost the record can never give up: number + title + tags + its newline.
+      const overhead = charCount(prefix) + charCount(head) + charCount(tail) + 1
+      const whole = `${prefix}${head}${item.text}${tail}`
+      const wholeCost = charCount(whole) + 1
+      if (wholeCost <= remaining) {
+        lines.push(whole)
+        remaining -= wholeCost
+        continue
+      }
+      // Shrink the body only when a meaningful share is left; otherwise drop
+      // the record whole and let a later, smaller one take the place.
+      const bodyShare = remaining - overhead
+      if (bodyShare >= RECALL_BODY_MIN) {
+        const body = clipWithNote(item.text, bodyShare, item.title ? `复取：memory_recall 「${item.title}」` : undefined)
+        const line = `${prefix}${head}${body}${tail}`
+        lines.push(line)
+        remaining -= charCount(line) + 1
+        if (remaining <= 0) {
+          dropped += items.length - index - 1
+          break
+        }
+        continue
+      }
+      dropped += 1
+    }
+    const note = dropNote(dropped, withHint ? options.hint : undefined)
+    const text = [...header, ...hintLines, ...lines, ...(note ? [note] : [])].join('\n')
+    return { text, note, count: dropped }
+  }
+  let pass = compose(0)
+  for (let attempt = 0; attempt < 3 && pass.note; attempt += 1) {
+    if (charCount(pass.text) <= budget) break
+    pass = compose(charCount(pass.note) + 1)
+  }
+  // Last resort: the note's quoted query is longer than the record it replaces.
+  // Fall back to the bare re-fetch note so the card still says what it left out
+  // and how to see it. Below the header + that note the budget cannot express
+  // any record, so the card is not injected at all (never a silent slice).
+  if (charCount(pass.text) > budget && pass.count > 0) {
+    pass = compose(charCount(dropNote(pass.count)) + 1, false)
+    if (charCount(pass.text) > budget) return ''
+  }
+  return pass.text
 }

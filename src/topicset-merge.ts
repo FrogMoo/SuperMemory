@@ -23,6 +23,7 @@ import { newId } from './store.ts'
 import { normalizeTags } from './retrieval.ts'
 import { findVerifyTopicSet, topicSetPairScore, verifyTopicSetTitle } from './topicset-match.ts'
 import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, sessionTitleFor } from './title.ts'
+import { clipMarked } from './clip.ts'
 
 /** Bump when the merge rules change; an older marker re-runs. */
 export const MERGES_VERSION = 1
@@ -760,7 +761,7 @@ export function renderMergeReport(result: TopicSetMergeResult): string {
     lines.push('  · 合并后：'
       + (cluster.target.renameFrom ? '目标集改名为『' + cluster.target.title + '』；' : '标题不变；')
       + 'keywords=[' + cluster.keywordsAfter.join('、') + ']；成员 ' + cluster.membersAfter + ' 个')
-    if (cluster.summaryAfter) lines.push('  · 摘要预览：' + cluster.summaryAfter.slice(0, 120) + (cluster.summaryAfter.length > 120 ? '…' : ''))
+    if (cluster.summaryAfter) lines.push('  · 摘要预览：' + clipMarked(cluster.summaryAfter, 120))
     lines.push('  · 成员标题变化 ' + cluster.memberChanges.length + ' 条：')
     for (const change of cluster.memberChanges) {
       lines.push('    - ' + change.sessionId + '：「' + change.from + '」→「' + change.to + '」')

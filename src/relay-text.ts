@@ -9,6 +9,7 @@
  * @module supermemory/relay-text
  */
 import type { Episode } from './schema.ts'
+import { clipAtBoundary } from './clip.ts'
 
 /**
  * Relay safety valve, NOT a content policy: an answer larger than this is a
@@ -24,9 +25,17 @@ export function episodeResult(episode: Episode | undefined): string {
   return episode?.result || episode?.summary || ''
 }
 
-/** Clip a relay body at the safety valve, saying so instead of cutting silently. */
+/**
+ * Clip a relay body at the safety valve, saying so instead of cutting silently.
+ *
+ * R47: the cut now lands on a sentence boundary (the old raw `slice` could stop
+ * mid-sentence) and the note reports both sizes plus where the full answer
+ * lives, so a clipped result is visibly a clip and remains recoverable.
+ */
 export function clipRelayResult(text: string, branchSessionId: string): string {
-  if (text.length <= RELAY_RESULT_MAX_CHARS) return text
-  const kept = text.slice(0, RELAY_RESULT_MAX_CHARS)
-  return `${kept}\n……（结果超过 ${RELAY_RESULT_MAX_CHARS} 字，已截断；完整内容见分支会话 ${branchSessionId} 的记录）`
+  const source = String(text ?? '')
+  if (Array.from(source).length <= RELAY_RESULT_MAX_CHARS) return source
+  const kept = clipAtBoundary(source, RELAY_RESULT_MAX_CHARS)
+  const omitted = Array.from(source).length - Array.from(kept).length
+  return `${kept}\n……（结果超过 ${RELAY_RESULT_MAX_CHARS} 字，已省略 ${omitted} 字，已截断；完整内容见分支会话 ${branchSessionId} 的记录）`
 }
