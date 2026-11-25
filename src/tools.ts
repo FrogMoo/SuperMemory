@@ -1483,7 +1483,8 @@ ${listText}` : listText
     description: '重复工作的固化入口（R45 起以 skill 为主）：① 列出待处理提议、已注册能力与已生成的 skill；'
       + '② 接受/拒绝提议（accept 仍是旧的一键入口：把序列编译成组合工具，向后兼容）；'
       + '③ register 注册重复工作的经验——不给 entry 时产出 DSH skill（name/title/description/whenToUse/body，写入 <仓库>/.dsh/skills，同名更新 version+1 并保留 changelog，模型目录可路由）；给 entry 时仍注册"能力"（capability：入口命令 + 文档 + 适用范围 + 默认预演/写操作确认，向后兼容）；'
-      + '④ name + enabled 启用/停用已生成的 skill；⑤ refresh-builtin 刷新内置能力并返回差异报告与健康度。'
+      + '④ name + enabled 启用/停用已生成的 skill；⑤ refresh-builtin 刷新内置能力并返回差异报告与健康度；'
+      + '⑥ cleanup 归档历史自动生成的「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚，人工/manual 不动）。'
       + '为什么用 skill：技能正文讲「何时用/怎么判断/有哪些坑」，比固定流水线更容易在同类任务里被模型想起来；组合工具只保留给固定短子序列的一次调用。'
       + 'skill 文件是事实来源（重启后仍在，由宿主 skill 目录发现），tool_memory 行只镜像版本/使用计数/启用状态。'
       + CAPABILITY_ROUTING_RULES,
@@ -1506,13 +1507,39 @@ ${listText}` : listText
       writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },
       tags: { type: 'array', description: '标签（3–8 个短词，检索索引）', items: { type: 'string' } },
       refreshBuiltin: { type: 'boolean', description: '刷新内置能力：store 缺失则播种、旧于内置版本则升级（现场更新保留），并返回差异报告与各能力健康度' },
+      cleanup: { type: 'boolean', description: 'R48：归档历史自动生成的「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚；人工/manual skill 不动；可重复执行且幂等）' },
       changelog: { type: 'string', description: 'register 同名更新时的一行变更说明（写入 changelog，最新在前；缺省自动生成）' },
     },
     output: {
       schema: {
         type: 'object',
         properties: {
-          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'registered', 'refreshed', 'error'], required: true },
+          status: { type: 'string', enum: ['listed', 'accepted', 'declined', 'none', 'registered', 'refreshed', 'cleaned', 'error'], required: true },
+          archived: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                root: { type: 'string', required: true },
+                archivePath: { type: 'string', required: true },
+              },
+              additionalProperties: false,
+            },
+          },
+          archivedCount: { type: 'integer' },
+          archiveRoots: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                root: { type: 'string', required: true },
+                scanned: { type: 'integer' },
+                archived: { type: 'integer' },
+              },
+              additionalProperties: false,
+            },
+          },
           pending: {
             type: 'array',
             items: {
@@ -1612,6 +1639,9 @@ ${listText}` : listText
           message?: string
           capabilities?: Array<{ name: string; title?: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string }>
           skills?: Array<{ name: string; title?: string; description: string; version?: number; useCount?: number; enabled?: boolean; status?: string; path?: string; source?: string; occurrences?: number }>
+          archived?: Array<{ name: string; root: string; archivePath: string }>
+          archivedCount?: number
+          archiveRoots?: Array<{ root: string; scanned?: number; archived?: number }>
           builtin?: {
             seeded: string[]
             upgraded: string[]
@@ -1649,6 +1679,12 @@ ${listText}` : listText
             }
           }
           return [{ type: 'text', text: parts.join('\n') }]
+        }
+        if (v.status === 'cleaned') {
+          const archived = (v.archived ?? [])
+          if (archived.length === 0) return [{ type: 'text', text: '没有需要归档的自动生成壳子（人工/manual skill 未改动）。' }]
+          const lines = archived.map((entry) => `- ${entry.name} → ${entry.archivePath}（原根：${entry.root}）`)
+          return [{ type: 'text', text: `已归档 ${archived.length} 个自动生成的工具序列壳子（未删除，可在 <skills 根>-archive 回滚；manifest 已记录原名/时间/原因）：\n${lines.join('\n')}` }]
         }
         if (v.status === 'listed') {
           const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
@@ -1689,6 +1725,7 @@ ${listText}` : listText
         writeConfirm?: boolean
         tags?: string[]
         refreshBuiltin?: boolean
+        cleanup?: boolean
         changelog?: string
       },
       exec: ToolExec,
@@ -1730,6 +1767,22 @@ ${listText}` : listText
               notes: h.notes,
             })),
           },
+        }
+      }
+      // R48: 归档历史自动生成的工具序列壳子（人工 skill 不动，幂等）。
+      if (args.cleanup) {
+        const { archiveShellSkills, discoverSkillRoots } = await import('./skill-forge.ts')
+        const result = await archiveShellSkills({
+          roots: discoverSkillRoots({ store, cwd, dshHome: process.env.DSH_HOME }),
+          store,
+        })
+        deps.logger.info('supermemory: archived ' + result.totalArchived + ' legacy shell skill(s)')
+        return {
+          status: 'cleaned' as const,
+          message: '已归档 ' + result.totalArchived + ' 个自动生成的壳子 skill（扫描 ' + result.totalScanned + ' 个文件）。',
+          archived: result.archived.map((entry) => ({ name: entry.name, root: entry.root, archivePath: entry.archivePath })),
+          archivedCount: result.totalArchived,
+          archiveRoots: result.roots.map((root) => ({ root: root.root, scanned: root.scanned, archived: root.archived })),
         }
       }
       // R45: 启用/停用已生成的 skill（只给 name + enabled，不动定义）。

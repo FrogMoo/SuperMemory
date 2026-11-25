@@ -1,17 +1,20 @@
 /**
- * Skill forge (R45): repeated work becomes a REAL DSH skill.
+ * Skill forge (R45 / R48): repeated WORK becomes a REAL DSH skill.
  *
  * 背景：P3 把重复流程编译成 `sm_composite_*` 组合工具——「按什么顺序调哪些
- * 工具」。这类流水线写死在注册表里，容易生成、很难被模型想起来调用。R45 把
- * 重复工作的沉淀改到 DSH 的 skill 机制（`<project>/.dsh/skills/<name>/SKILL.md`，
- * 项目根判定见 dsh-skill-filesystem：最近含 `.git` 的祖先）：技能是给模型看的
- * 「何时用 / 怎么判断 / 有哪些坑」的指导，落在会话每步都可见的 available_skills
- * 目录里（只有 name + description 进目录，正文由 skill 工具按需加载）。
+ * 工具」。R45 把沉淀改到 DSH 的 skill 机制（`<project>/.dsh/skills/<name>/SKILL.md`，
+ * 项目根判定见 dsh-skill-filesystem：最近含 `.git` 的祖先），但自动生成退化成
+ * 了按工具序列命名（`sm-flow-bash-bash-…`）：没有对象、没有参数、没有坑，还会
+ * 挤占 available_skills 的路由注意力。
  *
- * 分工：
- * - skill：判断型、易变的重复工作（读哪些文件、先验证什么、失败怎么回退）；
- * - 组合工具：固定参数化的短子序列，保留为向后兼容的「一键入口」；
- * - capability：可执行入口命令（默认预演 + 写操作确认），不变。
+ * R48 起识别的主体是「做过的事」，不是「连续调了哪些工具」：
+ * - 任务签名来自任务/派发文本（动词 + 对象）、真实文件/目录族、命令家族与关键
+ *   参数（`pnpm git:sync`、`pnpm typecheck`、`git push`…）；
+ * - 同一任务签名跨 ≥N 次、≥2 个会话/派发才产出草稿；工具序列只作为正文里
+ *   的历史事实，不参与命名与聚合；
+ * - 名称是 `sm-<verb>-<object>`（`fix-skill-forge`、`sync-gitee-github`），
+ *   描述写「做什么任务时加载」，正文六节全部来自真实样本，缺信息写「待补充」；
+ * - 历史遗留的工具序列壳子由 archiveShellSkills 归档（不删除，写 manifest）。
  *
  * 文件是事实来源（重启后仍在），tool_memory 的 kind='skill' 行只承载版本号、
  * 使用计数与启用状态（不新增存储表，旧介质保持 v1 兼容）。同名更新 = version+1
@@ -23,8 +26,11 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync,
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import type { Signal, ToolMemory } from './schema.ts'
-import type { SequenceSample } from './composite.ts'
 import type { Store } from './store.ts'
+import {
+  extractCommandFamilies, extractFileFacts, extractTaskSignature, looksLikeToolFlowName,
+  taskNameSimilarity, type TaskSample, type TaskSignature,
+} from './task-signature.ts'
 
 /** Kebab-case contract enforced by the host skill registry. */
 export const SKILL_NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
@@ -40,22 +46,39 @@ const SKILL_CHANGELOG_MAX = 20
 
 /**
  * Per-root growth cap for AUTO-generated skills (manual register bypasses it).
- * Without a cap a busy workspace would fixate dozens of sliding-window flows
- * at boot and drown the model's available_skills catalog.
+ * R48 tightened it from 12 to 8: the catalog is routing attention, and a busy
+ * workspace must earn each entry with a repeated TASK, not a sliding window.
  */
-export const SKILL_MAX_PER_ROOT = 12
+export const SKILL_MAX_PER_ROOT = 8
 
-/** Where this skill record came from. */
-export type SkillSourceKind = 'sequence' | 'capability' | 'manual'
+/** Same task must recur in at least this many distinct sessions/dispatches. */
+export const SKILL_MIN_SESSIONS = 2
+
+/** Only recent task signatures auto-create/auto-update (time decay). */
+export const SKILL_RECENCY_DAYS = 30
+
+/** A draft this similar (name tokens) to an existing skill is a near-duplicate. */
+export const SKILL_SIMILARITY_MAX = 0.85
+
+/**
+ * Where this skill record came from.
+ * - task: repeated TASK (R48, the only auto path);
+ * - capability: repeated executable capability (sm-cap-*);
+ * - manual: memory_toolize register (never touched by automation);
+ * - sequence: legacy R45 tool-sequence shells (readable for cleanup only).
+ */
+export type SkillSourceKind = 'task' | 'capability' | 'manual' | 'sequence'
 
 export interface SkillSource {
   kind: SkillSourceKind
   /** Durable signal / capability key the draft was derived from. */
   key?: string
-  /** Human-readable pattern, e.g. `read → grep → edit`. */
+  /** Human-readable task label, e.g. `修复 skill-forge`. */
   label: string
-  /** How many times the transaction was observed. */
+  /** How many times the TASK was observed. */
   occurrences: number
+  /** How many distinct sessions/dispatches the task was observed in. */
+  sessions?: number
 }
 
 /** One human-editable skill draft (rendered to SKILL.md). */
@@ -70,11 +93,16 @@ export interface SkillDraft {
   /** Markdown body WITHOUT YAML frontmatter. */
   body: string
   source: SkillSource
+  /** Stable task signature key (`fix/skill-forge`); absent for manual/capability. */
+  taskKey?: string
   /** Facts rendered into the body (kept for assertions / manual register). */
   facts?: {
     commands: string[]
     files: string[]
     patterns: string[]
+    taskTexts?: string[]
+    commandCounts?: Array<{ command: string; count: number }>
+    fileCounts?: Array<{ file: string; count: number }>
   }
 }
 
@@ -88,6 +116,8 @@ export interface ParsedSkill {
   updatedAt: number
   source?: string
   occurrences: number
+  /** Task signature this file was generated from (R48 merge/dedupe key). */
+  taskKey?: string
   /** Hash of the generated body we last wrote (detects human edits). */
   renderedHash?: string
   changelog: string[]
@@ -134,6 +164,7 @@ const META = {
   updatedAt: 'sm-updated-at',
   source: 'sm-source',
   occurrences: 'sm-occurrences',
+  taskKey: 'sm-task-key',
   renderedHash: 'sm-rendered-hash',
   changelog: 'sm-changelog',
   enabled: 'sm-enabled',
@@ -174,11 +205,23 @@ export function isSkillName(name: string): boolean {
   return SKILL_NAME_RE.test(name) && name.startsWith(SKILL_PREFIX)
 }
 
-/** `sm-flow-read-grep-edit-<hash>` — stable for one tool sequence. */
-export function skillNameForFlow(tools: string[], sharedToken?: string): string {
-  const parts = tools.map((tool) => kebabCase(tool.replace(/^sm_composite_/, ''), 12) || 'tool').join('-')
-  const base = 'sm-flow-' + (parts || 'flow') + '-' + shortHash(tools.join('>'))
-  return clampName(sharedToken ? 'sm-' + sharedToken + '-' + base.slice(3) : base)
+/** `sm-<verb>-<object>` — stable for one repeated TASK (never a tool flow). */
+export function skillNameForTask(signature: TaskSignature, sharedToken?: string): string {
+  const base = 'sm-' + (sharedToken ? sharedToken + '-' : '') + signature.nameBase
+  return clampName(kebabCase(base, 64), 64)
+}
+
+/**
+ * Readability gate: a task skill name must talk about an OBJECT, not a tool
+ * flow. Legacy shells (`sm-flow-bash-bash-…`) and names built only from tool
+ * words are rejected outright.
+ */
+export function isReadableTaskSkillName(name: string): boolean {
+  if (!isSkillName(name)) return false
+  if (looksLikeToolFlowName(name)) return false
+  const body = name.replace(/^sm-/, '').replace(/^ws[a-z0-9]{5}-/, '')
+  const segments = body.split('-').filter(Boolean)
+  return segments.length >= 2 && segments.some((segment) => segment.length >= 3)
 }
 
 /** `sm-cap-<capability-name>` — stable for one capability registration. */
@@ -192,144 +235,262 @@ export function workspaceSkillToken(workspaceKey: string): string {
   return 'ws' + shortHash(workspaceKey, 5)
 }
 
-/** Title of a repeated flow, readable in the catalog and the panel. */
-export function flowTitle(tools: string[]): string {
-  return tools.join(' → ') + ' 重复流程'
+/** Parse durable task samples (broken/legacy entries skipped). */
+export function parseTaskSamples(raw: string[]): TaskSample[] {
+  const out: TaskSample[] = []
+  for (const entry of raw) {
+    try {
+      const parsed = JSON.parse(entry) as TaskSample
+      if (parsed && Array.isArray(parsed.tools) && Array.isArray(parsed.args)) out.push(parsed)
+    } catch { /* one broken sample is skipped */ }
+  }
+  return out
 }
 
-/** One-line step hint (tool semantics, not a command log). */
-function stepHint(tool: string): string {
-  const hints: Record<string, string> = {
-    read: '读取目标文件，确认现状再改',
-    write: '整文件写入前先 read，避免覆盖他人改动',
-    edit: '只做精确替换，保留并发改动',
-    glob: '先枚举候选文件',
-    grep: '先定位，避免盲改',
-    bash: '记录 exit code 与 stderr；失败先查原因',
-    todo_write: '多步任务先列清单',
-    memory_recall: '先检索既有结论，避免重复劳动',
-    memory_remember: '只记结论，不记过程流水账',
-    memory_dispatch: '把实质工作派发到分支会话',
-    memory_scan: '刷新项目文件地图',
-    skill: '加载对应 skill 的完整指导',
-    present: '交付产物给用户',
-    web_search: '先搜外部事实，再落地',
-    web_fetch: '读取具体来源并引用 URL',
-  }
-  return hints[tool] ?? '按工具契约执行'
+/** Rich facts used by the body, all derived from recorded samples. */
+export interface WorkflowFacts {
+  commands: string[]
+  files: string[]
+  patterns: string[]
+  taskTexts: string[]
+  commandCounts: Array<{ command: string; count: number }>
+  fileCounts: Array<{ file: string; count: number }>
+  commandFamilies: string[]
 }
 
 /** Extract human-relevant facts from recorded samples (no secrets copied). */
-export function extractWorkflowFacts(samples: SequenceSample[]): { commands: string[]; files: string[]; patterns: string[] } {
-  const commands = new Set<string>()
-  const files = new Set<string>()
-  const patterns = new Set<string>()
-  const push = (set: Set<string>, value: unknown): void => {
-    if (typeof value !== 'string') return
-    const text = value.trim()
-    if (!text || text.length > 200) return
-    set.add(text)
-  }
+export function extractWorkflowFacts(samples: TaskSample[]): { commands: string[]; files: string[]; patterns: string[] } {
+  const facts = workflowFacts(samples)
+  return { commands: facts.commands, files: facts.files, patterns: facts.patterns }
+}
+
+function countMapPush(map: Map<string, number>, value: unknown, max = 160): void {
+  if (typeof value !== 'string') return
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (!text || text.length > max) return
+  map.set(text, (map.get(text) ?? 0) + 1)
+}
+
+function topEntries(map: Map<string, number>, limit: number): Array<{ value: string; count: number }> {
+  // First-seen order (Map insertion), NOT frequency: a repeated turn must not
+  // reshuffle the definition and bump the version just because a command ran
+  // again. Counts are only used for the "seen more than once" pitfall.
+  return [...map.entries()]
+    .slice(0, limit)
+    .map(([value, count]) => ({ value, count }))
+}
+
+/** One sample's fact extraction (exported for smoke assertions). */
+export function workflowFacts(samples: TaskSample[]): WorkflowFacts {
+  const commands = new Map<string, number>()
+  const files = new Map<string, number>()
+  const patterns = new Map<string, number>()
+  const taskTexts = new Set<string>()
   for (const sample of samples) {
+    if (typeof sample.task === 'string' && sample.task.trim()) {
+      const task = sample.task.replace(/\s+/g, ' ').trim()
+      if (task) taskTexts.add(task.slice(0, 200))
+    }
     sample.tools.forEach((tool, index) => {
       const args = sample.args[index] ?? {}
-      if (tool === 'bash') {
-        push(commands, args.command)
-        push(commands, args.description)
-      } else if (tool === 'grep' || tool === 'glob') {
-        push(patterns, args.pattern)
-      } else if (tool === 'read' || tool === 'edit' || tool === 'write') {
-        push(files, args.file_path ?? args.path)
+      if (tool === 'bash' || tool === 'terminal' || tool === 'shell') countMapPush(commands, args.command)
+      if (tool === 'grep' || tool === 'glob') countMapPush(patterns, args.pattern, 120)
+      if (tool === 'read' || tool === 'edit' || tool === 'write') {
+        const path = args.file_path ?? args.path
+        countMapPush(files, path, 200)
       }
     })
   }
+  // Path facts also come from commands and task text (真实工作碰过的文件族).
+  for (const file of extractFileFacts(samples).files) {
+    if (!files.has(file)) files.set(file, 1)
+  }
+  const commandFamilies = extractCommandFamilies(samples).commands
+  const commandEntries = topEntries(commands, 8)
+  const fileEntries = topEntries(files, 10)
   return {
-    commands: [...commands].slice(0, 8),
-    files: [...files].slice(0, 10),
-    patterns: [...patterns].slice(0, 6),
+    commands: commandEntries.map((entry) => entry.value),
+    files: fileEntries.map((entry) => entry.value),
+    patterns: topEntries(patterns, 6).map((entry) => entry.value),
+    taskTexts: [...taskTexts].slice(-4),
+    commandCounts: commandEntries.map((entry) => ({ command: entry.value, count: entry.count })),
+    fileCounts: fileEntries.map((entry) => ({ file: entry.value, count: entry.count })),
+    commandFamilies,
   }
 }
 
-/** Pitfalls justified by the tools actually used. */
-export function derivePitfalls(tools: string[]): string[] {
-  const pitfalls: string[] = []
-  if (tools.includes('bash')) pitfalls.push('bash 失败先看 exit code 与 stderr；不要为了「重试」再执行一次有副作用的命令。')
-  if (tools.includes('edit') || tools.includes('write')) pitfalls.push('先 read 再 edit/write；并行工作区里只做精确编辑，禁止整文件覆盖他人改动。')
-  if (tools.includes('grep') || tools.includes('glob')) pitfalls.push('空结果不等于不存在：换关键词，或直接 read 目标文件核对。')
-  if (tools.some((tool) => tool.startsWith('memory_'))) pitfalls.push('先 memory_recall 取既有结论，避免把已经做过的调查再做一遍。')
-  pitfalls.push('重复出现 ≠ 每次都套模板：工具、顺序或参数形态变了就按新情况判断。')
-  pitfalls.push('skill 只提供判断与步骤，不免除写操作的确认与验证。')
-  return pitfalls.slice(0, 6)
+/**
+ * Routing description: short, specific, "when to load", never a tool order.
+ * Statistics deliberately stay OUT of the description/body so repeated
+ * detection of the same facts stays byte-identical (frontmatter occurrences
+ * carries the counters instead).
+ */
+export function taskSkillDescription(signature: TaskSignature, facts: WorkflowFacts): string {
+  const scope = facts.files.length > 0 ? '涉及 ' + facts.files.slice(0, 2).join('、') : (signature.commands.length > 0 ? '常用命令 ' + signature.commands.slice(0, 2).join('、') : '任务对象 ' + signature.objects.join('、'))
+  return clipDescription('当任务属于「' + signature.title + '」这一类（' + scope + '）时加载：真实步骤、关键坑与验证方式（任务级经验，不是工具序列）。')
 }
 
-/** Markdown body for one repeated flow (human-editable, no command dumps). */
+/** Routing hint for the catalog (frontmatter whenToUse). */
+function taskSkillWhenToUse(signature: TaskSignature): string {
+  return '任务文本与对象和「' + signature.title + '」相近时加载；只是工具顺序相同、任务对象不同，不要套用。'
+}
+
+function confidenceWord(confidence: number): string {
+  if (confidence >= 0.8) return '高'
+  if (confidence >= 0.6) return '中'
+  return '低'
+}
+
+function code(text: string): string {
+  return '`' + text.replace(/`/g, '\\`') + '`'
+}
+
+/**
+ * Markdown body for one repeated TASK. The six required sections are built
+ * from recorded commands/files/requests; anything the samples do not justify
+ * says 「待补充」 instead of inventing a trap or a step.
+ */
+export function renderTaskSkillBody(
+  draft: SkillDraft,
+  signature: TaskSignature,
+  samples: TaskSample[],
+  meta: { occurrences: number; sessions: number },
+): string {
+  const facts = workflowFacts(samples)
+  const tools = new Set(samples.flatMap((sample) => sample.tools))
+  const verification = facts.commands.filter((command) => extractCommandFamilies([{ tools: ['bash'], args: [{ command }] }]).commands.some((family) => /typecheck|build|smoke|test|lint|check/i.test(family)))
+  const lines: string[] = []
+  lines.push('# ' + draft.title)
+  lines.push('')
+  lines.push('> 由 SuperMemory 从重复任务自动沉淀（任务级经验，不是工具序列）。可以手工编辑：再次识别到同一任务时只更新统计，不会覆盖人工修改。')
+  lines.push('> 置信度：' + confidenceWord(signature.confidence) + '（样本信息' + (signature.confidence >= 0.8 ? '充分' : '有限，缺的细节标为「待补充」') + '）。')
+  lines.push('')
+  lines.push('## 何时用（触发条件）')
+  lines.push('')
+  lines.push('- 任务属于「' + draft.title + '」这一类' + (facts.files.length > 0 ? '，通常涉及 ' + facts.files.slice(0, 3).map(code).join('、') : '') + '。')
+  if (facts.taskTexts.length > 0) {
+    lines.push('- 历史请求样本（原样截取，用于判断是否同类）：')
+    for (const task of facts.taskTexts) lines.push('  - 「' + task.slice(0, 90) + (task.length > 90 ? '…' : '') + '」')
+  } else {
+    lines.push('- 待补充：样本没有记录任务文本，无法判断触发条件。')
+  }
+  if (facts.commandFamilies.length > 0) lines.push('- 历史命令家族：' + facts.commandFamilies.slice(0, 5).map(code).join('、') + '。')
+  lines.push('- 只是工具顺序相同、任务对象不同（不同仓库/目录/文件族）时不要套用。')
+  lines.push('')
+  lines.push('## 决策清单')
+  lines.push('')
+  let step = 1
+  if (facts.files.length > 0) {
+    lines.push(step + '. 先核对当前实现/现状：读 ' + facts.files.slice(0, 3).map(code).join('、') + '，确认这次改动是否落在同一对象上。')
+    step += 1
+  } else {
+    lines.push(step + '. 待补充：样本没有记录具体文件；先定位这次任务的真实对象，再决定是否复用。')
+    step += 1
+  }
+  if (facts.commands.length > 0) {
+    lines.push(step + '. 需要执行命令时优先复用历史命令形态：' + facts.commands.slice(0, 3).map(code).join('、') + '；先确认它们对当前目录/分支仍然成立。')
+    step += 1
+  } else {
+    lines.push(step + '. 待补充：样本没有记录可复用命令。')
+    step += 1
+  }
+  lines.push(step + '. 中途出现失败或与样本不同的分支时，按「关键坑」停下判断，不要机械跑完整个步骤。')
+  step += 1
+  lines.push(step + '. 完成后按「验证方式」核对，并把新发现的坑补进本文件（同名更新会升版并保留 changelog）。')
+  lines.push('')
+  lines.push('## 步骤纲要')
+  lines.push('')
+  let outline = 1
+  if (facts.files.length > 0) {
+    lines.push(outline + '. 读取/定位：' + facts.files.slice(0, 3).map((file) => code(file)).join('、') + '。')
+    outline += 1
+  }
+  if (facts.commandCounts.length > 0) {
+    lines.push(outline + '. 执行/修改：按历史命令形态推进，样本中的命令：')
+    for (const entry of facts.commandCounts.slice(0, 6)) {
+      lines.push('   - ' + code(entry.command))
+    }
+    outline += 1
+  }
+  if (verification.length > 0) {
+    lines.push(outline + '. 验证：' + [...new Set(verification)].slice(0, 4).map(code).join('、') + '。')
+    outline += 1
+  }
+  if (outline === 1) lines.push('1. 待补充：样本没有记录文件、命令或验证步骤，无法给出可复用纲要。')
+  lines.push('')
+  lines.push('## 关键坑')
+  lines.push('')
+  const repeated = facts.commandCounts.filter((entry) => entry.count >= 2)
+  for (const entry of repeated.slice(0, 3)) {
+    lines.push('- ' + code(entry.command) + ' 在样本里多次出现：重跑前先确认上一次是否失败/是否幂等，不要为了「重试」重复有副作用的命令。')
+  }
+  if (tools.has('edit') || tools.has('write')) lines.push('- 样本里有精确编辑：先读目标文件，再只改必要片段，避免整文件覆盖并行改动。')
+  if (tools.has('grep') || tools.has('glob')) lines.push('- 检索空结果不等于不存在：换关键词，或直接读目标文件核对。')
+  if (repeated.length === 0) lines.push('- 待补充：样本没有记录失败与回退细节，不要臆造具体报错或解决方式。')
+  lines.push('- 把 skill 当成免确认的写操作快捷方式：写操作仍需按原流程确认与验证。')
+  lines.push('')
+  lines.push('## 验证方式')
+  lines.push('')
+  if (verification.length > 0) {
+    lines.push('- 历史样本实际跑过的验证命令：' + [...new Set(verification)].slice(0, 5).map(code).join('、') + '。')
+  } else {
+    lines.push('- 待补充：历史样本没有记录验证命令；按仓库约定跑 typecheck / 相关 smoke 并记录结果。')
+  }
+  lines.push('- 用可观察结果核对（命令 exit code、文件内容、测试输出），不要凭印象宣称完成。')
+  lines.push('')
+  lines.push('## 反例（不要这样用）')
+  lines.push('')
+  lines.push('- 只是工具序列相同（例如同样是 read → edit → bash）但任务对象不同：这不是同一件事，不要加载。')
+  lines.push('- 一次性任务、或目标文件/目录族明显不同：按新情况判断，不要套历史步骤。')
+  lines.push('- 把 skill 当捷径跳过验证或用户确认：步骤可以复用，闸门不能跳过。')
+  lines.push('')
+  lines.push('## 调用与命中统计')
+  lines.push('')
+  lines.push('- 任务出现次数：由插件写入 frontmatter 的 sm-occurrences（面板可见）。')
+  lines.push('- 模型加载次数：由插件在调用 skill 工具时累加（面板「设置 → 已生成的 skills」）。')
+  lines.push('- 最近识别时间：见 frontmatter 的 sm-updated-at（插件更新，正文不随时间变化）。')
+  return lines.join('\n')
+}
+
+/** Neutral six-section skeleton for a skill without sampled facts (manual). */
 export function renderSkillBody(draft: SkillDraft): string {
-  const tools = draft.source.label.split(' → ').map((part) => part.trim()).filter(Boolean)
   const facts = draft.facts ?? { commands: [], files: [], patterns: [] }
   const lines: string[] = []
   lines.push('# ' + draft.title)
   lines.push('')
-  lines.push('> 由 SuperMemory 从重复事务自动沉淀（' + draft.source.label + '，已多次出现）。'
-    + '可以手工编辑：再次识别到同一事务时只更新统计，不会覆盖人工修改。')
+  lines.push('> ' + (draft.source.kind === 'manual' ? '手工登记的 skill。' : '由 SuperMemory 生成的 skill。')
+    + '可以手工编辑：再次识别到同一任务时只更新统计，不会覆盖人工修改。')
   lines.push('')
   lines.push('## 何时用（触发条件）')
   lines.push('')
-  lines.push('- 任务需要按 **' + tools.join(' → ') + '** 的顺序反复完成同类改动时。')
-  lines.push('- 近期多次出现过同一组合，说明是重复事务而不是一次性操作。')
-  lines.push('- 只要有一步的工具或顺序明显不同，就不要套用本 skill（见「反例」）。')
+  lines.push('- ' + (draft.description || '待补充：写清什么任务下加载它。'))
   lines.push('')
   lines.push('## 决策清单')
   lines.push('')
-  lines.push('1. 先确认这次是否真的是同类事务：对照「步骤纲要」的工具与参数形态，不要只看任务标题。')
-  lines.push('2. 有更具体的 skill / 可执行能力（capability）时优先用它们；本 skill 只补充判断与步骤经验。')
-  lines.push('3. 执行中若第 2 步就需要换路（文件不存在、命令失败），停下按「关键坑」处理，不要机械跑完。')
-  lines.push('4. 完成后按「验证方式」核对，再把新发现的坑补进本文件（同名更新会升版并保留 changelog）。')
+  lines.push('1. 待补充：先确认这次任务与 skill 描述是否同类。')
+  lines.push('2. 待补充：列出执行前必须核对的事实。')
   lines.push('')
   lines.push('## 步骤纲要')
   lines.push('')
-  tools.forEach((tool, index) => {
-    lines.push((index + 1) + '. `' + tool + '` — ' + stepHint(tool) + '。')
-  })
-  if (facts.commands.length > 0) {
-    lines.push('')
-    lines.push('### 记录到的命令（历史样本，按需复用）')
-    lines.push('')
-    for (const command of facts.commands) lines.push('- `' + command.replace(/`/g, '\\`') + '`')
-  }
-  if (facts.files.length > 0) {
-    lines.push('')
-    lines.push('### 涉及文件（历史样本）')
-    lines.push('')
-    for (const file of facts.files) lines.push('- `' + file.replace(/`/g, '\\`') + '`')
-  }
-  if (facts.patterns.length > 0) {
-    lines.push('')
-    lines.push('### 检索模式（历史样本）')
-    lines.push('')
-    for (const pattern of facts.patterns) lines.push('- `' + pattern.replace(/`/g, '\\`') + '`')
+  if (facts.commands.length === 0 && facts.files.length === 0) {
+    lines.push('1. 待补充：样本不足，没有可复用的步骤。')
+  } else {
+    let index = 1
+    for (const file of facts.files) lines.push((index++) + '. 读取/定位 ' + code(file) + '。')
+    for (const command of facts.commands) lines.push((index++) + '. 执行 ' + code(command) + '。')
   }
   lines.push('')
   lines.push('## 关键坑')
   lines.push('')
-  for (const pitfall of derivePitfalls(tools)) lines.push('- ' + pitfall)
+  lines.push('- 待补充：样本不足，未记录失败与回退细节。')
   lines.push('')
   lines.push('## 验证方式')
   lines.push('')
-  if (tools.includes('edit') || tools.includes('write')) lines.push('- 改动后用 typecheck / 相关 smoke 或最小复现验证，别只看「命令退出 0」。')
-  else lines.push('- 用可观察的结果核对（文件内容、命令输出、测试结果），不要凭印象宣称完成。')
-  lines.push('- 若任务有既有闸门命令（如 `pnpm typecheck`、`pnpm smoke`），按仓库约定跑并记录结果。')
+  lines.push('- 待补充：写清可观察的验证命令与预期结果。')
   lines.push('')
   lines.push('## 反例（不要这样用）')
   lines.push('')
-  lines.push('- 一次性任务、或步骤顺序不同：不要强行套用本 skill。')
-  lines.push('- 工具参数形态明显不同（不同仓库/目录/对象）：先确认适用性，再决定是否复用。')
-  lines.push('- 把 skill 当成免确认的写操作快捷方式：写操作仍需按原流程确认与验证。')
-  lines.push('')
-  lines.push('## 调用与命中统计')
-  lines.push('')
-  lines.push('- 事务出现次数：由插件写入 frontmatter 的 sm-occurrences（面板可见），正文不随计数变化。')
-  lines.push('- 模型加载次数：由插件在调用 skill 工具时累加（面板「设置 → 已生成的 skills」）。')
-  lines.push('- 最近识别时间：见 frontmatter 的 sm-updated-at（插件更新，正文不随时间变化）。')
+  lines.push('- 一次性任务或对象不同：不要套用。')
   return lines.join('\n')
 }
 
@@ -347,6 +508,7 @@ export function renderSkillMarkdown(draft: SkillDraft, meta: { version: number; 
     META.updatedAt + ': ' + String(meta.updatedAt),
     META.source + ': ' + q(draft.source.kind),
     META.occurrences + ': ' + String(Math.max(0, draft.source.occurrences)),
+    ...(draft.taskKey ? [META.taskKey + ': ' + q(draft.taskKey)] : []),
     META.renderedHash + ': ' + q(meta.renderedHash),
     META.changelog + ': ' + JSON.stringify(meta.changelog.slice(0, SKILL_CHANGELOG_MAX)),
     '---',
@@ -407,6 +569,7 @@ export function parseSkillMarkdown(text: string, fallbackName = ''): ParsedSkill
     updatedAt: num(META.updatedAt, 0),
     ...(str(META.source) ? { source: str(META.source) } : {}),
     occurrences: num(META.occurrences, 0),
+    ...(str(META.taskKey) ? { taskKey: str(META.taskKey) } : {}),
     ...(str(META.renderedHash) ? { renderedHash: str(META.renderedHash) } : {}),
     changelog,
     body: raw.slice(match[0].length).trim(),
@@ -464,41 +627,70 @@ export function skillRowKey(workspaceKey: string, name: string): string {
   return 'ws/' + workspaceKey + '/skill/' + name
 }
 
-/** Build a draft from one durable repeated-tool signal. */
-export function draftSkillFromSignal(
-  signal: Signal,
-  samples: SequenceSample[],
-  options: { sharedToken?: string } = {},
-): SkillDraft | undefined {
-  const tools = (signal.sequence ?? []).filter((tool) => typeof tool === 'string' && tool.length > 0)
-  if (tools.length < 2) return undefined
-  const facts = extractWorkflowFacts(samples)
-  const name = skillNameForFlow(tools, options.sharedToken)
-  const label = tools.join(' → ')
-  const description = clipDescription('当任务需要按 ' + label + ' 的顺序反复处理同类改动时加载：含触发条件、决策清单、步骤纲要、关键坑与验证方式（自动化沉淀的重复事务）。')
-  return {
-    name,
-    title: flowTitle(tools),
-    description,
-    whenToUse: '重复出现 ' + label + ' 组合、且本次任务的工具与顺序相近时；一次性任务或顺序不同则不要套用。',
-    tags: ['skill', 'flow', ...tools.slice(0, 4)],
-    body: renderSkillBody({
-      name, title: flowTitle(tools), description, tags: [], body: '', source: {
-        kind: 'sequence',
-        key: signal.workspaceKey ? 'ws/' + signal.workspaceKey + '/seq/' + tools.join('>') : undefined,
-        label,
-        occurrences: Math.max(1, signal.count),
-      },
-      facts,
-    }),
-    source: {
-      kind: 'sequence',
-      key: signal.workspaceKey ? 'ws/' + signal.workspaceKey + '/seq/' + tools.join('>') : undefined,
-      label,
-      occurrences: Math.max(1, signal.count),
-    },
-    facts,
+/** Recover the task signature stored in one durable task signal. */
+export function signatureFromSignal(signal: Signal, samples: TaskSample[]): TaskSignature | undefined {
+  const withTask = [...samples].reverse().find((sample) => typeof sample.task === 'string' && sample.task.trim().length >= 6)
+  if (!withTask) return undefined
+  // Use the latest wording as the anchor but ALL samples as evidence: a turn
+  // that only read files must not lower the signature's confidence or split
+  // the task from its sibling turns.
+  const merged: TaskSample = {
+    task: withTask.task,
+    tools: samples.flatMap((sample) => sample.tools),
+    args: samples.flatMap((sample) => sample.args),
   }
+  const signature = extractTaskSignature(merged)
+  if (!signature) return undefined
+  // The pattern is the aggregation key; a mismatching signature means the
+  // sample was rewritten/truncated, so do not silently create a second name.
+  if (signal.pattern.startsWith('task:') && signal.pattern.slice(5) !== signature.key) return undefined
+  return signature
+}
+
+/**
+ * Build a draft from one repeated TASK signal. The tool sequence in the signal
+ * is evidence for the body only — the name/description/aggregation all come
+ * from the task signature.
+ */
+export function draftSkillFromTaskSignal(
+  signal: Signal,
+  samples: TaskSample[],
+  options: { sharedToken?: string; signature?: TaskSignature; sessions?: number } = {},
+): SkillDraft | undefined {
+  const signature = options.signature ?? signatureFromSignal(signal, samples)
+  if (!signature) return undefined
+  const name = skillNameForTask(signature, options.sharedToken)
+  if (!isReadableTaskSkillName(name)) return undefined
+  const facts = workflowFacts(samples)
+  const occurrences = Math.max(1, signal.count)
+  const sessions = Math.max(1, options.sessions ?? (signal.sessions?.length ?? 1))
+  const description = taskSkillDescription(signature, facts)
+  const draft: SkillDraft = {
+    name,
+    title: signature.title,
+    description,
+    whenToUse: taskSkillWhenToUse(signature),
+    tags: ['skill', 'task', ...signature.keywords].slice(0, 8),
+    body: '',
+    taskKey: signature.key,
+    source: {
+      kind: 'task',
+      key: 'task/' + signature.key,
+      label: signature.title,
+      occurrences,
+      sessions,
+    },
+    facts: {
+      commands: facts.commands,
+      files: facts.files,
+      patterns: facts.patterns,
+      taskTexts: facts.taskTexts,
+      commandCounts: facts.commandCounts,
+      fileCounts: facts.fileCounts,
+    },
+  }
+  draft.body = renderTaskSkillBody(draft, signature, samples, { occurrences, sessions })
+  return draft
 }
 
 /** Minimal capability shape skill-forge reads from a tool_memory row. */
@@ -585,29 +777,59 @@ export function draftSkillFromCapability(
   }
 }
 
+/** Options shared by detection and the boot/runtime sweep. */
+export interface DetectTaskOptions {
+  threshold: number
+  capabilityThreshold?: number
+  /** Distinct sessions/dispatches required (default SKILL_MIN_SESSIONS). */
+  minSessions?: number
+  /** Recency window; stale signatures never auto-create or auto-update. */
+  recencyDays?: number
+  now?: number
+  sharedToken?: string
+  /** Existing skill files under the target root (near-duplicate rejection). */
+  root?: string
+}
+
+/** Distinct sessions/dispatches recorded for one task signal. */
+export function signalSessionCount(signal: Signal, samples: TaskSample[] = []): number {
+  const recorded = signal.sessions ?? []
+  if (recorded.length > 0) return recorded.length
+  const fromSamples = samples.map((sample) => sample.sessionId).filter((value): value is string => Boolean(value))
+  return new Set(fromSamples).size
+}
+
 /**
- * Repeated-transaction detection: durable tool-sequence signals plus
- * capability rows whose execution count crossed the threshold. Pure read.
+ * Repeated-TASK detection (R48). Only `task:<signature>` signals qualify:
+ * legacy `<tool>><tool>` signals are deliberately ignored, which is what stops
+ * the plugin from regenerating `sm-flow-bash-bash-…` shells after cleanup.
+ * Capability rows remain a task-level path (sm-cap-*).
  */
 export function detectRepeatedTransactions(
   store: Store,
   workspaceKey: string,
-  options: { threshold: number; capabilityThreshold?: number; sharedToken?: string },
+  options: DetectTaskOptions,
 ): SkillDraft[] {
   const threshold = Math.max(1, options.threshold)
   const capThreshold = Math.max(1, options.capabilityThreshold ?? threshold)
-  const drafts: SkillDraft[] = []
-  const seen = new Set<string>()
+  const minSessions = Math.max(1, options.minSessions ?? SKILL_MIN_SESSIONS)
+  const now = options.now ?? Date.now()
+  const recencyMs = Math.max(0, options.recencyDays ?? SKILL_RECENCY_DAYS) * 86400000
+  const existing = options.root ? readSkillFiles(options.root) : []
+  const candidates: SkillDraft[] = []
   for (const [, signal] of store.signals.entries()) {
     if (signal.workspaceKey !== workspaceKey) continue
+    if (!signal.pattern.startsWith('task:')) continue
     if (signal.count < threshold) continue
-    if (signal.pattern.startsWith('nearmiss:')) continue
-    const tools = signal.sequence ?? []
-    if (tools.length < 2 || tools.length > 8) continue
-    const draft = draftSkillFromSignal(signal, parseSamples(signal.samples ?? []), { sharedToken: options.sharedToken })
-    if (!draft || seen.has(draft.name)) continue
-    seen.add(draft.name)
-    drafts.push(draft)
+    if (recencyMs > 0 && now - signal.lastSeen > recencyMs) continue
+    const samples = parseTaskSamples(signal.samples ?? [])
+    const sessions = signalSessionCount(signal, samples)
+    if (sessions < minSessions) continue
+    const draft = draftSkillFromTaskSignal(signal, samples, {
+      ...(options.sharedToken ? { sharedToken: options.sharedToken } : {}),
+      sessions,
+    })
+    if (draft) candidates.push(draft)
   }
   for (const [, record] of store.toolMemory.entries()) {
     if (record.kind !== 'composite') continue
@@ -619,23 +841,47 @@ export function detectRepeatedTransactions(
     if (spec.kind !== 'capability') continue
     if (record.workspaceKey && record.workspaceKey !== workspaceKey) continue
     const draft = draftSkillFromCapability(spec, record.useCount, { sharedToken: options.sharedToken })
-    if (!draft || seen.has(draft.name)) continue
-    seen.add(draft.name)
-    drafts.push(draft)
+    if (draft) candidates.push(draft)
   }
-  return drafts.sort((left, right) => right.source.occurrences - left.source.occurrences)
-}
-
-/** Parse durable signal samples (broken entries skipped). */
-function parseSamples(raw: string[]): SequenceSample[] {
-  const out: SequenceSample[] = []
-  for (const entry of raw) {
-    try {
-      const parsed = JSON.parse(entry) as SequenceSample
-      if (parsed && Array.isArray(parsed.tools) && Array.isArray(parsed.args)) out.push(parsed)
-    } catch { /* one broken sample is skipped */ }
+  // Merge by name (same task = one skill), then drop near-duplicates and
+  // unreadable names. Existing files are the reference set: a new draft that
+  // merely rephrases an existing skill is discarded on purpose.
+  candidates.sort((left, right) => right.source.occurrences - left.source.occurrences)
+  const accepted: SkillDraft[] = []
+  const names = new Set(existing.map((entry) => entry.name))
+  const tokenOf = (name: string): string | undefined => /^sm-(ws[a-z0-9]{5})-/.exec(name)?.[1]
+  for (const candidate of candidates) {
+    if (candidate.source.kind === 'task' && !isReadableTaskSkillName(candidate.name)) continue
+    const candidateToken = tokenOf(candidate.name)
+    const byTaskKey = candidate.taskKey
+      ? existing.find((entry) => {
+          if (entry.parsed.taskKey !== candidate.taskKey) return false
+          const fileToken = tokenOf(entry.name)
+          return !candidateToken || !fileToken || candidateToken === fileToken
+        })
+      : undefined
+    if (byTaskKey) {
+      // Same task already has a file: keep its name and let persistSkillDraft
+      // run the idempotent/versioned update. This is the merge path, not a
+      // duplicate to discard.
+      accepted.push({ ...candidate, name: byTaskKey.name })
+      continue
+    }
+    const draft = candidate
+    if (names.has(draft.name)) continue
+    // Workspace tokens make two same-task skills intentionally distinct in the
+    // shared user-level root; never treat those as near duplicates.
+    const draftToken = candidateToken
+    const similar = [...names].some((name) => {
+      const otherToken = tokenOf(name)
+      if (draftToken && otherToken && draftToken !== otherToken) return false
+      return taskNameSimilarity(name, draft.name) >= SKILL_SIMILARITY_MAX
+    })
+    if (similar) continue
+    names.add(draft.name)
+    accepted.push(draft)
   }
-  return out
+  return accepted
 }
 
 /** Read every generated skill bundle under one root. */
@@ -786,25 +1032,37 @@ async function putSkillRow(
   await store.toolMemory.put(key, row)
 }
 
+/** Auto-generated files only (manual register never consumes the cap). */
+function countAutoSkills(entries: Array<{ name: string; parsed: ParsedSkill }>, sharedToken?: string): number {
+  return entries.filter((entry) =>
+    entry.parsed.source !== 'manual'
+    && (!sharedToken || entry.name.startsWith('sm-' + sharedToken + '-'))).length
+}
+
 /**
- * Sync every detected repeated transaction into skill files. Returns the drafts
- * and per-draft results; one broken skill never blocks the rest.
+ * Sync every detected repeated TASK into skill files. Returns the drafts and
+ * per-draft results; one broken skill never blocks the rest. The per-root cap
+ * counts AUTO skills only and is checked for NEW names (updates always pass).
  */
 export async function syncRepeatedTransactions(
   store: Store,
   workspaceKey: string,
   scope: SkillRootInfo,
-  options: { threshold: number; capabilityThreshold?: number; now?: number },
+  options: { threshold: number; capabilityThreshold?: number; minSessions?: number; recencyDays?: number; now?: number },
 ): Promise<{ drafts: SkillDraft[]; results: SkillWriteResult[] }> {
   const sharedToken = scope.shared ? workspaceSkillToken(workspaceKey) : undefined
+  const existing = readSkillFiles(scope.root)
   const drafts = detectRepeatedTransactions(store, workspaceKey, {
     threshold: options.threshold,
     ...(options.capabilityThreshold !== undefined ? { capabilityThreshold: options.capabilityThreshold } : {}),
+    ...(options.minSessions !== undefined ? { minSessions: options.minSessions } : {}),
+    ...(options.recencyDays !== undefined ? { recencyDays: options.recencyDays } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
     ...(sharedToken ? { sharedToken } : {}),
+    root: scope.root,
   })
   const results: SkillWriteResult[] = []
-  // Shared with persistSequenceSkill: cap NEW names at boot-sweep time too.
-  let fileCount = readSkillFiles(scope.root).filter((entry) => !scope.shared || entry.name.startsWith('sm-' + workspaceSkillToken(workspaceKey) + '-')).length
+  let fileCount = countAutoSkills(existing, sharedToken)
   for (const draft of drafts) {
     try {
       if (!findSkillFile(scope.root, draft.name)) {
@@ -819,43 +1077,327 @@ export async function syncRepeatedTransactions(
   return { drafts, results }
 }
 
+/** Durable signal key for one task signature. */
+export function taskSignalKey(workspaceKey: string, signatureKey: string): string {
+  return 'ws/' + workspaceKey + '/task/' + signatureKey
+}
+
+/** Only keep arguments the body can actually use; never store result blobs. */
+function compactArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const key of ['command', 'description', 'file_path', 'path', 'pattern', 'glob', 'cwd', 'query', 'name']) {
+    const value = args[key]
+    if (typeof value === 'string' && value.length > 0 && value.length <= 400) out[key] = value
+  }
+  return out
+}
+
+function uniqueCompact(values: Array<string | undefined>, cap: number): string[] {
+  const out: string[] = []
+  for (const value of values) {
+    if (!value || out.includes(value)) continue
+    out.push(value)
+  }
+  return out.slice(-cap)
+}
+
+export interface TaskObservationResult {
+  signature: TaskSignature
+  key: string
+  count: number
+  sessions: number
+  /** True when threshold + cross-session requirements are both met. */
+  crossed: boolean
+}
+
 /**
- * Convenience entry for the runtime hooks: persist one repeated tool sequence
- * as a skill. Returns undefined for sequences that are not worth a skill.
+ * Record ONE task occurrence for this workspace. Unlike the old tool-sequence
+ * counter, the key is `<verb>/<object>` — different tool orders of the same
+ * task land on the same signal and therefore merge into one skill.
  */
-export async function persistSequenceSkill(
+export async function recordTaskObservation(
   store: Store,
   workspaceKey: string,
-  tools: string[],
-  samples: SequenceSample[],
-  occurrences: number,
-  options: { root?: string; shared?: boolean; now?: number } = {},
+  observation: TaskSample,
+  options: { threshold?: number; minSessions?: number; now?: number } = {},
+): Promise<TaskObservationResult | undefined> {
+  if (!workspaceKey || workspaceKey === 'unknown') return undefined
+  const signature = extractTaskSignature(observation)
+  if (!signature) return undefined
+  const now = options.now ?? Date.now()
+  const key = signature.key
+  const signalKey = taskSignalKey(workspaceKey, key)
+  const existing = store.signals.get(signalKey)
+  const sample: TaskSample = {
+    tools: observation.tools.slice(0, 60),
+    args: observation.args.slice(0, 60).map(compactArgs),
+    ...(observation.task ? { task: observation.task.replace(/\s+/g, ' ').slice(0, 2000) } : {}),
+    ...(observation.sessionId ? { sessionId: observation.sessionId } : {}),
+    ...(observation.dispatchId ? { dispatchId: observation.dispatchId } : {}),
+    ...(observation.topicSetId ? { topicSetId: observation.topicSetId } : {}),
+    at: now,
+  }
+  const samples = [...(existing?.samples ?? []), JSON.stringify(sample)].slice(-5)
+  const sessions = uniqueCompact([...(existing?.sessions ?? []), observation.sessionId], 20)
+  const dispatches = uniqueCompact([...(existing?.dispatches ?? []), observation.dispatchId], 10)
+  const count = (existing?.count ?? 0) + 1
+  const signal: Signal = {
+    workspaceKey,
+    pattern: 'task:' + key,
+    count,
+    lastSeen: now,
+    examples: [...(existing?.examples ?? []), signature.title].slice(-3),
+    sequence: observation.tools.slice(0, 8),
+    samples,
+    sessions,
+    dispatches,
+  }
+  await store.signals.put(signalKey, signal)
+  const threshold = Math.max(1, options.threshold ?? 3)
+  const minSessions = Math.max(1, options.minSessions ?? SKILL_MIN_SESSIONS)
+  return { signature, key, count, sessions: sessions.length, crossed: count >= threshold && sessions.length >= minSessions }
+}
+
+/**
+ * Persist the skill for one crossed task signal (runtime hook + tests).
+ * Re-runs detection so cap / similarity / recency rules stay in ONE place.
+ */
+export async function persistTaskSkillForSignature(
+  store: Store,
+  workspaceKey: string,
+  signatureKey: string,
+  options: { threshold: number; minSessions?: number; recencyDays?: number; now?: number; root?: string; shared?: boolean },
 ): Promise<SkillWriteResult | undefined> {
-  if (tools.length < 2) return undefined
-  // A session without cwd has workspaceKey 'unknown'; never let it fall through
-  // to the process cwd and write into whatever repository the host was started in.
-  if (!options.root && (!workspaceKey || workspaceKey === 'unknown')) return undefined
+  if (!workspaceKey || workspaceKey === 'unknown') return undefined
   const scope = options.root
     ? { root: options.root, scope: 'project' as const, shared: Boolean(options.shared), note: '' }
     : resolveSkillRoot(workspaceKey)
-  const signal: Signal = {
-    workspaceKey,
-    pattern: tools.join('>'),
-    count: Math.max(1, occurrences),
-    lastSeen: Date.now(),
-    examples: [tools.join(' → ')],
-    sequence: tools,
-    samples: [],
-  }
-  const draft = draftSkillFromSignal(signal, samples, scope.shared ? { sharedToken: workspaceSkillToken(workspaceKey) } : {})
+  const sharedToken = scope.shared ? workspaceSkillToken(workspaceKey) : undefined
+  const drafts = detectRepeatedTransactions(store, workspaceKey, {
+    threshold: options.threshold,
+    ...(options.minSessions !== undefined ? { minSessions: options.minSessions } : {}),
+    ...(options.recencyDays !== undefined ? { recencyDays: options.recencyDays } : {}),
+    ...(options.now !== undefined ? { now: options.now } : {}),
+    ...(sharedToken ? { sharedToken } : {}),
+    root: scope.root,
+  })
+  const draft = drafts.find((candidate) => candidate.taskKey === signatureKey)
   if (!draft) return undefined
-  // Auto growth cap: updating an existing skill is always allowed; a NEW name
-  // beyond the cap is skipped (manual register still works).
-  if (!findSkillFile(scope.root, draft.name) && readSkillFiles(scope.root).length >= SKILL_MAX_PER_ROOT) return undefined
+  if (!findSkillFile(scope.root, draft.name)) {
+    if (countAutoSkills(readSkillFiles(scope.root), sharedToken) >= SKILL_MAX_PER_ROOT) return undefined
+  }
   return persistSkillDraft(store, workspaceKey, draft, {
     root: scope.root,
     ...(options.now !== undefined ? { now: options.now } : {}),
   })
+}
+
+/**
+ * Legacy shell detection (R48 cleanup): an auto-generated skill whose NAME or
+ * DESCRIPTION is just a tool order. Manual/capability skills never qualify.
+ */
+export function isShellSkill(parsed: ParsedSkill): boolean {
+  if (parsed.source !== 'sequence') return false
+  if (/^sm-(?:ws[a-z0-9]{5}-)?flow(?:-|$)/.test(parsed.name)) return true
+  const description = String(parsed.description ?? '')
+  return /当任务需要按/.test(description) && /的顺序反复处理同类改动/.test(description)
+}
+
+/** Archive directory is a SIBLING of the skill root: <root>-archive. */
+export function archiveDirForRoot(root: string): string {
+  return root + '-archive'
+}
+
+export interface ArchivedSkill {
+  root: string
+  name: string
+  from: string
+  archivePath: string
+  version: number
+  description: string
+  archivedAt: number
+  reason: string
+}
+
+export interface SkillArchiveRoot {
+  root: string
+  scanned: number
+  archived: number
+  skippedManual: number
+  skippedOther: number
+}
+
+export interface SkillArchiveResult {
+  archived: ArchivedSkill[]
+  roots: SkillArchiveRoot[]
+  totalScanned: number
+  totalArchived: number
+  dryRun: boolean
+}
+
+interface ArchiveManifest {
+  version: number
+  entries: Array<Omit<ArchivedSkill, 'root' | 'from'> & { from: string }>
+}
+
+function readArchiveManifest(file: string): ArchiveManifest {
+  if (!existsSync(file)) return { version: 1, entries: [] }
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as ArchiveManifest
+    if (parsed && Array.isArray(parsed.entries)) return { version: 1, entries: parsed.entries }
+  } catch { /* rebuild from this run */ }
+  return { version: 1, entries: [] }
+}
+
+/**
+ * Archive auto-generated tool-sequence shells under every given root.
+ *
+ * - moves `<root>/<name>` to `<root>-archive/<name>` (never deletes);
+ * - appends a manifest entry (name/time/reason/version/description/from);
+ * - retires the mirror tool_memory row when a store is supplied;
+ * - IDEMPOTENT: a second run finds no shell skills and archives 0.
+ */
+export async function archiveShellSkills(options: {
+  roots: string[]
+  store?: Store
+  now?: number
+  dryRun?: boolean
+}): Promise<SkillArchiveResult> {
+  const now = options.now ?? Date.now()
+  const dryRun = Boolean(options.dryRun)
+  const archived: ArchivedSkill[] = []
+  const rootReports: SkillArchiveRoot[] = []
+  let totalScanned = 0
+  for (const root of [...new Set(options.roots)]) {
+    const entries = readSkillFiles(root)
+    const report: SkillArchiveRoot = { root, scanned: entries.length, archived: 0, skippedManual: 0, skippedOther: 0 }
+    totalScanned += entries.length
+    const archiveDir = archiveDirForRoot(root)
+    const toArchive: Array<{ name: string; parsed: ParsedSkill; from: string }> = []
+    for (const entry of entries) {
+      if (!isShellSkill(entry.parsed)) {
+        if (entry.parsed.source === 'manual') report.skippedManual += 1
+        else report.skippedOther += 1
+        continue
+      }
+      toArchive.push({ name: entry.name, parsed: entry.parsed, from: dirname(entry.path) })
+    }
+    if (toArchive.length === 0) {
+      rootReports.push(report)
+      continue
+    }
+    if (!dryRun) mkdirSync(archiveDir, { recursive: true })
+    const manifestFile = join(archiveDir, 'manifest.json')
+    const manifest = readArchiveManifest(manifestFile)
+    for (const item of toArchive) {
+      let target = join(archiveDir, item.name)
+      if (existsSync(target)) target = join(archiveDir, item.name + '-dup-' + shortHash(root + ':' + now + ':' + item.name, 4))
+      if (!dryRun) {
+        try {
+          renameSync(item.from, target)
+        } catch {
+          report.skippedOther += 1
+          continue
+        }
+      }
+      const record: ArchivedSkill = {
+        root,
+        name: item.name,
+        from: item.from,
+        archivePath: target,
+        version: item.parsed.version,
+        description: item.parsed.description,
+        archivedAt: now,
+        reason: '自动生成的工具序列壳子（R48 清理：归档保留，可回滚）',
+      }
+      archived.push(record)
+      report.archived += 1
+      manifest.entries.push({
+        name: record.name,
+        archivePath: record.archivePath,
+        version: record.version,
+        description: record.description,
+        archivedAt: record.archivedAt,
+        reason: record.reason,
+        from: record.from,
+      })
+      if (options.store !== undefined) await retireSkillRow(options.store, item.from)
+    }
+    if (!dryRun && manifest.entries.length > 0) {
+      try { writeFileAtomic(manifestFile, JSON.stringify({ version: 1, entries: manifest.entries.slice(-500) }, null, 2)) } catch { /* archive files still moved */ }
+    }
+    rootReports.push(report)
+  }
+  return {
+    archived,
+    roots: rootReports,
+    totalScanned,
+    totalArchived: archived.length,
+    dryRun,
+  }
+}
+
+/** Retire the durable mirror row of an archived skill (best effort). */
+async function retireSkillRow(store: Store, fromDir: string): Promise<void> {
+  const marker = normalizeDir(fromDir) + '/'
+  for (const [key, row] of store.toolMemory.entries()) {
+    if (row.kind !== 'skill') continue
+    const entry = normalizeDir(row.entry)
+    if (entry !== normalizeDir(join(fromDir, 'SKILL.md')) && !entry.startsWith(marker)) continue
+    try { await store.toolMemory.update(key, (record) => ({ ...record, status: 'retired' })) } catch { /* advisory */ }
+  }
+}
+
+function normalizeDir(path: string): string {
+  return resolve(String(path ?? '')).replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+/**
+ * Every skill root this machine is likely to have used: <DSH_HOME>/skills plus
+ * `<project>/.dsh/skills` for every workspace key found in the store and the
+ * caller's cwd. Missing roots are ignored.
+ */
+export function discoverSkillRoots(options: {
+  dshHome?: string
+  store?: Store
+  workspaces?: string[]
+  cwd?: string
+} = {}): string[] {
+  const dshHome = options.dshHome ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const workspaces = new Set<string>()
+  if (options.cwd) workspaces.add(resolve(options.cwd))
+  for (const workspace of options.workspaces ?? []) if (workspace) workspaces.add(workspace)
+  const store = options.store as unknown as Record<string, { entries?: () => IterableIterator<[string, unknown]> }> | undefined
+  if (store) {
+    for (const table of ['memories', 'signals', 'toolMemory', 'filemap', 'topicsets']) {
+      const handle = store[table]
+      if (!handle || typeof handle.entries !== 'function') continue
+      try {
+        for (const [, row] of handle.entries()) {
+          const workspaceKey = (row as { workspaceKey?: unknown } | null | undefined)?.workspaceKey
+          if (typeof workspaceKey === 'string' && workspaceKey.length > 0) workspaces.add(workspaceKey)
+        }
+      } catch { /* one broken table never blocks discovery */ }
+    }
+  }
+  const roots = new Set<string>()
+  roots.add(join(dshHome, 'skills'))
+  for (const workspace of workspaces) {
+    const projectRoot = findProjectRoot(workspace) ?? (existsSync(join(workspace, '.git')) ? workspace : undefined)
+    if (projectRoot) roots.add(join(projectRoot, '.dsh', 'skills'))
+  }
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const root of roots) {
+    let key: string
+    try { key = normalizeDir(root) } catch { continue }
+    if (seen.has(key)) continue
+    seen.add(key)
+    try {
+      if (existsSync(root) && statSync(root).isDirectory()) out.push(root)
+    } catch { /* unreadable root is skipped */ }
+  }
+  return out.sort()
 }
 
 /** List generated skills of one workspace (files first, store row overlaid). */
@@ -901,6 +1443,7 @@ function rewriteFrontmatter(file: string, parsed: ParsedSkill, patch: { enabled?
     ...(patch.whenToUse ?? parsed.whenToUse ? { whenToUse: patch.whenToUse ?? parsed.whenToUse } : {}),
     tags: [],
     body: parsed.body,
+    ...(parsed.taskKey ? { taskKey: parsed.taskKey } : {}),
     source: { kind: (parsed.source as SkillSourceKind) ?? 'manual', label: parsed.source ?? 'manual', occurrences: parsed.occurrences },
   }, {
     version,

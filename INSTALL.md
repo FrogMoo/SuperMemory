@@ -39,19 +39,19 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 | `.../releases` 页面 URL | ❌ | 报 “a URL must point at a git repository or a tarball” |
 | Release 里的 `.zip` 资产 | ❌ | 同上；zip 只用于下面的手动安装 |
 
-> 当前 `v1.2.0` Release 如果还没有 `.tgz` 资产，稳定别名 URL 会 404：请改用上面的 Git 地址，或按方式 B 手动安装。补齐 tgz 的发布清单见 `DEV-NOTES` 对应章节。
+> 自 `v1.2.1` 起，每个 Release 都同时带版本 tgz（`dsh-supermemory-<版本>.tgz`）与稳定别名 `dsh-supermemory.tgz`，上面的稳定 URL 可直接使用。若安装器仍报 404（CDN 尚未刷新），改用 Git 地址，或按方式 B 手动安装。
 
 ## 方式 B：手动下载 Release 包（离线/内网）
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.2.0.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.2.1.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.2.0`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.2.0`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.2.1`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.2.1`
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 

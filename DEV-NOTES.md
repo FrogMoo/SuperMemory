@@ -3428,3 +3428,138 @@ v2 的收敛条件是「pending === 0 才写 marker」，而冷会话永远 pend
 - 单条集成提交（中文提交信息列出四条线 + 轮次 + 闸门结果），含源码、断言、文档与 lib/ 产物；
   提交后按 docs/git-sync.md 双推（origin 首位 GitHub、次 Gitee；fetch 走 Gitee），本地/Gitee/GitHub 核验同一 SHA。
 - 遗留：R47 的修复要生效需重载插件（本轮执行）；面板页签 / 省略标记 / 设置页签 skills 三项由用户点开验收。
+
+---
+
+## 60. R48：任务级 skill 识别 + 旧「工具序列壳子」清理（2026-11-25）
+
+### 60.1 问题
+
+R45 把重复工作固化成 DSH skill 后，自动路径把「连续出现了哪些工具」当主体特征，
+宿主 skill 目录堆出 `sm-flow-bash-bash-…` / `sm-ws…-flow-run-code-run-code-…`：
+描述统一是「当任务需要按 A → B 的顺序反复处理同类改动时加载」，没有对象、参数、坑与验证，
+还会挤占 available_skills 的路由注意力。R48 把识别主体改成「做过的事」。
+
+### 60.2 任务签名（src/task-signature.ts）
+
+- **文本锚点**：原始任务/派发文本第一行（≤180 字）作为 headline；动词取 headline 中最早出现的
+  动作词（修/改/实现/清理/发布/同步/验证…，中英各一套），对象取 headline 中的中文名词（受控词表）
+  与 ASCII 标识符（`skill-forge`、`gitee`、`tgz`…）。
+- **真实工作证据**：文件/目录族（read/edit/write 的 file_path、命令里的路径、任务文本里的路径）与
+  命令家族（`pnpm git:sync`、`pnpm typecheck`、`git push`、`tar` …）只做佐证与正文事实；
+  只有 headline 没有任何可命名对象时才回退到证据对象。
+- **key** = `<verb>/<primary-object>`（`fix/skill-forge`、`sync/gitee`、`release/package`）。
+  工具序列完全不参与 key / 名称 / 描述 —— 这正是不会退化回 `sm-flow-*` 的结构性保证。
+- **拒绝条件**（一律不产出）：没有任务文本或文本 <6 字；只有 2 连工具序列且无对象；只有
+  `ls`/`git status`/`pnpm build` 这类泛化命令；对象只有工具词（bash/read/run_code…）；
+  置信度 <0.5。没有失败/回退证据时正文写「待补充」，不编造。
+
+### 60.3 命名、描述与正文
+
+- 名称 `sm-<verb>-<object>[-<object2>]`：`sm-fix-skill-forge`、`sm-sync-gitee-github`、
+  `sm-release-package-tgz`、`sm-refactor-panel-tab`。保留 `sm-` 命名空间（面板/清理/共享根隔离依赖它）。
+- 描述写「当任务属于「修复 X」这一类（涉及 …）时加载：真实步骤、关键坑与验证方式（任务级经验，不是工具序列）」，
+  **不含统计数字**（occurrences 只进 frontmatter），重复检测同事实才能 byte-stable。
+- 正文六节：触发条件（历史请求原文截取 + 文件/命令家族）、决策清单、步骤纲要（真实命令/文件）、
+  关键坑（只写样本能证明的：命令多次出现、精确编辑、检索空结果；其余「待补充」）、验证方式（历史验证命令）、反例。
+- frontmatter 新增 `sm-task-key`：同一任务重命名/合并时按 key 找回原文件，不新建近似名。
+
+### 60.4 合并、阈值与上限
+
+- 同一任务签名的不同工具序列写同一个 `ws/<ws>/task/<key>` signal（`sessions`/`dispatches` 上限 20/10），
+  因此天然归并成一个 skill；重复检测只走持久化幂等/升版，不再产生近似名。
+- 名称可读性（`isReadableTaskSkillName`，拒绝 flow/bash/read/edit 等工具词）与
+  `taskNameSimilarity ≥ 0.85` 的近似草稿直接丢弃；共享根里不同 `ws<token>` 不算近似。
+- 阈值：同任务 **≥3 次**（`maintenance.signalsThreshold`）且 **≥2 个会话/派发**（新增
+  `maintenance.skillMinSessions`，默认 2）；新增 `maintenance.skillRecencyDays`（默认 30 天）
+  做时间衰减：超窗不再自动新增/升版。
+- 每个根自动 skill 上限 **8**（`SKILL_MAX_PER_ROOT`，manual register 不占额度；已存在 skill 总能更新）。
+- 旧 `<tool>><tool>` signal 仍可用于显式打开的组合工具（默认关），但**永不生成 skill**；
+  启动扫尾 `sweepSkillDrafts` 只看 `task:` signal。
+
+### 60.5 存量清理（可回滚、幂等）
+
+- `archiveShellSkills()`：只认 `sm-source: sequence` 且名字/描述符合工具序列壳子的 skill；
+  manual / capability / task 一律跳过。目录整体移动到 **`<skills 根>-archive/<name>`**（兄弟目录，不删除），
+  每个根写 `manifest.json`（原名/原路径/归档路径/时间/原因/版本/描述），并把 mirror 行标 retired。
+- 入口：插件启动时自动扫（`discoverSkillRoots` = `$DSH_HOME/skills` + store 里各工作区的
+  `<repo>/.dsh/skills`），以及 `memory_toolize cleanup` / `pnpm skill:cleanup [--dry-run]`。
+- 本次实机批量归档 **22 条**：`C:\Users\admin\.dsh\skills` 10 条
+  → `C:\Users\admin\.dsh\skills-archive\`；`F:\10-SuperMemory\.dsh\skills` 12 条
+  → `F:\10-SuperMemory\.dsh\skills-archive\`。第二次执行归档 0（幂等）；随后运行中的旧插件又补写 1 条（同名），
+  已用 `-dup-*` 归档，项目根 manifest 共 13 条。
+- 回滚：把 `<root>-archive/<name>` 移回 `<root>/<name>` 即可；manifest 保留原路径。
+- **注意**：清理时运行中的旧插件仍会在同一请求内按 run_code 窗口补写 1 条壳子；新代码重载后
+  启动扫尾会把它归档，之后不再生成。清理完成后需要重载插件让新识别逻辑生效。
+
+### 60.6 闸门
+
+- `pnpm typecheck`：宿主 + client 双工程 0 错。
+- `pnpm build`：exit 0；宿主 12 文件 858.08 kB（入口 550.91 kB，新增 skill-forge-* chunk），
+  client 175.74 kB（wrap 后 170340 B）；lib chunk 引用已更新。
+- `pnpm smoke`：七套全绿——core 43 / mechanism 114 / webui 35 / client-sim OK /
+  capability 12 / workspace-scope 9 / skill **23**（S1–S23，新增任务签名否定、合并、壳子不生成、
+  命名、阈值衰减、清理幂等、manual 保护）。
+
+### 60.7 风险
+
+- 任务文本过短或只有泛化指令时宁可不出 skill（自动生成量会显著下降，这是有意的）。
+- 同一任务的不同措辞可能落到不同 key（动词/主对象不同）→ 两个 skill；目前靠命名相似度丢弃
+  近似项，不做跨 key 合并。
+- 正文事实来自最近 5 个样本；样本不足时坑与步骤会标「待补充」，置信度显示为低/中。
+- 长 dispatch 文本以 headline 锚定；headline 与实际工作对象不一致时（例如标题很泛）可能命名偏泛。
+
+
+---
+
+## 61. v1.2.1 发布轮：R48 任务级 skill + 面板安装资产（2026-11-25）
+
+### 61.1 定级与范围
+
+- v1.2.0（tag `fdfe716`）之后区间为 `55d8455`（R44–R47 集成）+ 本轮 R48 提交。区间含新功能
+  （任务级 skill 识别、存量壳子归档、面板 tgz 资产），按语义化版本取 **patch → 1.2.1**；用户已批准发布。
+  R44–R47 在 v1.2.0 之后合入，一并在本版交付，CHANGELOG 用「同时包含」标注而不重复细节。
+- `package.json` 版本 1.2.0 → 1.2.1；`README.md` 版本行、`INSTALL.md` 示例版本与 tgz 说明、
+  `CHANGELOG.md` [1.2.1] 同步；本小节。
+
+### 61.2 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 12 文件 **858.08 kB**（入口 `supermemory.js` 550.91 kB），client
+  `lib/client.js` 175.74 kB（wrap 后 170340 B）——与 §60 一致，lib/ 为全新产物。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **114** / webui **35** / client-sim **OK** /
+  capability **12** / workspace-scope **9** / skill **23**。
+
+### 61.3 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.2.1.zip` | 1,998,049 | `a81962694d67fbdac75a28e480df5bed7a61df7cf0205611e5627ac694e1416f` |
+| `dsh-supermemory-1.2.1.tgz` | 767,830 | `650ca211cec3cc18bc1d733201d1147940b693b272a80b8667ba642f31fdee5d` |
+| `dsh-supermemory.tgz`（稳定别名） | 767,830 | 同上（字节一致） |
+
+- tgz 结构校验：`package/package.json`、`package/lib/supermemory.js`、`package/lib/client.js`、
+  `package/cordis.patch.yml` 均在；无反斜杠路径；包内 version=1.2.1。
+- 安装自检：临时空目录 `pnpm add`（`auto-install-peers=false`，模拟宿主提供 peer）→ exit 0，
+  259ms（含缓存复用；总耗时 1s），+5 包，安装版本 1.2.1，`lib/supermemory.js` 存在。
+
+### 61.4 入库边界
+
+- `.gitignore` 新增：`.dsh/skills/`、`.dsh/skills-archive/`、`.dsh/r48-delayed-cleanup-*.json`、
+  `release/*.zip`、`release/*.tgz`、`release/*.tar.gz`（staging 目录规则原有）。
+- 本轮 release 二进制与运行期目录**不入库**；历史上已跟踪的 1.0.0–1.2.0 zip 保持原状。
+
+### 61.5 提交与发布
+
+- 单条中文提交（R48 + release 1.2.1 + 闸门结果）+ 附注 tag `v1.2.1`；按 `docs/git-sync.md` 双推
+  （GitHub 首位、Gitee 其次；fetch 走 Gitee）；GitHub git 端点若阻断，用 `scripts/github-api-release.mjs`
+  以单提交快进 + tag 对象 + Release 三资产兜底。
+- GitHub Release 资产＝版本 zip + 版本 tgz + 稳定别名 tgz；上传后核验 API assets 名称/大小/state，
+  以及 `releases/latest` 指向 v1.2.1、稳定 URL 的实际 HTTP 状态（CDN 延迟允许重试）。
+- 分支不能重载插件；重载与 GUI 验收由用户在插件页「禁用 → 启用」完成。
+
+### 61.6 风险
+
+- CDN 延迟：`releases/latest/download/...` 可能短时 404 或指向旧资产，需重试并在汇报里记录实际状态。
+- Gitea Release 无固化脚本：以 git tag 到位为准；若 API 可用再补同口径 Release。
+- 任务文本过短/措辞不同的生成率与近名问题见 §60.7（有意取舍）。

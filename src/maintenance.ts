@@ -37,6 +37,10 @@ export interface MaintenanceConfig {
   toolizeMinDistinctTools: number
   nearMissHint: boolean
   recycleIdleToolDays: number
+  /** R48: same task must cross this many distinct sessions/dispatches. */
+  skillMinSessions: number
+  /** R48: recency window (days) for auto-creating/updating task skills. */
+  skillRecencyDays: number
 }
 
 interface BufferedUser {
@@ -185,8 +189,10 @@ export function attachMaintenance(
     if (createdIds.length > 0 || reqIds.length > 0) {
       logger.info(`supermemory: +${createdIds.length} memories, +${reqIds.length} requirements from ${task.sessionId}@${task.seq}`)
     }
-    // §2.3: repeated tool sequences feed the tool-ization pipeline.
-    await countSequenceSignal(activeStore, ctx, task.sessionId, workspaceKey, cursor, task.seq, config, logger)
+    // §2.3 / R48: repeated tool sequences feed the legacy composite pipeline;
+    // the TASK text + session id feed the task-level skill signature.
+    const taskText = users.map((user) => user.text).filter(Boolean).join('\n').slice(0, 2000)
+    await countSequenceSignal(activeStore, ctx, task.sessionId, workspaceKey, cursor, task.seq, config, logger, taskText, now)
   }
 
   async function persistCursor(sessionId: string, seq: number, createdIds: string[] = []): Promise<void> {
@@ -311,6 +317,8 @@ async function countSequenceSignal(
   untilSeq: number,
   config: MaintenanceConfig,
   logger: { info: (msg: string) => void; warn: (msg: string) => void },
+  taskText?: string,
+  now: number = Date.now(),
 ): Promise<void> {
   let tools: string[] = []
   const args: Array<Record<string, unknown>> = []
@@ -345,8 +353,14 @@ async function countSequenceSignal(
     minDistinctTools: config.toolizeMinDistinctTools,
     nearMissHint: config.nearMissHint,
     recycleIdleDays: config.recycleIdleToolDays,
+    skillMinSessions: config.skillMinSessions,
+    skillRecencyDays: config.skillRecencyDays,
   }
-  await recordTurnSequences(ctx, store, workspaceKey, tools, args, toolize, logger)
+  await recordTurnSequences(ctx, store, workspaceKey, tools, args, toolize, logger, undefined, {
+    sessionId,
+    ...(taskText ? { task: taskText } : {}),
+    now,
+  })
   await recycleIdleComposites(ctx, store, toolize, logger)
 }
 

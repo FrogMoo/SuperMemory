@@ -1,6 +1,6 @@
 {
   "name": "dsh-supermemory",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与组合工具自动固化。",
   "private": true,
   "license": "UNLICENSED",
@@ -50,6 +50,7 @@
     "smoke:webui": "node scripts/webui-smoke.mjs",
     "smoke:core": "node scripts/core-smoke.mjs",
     "smoke:skill": "node scripts/skill-smoke.mjs",
+    "skill:cleanup": "node --experimental-transform-types scripts/skill-cleanup.mjs",
     "smoke": "node scripts/core-smoke.mjs && node scripts/mechanism-smoke.mjs && node scripts/webui-smoke.mjs && node scripts/client-sim-smoke.mjs && node scripts/capability-smoke.mjs && node scripts/workspace-scope-smoke.mjs && node scripts/skill-smoke.mjs"
   },
   "dsh": {

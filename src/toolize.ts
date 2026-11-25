@@ -35,7 +35,7 @@ import {
 import type { Signal } from './schema.ts'
 import type { Store } from './store.ts'
 import type { RequestState } from './inrequest.ts'
-import { persistSequenceSkill } from './skill-forge.ts'
+import { persistTaskSkillForSignature, recordTaskObservation } from './skill-forge.ts'
 
 /** Tool-ization knobs (all surfaced in the plugin Config schema). */
 export interface ToolizeConfig {
@@ -52,6 +52,10 @@ export interface ToolizeConfig {
    * 行为不变（只生成组合工具）；真实配置由 index.ts 显式打开。
    */
   autoSkill?: boolean
+  /** R48: 同一任务至少跨几个会话/派发才自动生成（默认 2）。 */
+  skillMinSessions?: number
+  /** R48: 任务签名的时间衰减窗口（天）；超窗不再自动新增/升版（默认 30）。 */
+  skillRecencyDays?: number
 }
 
 /** Injectable seam so unit tests can drive auto-toolization without a host. */
@@ -325,9 +329,35 @@ export function parseSamples(raw: string[]): SequenceSample[] {
   return out
 }
 
+/** Turn context the maintenance loop attaches to a recorded task observation. */
+export interface TurnSequenceContext {
+  sessionId?: string
+  /** User request text of this turn (the primary task feature). */
+  task?: string
+  dispatchId?: string
+  topicSetId?: string
+  now?: number
+}
+
+/** Find the dispatch row of one branch session (no host dependency). */
+function dispatchOf(store: Store, sessionId: string | undefined): { id: string; task: string; topicSetId?: string } | undefined {
+  if (!sessionId) return undefined
+  const table = (store as unknown as { dispatches?: { entries?: () => IterableIterator<[string, { branchSessionId?: string; task?: string; topicSetId?: string }]> } }).dispatches
+  if (!table || typeof table.entries !== 'function') return undefined
+  try {
+    for (const [id, row] of table.entries()) {
+      if (row?.branchSessionId !== sessionId) continue
+      return { id, task: String(row.task ?? ''), ...(row.topicSetId ? { topicSetId: row.topicSetId } : {}) }
+    }
+  } catch { /* cold dispatch table never blocks the turn */ }
+  return undefined
+}
+
 /**
  * Durable per-turn sequence counting: sliding windows of 2..4 calls (each
- * occurrence counts) plus the whole turn when it is short (legacy signature).
+ * occurrence counts) plus the whole turn when it is short (legacy composite
+ * signature). R48 only the TASK observation can become a skill; the windows
+ * below are kept for the optional legacy composite entrance.
  */
 export async function recordTurnSequences(
   ctx: Context,
@@ -338,8 +368,47 @@ export async function recordTurnSequences(
   config: ToolizeConfig,
   logger: { info: (msg: string) => void; warn: (msg: string) => void },
   deps?: ToolizeDeps,
+  context: TurnSequenceContext = {},
 ): Promise<void> {
   if (tools.length < 2) return
+  // ---- R48: task-level observation (once per turn, never per window) ----
+  if (config.autoSkill) {
+    try {
+      const dispatch = dispatchOf(store, context.sessionId)
+      // Dispatch task text is curated (title + task); the raw user message can
+      // carry injected cards, so it comes second when both exist.
+      const taskParts = [dispatch?.task, context.task].filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      const task = taskParts.join('\n').trim()
+      if (task) {
+        const observation = await recordTaskObservation(store, workspaceKey, {
+          tools,
+          args,
+          task,
+          ...(context.sessionId ? { sessionId: context.sessionId } : {}),
+          ...(context.dispatchId ?? dispatch?.id ? { dispatchId: context.dispatchId ?? dispatch?.id } : {}),
+          ...(context.topicSetId ?? dispatch?.topicSetId ? { topicSetId: context.topicSetId ?? dispatch?.topicSetId } : {}),
+          ...(context.now !== undefined ? { at: context.now } : {}),
+        }, {
+          threshold: config.threshold,
+          ...(config.skillMinSessions !== undefined ? { minSessions: config.skillMinSessions } : {}),
+          ...(context.now !== undefined ? { now: context.now } : {}),
+        })
+        if (observation?.crossed) {
+          const written = await persistTaskSkillForSignature(store, workspaceKey, observation.key, {
+            threshold: config.threshold,
+            ...(config.skillMinSessions !== undefined ? { minSessions: config.skillMinSessions } : {}),
+            ...(config.skillRecencyDays !== undefined ? { recencyDays: config.skillRecencyDays } : {}),
+            ...(context.now !== undefined ? { now: context.now } : {}),
+          })
+          if (written && written.status !== 'unchanged' && written.status !== 'preserved') {
+            logger.info('supermemory: task skill ' + written.name + ' ' + written.status + ' (v' + written.version + ')')
+          }
+        }
+      }
+    } catch (error) {
+      logger.warn('supermemory: task skill recording failed: ' + String(error).slice(0, 160))
+    }
+  }
   const jobs = new Map<string, { tools: string[]; args: Array<Record<string, unknown>>; occurrences: number }>()
   const add = (jobTools: string[], jobArgs: Array<Record<string, unknown>>): void => {
     const key = jobTools.join('>')
@@ -356,7 +425,7 @@ export async function recordTurnSequences(
     if (jobs.size >= 40) break
   }
   if (tools.length <= 6) add(tools, args)
-  const now = Date.now()
+  const now = context.now ?? Date.now()
   for (const [key, job] of jobs) {
     const signalKey = 'ws/' + workspaceKey + '/seq/' + key
     const existing = store.signals.get(signalKey)
@@ -375,18 +444,9 @@ export async function recordTurnSequences(
       proposalStatus: crossed ? 'pending' : existing?.proposalStatus,
     }
     await store.signals.put(signalKey, signal)
-    // R45: 跨过阈值 = 重复事务确认。默认把它沉淀成可路由的 skill（文件），
-    // 组合工具仍是可选的一键入口（见 autoToolizeFromSequence）。
-    if (crossed && config.autoSkill) {
-      try {
-        const written = await persistSequenceSkill(store, workspaceKey, job.tools, parseSamples(samples), count)
-        if (written && written.status !== 'unchanged' && written.status !== 'preserved') {
-          logger.info('supermemory: skill ' + written.name + ' ' + written.status + ' (v' + written.version + ')')
-        }
-      } catch (error) {
-        logger.warn('supermemory: skill draft failed: ' + String(error).slice(0, 160))
-      }
-    }
+    // R48: no skill is derived from these windows. Skills come from the
+    // task signature recorded above; composites remain the optional legacy
+    // one-click entrance (see autoToolizeFromSequence).
     if (!crossed) continue
     const outcome = await autoToolizeFromSequence(ctx, store, workspaceKey, job.tools, parseSamples(samples), config, logger, deps)
     if (outcome.action === 'create' || outcome.action === 'duplicate') {
@@ -431,10 +491,10 @@ export async function sweepAutoToolize(
 }
 
 /**
- * R45 boot sweep: turn every durable repetition that already crossed the
- * threshold into a skill (upgrade path for signals recorded before skills
- * existed). Grouped per workspace so each lands in its own project skill root;
- * an unknown workspace is skipped rather than writing into the current cwd.
+ * R48 boot sweep: durable TASK signals that already crossed the thresholds are
+ * fixated as task skills. Legacy `<tool>><tool>` signals are ignored on
+ * purpose — that is what keeps the cleaned-up shell skills from coming back.
+ * Grouped per workspace so each lands in its own project skill root.
  */
 export async function sweepSkillDrafts(
   store: Store,
@@ -445,8 +505,9 @@ export async function sweepSkillDrafts(
   const threshold = Math.max(1, config.threshold)
   const workspaces = new Set<string>()
   for (const [, signal] of store.signals.entries()) {
+    if (!signal.pattern.startsWith('task:')) continue
     if (signal.count < threshold) continue
-    if ((signal.sequence ?? []).length < Math.max(2, config.minSteps)) continue
+    if ((signal.sessions ?? []).length < Math.max(1, config.skillMinSessions ?? 2)) continue
     if (!signal.workspaceKey || signal.workspaceKey === 'unknown') continue
     workspaces.add(signal.workspaceKey)
   }
@@ -456,7 +517,11 @@ export async function sweepSkillDrafts(
   for (const workspaceKey of workspaces) {
     try {
       const scope = resolveSkillRoot(workspaceKey)
-      const { results } = await syncRepeatedTransactions(store, workspaceKey, scope, { threshold })
+      const { results } = await syncRepeatedTransactions(store, workspaceKey, scope, {
+        threshold,
+        ...(config.skillMinSessions !== undefined ? { minSessions: config.skillMinSessions } : {}),
+        ...(config.skillRecencyDays !== undefined ? { recencyDays: config.skillRecencyDays } : {}),
+      })
       for (const result of results) {
         if (result.status === 'created') created += 1
         else if (result.status === 'error') logger.warn('supermemory: skill sweep failed for ' + result.name + ': ' + result.message)

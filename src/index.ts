@@ -97,6 +97,10 @@ export interface Config {
     autoComposite: boolean
     /** R45: repeated work becomes a DSH skill (the default path). */
     autoSkill: boolean
+    /** R48: same task must recur in ≥N sessions/dispatches (default 2). */
+    skillMinSessions: number
+    /** R48: auto-create/update only within this recency window (days). */
+    skillRecencyDays: number
     toolizeCooldownMs: number
     toolizeMax: number
     toolizeMinSteps: number
@@ -122,6 +126,8 @@ export function toolizeConfig(config: Config): ToolizeConfig {
     // primary fixation path is now a skill.
     enabled: config.maintenance.autoComposite || config.maintenance.autoToolize,
     autoSkill: config.maintenance.autoSkill,
+    skillMinSessions: config.maintenance.skillMinSessions,
+    skillRecencyDays: config.maintenance.skillRecencyDays,
     threshold: config.maintenance.signalsThreshold,
     cooldownMs: config.maintenance.toolizeCooldownMs,
     maxActive: config.maintenance.toolizeMax,
@@ -173,7 +179,9 @@ export const Config: Schema<Config> = Schema.object({
     enabled: Schema.boolean().description('维护循环开关').default(true),
     signalsThreshold: Schema.natural().description('工具化序列阈值（同一短流程出现次数）').default(3),
     summaryEveryTurns: Schema.natural().description('话题集梗概滚动更新间隔（轮）').default(10),
-    autoSkill: Schema.boolean().description('R45：重复事务自动沉淀为 DSH skill（写入 <仓库>/.dsh/skills，模型目录可路由；默认开）').default(true),
+    autoSkill: Schema.boolean().description('R45/R48：重复任务自动沉淀为 DSH skill（写入 <仓库>/.dsh/skills，模型目录可路由；默认开。任务级签名 + 跨会话阈值，宁可不生成也不生成工具序列壳子）').default(true),
+    skillMinSessions: Schema.natural().description('R48：同一任务签名至少跨几个会话/派发才自动生成 skill（默认 2；同会话重复不算）').default(2),
+    skillRecencyDays: Schema.natural().description('R48：任务签名的时间衰减窗口（天）：超过这么多天没再出现的任务不再自动新增/升版（默认 30）').default(30),
     autoComposite: Schema.boolean().description('R45：重复事务自动固化为组合工具（旧的一键入口；默认关）。组合工具仍可通过 memory_toolize accept 手工生成').default(false),
     autoToolize: Schema.boolean().description('需求 B 的旧开关（向后兼容）：显式 true 仍会生成组合工具；新安装请用 autoComposite').default(false),
     toolizeCooldownMs: Schema.natural().description('自动固化冷却毫秒数（同一工作区两次固化之间的最小间隔，防止无限增长）').default(60000),
@@ -490,10 +498,21 @@ export async function apply(ctx: Context, config: Config) {
         // are fixated at boot; zero-use composites are audited there as well.
         const sweepCreated = await sweepAutoToolize(ctx, store, toolizeConfig(config), logger)
         if (sweepCreated > 0) logger.info('supermemory: auto-toolized ' + sweepCreated + ' composite(s) at boot')
-        // R45: durable repetitions that crossed the threshold before skills
-        // existed are fixated as skills at boot (files survive restarts).
+        // R48: durable TASK signatures that already crossed the thresholds are
+        // fixated as task skills at boot (files survive restarts).
         const { sweepSkillDrafts } = await import('./toolize.ts')
         await sweepSkillDrafts(store, toolizeConfig(config), logger)
+        // R48 cleanup: archive legacy auto-generated tool-sequence shells
+        // (move, never delete; manifest under <root>-archive). Idempotent, so
+        // it is safe on every boot and will not touch manual skills.
+        const { archiveShellSkills, discoverSkillRoots } = await import('./skill-forge.ts')
+        const archive = await archiveShellSkills({
+          roots: discoverSkillRoots({ store, cwd: process.cwd() }),
+          store,
+        })
+        if (archive.totalArchived > 0) {
+          logger.info('supermemory: archived ' + archive.totalArchived + ' legacy shell skill(s) under ' + archive.roots.filter((root) => root.archived > 0).map((root) => root.root).join(', '))
+        }
       } catch (error) {
         logger.warn(`supermemory: composite rebuild failed: ${String(error).slice(0, 200)}`)
       }
@@ -519,6 +538,8 @@ export async function apply(ctx: Context, config: Config) {
     summaryEveryTurns: config.maintenance.summaryEveryTurns,
     autoToolize: config.maintenance.autoComposite || config.maintenance.autoToolize,
     autoSkill: config.maintenance.autoSkill,
+    skillMinSessions: config.maintenance.skillMinSessions,
+    skillRecencyDays: config.maintenance.skillRecencyDays,
     toolizeCooldownMs: config.maintenance.toolizeCooldownMs,
     toolizeMax: config.maintenance.toolizeMax,
     toolizeMinSteps: config.maintenance.toolizeMinSteps,

@@ -225,6 +225,11 @@ export async function buildSchemas() {
     // recorded tool-call sequence for composite generation
     sequence: z.array(z.string()).default([]),
     samples: z.array(z.string()).default([]),
+    // R48 task-level skills: distinct sessions/dispatches that produced this
+    // signature. Optional (no default) so pre-R48 signal rows still validate
+    // and the storage domain stays v1-compatible.
+    sessions: z.array(z.string()).optional(),
+    dispatches: z.array(z.string()).optional(),
   })
 
   const dispatches = z.object({

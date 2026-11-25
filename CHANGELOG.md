@@ -2,6 +2,43 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.2.1] - 2026-11-25
+
+发布轮：R48「任务级 skill 识别 + 旧工具序列壳子清理」与发布资产补齐。自本版起每个 Release 同时提供版本 tgz 与稳定别名 tgz，DSH 插件面板可用固定 URL 直接安装。全量闸门（typecheck + 七套冒烟）通过。
+
+### 新增
+
+- **任务级 skill（R48）**：自动固化不再以「连续用过哪些工具」为主体特征，改以任务签名（`src/task-signature.ts`）识别「做过的事」——动词 + 主对象（如 `fix/skill-forge`、`release/package`），文件/命令证据只作佐证，工具序列完全不参与 key 与命名。名称 `sm-<动词>-<对象>`（保留 `sm-` 命名空间），描述写「何时用 + 真实步骤/坑/验证」，正文六节；frontmatter 新增 `sm-task-key`，同一任务改名/合并可找回原文件。同一任务需跨会话（默认 ≥2 个会话/派发、≥3 次、30 天窗口）才自动生成，每个根上限 8 条。
+- **存量壳子清理**：新增 `archiveShellSkills()` 与 `memory_toolize cleanup` / `pnpm skill:cleanup [--dry-run]`；只归档 `sm-source: sequence` 且命名/描述符合工具序列壳子的 skill，目录整体移到 `<skills 根>-archive/<name>` 并写 `manifest.json`，可回滚、幂等，人工/manual skill 不动。插件启动时也会自动扫一次。
+- **发布资产**：`release/dsh-supermemory-1.2.1.tgz`（npm-pack 结构，面板安装器可直接消费）与稳定别名 `dsh-supermemory.tgz`，对应固定 URL `.../releases/latest/download/dsh-supermemory.tgz`；版本化 zip 仍供手动安装。
+
+### 变更
+
+- 一次请求内的工具重复不再直接生成 skill（改由回合末维护按任务记录、跨会话计数），避免同一轮双重计数与单会话误生成。
+- 新增配置 `maintenance.skillMinSessions`（默认 2）与 `maintenance.skillRecencyDays`（默认 30）；`maintenance.autoSkill` 的说明同步更新。
+- `signals` 表新增可选 `sessions` / `dispatches` 字段（旧行读作缺省，存储域 version 仍为 1）。
+
+### 同时包含（v1.2.0 之后合入）
+
+- R44–R47 集成（面板页签结构 / skill 主路径与组合工具降级 / 注入截断修复 / 发布资产脚本与文档），详见 `DEV-NOTES.md` §55–§59；从 v1.2.0 升级即同时获得，本节不重复细节。
+
+### 工程
+
+- 七套冒烟；`scripts/skill-smoke.mjs` 扩充任务签名、合并、壳子不生成、清理幂等断言；新增 `scripts/skill-cleanup.mjs` CLI。
+- 发布流程：版本 zip + 版本 tgz + 稳定别名 tgz 三资产；提交与 tag 双推 GitHub/Gitee，Release 上传后核验名称/大小/摘要。
+
+### 兼容性
+
+- 宿主要求 DSH `>=0.2.0 <0.3.0` 不变；存储域 `supermemory` version 1 不变，无强制迁移。
+- 面板安装：`.tgz` 直链（含稳定别名）或 Git 仓库地址；Release 页面 URL 与 `.zip` 资产仍不被安装器接受。
+
+### 已知限制
+
+- 任务文本过短或只有泛化指令时宁可不出 skill（自动生成量会下降，有意为之）；同一任务不同措辞可能落到不同 key，靠命名相似度丢弃近似项。
+- 分支会话不能重载插件；重载与 GUI 验收由中枢/用户执行。
+
+[1.2.1]: https://github.com/FrogMoo/SuperMemory/releases/tag/v1.2.1
+
 ## [1.2.0] - 2026-11-25
 
 v1.1.0 之后的能力轮次（R43）：分支卡片点击不再误跳「新建会话」、中枢/分支会话名称说清主题。全量闸门（typecheck + 六套冒烟）通过。
