@@ -1481,10 +1481,10 @@ ${listText}` : listText
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
     description: '重复工作的固化入口（R45 起以 skill 为主）：① 列出待处理提议、已注册能力与已生成的 skill；'
-      + '② 接受/拒绝提议（accept 仍是旧的一键入口：把序列编译成组合工具，向后兼容）；'
+      + '② 接受/拒绝提议（accept 是 R49 之后唯一能把工具序列编译成组合工具的入口：只接受「有业务对象」的待处理提议，宽泛工具序列如 run_code>run_code 永远不生成候选）；'
       + '③ register 注册重复工作的经验——不给 entry 时产出 DSH skill（name/title/description/whenToUse/body，写入 <仓库>/.dsh/skills，同名更新 version+1 并保留 changelog，模型目录可路由）；给 entry 时仍注册"能力"（capability：入口命令 + 文档 + 适用范围 + 默认预演/写操作确认，向后兼容）；'
       + '④ name + enabled 启用/停用已生成的 skill；⑤ refresh-builtin 刷新内置能力并返回差异报告与健康度；'
-      + '⑥ cleanup 归档历史自动生成的「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚，人工/manual 不动）。'
+      + '⑥ cleanup 一次性清理存量：停用自动生成的工具序列组合工具、清空待处理提议与宽泛序列信号、归档历史「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚；人工/manual 能力与 skill 一律不动；幂等）。'
       + '为什么用 skill：技能正文讲「何时用/怎么判断/有哪些坑」，比固定流水线更容易在同类任务里被模型想起来；组合工具只保留给固定短子序列的一次调用。'
       + 'skill 文件是事实来源（重启后仍在，由宿主 skill 目录发现），tool_memory 行只镜像版本/使用计数/启用状态。'
       + CAPABILITY_ROUTING_RULES,
@@ -1507,7 +1507,7 @@ ${listText}` : listText
       writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },
       tags: { type: 'array', description: '标签（3–8 个短词，检索索引）', items: { type: 'string' } },
       refreshBuiltin: { type: 'boolean', description: '刷新内置能力：store 缺失则播种、旧于内置版本则升级（现场更新保留），并返回差异报告与各能力健康度' },
-      cleanup: { type: 'boolean', description: 'R48：归档历史自动生成的「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚；人工/manual skill 不动；可重复执行且幂等）' },
+      cleanup: { type: 'boolean', description: 'R49：一次性清理存量并返回分别计数 archivedSkills / retiredComposites / clearedProposals——停用自动生成的工具序列组合工具（人工能力不动）、清空待处理提议与宽泛序列信号、归档工具序列壳子 skill（移到 <skills 根>-archive，可回滚）；幂等，可重复执行' },
       changelog: { type: 'string', description: 'register 同名更新时的一行变更说明（写入 changelog，最新在前；缺省自动生成）' },
     },
     output: {
@@ -1528,6 +1528,14 @@ ${listText}` : listText
             },
           },
           archivedCount: { type: 'integer' },
+          /** R49 counts: archived shell skills / retired auto composites / cleared proposals. */
+          archivedSkills: { type: 'integer' },
+          retiredComposites: { type: 'integer' },
+          clearedProposals: { type: 'integer' },
+          prunedSignals: { type: 'integer' },
+          pendingBefore: { type: 'integer' },
+          pendingAfter: { type: 'integer' },
+          retired: { type: 'array', items: { type: 'string' } },
           archiveRoots: {
             type: 'array',
             items: {
@@ -1641,6 +1649,13 @@ ${listText}` : listText
           skills?: Array<{ name: string; title?: string; description: string; version?: number; useCount?: number; enabled?: boolean; status?: string; path?: string; source?: string; occurrences?: number }>
           archived?: Array<{ name: string; root: string; archivePath: string }>
           archivedCount?: number
+          archivedSkills?: number
+          retiredComposites?: number
+          clearedProposals?: number
+          prunedSignals?: number
+          pendingBefore?: number
+          pendingAfter?: number
+          retired?: string[]
           archiveRoots?: Array<{ root: string; scanned?: number; archived?: number }>
           builtin?: {
             seeded: string[]
@@ -1682,9 +1697,16 @@ ${listText}` : listText
         }
         if (v.status === 'cleaned') {
           const archived = (v.archived ?? [])
-          if (archived.length === 0) return [{ type: 'text', text: '没有需要归档的自动生成壳子（人工/manual skill 未改动）。' }]
+          const counts: string[] = []
+          const skillCount = v.archivedSkills ?? v.archivedCount ?? archived.length
+          if (skillCount > 0) counts.push('归档壳子 skill ' + skillCount + ' 个')
+          if ((v.retiredComposites ?? 0) > 0) counts.push('停用自动组合工具 ' + (v.retiredComposites ?? 0) + ' 个' + (v.retired?.length ? '（' + v.retired.join('、') + '）' : ''))
+          if ((v.clearedProposals ?? 0) > 0) counts.push('清空待处理提议 ' + (v.clearedProposals ?? 0) + ' 条')
+          if ((v.prunedSignals ?? 0) > 0) counts.push('清理宽泛序列信号 ' + (v.prunedSignals ?? 0) + ' 条')
+          const head = counts.length > 0 ? '已清理：' + counts.join('；') + '。' : '没有需要清理的自动生成物（人工/manual 能力与 skill 未改动）。'
+          const tail = 'pending ' + (v.pendingBefore ?? 0) + ' → ' + (v.pendingAfter ?? 0)
           const lines = archived.map((entry) => `- ${entry.name} → ${entry.archivePath}（原根：${entry.root}）`)
-          return [{ type: 'text', text: `已归档 ${archived.length} 个自动生成的工具序列壳子（未删除，可在 <skills 根>-archive 回滚；manifest 已记录原名/时间/原因）：\n${lines.join('\n')}` }]
+          return [{ type: 'text', text: [head + ' ' + tail, ...(lines.length > 0 ? ['归档明细（未删除，可在 <skills 根>-archive 回滚；manifest 已记录原名/时间/原因）：', ...lines] : [])].join('\n') }]
         }
         if (v.status === 'listed') {
           const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
@@ -1769,20 +1791,32 @@ ${listText}` : listText
           },
         }
       }
-      // R48: 归档历史自动生成的工具序列壳子（人工 skill 不动，幂等）。
+      // R49: 一次性清理存量——停用自动生成的工具序列组合工具、清空待处理提议与
+      // 宽泛序列信号、归档 R48 的壳子 skill。人工能力/manual skill 不动；幂等。
       if (args.cleanup) {
-        const { archiveShellSkills, discoverSkillRoots } = await import('./skill-forge.ts')
-        const result = await archiveShellSkills({
-          roots: discoverSkillRoots({ store, cwd, dshHome: process.env.DSH_HOME }),
+        const { cleanupToolize } = await import('./toolize.ts')
+        const { discoverSkillRoots } = await import('./skill-forge.ts')
+        const result = await cleanupToolize({
           store,
+          roots: discoverSkillRoots({ store, cwd, dshHome: process.env.DSH_HOME }),
+          dropPending: true,
         })
-        deps.logger.info('supermemory: archived ' + result.totalArchived + ' legacy shell skill(s)')
+        deps.logger.info('supermemory: cleanup retired ' + result.retiredCount + ' composite(s), cleared '
+          + result.clearedProposals + ' proposal(s), archived ' + result.archivedCount + ' shell skill(s)')
         return {
           status: 'cleaned' as const,
-          message: '已归档 ' + result.totalArchived + ' 个自动生成的壳子 skill（扫描 ' + result.totalScanned + ' 个文件）。',
+          message: '已清理：停用自动组合工具 ' + result.retiredCount + '，清空待处理提议 ' + result.clearedProposals
+            + '，归档壳子 skill ' + result.archivedCount + '（扫描 ' + result.scannedSkills + ' 个文件）。',
           archived: result.archived.map((entry) => ({ name: entry.name, root: entry.root, archivePath: entry.archivePath })),
-          archivedCount: result.totalArchived,
-          archiveRoots: result.roots.map((root) => ({ root: root.root, scanned: root.scanned, archived: root.archived })),
+          archivedCount: result.archivedCount,
+          archivedSkills: result.archivedCount,
+          retiredComposites: result.retiredCount,
+          clearedProposals: result.clearedProposals,
+          prunedSignals: result.prunedSignals,
+          pendingBefore: result.pendingBefore,
+          pendingAfter: result.pendingAfter,
+          retired: result.retired.map((item) => item.name),
+          archiveRoots: result.archiveRoots.map((root) => ({ root: root.root, scanned: root.scanned, archived: root.archived })),
         }
       }
       // R45: 启用/停用已生成的 skill（只给 name + enabled，不动定义）。
@@ -1846,10 +1880,10 @@ ${listText}` : listText
         deps.logger.info(`supermemory: capability ${result.name} registered via memory_toolize`)
         return { status: 'registered' as const, tool: result.name, message: result.message }
       }
-      const pending: Array<[string, Signal]> = []
-      for (const [key, signal] of store.signals.entries()) {
-        if (signal.proposalStatus === 'pending' && signal.proposedAt !== undefined) pending.push([key, signal])
-      }
+      // R49: only valuable (business-object) proposals are listed/accepted; a
+      // broad tool order never reaches this surface.
+      const { pendingProposals, acceptProposal } = await import('./toolize.ts')
+      const pending: Array<[string, Signal]> = pendingProposals(store)
       if (!args.accept && !args.decline) {
         const { capabilityRecordsOf, liveCompositeSpecs } = await import('./composite.ts')
         const { listSkills, resolveSkillRoot } = await import('./skill-forge.ts')
@@ -1894,24 +1928,12 @@ ${listText}` : listText
         await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'declined' }))
         return { status: 'declined' as const }
       }
-      try {
-        const { compileComposite, registerComposite, persistComposite } = await import('./composite.ts')
-        const samples = (signal.samples ?? []).map((raw) => {
-          try {
-            return JSON.parse(raw) as { tools: string[]; args: Array<Record<string, unknown>> }
-          } catch {
-            return undefined
-          }
-        }).filter((s): s is { tools: string[]; args: Array<Record<string, unknown>> } => s !== undefined)
-        const spec = compileComposite(signal, samples)
-        await registerComposite(ctx, store, spec)
-        await persistComposite(store, spec, key)
-        await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'accepted' }))
-        deps.logger.info(`supermemory: composite tool ${spec.name} registered via memory_toolize`)
-        return { status: 'accepted' as const, tool: spec.name }
-      } catch (error) {
-        return { status: 'error' as const, message: `生成失败：${String(error).slice(0, 200)}` }
-      }
+      // R49: acceptProposal is the only sequence-composite entrance; it refuses
+      // broad sequences (defence in depth) and stamps origin:'manual'.
+      const result = await acceptProposal(ctx, store, key, signal)
+      if (result.status === 'error') return { status: 'error' as const, message: result.message }
+      deps.logger.info(`supermemory: composite tool ${result.tool} registered via memory_toolize`)
+      return { status: 'accepted' as const, ...(result.tool ? { tool: result.tool } : {}) }
     },
   })))
 

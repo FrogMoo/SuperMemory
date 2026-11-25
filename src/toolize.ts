@@ -1,24 +1,29 @@
 /**
- * Tool-ization hard mechanism (requirement B): repeated flows become composite
- * tools WITHOUT a human confirmation step, and the registered composites are
- * advertised where the model can actually see them.
+ * Tool-ization hard mechanism (requirement B, re-scoped by R49).
  *
- * Two trigger sources feed one mechanism:
- * 1. Durable per-turn sequences (maintenance, after turn/end): sliding windows of
- *    2..4 tool calls plus the whole short turn sequence. Crossing the threshold
- *    fixates the repeated work as a DSH skill (maintenance.autoSkill, default
- *    true); composite auto-registration is the legacy one-click entrance
- *    (maintenance.autoComposite, default false) with a per-workspace cooldown and
- *    an active cap; with both off, the pending proposal + memory_toolize
- *    confirmation path stays intact.
- * 2. Request-local repetition (activity, on tools/post-execute): the same window
- *    seen threshold times inside ONE request is already a hard signal, so it
- *    auto-registers immediately, with no user turn required.
+ * R49 (2026-11-26) removed the "auto-register a composite" entrances for good:
+ * crossing a durable threshold, the boot sweep and the in-request activity
+ * window may at most leave a PENDING proposal — and only for a sequence that
+ * names a business object. Generic tool orders (run_code>run_code, bash>edit,
+ * memory_recall>memory_dispatch, …) are not candidates at all: they get no
+ * signal row either, so an old junk pending cannot resurface.
  *
- * Registration reuses ctx.tools.register(defineTool(...)), so a composite is a
- * normal model-visible tool: it appears in the tool table with name, description
- * and parameters, and a call to a name that is not live still fails as
- * UNKNOWN_TOOL (we never advertise a name that is not registered).
+ * A composite tool is created by exactly two explicit user entrances:
+ *   1. memory_toolize accept — accepts ONE pending proposal (acceptProposal);
+ *   2. memory_toolize register — a capability (entry command + doc + scope).
+ *
+ * Why the rule is structural: before R49 the "auto" path was reachable even with
+ * maintenance.autoComposite=false. attachProposals asked a user question on every
+ * user turn whose FIRST option was "固化为组合工具"; the host settled that question
+ * synchronously (4 ms in the 2026-11-26 incident), so the answer minted a
+ * composite + a visible notice from a stale run_code>run_code pending left over
+ * from v1.2.0's autoToolize=true default. Anything that can mint a composite from
+ * a generic tool order is a junk factory.
+ *
+ * Registration still reuses ctx.tools.register(defineTool(...)), so a composite
+ * is a normal model-visible tool: it appears in the tool table with name,
+ * description and parameters, and a call to a name that is not live still fails
+ * as UNKNOWN_TOOL (we never advertise a name that is not registered).
  * @module supermemory/toolize
  */
 import type { Context } from '@deepseek-ai/cordis'
@@ -26,22 +31,35 @@ import {
   compileComposite,
   editCompositeTool,
   liveCompositeSpecs,
-  parseArgs,
   persistComposite,
   registerComposite,
+  retireComposite,
   type CompositeSpec,
   type SequenceSample,
 } from './composite.ts'
 import type { Signal } from './schema.ts'
 import type { Store } from './store.ts'
-import type { RequestState } from './inrequest.ts'
-import { persistTaskSkillForSignature, recordTaskObservation } from './skill-forge.ts'
+import {
+  archiveShellSkills,
+  persistTaskSkillForSignature,
+  recordTaskObservation,
+  type ArchivedSkill,
+  type SkillArchiveRoot,
+} from './skill-forge.ts'
 
 /** Tool-ization knobs (all surfaced in the plugin Config schema). */
 export interface ToolizeConfig {
+  /**
+   * R49: may a crossing sequence leave a PENDING proposal? It never registers a
+   * composite either way; the flag is the legacy autoComposite/autoToolize pair
+   * and defaults to false, so with default config the sequence pipeline writes
+   * nothing at all.
+   */
   enabled: boolean
   threshold: number
+  /** R49: kept for config compatibility; automatic registration is gone. */
   cooldownMs: number
+  /** R49: kept for config compatibility; an explicit accept is never capped. */
   maxActive: number
   minSteps: number
   minDistinctTools: number
@@ -58,7 +76,7 @@ export interface ToolizeConfig {
   skillRecencyDays?: number
 }
 
-/** Injectable seam so unit tests can drive auto-toolization without a host. */
+/** Injectable seam so unit tests can drive the explicit accept path without a host. */
 export interface ToolizeDeps {
   register: (ctx: Context, store: Store, spec: CompositeSpec) => Promise<() => void>
   persist: (store: Store, spec: CompositeSpec, key: string) => Promise<string>
@@ -74,12 +92,6 @@ export function defaultToolizeDeps(): ToolizeDeps {
     toolExists: (ctx, name) => Boolean(ctx.tools.get(name)),
     now: () => Date.now(),
   }
-}
-
-/** Name compileComposite gives this sequence (single source of the naming rule). */
-export function compositeNameOf(tools: string[]): string {
-  const pattern = tools.join('>')
-  return 'sm_composite_' + (pattern.replace(/[^a-zA-Z0-9]+/g, '_').slice(0, 24) || 'seq')
 }
 
 /** One durable composite definition plus its usage counter. */
@@ -184,50 +196,62 @@ export function renderCatalog(entries: CatalogEntry[]): string {
   return lines.join('\n')
 }
 
-/** Pure decision inputs for one auto-toolization attempt. */
-export interface AutoToolizePlanInput {
-  tools: string[]
-  existingNames: ReadonlySet<string>
-  activeCount: number
-  cooldown: boolean
-  registered: ReadonlySet<string>
-  config: ToolizeConfig
+// ---------------------------------------------------------------------------
+// R49: broad-sequence filter. A "business" tool answers a domain question
+// (erp_sync_orders, crm_pull_contacts, deploy_release …); a HOST tool is the
+// workflow itself. Their order is a habit, not a transaction, so recording it
+// as a composite would only teach the model to skip thinking.
+// ---------------------------------------------------------------------------
+
+/** Host tools whose order is a workflow, never a business transaction. */
+const GENERIC_TOOL_NAMES: ReadonlySet<string> = new Set([
+  'run_code', 'bash', 'read', 'edit', 'write', 'glob', 'grep',
+  'todo_write', 'present', 'skill', 'read_image', 'working_directory',
+  'wait_agent', 'send_message', 'list_agents', 'subagent', 'subagent_fork',
+  'ask_user_question', 'web_search', 'web_fetch',
+  'schedule_create', 'schedule_edit', 'schedule_list', 'schedule_view',
+  'job_list', 'job_output', 'job_kill',
+  'list_mcp_resources', 'list_mcp_resource_templates', 'read_mcp_resource',
+])
+
+/** Whole families that are generic by construction (memory_* is the plugin itself). */
+const GENERIC_TOOL_PREFIXES: readonly string[] = [
+  'memory_', 'sm_composite_', 'job_', 'schedule_', 'session_', 'cordis_', 'plugin_',
+]
+
+/** True when the name is a generic host tool (shell/file/session/memory plumbing). */
+export function isGenericToolName(name: string): boolean {
+  const tool = String(name ?? '').trim()
+  if (!tool) return true
+  if (GENERIC_TOOL_NAMES.has(tool)) return true
+  return GENERIC_TOOL_PREFIXES.some((prefix) => tool.startsWith(prefix))
 }
 
-/** Decision of planAutoToolize; only 'create' registers anything. */
-export interface AutoToolizePlan {
-  action: 'create' | 'duplicate' | 'cooldown' | 'cap' | 'invalid' | 'disabled'
+/** Why one sequence is (not) a proposal candidate; valuable gates the pending list. */
+export interface ProposalVerdict {
+  valuable: boolean
   reason: string
-  name: string
 }
 
-/** Decide whether one sequence may become a composite right now (pure). */
-export function planAutoToolize(input: AutoToolizePlanInput): AutoToolizePlan {
-  const config = input.config
-  const name = compositeNameOf(input.tools)
-  if (!config.enabled) return { action: 'disabled', reason: 'autoToolize 关闭', name }
-  if (input.tools.length < Math.max(2, config.minSteps)) return { action: 'invalid', reason: '步数不足', name }
-  if (input.tools.length > 6) return { action: 'invalid', reason: '步数过多（只固化短流程）', name }
-  const distinct = new Set(input.tools)
-  if (distinct.size < Math.max(1, config.minDistinctTools)) return { action: 'invalid', reason: '同一工具重复不构成流程', name }
-  for (const tool of input.tools) {
-    if (tool.startsWith('sm_composite_')) return { action: 'invalid', reason: '序列包含组合工具本身', name }
-    if (!input.registered.has(tool)) return { action: 'invalid', reason: '工具当前未注册：' + tool, name }
-  }
-  if (input.existingNames.has(name)) return { action: 'duplicate', reason: '组合工具已存在', name }
-  if (input.activeCount >= Math.max(1, config.maxActive)) return { action: 'cap', reason: '已达组合工具上限', name }
-  if (input.cooldown) return { action: 'cooldown', reason: '冷却窗口内', name }
-  return { action: 'create', reason: 'ok', name }
+/**
+ * Decide whether a tool sequence names a business object at all.
+ *
+ * R49 rule: EVERY step must be non-generic. One host tool in the chain makes the
+ * whole pattern a workflow shell, and such a sequence must never become a
+ * candidate (no pending proposal, no composite) — see the module header.
+ */
+export function proposalVerdict(tools: readonly string[]): ProposalVerdict {
+  const steps = tools.map((tool) => String(tool ?? '').trim()).filter(Boolean)
+  if (steps.length < 2) return { valuable: false, reason: '步数不足（至少 2 步）' }
+  if (new Set(steps).size < 2) return { valuable: false, reason: '同一工具重复不构成流程' }
+  const generic = steps.find((tool) => isGenericToolName(tool))
+  if (generic) return { valuable: false, reason: '宽泛工具序列：' + generic + ' 是通用工具，没有业务对象/命令/文件/入口' }
+  return { valuable: true, reason: 'ok' }
 }
 
-/** Last successful auto-toolization time per workspace (cooldown state). */
-const cooldownUntil = new Map<string, number>()
-
-/** Outcome of one auto-toolization attempt (also records skipped reasons). */
-export interface AutoToolizeOutcome {
-  action: AutoToolizePlan['action'] | 'failed'
-  name: string
-  reason: string
+/** Convenience: the sequence is a broad tool order (never a candidate). */
+export function isBroadSequence(tools: readonly string[]): boolean {
+  return !proposalVerdict(tools).valuable
 }
 
 /** Minimal durable Signal compileComposite needs for one sequence. */
@@ -245,52 +269,63 @@ function signalOf(workspaceKey: string, tools: string[], samples: SequenceSample
   }
 }
 
-/** Compile, register and persist one sequence under cooldown/cap/duplicate rules. */
-export async function autoToolizeFromSequence(
+/** Result of one explicit accept (memory_toolize accept). */
+export interface AcceptProposalResult {
+  status: 'accepted' | 'error'
+  tool?: string
+  message: string
+}
+
+/**
+ * R49 explicit entrance #1: turn ONE pending proposal into a composite.
+ *
+ * This is the ONLY code path that may register a sequence composite, and it is
+ * only reachable from the model-facing memory_toolize tool after a user asked for
+ * it. Broad sequences are refused here too (defence in depth: the pending list
+ * already filters them).
+ *
+ * origin:'manual' is stamped on the definition so the cleanup classifier can tell
+ * a user-accepted sequence from a legacy auto shell and leave it alone.
+ */
+export async function acceptProposal(
   ctx: Context,
   store: Store,
-  workspaceKey: string,
-  tools: string[],
-  samples: SequenceSample[],
-  config: ToolizeConfig,
-  logger: { info: (msg: string) => void; warn: (msg: string) => void },
+  key: string,
+  signal: Signal,
   deps?: ToolizeDeps,
-): Promise<AutoToolizeOutcome> {
+): Promise<AcceptProposalResult> {
   const seam = deps ?? defaultToolizeDeps()
-  // 关闭时不做任何宿主探测（recordTurnSequences 在 autoSkill 打开、组合工具关闭
-  // 时仍会走到这里；默认 seam 的 toolExists 需要真实 ctx.tools，不能白碰）。
-  if (!config.enabled) return { action: 'disabled', name: compositeNameOf(tools), reason: 'autoToolize 关闭' }
-  const candidates = activeComposites(store)
-  const existingNames = new Set(candidates.map((candidate) => candidate.spec.name))
-  const registered = new Set<string>()
-  for (const tool of tools) if (seam.toolExists(ctx, tool)) registered.add(tool)
-  const now = seam.now()
-  const plan = planAutoToolize({
-    tools,
-    existingNames,
-    activeCount: candidates.length,
-    cooldown: (cooldownUntil.get(workspaceKey) ?? 0) > now,
-    registered,
-    config,
-  })
-  if (plan.action !== 'create') {
-    if (plan.action !== 'duplicate' && plan.action !== 'disabled') {
-      logger.info('supermemory: auto-toolize skipped (' + plan.action + '): ' + plan.reason + ' ' + tools.join('>'))
-    }
-    return { action: plan.action, name: plan.name, reason: plan.reason }
+  const tools = sequenceOf(signal, key)
+  const verdict = proposalVerdict(tools)
+  if (!verdict.valuable) {
+    try { await store.signals.update(key, (record) => ({ ...record, proposalStatus: 'declined' })) } catch { /* advisory */ }
+    return { status: 'error', message: '宽泛工具序列不生成组合工具：' + verdict.reason }
   }
   try {
-    const fallback: SequenceSample = { tools, args: tools.map(() => ({} as Record<string, unknown>)) }
-    const usable = samples.length > 0 ? samples : [fallback]
-    const spec = compileComposite(signalOf(workspaceKey, tools, usable, now), usable)
+    const samples = parseSamples(signal.samples ?? [])
+    const usable = samples.length > 0 ? samples : [{ tools, args: tools.map(() => ({} as Record<string, unknown>)) }]
+    const spec: CompositeSpec = { ...compileComposite(signalOf(signal.workspaceKey, tools, usable, seam.now()), usable), origin: 'manual' }
     await seam.register(ctx, store, spec)
-    await seam.persist(store, spec, 'ws/' + workspaceKey + '/seq/' + tools.join('>'))
-    cooldownUntil.set(workspaceKey, now + Math.max(0, config.cooldownMs))
-    logger.info('supermemory: auto-toolized ' + tools.join('>') + ' -> ' + spec.name)
-    return { action: 'create', name: spec.name, reason: 'ok' }
+    // Idempotent accept: an earlier accept of the SAME proposal updates that row
+    // instead of leaving a second row with the same name behind.
+    const existing = [...store.toolMemory.entries()].find(([, record]) =>
+      record.kind === 'composite' && record.status === 'active' && record.trigger === key)
+    if (existing) {
+      await store.toolMemory.update(existing[0], (record) => ({
+        ...record,
+        title: spec.title ?? record.title,
+        tags: spec.tags ?? record.tags,
+        description: spec.description,
+        entry: JSON.stringify(spec),
+        status: 'active',
+      }))
+    } else {
+      await seam.persist(store, spec, key)
+    }
+    await store.signals.update(key, (record) => ({ ...record, proposalStatus: 'accepted' }))
+    return { status: 'accepted', tool: spec.name, message: '已固化为组合工具 ' + spec.name }
   } catch (error) {
-    logger.warn('supermemory: auto-toolize failed: ' + String(error).slice(0, 200))
-    return { action: 'failed', name: plan.name, reason: String(error).slice(0, 160) }
+    return { status: 'error', message: '生成失败：' + String(error).slice(0, 200) }
   }
 }
 
@@ -354,10 +389,13 @@ function dispatchOf(store: Store, sessionId: string | undefined): { id: string; 
 }
 
 /**
- * Durable per-turn sequence counting: sliding windows of 2..4 calls (each
- * occurrence counts) plus the whole turn when it is short (legacy composite
- * signature). R48 only the TASK observation can become a skill; the windows
- * below are kept for the optional legacy composite entrance.
+ * Durable per-turn sequence counting (R49 semantics).
+ *
+ * R48's task-level observation is unchanged and is the only fixation path: a
+ * repeated TASK becomes a skill. The sliding windows below are kept solely as the
+ * optional proposal entrance: they only count when the legacy
+ * autoComposite/autoToolize switch is on, only for valuable sequences, and a
+ * crossing writes a PENDING proposal — never a composite, never a question.
  */
 export async function recordTurnSequences(
   ctx: Context,
@@ -409,6 +447,10 @@ export async function recordTurnSequences(
       logger.warn('supermemory: task skill recording failed: ' + String(error).slice(0, 160))
     }
   }
+  // ---- R49: sequence windows may only leave a pending proposal ----
+  // With the legacy switch off (the default) nothing is written at all, so a
+  // default install can neither create nor grow a pending proposal.
+  if (!config.enabled) return
   const jobs = new Map<string, { tools: string[]; args: Array<Record<string, unknown>>; occurrences: number }>()
   const add = (jobTools: string[], jobArgs: Array<Record<string, unknown>>): void => {
     const key = jobTools.join('>')
@@ -428,6 +470,14 @@ export async function recordTurnSequences(
   const now = context.now ?? Date.now()
   for (const [key, job] of jobs) {
     const signalKey = 'ws/' + workspaceKey + '/seq/' + key
+    const verdict = proposalVerdict(job.tools)
+    if (!verdict.valuable) {
+      // Never a candidate. Drop a legacy row so an old pending cannot resurface.
+      if (store.signals.get(signalKey) !== undefined) {
+        try { await store.signals.delete(signalKey) } catch { /* the row is advisory */ }
+      }
+      continue
+    }
     const existing = store.signals.get(signalKey)
     const count = (existing?.count ?? 0) + job.occurrences
     const samples = [...(existing?.samples ?? []), JSON.stringify({ tools: job.tools, args: job.args })].slice(-3)
@@ -444,50 +494,213 @@ export async function recordTurnSequences(
       proposalStatus: crossed ? 'pending' : existing?.proposalStatus,
     }
     await store.signals.put(signalKey, signal)
-    // R48: no skill is derived from these windows. Skills come from the
-    // task signature recorded above; composites remain the optional legacy
-    // one-click entrance (see autoToolizeFromSequence).
-    if (!crossed) continue
-    const outcome = await autoToolizeFromSequence(ctx, store, workspaceKey, job.tools, parseSamples(samples), config, logger, deps)
-    if (outcome.action === 'create' || outcome.action === 'duplicate') {
-      await store.signals.update(signalKey, (record) => ({ ...record, proposalStatus: 'accepted' }))
-    } else if (outcome.action !== 'disabled' && outcome.action !== 'failed') {
-      // recorded skip (cap/cooldown/invalid): never turn it into a user question
-      await store.signals.update(signalKey, (record) => ({ ...record, proposalStatus: 'declined' }))
-    }
-    logger.info('supermemory: sequence ' + key + ' crossed (count=' + count + ', auto=' + outcome.action + ')')
+    // R49: a crossing never registers anything. memory_toolize accept is the
+    // only sequence entrance (acceptProposal), and it is user-driven.
+    if (crossed) logger.info('supermemory: sequence ' + key + ' crossed (count=' + count + ', pending proposal)')
   }
 }
 
+/** Tool names of one durable signal (falls back to the /seq/<a>b<c> key shape). */
+function sequenceOf(signal: Signal, key: string): string[] {
+  if (Array.isArray(signal.sequence) && signal.sequence.length > 0) return signal.sequence.map((tool) => String(tool))
+  const match = /\/seq\/([^/]+)$/.exec(key)
+  return match ? match[1].split('>').filter(Boolean) : []
+}
+
+/** True for a per-workspace tool-sequence signal row (ws/<ws>/seq/<a>b<c>). */
+function isSequenceSignal(key: string): boolean {
+  return /\/seq\//.test(key)
+}
+
+/** Pending proposals that are worth showing (valuable sequences only), best first. */
+export function pendingProposals(store: Store): Array<[string, Signal]> {
+  const out: Array<[string, Signal]> = []
+  for (const [key, signal] of store.signals.entries()) {
+    if (signal.proposalStatus !== 'pending' || signal.proposedAt === undefined) continue
+    if (!proposalVerdict(sequenceOf(signal, key)).valuable) continue
+    out.push([key, signal])
+  }
+  return out.sort((left, right) => right[1].count - left[1].count)
+}
+
+/** Outcome of one proposal cleanup pass. */
+export interface ProposalCleanup {
+  /** Pending proposals present before the pass. */
+  pendingBefore: number
+  /** Pending proposals removed (broad ones always; valuable ones when dropAllPending). */
+  clearedProposals: number
+  /** Non-pending broad sequence signal rows removed (declined legacy junk). */
+  prunedSignals: number
+  /** Pending proposals left after the pass. */
+  pendingAfter: number
+  dryRun: boolean
+}
+
 /**
- * Startup sweep: auto-register every durable signal that already crossed the
- * threshold (upgrade path for signals recorded before autoToolize existed).
+ * Clear tool-sequence proposals (idempotent).
+ *
+ * - every BROAD sequence signal row is removed, whatever its status — those are
+ *   the rows that kept run_code>run_code alive for 2700 crossings;
+ * - pending proposals are removed too when dropAllPending is set (the default):
+ *   the R49 rule is that a pending proposal is only meaningful while the legacy
+ *   switch is on, and a one-shot clear must not need per-item decline.
  */
-export async function sweepAutoToolize(
-  ctx: Context,
+export async function clearSequenceSignals(
   store: Store,
-  config: ToolizeConfig,
-  logger: { info: (msg: string) => void; warn: (msg: string) => void },
-  deps?: ToolizeDeps,
-): Promise<number> {
-  if (!config.enabled) return 0
-  const threshold = Math.max(1, config.threshold)
-  let created = 0
+  options: { dropAllPending?: boolean; dryRun?: boolean } = {},
+): Promise<ProposalCleanup> {
+  const dryRun = Boolean(options.dryRun)
+  let pendingBefore = 0
+  for (const [, signal] of store.signals.entries()) if (signal.proposalStatus === 'pending') pendingBefore += 1
+  let clearedProposals = 0
+  let prunedSignals = 0
   for (const [key, signal] of [...store.signals.entries()]) {
-    if (signal.count < threshold) continue
-    if (signal.proposalStatus === 'accepted' || signal.proposalStatus === 'declined') continue
-    const tools = signal.sequence ?? []
-    if (tools.length < Math.max(2, config.minSteps) || tools.length > 6) continue
-    const outcome = await autoToolizeFromSequence(ctx, store, signal.workspaceKey, tools, parseSamples(signal.samples ?? []), config, logger, deps)
-    if (outcome.action === 'create' || outcome.action === 'duplicate') {
-      await store.signals.update(key, (record) => ({ ...record, proposalStatus: 'accepted' }))
-      if (outcome.action === 'create') created += 1
+    if (!isSequenceSignal(key)) continue
+    const pending = signal.proposalStatus === 'pending'
+    const broad = !proposalVerdict(sequenceOf(signal, key)).valuable
+    if (!broad && !(pending && options.dropAllPending === true)) continue
+    if (!dryRun) {
+      try { await store.signals.delete(key) } catch { continue }
+    }
+    if (pending) clearedProposals += 1
+    else prunedSignals += 1
+  }
+  let pendingAfter = 0
+  for (const [, signal] of store.signals.entries()) if (signal.proposalStatus === 'pending') pendingAfter += 1
+  return { pendingBefore, clearedProposals, prunedSignals, pendingAfter, dryRun }
+}
+
+/** One durable sequence composite that only an automatic entrance could have made. */
+export interface AutoSequenceComposite {
+  id: string
+  name: string
+  steps: string[]
+  reason: string
+}
+
+/**
+ * Every ACTIVE composite row that is a legacy auto-generated broad tool-order
+ * shell. Kept as a pure classifier so the panel/report and the cleanup agree.
+ *
+ * Judgement criteria (R49):
+ *   1. tool_memory row kind='composite', status='active', definition parses;
+ *   2. NOT a capability (spec.kind !== 'capability' and no entry) — a registered
+ *      capability like sm_composite_git_sync_supermemory is manual by definition;
+ *   3. NOT stamped origin:'manual' — an explicit memory_toolize accept;
+ *   4. provenance is the automatic sequence shape (trigger matches
+ *      <ws>/seq/<tools>) or the legacy origin:'auto' marker;
+ *   5. the sequence itself is BROAD (every step must be non-generic), so a
+ *      genuinely valuable sequence accepted before R49 is preserved.
+ */
+export function autoSequenceComposites(store: Store): AutoSequenceComposite[] {
+  const out: AutoSequenceComposite[] = []
+  for (const [id, record] of store.toolMemory.entries()) {
+    if (record.kind !== 'composite' || record.status !== 'active' || !record.entry) continue
+    let spec: CompositeSpec | undefined
+    try {
+      spec = JSON.parse(record.entry) as CompositeSpec
+    } catch {
+      continue // a corrupt definition cannot be judged; leave it alone
+    }
+    if (!spec || !Array.isArray(spec.steps)) continue
+    if (spec.kind === 'capability' || spec.entry) continue
+    if (spec.origin === 'manual') continue
+    const autoTrigger = /(^|\/)seq\//.test(String(record.trigger ?? ''))
+    if (!autoTrigger && spec.origin !== 'auto') continue
+    const steps = spec.steps.map((step) => String(step.tool ?? '')).filter(Boolean)
+    const verdict = proposalVerdict(steps)
+    if (verdict.valuable) continue
+    out.push({
+      id,
+      name: spec.name || id,
+      steps,
+      reason: '自动生成的宽泛工具序列壳子：' + verdict.reason,
+    })
+  }
+  return out
+}
+
+/** Retire every legacy auto sequence composite (unregister + durable status). Idempotent. */
+export async function retireAutoSequenceComposites(
+  store: Store,
+  logger?: { info: (msg: string) => void; warn?: (msg: string) => void },
+  options: { dryRun?: boolean } = {},
+): Promise<AutoSequenceComposite[]> {
+  const candidates = autoSequenceComposites(store)
+  if (options.dryRun) return candidates
+  const retired: AutoSequenceComposite[] = []
+  for (const item of candidates) {
+    try {
+      const result = await retireComposite(store, item.id)
+      if (result.status === 'ok') {
+        retired.push(item)
+        logger?.info('supermemory: retired auto sequence composite ' + item.name + ' (' + item.reason + ')')
+      } else {
+        logger?.warn?.('supermemory: retire failed for ' + item.name + ': ' + result.message)
+      }
+    } catch (error) {
+      logger?.warn?.('supermemory: retire failed for ' + item.name + ': ' + String(error).slice(0, 120))
     }
   }
-  const idle = activeComposites(store).filter((entry) => entry.useCount === 0).length
-  if (idle > 0) logger.info('supermemory: ' + idle + ' composite tool(s) have zero recorded use')
-  if (created > 0) logger.info('supermemory: startup sweep auto-toolized ' + created + ' sequence(s)')
-  return created
+  return retired
+}
+
+/** Result of the one-shot maintenance entrance (memory_toolize cleanup + boot). */
+export interface ToolizeCleanupResult {
+  retired: AutoSequenceComposite[]
+  retiredCount: number
+  clearedProposals: number
+  prunedSignals: number
+  pendingBefore: number
+  pendingAfter: number
+  archived: ArchivedSkill[]
+  archiveRoots: SkillArchiveRoot[]
+  archivedCount: number
+  scannedSkills: number
+  dryRun: boolean
+}
+
+/**
+ * R49 one-shot cleanup: legacy auto sequence composites + proposal junk + the
+ * R48 shell skills, in one idempotent pass. Used by the boot path (so a reload
+ * cleans the durable store before composites are rebuilt) and by
+ * memory_toolize cleanup (same behaviour on demand).
+ */
+export async function cleanupToolize(options: {
+  store: Store
+  roots?: string[]
+  now?: number
+  dryRun?: boolean
+  dropPending?: boolean
+  logger?: { info: (msg: string) => void; warn: (msg: string) => void }
+}): Promise<ToolizeCleanupResult> {
+  const now = options.now ?? Date.now()
+  const dryRun = Boolean(options.dryRun)
+  const dropPending = options.dropPending !== false
+  const retired = await retireAutoSequenceComposites(options.store, options.logger, { dryRun })
+  const proposals = await clearSequenceSignals(options.store, { dropAllPending: dropPending, dryRun })
+  let archived: ArchivedSkill[] = []
+  let archiveRoots: SkillArchiveRoot[] = []
+  let scannedSkills = 0
+  if (options.roots !== undefined && options.roots.length > 0) {
+    const result = await archiveShellSkills({ roots: options.roots, store: options.store, now, dryRun })
+    archived = result.archived
+    archiveRoots = result.roots
+    scannedSkills = result.totalScanned
+  }
+  return {
+    retired,
+    retiredCount: retired.length,
+    clearedProposals: proposals.clearedProposals,
+    prunedSignals: proposals.prunedSignals,
+    pendingBefore: proposals.pendingBefore,
+    pendingAfter: proposals.pendingAfter,
+    archived,
+    archiveRoots,
+    archivedCount: archived.length,
+    scannedSkills,
+    dryRun,
+  }
 }
 
 /**
@@ -572,34 +785,4 @@ export async function recycleIdleComposites(
   return retired
 }
 
-/** The strongest same-window repetition inside ONE request (hard signal). */
-export function repeatedWindow(state: RequestState, config: ToolizeConfig): { tools: string[]; samples: SequenceSample[]; count: number } | undefined {
-  const names = state.recent.map((item) => item.name)
-  if (names.length < 2) return undefined
-  const low = Math.max(2, config.minSteps)
-  const high = Math.min(4, low + 2)
-  const need = Math.max(2, config.threshold)
-  let best: { tools: string[]; samples: SequenceSample[]; count: number } | undefined
-  for (let len = high; len >= low; len -= 1) {
-    if (names.length < len) continue
-    for (let start = 0; start + len <= names.length; start += 1) {
-      const window = names.slice(start, start + len)
-      let count = 0
-      for (let probe = 0; probe + len <= names.length; probe += 1) {
-        let same = true
-        for (let offset = 0; offset < len; offset += 1) {
-          if (names[probe + offset] !== window[offset]) {
-            same = false
-            break
-          }
-        }
-        if (same) count += 1
-      }
-      if (count < need) continue
-      if (best && best.tools.length >= len) continue
-      const observations = state.recent.slice(start, start + len)
-      best = { tools: window, samples: [{ tools: window, args: observations.map((item) => item.args) }], count }
-    }
-  }
-  return best
-}
+

@@ -14,7 +14,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 - 模型用 `memory_remember` 写结论、`memory_recall` 跨会话检索（回答"之前说过什么/做过什么"前先检索）；
 - 中枢用 `memory_dispatch` 把任务异步派发到分支会话，完成后结果经 relay 自动回送；
 - 分支不直接问用户——`memory_raise_question` 上交中枢，由中枢 `memory_questions` 汇总后一次提问；
-- 重复出现的操作流程自动固化为「固化能力」（组合工具），可一键执行；
+- 重复出现的**任务**自动沉淀为 DSH skill（R48/R49）；组合工具只能由用户显式 `memory_toolize accept` / `register` 产生，工具序列不再自动注册；
 - 记忆带版本（同 key 就地更新升版、旧版本归档），结论的演变过程可溯源。
 
 ## 2. 功能特性
@@ -27,7 +27,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 | 话题集 | 中枢/分支会话的分组：标题/梗概/标签/分支成员/默认模型；recall 命中记忆时一并给出相关话题集，便于把结论关联回会话上下文 |
 | 中枢/分支协同 | `memory_dispatch` 异步派发（单发/并行组）；分支问题上交 + 中枢统一提问；`memory_resume` 续跑中断任务；relay 按派发记录的 `hubSessionId` 回送；分支会话标题/标签（任务首行 + 话题集标签 + 轮次令牌） |
 | 过程内再召回 | pre-step 注入卡片：同一请求内可注入多张（去重 + 条数/字符预算），避免模型"失忆" |
-| 固化能力 | `memory_toolize` 注册/维护能力（入口命令 + 文档 + 适用范围 + 路由描述）；重复流程自动固化为组合工具；内置 `git-sync` 能力；使用计数与健康度（成败分列、连续失败） |
+| 固化能力 | `memory_toolize` 注册/维护能力（入口命令 + 文档 + 适用范围 + 路由描述）；重复任务自动沉淀为 skill；组合工具只由显式 accept/register 产生（R49：宽泛工具序列如 run_code>run_code 永不成为候选）；`cleanup` 一次性清理壳子与 pending；内置 `git-sync` 能力；使用计数与健康度（成败分列、连续失败） |
 | 可视化管理 | DSH 内面板（话题集/记忆两级页/固化能力/中枢会话/派发卡）+ 独立 Web 管理台（`/memory ui`，带令牌链接） |
 | 维护循环 | 自动抽取事实与需求、组合工具记录与回收、记忆整理（正文哈希 + 标记守卫、默认 dry-run）、标题补正 |
 
@@ -62,7 +62,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 │   │                           # 派发、观测结算、续跑、并行组、分支问题上交、轮次收尾
 │   ├── prestep.ts / inrequest.ts / activity.ts   # 过程内再召回（注入卡片/预算/近失提示）
 │   ├── toolize.ts / composite.ts / builtin-capabilities.ts / capabilities.ts / route.ts
-│   │                           # 组合工具自动固化、能力注册与健康度、内置能力、路由规则
+│   │                           # 任务级 skill 固化、组合工具清理、能力注册与健康度、内置能力、路由规则
 │   ├── topicsets.ts / topicset-match.ts / topicset-merge.ts / topic-shape.ts
 │   │                           # 话题集增删改查、匹配、合并治理、LLM 形状
 │   ├── hub-sessions.ts / hub-branches.ts / branch-meta.ts / branch-restore.ts
@@ -110,7 +110,7 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
 | 套件 | 覆盖 |
 |---|---|
 | `core` | 宿主纯逻辑：导出隔离、检索阈值、记录形态、记忆原子拆分 |
-| `mechanism` | 过程内召回、自动固化、面板 wire 契约（host/client 描述符 parity）、话题集匹配/合并 |
+| `mechanism` | 过程内召回、R49 宽泛序列过滤/启动清理、面板 wire 契约（host/client 描述符 parity）、话题集匹配/合并 |
 | `webui` | 管理台：认证、路由、记忆/需求/话题集 CRUD、能力执行 |
 | `client-sim` | 对**构建产物**跑客户端 apply()，校验每个 slot 注册成功 |
 | `capability` | 固化能力持续维护：计数、register 同名更新、内置播种、执行门禁 |

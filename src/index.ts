@@ -17,9 +17,7 @@ import { attachObserve, flushObserve, settleInterruptedDispatches } from './obse
 import { attachToolActivity } from './activity.ts'
 import { createTracker } from './inrequest.ts'
 import { attachPreStep } from './prestep.ts'
-import { sweepAutoToolize, type ToolizeConfig } from './toolize.ts'
-import { loadHostModule } from './host.ts'
-import { isPluginBranchId } from './hub-sessions.ts'
+import type { ToolizeConfig } from './toolize.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
@@ -29,7 +27,6 @@ import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
 import { notifyInterruptedDispatches, type NotifyState } from './resume.ts'
 import { attachRoute, type RouteDeps } from './route.ts'
-import type { Signal } from './schema.ts'
 import { attachPanel } from './panel.ts'
 import { openStoreWithRetry, workspaceKeyOf, type Store } from './store.ts'
 import { attachTools, type ToolsDeps } from './tools.ts'
@@ -117,13 +114,16 @@ export interface Config {
 
 /**
  * Project the plugin Config onto the tool-ization knobs (one place, so the
- * maintenance loop and the tool-activity listener never disagree).
+ * maintenance loop and the boot cleanup never disagree).
+ *
+ * R49: the pair below governs PENDING PROPOSALS ONLY. No configuration value
+ * can make the automatic entrances register a composite anymore — that path was
+ * removed, and memory_toolize accept / register are the only two entrances.
  */
 export function toolizeConfig(config: Config): ToolizeConfig {
   return {
-    // R45: the legacy autoToolize flag keeps working for anyone who set it
-    // explicitly; composite auto-registration is otherwise off, because the
-    // primary fixation path is now a skill.
+    // Legacy pair kept for compatibility: true = a crossing may leave a pending
+    // proposal for a valuable (business-object) sequence; false = write nothing.
     enabled: config.maintenance.autoComposite || config.maintenance.autoToolize,
     autoSkill: config.maintenance.autoSkill,
     skillMinSessions: config.maintenance.skillMinSessions,
@@ -182,10 +182,10 @@ export const Config: Schema<Config> = Schema.object({
     autoSkill: Schema.boolean().description('R45/R48：重复任务自动沉淀为 DSH skill（写入 <仓库>/.dsh/skills，模型目录可路由；默认开。任务级签名 + 跨会话阈值，宁可不生成也不生成工具序列壳子）').default(true),
     skillMinSessions: Schema.natural().description('R48：同一任务签名至少跨几个会话/派发才自动生成 skill（默认 2；同会话重复不算）').default(2),
     skillRecencyDays: Schema.natural().description('R48：任务签名的时间衰减窗口（天）：超过这么多天没再出现的任务不再自动新增/升版（默认 30）').default(30),
-    autoComposite: Schema.boolean().description('R45：重复事务自动固化为组合工具（旧的一键入口；默认关）。组合工具仍可通过 memory_toolize accept 手工生成').default(false),
-    autoToolize: Schema.boolean().description('需求 B 的旧开关（向后兼容）：显式 true 仍会生成组合工具；新安装请用 autoComposite').default(false),
-    toolizeCooldownMs: Schema.natural().description('自动固化冷却毫秒数（同一工作区两次固化之间的最小间隔，防止无限增长）').default(60000),
-    toolizeMax: Schema.natural().description('组合工具数量上限（达到后不再自动新增）').default(8),
+    autoComposite: Schema.boolean().description('R49：允许把「有业务对象」的重复工具序列记为待接受提议（默认关；宽泛工具序列如 run_code>run_code 一律不生成候选）。无论开关如何，阈值跨越/启动扫尾/过程内重复都不会自动注册组合工具——组合工具只能由用户显式 memory_toolize accept 或 register 产生').default(false),
+    autoToolize: Schema.boolean().description('需求 B 的旧开关（向后兼容的 autoComposite 别名）：true 也只生成待接受提议，不注册组合工具').default(false),
+    toolizeCooldownMs: Schema.natural().description('（R49 停用，保留键兼容旧配置）自动注册已移除，不存在自动固化冷却').default(60000),
+    toolizeMax: Schema.natural().description('（R49 停用，保留键兼容旧配置）显式 accept 不受数量上限约束').default(8),
     toolizeMinSteps: Schema.natural().description('自动固化的最少步数（默认 2）').default(2),
     toolizeMinDistinctTools: Schema.natural().description('自动固化要求的最少不同工具数（默认 2；同一工具重复不构成流程）').default(2),
     nearMissHint: Schema.boolean().description('模型手工执行组合工具前几步时，注入一句可直接调用组合工具的提示（走 post-execute additionalContexts，真实可见）').default(true),
@@ -198,87 +198,6 @@ export const Config: Schema<Config> = Schema.object({
       .description('HTTP 载体：own=自有 loopback 端口（与 GUI 不同源，侧边栏 browser tab 能打开，默认）；auto=优先宿主 webServer（GUI 同源，省一个端口，但侧边栏 browser tab 会以「应用自身」为由拒绝打开，仅适合系统浏览器）').default('own'),
   }).description('Web 管理台参数').default({}),
 }).description('SuperMemory 记忆插件配置').default({})
-
-/**
- * P3: ask about pending tool-ization proposals at the next user turn (§2.3).
- * Additive waterfall: the decision is always passed through; only a context
- * message is attached when the user accepts (so the hub learns the new tool).
- */
-function attachProposals(ctx: Context, store: Store | undefined, logger: { warn: (msg: string) => void; info: (msg: string) => void }): () => void {
-  if (!store) return () => {}
-  let createMessage: ((input: { content: Array<{ type: 'text'; text: string }>; source: Record<string, unknown> }) => unknown) | undefined
-  const ensureFactory = async () => {
-    if (!createMessage) {
-      const llm = await loadHostModule('@deepseek-ai/dsh-llm')
-      createMessage = llm.createUserMessage as typeof createMessage
-    }
-    return createMessage!
-  }
-  return ctx.on('agent/pre-step', async (payload, next) => {
-    const decision = await next()
-    if (decision.kind !== 'enter') return decision
-    const messages = decision.messages ?? []
-    if (!messages.some((m) => m.source?.kind === 'user')) return decision
-    // R25: dispatch inputs are kind 'user' now, so a BRANCH passes this gate
-    // too. A tool-ization proposal is a hub↔user interaction and a branch must
-    // never ask the user itself (R20) — skip plugin-minted branches here.
-    if (isPluginBranchId(String(payload.agent?.id ?? ''))) return decision
-    try {
-      const pending: Array<[string, Signal]> = []
-      for (const [key, signal] of store.signals.entries()) {
-        if (signal.proposalStatus === 'pending' && signal.proposedAt !== undefined) pending.push([key, signal])
-      }
-      if (pending.length === 0) return decision
-      const signal = pending[0][1]
-      const answer = await ctx.userQuestions.ask({
-        questions: [{
-          id: 'supermemory-toolize',
-          header: '工具化提议',
-          question: `检测到重复流程「${signal.pattern}」（已出现 ${signal.count} 次）。要固化为组合工具吗？`,
-          detail: `样例：${(signal.examples ?? []).slice(0, 3).join('；') || '（无）'}`,
-          options: [
-            { label: '固化为组合工具', description: '生成可一次调用完成的组合工具并持久化' },
-            { label: '以后再说', description: '保留提议，下次再问' },
-            { label: '不再提示', description: '忽略此模式' },
-          ],
-        }],
-        ...(payload.agent ? { agent: payload.agent as never } : {}),
-        ...(payload.signal ? { signal: payload.signal } : {}),
-      })
-      const selected = answer?.answers?.[0]?.selected?.[0] ?? ''
-      const key = pending[0][0]
-      if (selected === '固化为组合工具') {
-        const { compileComposite, registerComposite, persistComposite } = await import('./composite.ts')
-        const samples = (signal.samples ?? []).map((raw) => {
-          try {
-            return JSON.parse(raw) as { tools: string[]; args: Array<Record<string, unknown>> }
-          } catch {
-            return undefined
-          }
-        }).filter((s): s is { tools: string[]; args: Array<Record<string, unknown>> } => s !== undefined)
-        const spec = compileComposite(signal, samples)
-        await registerComposite(ctx, store, spec)
-        await persistComposite(store, spec, key)
-        await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'accepted' }))
-        logger.info(`supermemory: composite tool ${spec.name} registered`)
-        const factory = await ensureFactory()
-        const note = factory({
-          content: [{ type: 'text', text: `[SuperMemory] 已固化为组合工具 ${spec.name}：${spec.description}。后续同样流程优先一次调用它。` }],
-          source: { kind: 'supermemory', form: 'notice', summary: '组合工具已固化' },
-        })
-        return { ...decision, messages: [...decision.messages, note as never] }
-      }
-      await store.signals.update(key, (r) => ({
-        ...r,
-        proposalStatus: selected === '不再提示' ? 'declined' : r.proposalStatus,
-      }))
-      return decision
-    } catch (error) {
-      logger.warn(`supermemory: proposal flow skipped: ${String(error).slice(0, 200)}`)
-      return decision
-    }
-  })
-}
 
 /**
  * R18 需求⑤ (软约定): the hub session's role. Injected ONLY when the initiating
@@ -470,7 +389,6 @@ export async function apply(ctx: Context, config: Config) {
   ctx.effect(() => attachToolActivity(ctx, store, tracker, {
     repeat: config.recall.repeat,
     nearMissHint: config.maintenance.nearMissHint,
-    toolize: toolizeConfig(config),
   }, logger), 'supermemory: tool-activity')
 
   const routeDeps: RouteDeps = {
@@ -487,40 +405,45 @@ export async function apply(ctx: Context, config: Config) {
   }
   ctx.effect(() => attachRoute(ctx, routeDeps), 'supermemory: route')
 
-  // P3: composite tools are rebuilt from durable JSON on every start.
+  // R49 boot order matters: cleanup runs BEFORE the rebuild, so a legacy
+  // auto-generated sequence composite is retired while it is still unregistered
+  // and rebuildComposites never brings it back. Idempotent — safe on every start.
   if (store) {
     void (async () => {
       try {
+        const { cleanupToolize, sweepSkillDrafts } = await import('./toolize.ts')
+        const { discoverSkillRoots } = await import('./skill-forge.ts')
+        const toolize = toolizeConfig(config)
+        // R49: autoComposite/autoToolize now only govern pending proposals, never
+        // registration; with both off (the default) stale pending rows are cleared.
+        const cleanup = await cleanupToolize({
+          store,
+          roots: discoverSkillRoots({ store, cwd: process.cwd() }),
+          dropPending: !toolize.enabled,
+        })
+        if (cleanup.retiredCount > 0) {
+          logger.info('supermemory: retired ' + cleanup.retiredCount + ' legacy auto sequence composite(s): '
+            + cleanup.retired.map((item) => item.name).join(', '))
+        }
+        if (cleanup.clearedProposals > 0 || cleanup.prunedSignals > 0) {
+          logger.info('supermemory: proposal cleanup cleared ' + cleanup.clearedProposals + ' pending, pruned '
+            + cleanup.prunedSignals + ' broad sequence signal(s)')
+        }
+        if (cleanup.archivedCount > 0) {
+          logger.info('supermemory: archived ' + cleanup.archivedCount + ' legacy shell skill(s) under '
+            + cleanup.archiveRoots.filter((root) => root.archived > 0).map((root) => root.root).join(', '))
+        }
+        // R48: durable TASK signatures that already crossed the thresholds are
+        // fixated as task skills at boot (files survive restarts).
+        await sweepSkillDrafts(store, toolize, logger)
         const { rebuildComposites } = await import('./composite.ts')
         const count = await rebuildComposites(ctx, store)
         if (count > 0) logger.info('supermemory: rebuilt ' + count + ' composite tool(s)')
-        // 需求 B: signals that crossed the threshold before autoToolize existed
-        // are fixated at boot; zero-use composites are audited there as well.
-        const sweepCreated = await sweepAutoToolize(ctx, store, toolizeConfig(config), logger)
-        if (sweepCreated > 0) logger.info('supermemory: auto-toolized ' + sweepCreated + ' composite(s) at boot')
-        // R48: durable TASK signatures that already crossed the thresholds are
-        // fixated as task skills at boot (files survive restarts).
-        const { sweepSkillDrafts } = await import('./toolize.ts')
-        await sweepSkillDrafts(store, toolizeConfig(config), logger)
-        // R48 cleanup: archive legacy auto-generated tool-sequence shells
-        // (move, never delete; manifest under <root>-archive). Idempotent, so
-        // it is safe on every boot and will not touch manual skills.
-        const { archiveShellSkills, discoverSkillRoots } = await import('./skill-forge.ts')
-        const archive = await archiveShellSkills({
-          roots: discoverSkillRoots({ store, cwd: process.cwd() }),
-          store,
-        })
-        if (archive.totalArchived > 0) {
-          logger.info('supermemory: archived ' + archive.totalArchived + ' legacy shell skill(s) under ' + archive.roots.filter((root) => root.archived > 0).map((root) => root.root).join(', '))
-        }
       } catch (error) {
         logger.warn(`supermemory: composite rebuild failed: ${String(error).slice(0, 200)}`)
       }
     })()
   }
-
-  // P3: pending tool-ization proposals are asked at the next user interaction.
-  ctx.effect(() => attachProposals(ctx, store, logger), 'supermemory: proposals')
 
   ctx.effect(() => attachObserve(ctx, {
     ctx,

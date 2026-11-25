@@ -313,7 +313,7 @@ async function toolsCommand(deps: CommandsDeps, arg: string): Promise<Result> {
   if (!verb) {
     const rows = service.listTools()
     if (rows.length === 0) {
-      return { kind: 'success', text: '（暂无组合工具；重复流程出现 3 次后会提议固化，或用 memory_toolize 接受）' }
+      return { kind: 'success', text: '（暂无组合工具；R49 起自动路径不再生成组合工具，可用 memory_toolize accept 接受有业务对象的待处理提议，或用 memory_toolize register 登记能力）' }
     }
     const lines = rows.map((row) => [
       `- ${row.name}（${row.status}${row.live ? '' : '，未注册'}，使用 ${row.useCount} 次）`,

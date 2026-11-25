@@ -73,6 +73,12 @@ export interface CompositeSpec {
   writeConfirm?: boolean
   /** 路由描述：何时优先用本能力，并入模型可见的工具描述。 */
   routeNote?: string
+  /**
+   * R49: 来源标记。'manual' = 用户显式 memory_toolize accept / register 生成；
+   * 'auto' = 已移除的自动入口（阈值跨越/启动扫尾/过程内重复）生成的旧行。
+   * R49 之前写入的行没有这个字段，清理按形状判定（见 toolize.autoSequenceComposites）。
+   */
+  origin?: 'auto' | 'manual'
   // ---- 维护元数据（R26 持续维护）：版本 / 变更说明 / 使用统计 ----
   /** 定义版本：memory_toolize register 同名更新 +1；内置升级以它判定新旧。 */
   version?: number
@@ -583,6 +589,33 @@ export async function deleteCompositeTool(
     try { await store.signals.delete(record.trigger) } catch { /* the signal row is advisory */ }
   }
   return { status: 'ok', message: `已删除组合工具 ${name}。`, id }
+}
+
+/**
+ * R49: retire one composite definition durably (unregister the live tool, set
+ * the row status to 'retired'). Never deletes the row: a restart rebuilds only
+ * active rows, so a retired row stays retired across reloads. Idempotent — a
+ * row that is already retired (or gone) reports ok without touching anything.
+ */
+export async function retireComposite(
+  store: Store,
+  id: string,
+): Promise<{ status: 'ok' | 'error'; message: string; name?: string; alreadyRetired?: boolean }> {
+  const record = store.toolMemory.get(id)
+  if (!record || record.kind !== 'composite') return { status: 'error', message: '组合工具不存在。' }
+  let name = id
+  try {
+    name = (JSON.parse(record.entry) as CompositeSpec).name ?? id
+  } catch {
+    // a broken definition still unregisters under its row id fallback
+  }
+  const dispose = liveComposites.get(name)
+  if (dispose) { try { dispose() } catch { /* best-effort */ } }
+  liveComposites.delete(name)
+  liveCompositeSpecs.delete(name)
+  if (record.status === 'retired') return { status: 'ok', message: `组合工具 ${name} 已停用。`, name, alreadyRetired: true }
+  await store.toolMemory.update(id, (row) => ({ ...row, status: 'retired' }))
+  return { status: 'ok', message: `已停用组合工具 ${name}（重启后不会重新注册）。`, name }
 }
 
 /**

@@ -303,10 +303,11 @@ function rollSummary(
 }
 
 /**
- * One turn's tool sequence feeds the tool-ization pipeline: sliding windows of
- * 2..4 calls (every occurrence counts) plus the whole short turn. Crossing the
- * threshold auto-registers the composite (需求 B) or, with autoToolize off,
- * raises the manual pending proposal exactly as before.
+ * One turn's tool sequence feeds the tool-ization pipeline: R48's task signature
+ * (a repeated TASK becomes a skill) plus, only when the legacy autoComposite
+ * switch is on, a PENDING proposal for a sequence that names a business object.
+ * R49: nothing here registers a composite — memory_toolize accept is the only
+ * sequence entrance.
  */
 async function countSequenceSignal(
   store: Store,

@@ -3563,3 +3563,84 @@ R45 把重复工作固化成 DSH skill 后，自动路径把「连续出现了�
 - CDN 延迟：`releases/latest/download/...` 可能短时 404 或指向旧资产，需重试并在汇报里记录实际状态。
 - Gitea Release 无固化脚本：以 git tag 到位为准；若 API 可用再补同口径 Release。
 - 任务文本过短/措辞不同的生成率与近名问题见 §60.7（有意取舍）。
+
+## 62. R49：关掉「工具序列自动生成组合工具」的自动入口 + 存量清理（2026-11-26）
+
+### 62.1 现象与根因（源码级 + 会话日志实证）
+
+v1.2.1 重载后仍出现 `sm_composite_run_code_run_code`（run_code → run_code，来自 2706 次重复），
+`memory_toolize` 仍列 2 条 run_code pending。根因不在「阈值自动 accept」，也不在配置继承（profile 的
+`cordis.patch.yml` 没有 supermemory 配置项，lib 里 `autoComposite`/`autoToolize` 默认都是 false）：
+
+1. **陈旧 pending 是 v1.2.0 的遗产**：v1.2.0 的 `maintenance.autoToolize` 默认 true，运行期把
+   `ws/F:\10-SuperMemory/seq/run_code>run_code`（2 步及其 3/4 步窗口）写成 `proposalStatus:'pending'`。
+   v1.2.1 只改了默认值，没有清历史行。
+2. **v1.2.1 仍有一条「问题即固化」路径**：已删除的 `attachProposals`（原 `src/index.ts:207-281`）在
+   每个用户回合的 `agent/pre-step` 里挑第一条 pending，调用 `ctx.userQuestions.ask`，问题选项顺序是
+   `[固化为组合工具, 以后再说, 不再提示]`；`selected === '固化为组合工具'` 时直接
+   `compileComposite + registerComposite + persistComposite` 并注入「[SuperMemory] 已固化为组合工具」通知。
+3. **宿主瞬时结算了这个问题**：中枢会话日志（`session-0c84a721-.../session.v4.jsonl`）里
+   `seq 217` 为 `turn 9 / step 1` 开始（16:07:58.630Z），`seq 220` 在 **.634Z** 就出现上述通知——4 ms，
+   会话里没有任何 user-question 事件。即本环境下答案通道以首选项自动结算，提问不构成人工闸门。
+4. **持久行每次启动都会被重建**：`rebuildComposites`（`src/composite.ts`）会把所有
+   `kind='composite' && status='active'` 的 durable 行原样 `registerComposite`，与 autoComposite 无关。
+   所以即使不产生新行，旧壳子也会在每次重载后重新出现在工具表里；near-miss 提示（实测 14 次）还会一直
+   劝模型直接调用它。
+5. **pending 每轮复活**：`recordTurnSequences` 只要 `count >= threshold` 就把 `proposalStatus` 覆盖成
+   `'pending'`（R49 前），而 `autoToolizeFromSequence` 在关闭时返回 `disabled` 不做后处理，于是 pending
+   永远在，提问每轮可再次触发，还能重复 persist 同名新行。
+
+结论：自动注册的真正入口是「pre-step 提问 + 首选项即固化」，阈值/扫尾只是把 pending 攒出来；提问被
+宿主自动应答后，它就等价于一个无人值守的 auto-accept。
+
+### 62.2 结构性修法（R49）
+
+- **入口删除**：`src/index.ts` 删除 `attachProposals` 与 `supermemory: proposals` effect；`src/activity.ts`
+  删除「过程内重复窗口立即固化」调用（`repeatedWindow` 一并移除，避免再被接线）。自动路径现在只能
+  写 pending，或干脆什么都不写。
+- **唯一序列入口**：`acceptProposal`（`src/toolize.ts:297`）＝ `memory_toolize accept` 的实现，编译/注册/
+  持久化并给 spec 盖 `origin:'manual'`；`memory_toolize register` 仍是能力（capability）入口。
+- **宽泛序列过滤**：`proposalVerdict` / `isBroadSequence`（`src/toolize.ts:250/260`）要求每一步都不是通用
+  工具（`run_code`/`bash`/`read`/`edit`/`write`/`glob`/`grep`/`todo_write`/`skill`/`wait_agent`/… 以及
+  `memory_*`/`sm_composite_*`/`job_*` 等前缀族）。`recordTurnSequences` 对宽泛序列连 signal 行都不写，
+  已有的旧行顺手删除（`:407`）；显式 accept 同样拒绝（`acceptProposal` 内二次校验）。
+- **pending 一次清空**：`clearSequenceSignals`（`:555`）删除全部宽泛序列信号 + 全部 pending，返回
+  `pendingBefore/clearedProposals/prunedSignals/pendingAfter`，重复执行返回 0。
+- **存量判定**：`autoSequenceComposites`（`:602`）只认「kind=composite + active + 非 capability + 未标
+  `origin:'manual'` + trigger 形如 `/seq/` + 序列宽泛」；`retireAutoSequenceComposites`（`:631`）逐行
+  `retireComposite`（`src/composite.ts:600`：注销 live 工具 + 行 status=retired，不删行）。人工能力
+  `sm_composite_git_sync_supermemory`（spec.kind='capability'）与显式 accept 行永远不在候选里。
+- **启动顺序**：`src/index.ts:409` 起，boot 先 `cleanupToolize`（停用壳子 + 清 pending/宽泛信号 + 归档
+  壳子 skill），再 `sweepSkillDrafts`，最后 `rebuildComposites`——retired 行不会被注册，重载即净化。
+- **入口复用**：`memory_toolize cleanup`（`src/tools.ts:1797`）调 `cleanupToolize`（`src/toolize.ts:676`），
+  返回 `archivedSkills` / `retiredComposites` / `clearedProposals`（另含 `prunedSignals` / `pendingBefore` /
+  `pendingAfter` / `retired`），并保留 R48 的 `archived` / `archivedCount` / `archiveRoots`。
+
+### 62.3 存量清理实测（对真实介质快照执行同一函数）
+
+对 `~/.dsh/storages/supermemory.json` 的内存快照跑 `cleanupToolize({dropPending:true})`：
+
+| 项目 | 结果 |
+|---|---|
+| 停用自动组合工具 | 4：`sm_composite_run_code_run_code`、`sm_composite_memory_recall_memory_rec`、`sm_composite_memory_topicsets_memory_`、`sm_composite_sm_composite_git_sync_su` |
+| 清空 pending | 2（3 步 / 4 步 run_code） |
+| 清除宽泛序列信号 | 526（含大量 declined 的 bash/edit/read 组合） |
+| 保留 | `sm_composite_git_sync_supermemory`（capability，active，useCount 19） |
+| 二次执行 | 0 / 0 / 0（幂等） |
+
+说明：分支不能重载插件，且运行中宿主把 tool_memory/signals 缓存在内存里，外部进程直写介质会被覆盖；
+因此本轮**不在活进程外改库**，而是把同一逻辑接进 boot（重载即执行）与 `memory_toolize cleanup`
+（随时可执行），并用上面的快照实测给出计数与幂等证据。旧实例在重载前仍会继续写 signal（已写进已知限制）。
+
+### 62.4 闸门
+
+- `pnpm typecheck`：宿主 + client 双工程 0 错。
+- `pnpm build`：exit 0（宿主 12 文件 861.99 kB，client 175.74 kB / wrap 后 170340 B）。
+- `pnpm smoke`：七套全绿；mechanism 111 checks，skill-smoke 29 组（含 R49-1..R49-6）。
+
+### 62.5 重载后用户侧两步验证
+
+1. `memory_toolize({"cleanup": true})` → `retiredComposites` / `clearedProposals` 为 0（boot 已清）或首轮
+   非 0、二次为 0；`capabilities` 只剩 `sm_composite_git_sync_supermemory`。
+2. `memory_toolize({})` → `pending` 为空；再让中枢跑几轮 `run_code` 后复取仍为空（默认配置下序列管线不写）。
+

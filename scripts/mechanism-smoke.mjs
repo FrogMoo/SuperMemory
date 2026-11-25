@@ -29,8 +29,8 @@ const {
   renderRepeatCard, remainingChars, buildQuery, extractPaths, memoryOverlap,
 } = await import('../src/inrequest.ts')
 const {
-  planAutoToolize, longestPrefixMatch, pickCompositeMatch, catalogFor, renderCatalog,
-  repeatedWindow, autoToolizeFromSequence, sweepAutoToolize,
+  proposalVerdict, isBroadSequence, cleanupToolize,
+  longestPrefixMatch, pickCompositeMatch, catalogFor, renderCatalog,
 } = await import('../src/toolize.ts')
 // R22 能力（capability）：数据模型 / 执行安全闸 / 注册-持久化-重建 / 面板一键执行。
 const {
@@ -179,54 +179,38 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   ok('R47-8 过程内补充卡预算化：整卡 ≤ 预算、目录先于正文牺牲、正文句界省略带复取线索、丢卡计数')
 }
 
-// ---- requirement B: auto tool-ization + catalog ----
-const scenarios = () => [
-  { tools: ['read', 'edit'], args: [{ path: 'a.ts' }, { old: 'x' }] },
-]
-const makeDeps = (log) => ({
-  register: async (_ctx, _store, spec) => { log.push('register:' + spec.name); return () => {} },
-  persist: async (store, spec, key) => {
-    log.push('persist:' + spec.name)
-    await store.toolMemory.put('tm-' + log.length, { kind: 'composite', trigger: key, description: spec.description, entry: JSON.stringify(spec), useCount: 0, status: 'active' })
-    return 'tm'
-  },
-  toolExists: () => true,
-  now: () => now,
-})
+// ---- requirement B: tool-ization (R49: observe-only + explicit accept) ----
 
 {
-  const log = []
-  const store = fakeStore()
-  const first = await autoToolizeFromSequence({}, store, 'ws-1', ['read', 'edit'], scenarios(), toolize, logger, makeDeps(log))
-  assert.equal(first.action, 'create', 'crossing the threshold must register immediately')
-  assert.ok(log.some((line) => line.startsWith('register:sm_composite_')))
-  assert.equal(store.toolMemory.size, 1, 'the composite definition must be persisted')
-  const second = await autoToolizeFromSequence({}, store, 'ws-1', ['read', 'edit'], scenarios(), toolize, logger, makeDeps(log))
-  assert.equal(second.action, 'duplicate', 'the same sequence must not be fixated twice')
-  ok('B1 自动固化：注册 + 持久化，重复序列不重复固化')
+  assert.equal(isBroadSequence(['run_code', 'run_code']), true, 'a run_code chain is broad by construction')
+  assert.equal(isBroadSequence(['bash', 'edit']), true)
+  assert.equal(isBroadSequence(['read', 'edit', 'write']), true)
+  assert.equal(isBroadSequence(['memory_recall', 'memory_dispatch']), true, 'memory_* is generic')
+  assert.equal(isBroadSequence(['sm_composite_git_sync_supermemory', 'bash']), true, 'a composite itself is generic')
+  assert.equal(isBroadSequence(['erp_sync_orders', 'erp_push_invoice']), false, 'a business-object sequence stays a candidate')
+  assert.equal(proposalVerdict(['erp_sync_orders', 'erp_sync_orders']).valuable, false, 'one repeated tool is not a flow')
+  assert.equal(proposalVerdict(['erp_sync_orders']).valuable, false)
+  ok('B1 R49 宽泛序列过滤：run_code/bash/read/edit/write/memory_*/sm_composite_* 永不成为候选，业务序列保留')
 }
 
 {
-  const log = []
-  const store = fakeStore()
-  const deps = makeDeps(log)
-  const first = await autoToolizeFromSequence({}, store, 'ws-cd', ['read', 'edit'], scenarios(), toolize, logger, deps)
-  assert.equal(first.action, 'create')
-  const second = await autoToolizeFromSequence({}, store, 'ws-cd', ['read', 'grep'], scenarios(), toolize, logger, deps)
-  assert.equal(second.action, 'cooldown', 'the cooldown window must prevent a second fixation')
-  assert.equal(store.toolMemory.size, 1)
-  ok('B2 冷却：同一工作区冷却窗口内不再自动固化')
-}
-
-{
-  const base = { existingNames: new Set(), activeCount: 0, cooldown: false, registered: new Set(['read', 'edit']), config: toolize }
-  assert.equal(planAutoToolize({ ...base, tools: ['read', 'edit'], activeCount: 8, config: { ...toolize, maxActive: 8 } }).action, 'cap')
-  assert.equal(planAutoToolize({ ...base, tools: ['read', 'edit'], cooldown: true }).action, 'cooldown')
-  assert.equal(planAutoToolize({ ...base, tools: ['read', 'edit'], existingNames: new Set(['sm_composite_read_edit']) }).action, 'duplicate')
-  assert.equal(planAutoToolize({ ...base, tools: ['run_code', 'run_code'], registered: new Set(['run_code']) }).action, 'invalid')
-  assert.equal(planAutoToolize({ ...base, tools: ['read', 'missing'], registered: new Set(['read']) }).action, 'invalid')
-  assert.equal(planAutoToolize({ ...base, tools: ['read', 'edit'], config: { ...toolize, enabled: false } }).action, 'disabled')
-  ok('B3 上限/冷却/重复/非法序列/关闭 全部按规则拒绝')
+  // R49: no automatic entrance may register; the boot cleanup only clears/prunes.
+  const broadSignal = { workspaceKey: 'ws-s', pattern: 'run_code>run_code', count: 2706, lastSeen: now, examples: [], sequence: ['run_code', 'run_code'], samples: [], proposedAt: now, proposalStatus: 'pending' }
+  const broadStore = fakeStore({ signals: [['ws/ws-s/seq/run_code>run_code', broadSignal]] })
+  const swept = await cleanupToolize({ store: broadStore, dropPending: true })
+  assert.equal(swept.clearedProposals, 1, 'a broad pending proposal is cleared at boot')
+  assert.equal(broadStore.signals.size, 0, 'never fixated into a signal row')
+  assert.equal(broadStore.toolMemory.size, 0, 'the boot cleanup must not register/persist anything')
+  const valuable = { workspaceKey: 'ws-s', pattern: 'erp_sync_orders>erp_push_invoice', count: 3, lastSeen: now, examples: [], sequence: ['erp_sync_orders', 'erp_push_invoice'], samples: [], proposedAt: now, proposalStatus: 'pending' }
+  const keptStore = fakeStore({ signals: [['ws/ws-s/seq/erp_sync_orders>erp_push_invoice', valuable]] })
+  const kept = await cleanupToolize({ store: keptStore, dropPending: false })
+  assert.equal(kept.clearedProposals, 0, 'a valuable proposal survives while the legacy switch is on')
+  assert.equal(keptStore.signals.get('ws/ws-s/seq/erp_sync_orders>erp_push_invoice').proposalStatus, 'pending')
+  assert.equal(keptStore.toolMemory.size, 0, 'surviving the boot cleanup still registers nothing')
+  const offStore = fakeStore({ signals: [['ws/ws-s/seq/erp_sync_orders>erp_push_invoice', valuable]] })
+  const off = await cleanupToolize({ store: offStore, dropPending: true })
+  assert.equal(off.clearedProposals, 1, 'with the legacy switch off every pending is cleared')
+  ok('B2 R49 启动清理只清理/保留提议、永不注册；开关关闭时清空 pending')
 }
 
 {
@@ -243,29 +227,6 @@ const makeDeps = (log) => ({
   ok('B4 组合工具前缀匹配与结构化目录（只列已注册工具）')
 }
 
-{
-  const state = createTracker().begin('s7', 1, 0, 'q')
-  for (const name of ['read', 'edit', 'read', 'edit', 'read', 'edit', 'grep']) {
-    observe(state, obs(name, ''), quiet, memories.entries(), 100)
-  }
-  const repeatWindow = repeatedWindow(state, toolize)
-  assert.ok(repeatWindow, 'a window repeated three times inside one request must be found')
-  assert.equal(repeatWindow.tools.join('>'), 'read>edit')
-  assert.equal(repeatWindow.count >= 3, true)
-  assert.equal(repeatedWindow(createTracker().begin('s8', 1, 0, 'q'), toolize), undefined)
-  ok('B5 同一请求内重复窗口即硬信号（无需用户确认）')
-}
-
-{
-  const log = []
-  const sample = JSON.stringify({ tools: ['read', 'edit'], args: [{ path: 'a' }, {}] })
-  const store = fakeStore({ signals: [['ws/ws-s/seq/read>edit', { workspaceKey: 'ws-s', pattern: 'read>edit', count: 3, lastSeen: now, examples: [], sequence: ['read', 'edit'], samples: [sample], proposedAt: now, proposalStatus: 'pending' }]] })
-  const created = await sweepAutoToolize({}, store, toolize, logger, makeDeps(log))
-  assert.equal(created, 1, 'a crossed pending signal must be fixated at boot')
-  assert.equal(store.signals.get('ws/ws-s/seq/read>edit').proposalStatus, 'accepted')
-  assert.equal(await sweepAutoToolize({}, fakeStore(), { ...toolize, enabled: false }, logger, makeDeps([])), 0)
-  ok('B6 启动扫描：已达阈值的 pending 信号自动固化（关闭时不动）')
-}
 
 // ---- requirement C: session naming ----
 const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, applySessionTitle } = await import('../src/title.ts')

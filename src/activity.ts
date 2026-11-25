@@ -1,6 +1,9 @@
 /**
- * Tool activity: feeds the in-request tracker, records composite near-misses
- * and auto-toolizes a window that repeats inside ONE request.
+ * Tool activity: feeds the in-request tracker and records composite near-misses.
+ *
+ * R49: this listener never registers a composite. A window repeating inside one
+ * request used to auto-register immediately (the "hard signal" path) — that is
+ * exactly how generic run_code chains became tools, so the entrance is gone.
  *
  * Host surface (verified): tools/post-execute is a waterfall whose accept
  * decision carries additionalContexts for the NEXT request - a supported,
@@ -20,17 +23,12 @@ import type { Signal } from './schema.ts'
 import { workspaceKeyOf, type Store } from './store.ts'
 import {
   activeComposites,
-  autoToolizeFromSequence,
   pickCompositeMatch,
-  repeatedWindow,
   type CompositeMatch,
-  type ToolizeConfig,
-  type ToolizeDeps,
 } from './toolize.ts'
 
 export interface ActivityConfig {
   repeat: RepeatConfig
-  toolize: ToolizeConfig
   nearMissHint: boolean
 }
 
@@ -85,7 +83,6 @@ export function attachToolActivity(
   tracker: Tracker,
   config: ActivityConfig,
   logger: { info: (msg: string) => void; warn: (msg: string) => void },
-  deps?: ToolizeDeps,
 ): () => void {
   if (!store) return () => {}
   const activeStore: Store = store
@@ -134,10 +131,8 @@ export function attachToolActivity(
       const recent = state.recent.map((entry) => entry.name)
       const match = pickCompositeMatch(recent, activeComposites(activeStore))
       if (match && match.hits >= 2) recordNearMiss(activeStore, workspaceKey, match, logger)
-      const repeat = config.toolize.enabled || config.toolize.autoSkill ? repeatedWindow(state, config.toolize) : undefined
-      if (repeat && config.toolize.enabled) {
-        await autoToolizeFromSequence(ctx, activeStore, workspaceKey, repeat.tools, repeat.samples, config.toolize, logger, deps)
-      }
+      // R49: in-request repetition neither registers a composite nor asks the
+      // user; a repeated TURN is what the maintenance task signature records.
       // R48: in-request repetition no longer mints a skill directly. A task
       // is recorded once per turn by the maintenance pass (with the user's
       // task text + session id), which is what the cross-session threshold

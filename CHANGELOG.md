@@ -2,6 +2,35 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [Unreleased]
+
+R49（2026-11-26）修复轮：彻底关掉「工具序列自动生成组合工具」的自动入口，组合工具只能由用户显式 `memory_toolize accept` / `register` 产生；存量自动壳子与 pending 一次性清理（幂等）。全量闸门（typecheck + 七套冒烟 + build）通过。
+
+### 修复
+
+- **重载后仍自动注册组合工具（根因）**：v1.2.0 的 `maintenance.autoToolize` 默认 true，运行期把 `run_code>run_code` 之类的工具序列攒成了 pending 提议；v1.2.1 虽把自动注册默认关掉，但 `attachProposals` 仍会在每个用户回合的 pre-step 用 `ctx.userQuestions.ask` 询问「要固化为组合工具吗」，而**选项 0 就是「固化为组合工具」**。宿主在本环境瞬时结算该问题（实测 4 ms、会话日志里没有任何 user-question 事件），于是 2026-11-25T16:07:58Z 一条 2706 次的陈旧 pending 被自动接受：注册并持久化 `sm_composite_run_code_run_code`，同时向对话注入「已固化」通知；而 `recordTurnSequences` 每次跨越都把 `proposalStatus` 重写成 `pending`，所以提议每轮又回来（实测 3 条 run_code 序列、2708 次）。`rebuildComposites` 每次启动又会把这类持久行原样注册回来——这才是「重载也还在」的机制。修法：删除 `attachProposals` 的提问/固化路径；阈值跨越、启动扫尾、过程内重复三条自动路径一律只观察、不注册。
+- **宽泛工具序列过滤**：新增 `proposalVerdict` / `isBroadSequence`（`src/toolize.ts`）——任一步骤是 `run_code`、`bash`、`read`、`edit`、`write`、`glob`、`grep`、`todo_write`、`skill`、`wait_agent`、`send_message` 等通用工具，或属于 `memory_*` / `sm_composite_*` / `job_*` 等通用族，整条序列不生成候选、不落 signal、不进 pending；显式 accept 同样拒绝。
+- **存量清理幂等**：`retireAutoSequenceComposites` 只停用「来源是自动序列形状（`/seq/`）+ 序列宽泛 + 非 capability + 未标 `origin:'manual'`」的行，人工能力（如 `sm_composite_git_sync_supermemory`）与显式 accept 的行不动；`clearSequenceSignals` 一次清空 pending 与全部宽泛序列信号。启动时**先清理再 rebuild**，重载即净化。
+
+### 变更
+
+- `memory_toolize cleanup` 扩展为一次性清理组合工具壳子 + 无价值 pending + 归档 skill，返回分别计数 `archivedSkills` / `retiredComposites` / `clearedProposals`（以及 `prunedSignals` / `pendingBefore` / `pendingAfter` / `retired`），并保留 R48 的 `archived` / `archivedCount` / `archiveRoots`，向后兼容。
+- `maintenance.autoComposite` / `autoToolize` 语义收窄为「是否允许留下待接受提议」，任何取值都不能再注册组合工具（默认 false 时序列管线不写任何东西）；`toolizeCooldownMs` / `toolizeMax` 停用但保留键，避免旧配置报错。
+
+### 工程
+
+- mechanism 冒烟 B1/B2 改写为 R49 语义（空检测试与启动清理）；skill-smoke 新增 R49-1..R49-6：宽泛过滤、阈值跨越不注册（开关开/关）、显式 accept（origin=manual 幂等）、清理只动自动壳子、三计数与向后兼容字段、pending 清空后不复发。
+- 对当前 `~/.dsh/storages/supermemory.json` 快照执行同一清理逻辑（重载时由 boot 路径自动执行）：停用 4 个自动组合工具（`sm_composite_run_code_run_code`、`sm_composite_memory_recall_memory_rec`、`sm_composite_memory_topicsets_memory_`、`sm_composite_sm_composite_git_sync_su`），清空 2 条 pending、清除 526 条宽泛序列信号；二次执行 0/0/0；`sm_composite_git_sync_supermemory` 人工能力保持 active（useCount 19）。
+
+### 兼容性
+
+- 存储域 `supermemory` version 1 不变；`tool_memory.entry` 里的 spec 新增可选 `origin`（旧行缺省按形状判定），无强制迁移。
+- 语义变化（有意）：工具序列组合工具不再有任何自动来源；`memory_toolize accept` 是唯一序列入口，`memory_toolize register` 仍是能力入口。
+
+### 已知限制
+
+- 正在运行的旧实例（v1.2.1）在重载前仍会继续写 signal（本修复只对新实例生效）；重载后 boot 清理会把存量一次清掉。
+- `recordTurnSequences` 里 `ctx` / `deps` 参数保留仅为签名兼容，自动路径已不再使用注入的宿主注册器。
 ## [1.2.1] - 2026-11-25
 
 发布轮：R48「任务级 skill 识别 + 旧工具序列壳子清理」与发布资产补齐。自本版起每个 Release 同时提供版本 tgz 与稳定别名 tgz，DSH 插件面板可用固定 URL 直接安装。全量闸门（typecheck + 七套冒烟）通过。
