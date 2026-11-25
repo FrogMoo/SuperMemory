@@ -3644,3 +3644,77 @@ v1.2.1 重载后仍出现 `sm_composite_run_code_run_code`（run_code → run_co
    非 0、二次为 0；`capabilities` 只剩 `sm_composite_git_sync_supermemory`。
 2. `memory_toolize({})` → `pending` 为空；再让中枢跑几轮 `run_code` 后复取仍为空（默认配置下序列管线不写）。
 
+---
+
+## 63. R50：单一能力（知识面 SKILL.md + 执行面 sm_cap_*），删除组合工具（2026-11-26）
+
+### 63.1 结论
+
+R50 把「固化能力」与「自动生成的 skill」合并成**一条记录、两个面**：
+
+- 知识面：SKILL.md（六节散文 + 事实块），文件是正文事实源；
+- 执行面：sm_cap_<name>（固定入口、dry_run/confirm、scope 门禁、默认预演、写确认）；
+- 组合工具（工具序列编译/注册/rebuild）**彻底删除**，不再有任何自动 accept 编译入口，旧序列行只退役不注册。
+
+### 63.2 数据模型与迁移
+
+tool_memory 记录 kind = capability | knowledge | proposal；行级镜像 skillPath/enabled/loadCount/runCount/source/taskKey/entryDraft/entryVerified/bodyHash/factsHash，完整定义仍以 entry 的 JSON（schema=sm.capability/1）为准。迁移（migrateCapabilities，幂等、启动自动）：
+
+| 旧形态 | 新形态 |
+|---|---|
+| kind=composite + spec.kind=capability（entry 命令） | kind=capability；逻辑名去掉 sm_composite_ 前缀并转 kebab（sm_composite_git_sync_supermemory → git-sync-supermemory）；执行面工具 sm_cap_git_sync_supermemory；生成/补全 SKILL.md |
+| kind=composite 的工具序列行 | status=retired（保留审计，不注册） |
+| kind=skill（entry=路径） | kind=knowledge，skillPath=路径，entry=''（仅知识） |
+| 无行的 sm-* SKILL.md（手工） | kind=knowledge、source=manual/migrated，首次只追加事实块，不改正文 |
+
+旧名映射只在读取历史记录时发生（capabilityLogicalName 兼容 sm_cap_/sm_composite_/sm- 前缀），不再注册任何 sm_composite_* 名称。
+
+### 63.3 执行面契约
+
+- 一个能力一个工具：sm_cap_<name>；parameters 只有 dry_run / confirm；入口是固定字符串，不接受任意参数透传。
+- 默认预演：有 dryRunArg 且未 confirm 时自动追加；writeConfirm 能力真实执行必须 confirm=true；writeConfirm 但无 dryRunArg 时无法预演，返回失败并说明。
+- scope 外拒绝（先于工作区判定）；跨工作区调用拒绝且不计数。
+- 执行后 runCount++、成功/失败分列、连续失败累计并在 >=2 时提示「更新事实块/文档」；成功后连续失败归零；needs-confirm 不计数。
+- 输出截断 8k、超时 120s、PATH 兜底注入 node/pnpm 目录。
+
+### 63.4 事实块合并规则
+
+- SKILL.md 为正文事实源；自动维护只替换 <!-- sm:facts:start --> … <!-- sm:facts:end --> 之间的块：入口、scope、预演参数、写操作确认、验证命令、涉及文件、失败坑。
+- 块外人工散文一律保留；无标记的手工 skill 首次只追加「## 事实（自动维护）」+ 块，不改正文。
+- bodyHash（散文哈希，排除事实块）与 factsHash（事实块输入哈希）同时写入 frontmatter（sm-body-hash / sm-facts-hash）与行级字段。
+- 检测到人工编辑（文件中散文哈希 != 已记录 bodyHash）：status=preserved，只刷事实块，version+1，changelog 记「人工正文保留，仅刷新事实块」。
+- 内容与事实块都没变：status=unchanged，不升版。
+
+### 63.5 提案与高置信入口
+
+- 自动路径（recordTurnSequences / 启动 sweep）只写 kind=proposal 知识草稿：同一任务 >=3 次、>=2 会话、30 天窗口；名称与六节正文来自真实样本；pending 上限 20、30 天过期；不占每 skills 根 8 个自动上限。
+- 接受提案：创建 capability（有 entryDraft）或 knowledge（无）；接受时才占 8 个额度；接受不注册工具。
+- 高置信入口（只写 entryDraft，verified:false，不得自动执行；人工「启用执行」后 runnable=true 并注册）：规范化命令在 >=3 样本、>=2 会话里全部 exit 0；非交互（无 -i/编辑器/stdin）；命令家族在允许列表（pnpm/npm script 且脚本名存在于 package.json、仓库 scripts/*.mjs|sh、git 同步脚本）；无占位符与临时路径；scope=仓库根（规范化路径相等）。写操作判定：typecheck/smoke/test/lint/check/status/log/diff/verify 之外默认 writeConfirm=true。
+
+### 63.6 面板与管理台
+
+- 面板「固化能力」页签合并原能力列表与「已生成的 skills」卡片：名称、徽标（可执行/仅知识/自动/入口待验证）、vN、执行次数、加载次数、转化率、成功率、最后状态；行内：预演执行、启停（同时切两个面）、启用执行（入口草稿）、查看/编辑描述、删除（归档知识面）。
+- 提案在能力列表上方单独可见，可接受/拒绝。
+- Web 管理台能力页分为：待接受提案 / 能力（知识面+执行面）/ 历史工具序列（已退役，仅审计）。
+- memory_toolize 返回保留 capabilities/skills 旧字段，新增 units（统一列表）、proposals、expiredProposals、retiredComposites；list 输出执行/加载/转化率/入口草稿状态。
+
+### 63.7 测试与闸门
+
+- capability-smoke 重写：R50-1 迁移、R50-2 注册与执行闸门、R50-3 事实块与人工编辑、R50-4 统计/转化率、R50-5 内置、R50-6 提案与高置信入口、R50-7 上限/过期、R50-8 归档删除、R50-9 命名与描述。
+- skill-smoke：R50-S12 历史序列不注册、R50-S14 只产提案、R50-S15 启动扫尾写提案、R50-1..3 清理与不复发。
+- workspace-scope 重写：W1 判定、W2 列表隔离、W3 同名两工作区、W4 执行面跨区拒绝、W5 重建归属/内置播种、W6 迁移保留归属。
+- webui/mechanism：descriptor 两侧同步（acceptProposal/declineProposal/runTool），能力卡片与执行闸门断言改为统一能力。
+- 闸门证据见本轮提交说明：pnpm typecheck（宿主+client）exit 0；pnpm build exit 0；pnpm smoke 七套全绿（core 43 / mechanism 111 / webui 35 / client-sim OK / capability 9 组 / workspace-scope 6 组 / skill 26 组）。
+
+### 63.8 重载后用户三步验收
+
+1. memory_toolize({}) 或面板「固化能力」：列表只剩 sm_cap_*（可执行）与 sm-*（仅知识），没有 sm_composite_*、没有「自动固化序列」。
+2. 对 sm_cap_git_sync_supermemory 跑一次预演（默认 --dry-run），再点「确认执行」验证 confirm 闸门；检查返回 exitCode/stdout/stderr。
+3. 面板同一行看得到执行次数/加载次数/转化率/成功率/最后状态；加载一次 sm-git-sync-supermemory 后加载次数 +1，执行一次后执行次数 +1、转化率随之变化。
+
+### 63.9 假设与边界
+
+- 自动生成上限按「每 skills 根 8 个自动来源能力」判定（source=auto 且 skillPath 在该根下），接受提案时检查；pending 不占额度。
+- 旧 kind=composite 的序列行保留在库中但 status=retired，面板列为「历史工具序列（已退役，仅审计）」；不删除、可人工清理。
+- 删除能力只归档知识面目录（<skills 根>-archive + manifest），不硬删文件；行删除。
+- 测试会在临时目录创建 .git 夹具；内置能力播种仍指向插件仓库根（生产语义），因此仓库 .dsh/skills 下会出现 sm-git-sync-supermemory（插件自己生成的知识面，属工作区数据、已忽略）。

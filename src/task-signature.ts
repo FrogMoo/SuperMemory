@@ -26,6 +26,12 @@ export interface TaskSample {
   dispatchId?: string
   topicSetId?: string
   at?: number
+  /**
+   * R50: true when every tool call in this sample completed without isError.
+   * Only fully successful samples can justify an automatic entry draft (the
+   * high-confidence rule requires exit 0 evidence).
+   */
+  ok?: boolean
 }
 
 /** Stable, human-readable description of one repeated TASK (not a flow). */

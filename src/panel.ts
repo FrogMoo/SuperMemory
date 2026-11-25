@@ -12,6 +12,7 @@ import type { UserMessage, createUserMessage as CreateUserMessage } from '@deeps
 import { loadHostModule } from './host.ts'
 import type { ToolMemory } from './schema.ts'
 import type { Store } from './store.ts'
+import { readFileSync } from 'node:fs'
 import { newId, workspaceKeyOf } from './store.ts'
 import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
@@ -21,9 +22,12 @@ import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSess
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
-  bumpCompositeUse, capabilityAppliesToWorkspace, capabilityHealthOf, deleteCompositeTool, editCompositeTool,
-  liveCompositeSpecs, runCapability, type CapabilityRunResult, type CompositeSpec,
-} from './composite.ts'
+  acceptProposal as acceptCapabilityProposal, bumpCapabilityRun, capabilityHealthOf, capabilityRows,
+  capabilitySkillName, capabilityToolName, declineProposal as declineCapabilityProposal,
+  deleteCapability, editCapability, enableCapabilityEntryDraft, liveCapabilityToolNames,
+  pendingProposalsOf, runCapability, setCapabilityEnabled, updateCapabilitySkillBody,
+  type CapabilityRunResult,
+} from './capability.ts'
 import { enumerateModels, type ModelSelection } from './model.ts'
 import { tokenize } from './recall.ts'
 import { clipMarked } from './clip.ts'
@@ -53,7 +57,7 @@ import { recordHubSession } from './role.ts'
 import { defaultModelFor, readModelDefaults, writeModelDefaults, type ModelDefaultsView } from './model-defaults.ts'
 // R45: 已生成 skills 的面板读写（文件是事实来源，tool_memory 行仅镜像统计）。
 import {
-  listSkills as listSkillViews, resolveSkillRoot, setSkillEnabled, updateSkillDescription, type SkillView,
+  type SkillView,
 } from './skill-forge.ts'
 
 export interface TopicSetView {
@@ -190,14 +194,37 @@ export interface ToolView {
   live: boolean
   /** R27: 行的创建时间（旧行在回填前是 undefined，客户端显示 —）。 */
   createdAt?: number
-  // R22 能力（capability）字段；序列组合工具这些字段为空。
-  kind?: 'sequence' | 'capability'
+  // R22/R50 统一能力字段（知识面 + 执行面）。
+  kind?: 'sequence' | 'capability' | 'knowledge' | 'proposal'
+  /** 逻辑名（git-sync-supermemory / fix-skill-forge）。 */
+  logicalName?: string
   entry?: string
   doc?: string
   scope?: string
   runnable?: boolean
   dryRunArg?: string
   writeConfirm?: boolean
+  /** R50: 高置信自动起草的入口（未验证；人工「启用执行」前不得执行）。 */
+  entryDraft?: string
+  entryVerified?: boolean
+  enabled?: boolean
+  loadCount?: number
+  runCount?: number
+  /** runCount / loadCount：路由是否真的把加载转成执行。 */
+  loadsToRuns?: number
+  successRate?: number
+  successCount?: number
+  failCount?: number
+  consecutiveFailures?: number
+  lastStatus?: 'completed' | 'failed'
+  lastUsedAt?: number
+  lastDryRun?: boolean
+  lastSummary?: string
+  skillPath?: string
+  source?: string
+  taskKey?: string
+  proposalStatus?: 'pending' | 'accepted' | 'declined'
+  expiresAt?: number
   // R22 需求③: 能力详情面板要能读完一条能力的全部定义与健康信号——
   // 路由描述（何时优先用它）、是否内置及版本关系、文档/适用范围是否缺失、
   // 以及 capabilityHealthOf 给出的人读维护 notes。
@@ -1722,167 +1749,214 @@ export class SupermemoryPanelService {
    * （tool_memory.workspaceKey）或 scope 推导命中当前工作区；别的工作区的
    * 能力不列出。无 cwd（旧宿主/兼容路径）不过滤。
    */
+  /**
+   * R50: ONE unified list — capability/knowledge (and pending proposals) with
+   * both faces: entry/scope/dry-run/confirm plus version, runCount, loadCount,
+   * loads-to-runs conversion, success rate and the last status.
+   */
   listTools(cwd?: string): ToolView[] {
     const workspaceKey = cwd ? this.wk(cwd) : undefined
-    // R22 需求③: 能力详情面板需要维护信号，这里与 capabilityHealthOf 同源一次性取齐
-    // （按工具名对齐；序列组合工具没有这些字段）。
-    const health = new Map(capabilityHealthOf(this.store).map((row) => [row.name, row]))
+    const health = new Map(capabilityHealthOf(this.store, workspaceKey).map((row) => [row.id, row]))
     const rows: ToolView[] = []
-    for (const [id, record] of this.store.toolMemory.entries()) {
-      if (record.kind !== 'composite') continue
-      let steps: string[] = []
-      let parameters: string[] = []
-      let name = id
-      let kind: 'sequence' | 'capability' = 'sequence'
-      let entry: string | undefined
-      let doc: string | undefined
-      let scope: string | undefined
-      let runnable: boolean | undefined
-      let dryRunArg: string | undefined
-      let writeConfirm: boolean | undefined
-      let version: number | undefined
-      let routeNote: string | undefined
-      let usage: ToolView["usage"]
-      try {
-        const spec = JSON.parse(record.entry) as {
-          name?: string
-          kind?: 'sequence' | 'capability'
-          steps?: Array<{ tool: string }>
-          parameters?: Array<{ name: string }>
-          entry?: string
-          doc?: string
-          scope?: string
-          runnable?: boolean
-          dryRunArg?: string
-          writeConfirm?: boolean
-          routeNote?: string
-          version?: number
-          usage?: ToolView["usage"]
-        }
-        name = spec.name ?? id
-        kind = spec.kind === 'capability' ? 'capability' : 'sequence'
-        steps = (spec.steps ?? []).map((s) => s.tool)
-        parameters = (spec.parameters ?? []).map((p) => p.name)
-        entry = spec.entry
-        doc = spec.doc
-        scope = spec.scope
-        runnable = spec.runnable
-        dryRunArg = spec.dryRunArg
-        writeConfirm = spec.writeConfirm
-        version = typeof spec.version === 'number' ? spec.version : undefined
-        routeNote = spec.routeNote
-        usage = spec.usage
-      } catch { /* a broken definition still lists with its description */ }
-      // A3: 跨工作区的工具不列出（能力按行级归属/scope 判定；序列无归属=全局）。
-      if (!capabilityAppliesToWorkspace({ scope }, workspaceKey, record.workspaceKey)) continue
-      const healthRow = health.get(name)
+    for (const entry of capabilityRows(this.store, workspaceKey)) {
+      const record = entry.record
+      const h = health.get(entry.id)
+      const name = record.kind === 'capability' ? capabilityToolName(record.name) : ('sm-' + record.name)
       rows.push({
-        id, name,
-        title: record.title || record.description.slice(0, TITLE_MAX),
+        id: entry.id,
+        name,
+        logicalName: record.name,
+        title: record.title,
         tags: record.tags,
         description: record.description,
-        steps, parameters,
-        useCount: record.useCount,
-        status: record.status,
-        live: liveCompositeSpecs.has(name),
-        // R27: 旧行在 tool_memory.createdAt 回填前是 undefined（客户端显示 —）。
-        createdAt: record.createdAt,
-        kind, entry, doc, scope, runnable, dryRunArg, writeConfirm,
-        ...(routeNote ? { routeNote } : {}),
-        ...(healthRow
-          ? {
-              builtin: healthRow.builtin,
-              ...(healthRow.builtinVersion !== undefined ? { builtinVersion: healthRow.builtinVersion } : {}),
-              scopeMissing: healthRow.scopeMissing,
-              docMissing: healthRow.docMissing,
-              notes: healthRow.notes,
-            }
-          : {}),
-        ...(version !== undefined ? { version } : {}),
-        ...(usage ? { usage } : {}),
+        steps: [],
+        parameters: [],
+        useCount: record.runCount,
+        status: entry.row.status,
+        live: liveCapabilityToolNames.has(name),
+        createdAt: entry.row.createdAt,
+        kind: record.kind,
+        entry: record.entry,
+        doc: record.doc,
+        scope: record.scope,
+        runnable: record.runnable !== false,
+        dryRunArg: record.dryRunArg,
+        writeConfirm: record.writeConfirm,
+        entryDraft: record.entryDraft,
+        entryVerified: record.entryVerified,
+        enabled: record.enabled !== false,
+        loadCount: record.loadCount,
+        runCount: record.runCount,
+        loadsToRuns: h?.loadsToRuns ?? (record.loadCount > 0 ? record.runCount / record.loadCount : 0),
+        successRate: h?.successRate ?? (record.runCount > 0 ? record.successCount / record.runCount : 0),
+        successCount: record.successCount,
+        failCount: record.failCount,
+        consecutiveFailures: record.consecutiveFailures,
+        ...(record.lastStatus ? { lastStatus: record.lastStatus } : {}),
+        ...(record.lastUsedAt !== undefined ? { lastUsedAt: record.lastUsedAt } : {}),
+        ...(record.lastDryRun !== undefined ? { lastDryRun: record.lastDryRun } : {}),
+        ...(record.lastSummary ? { lastSummary: record.lastSummary } : {}),
+        skillPath: record.skillPath,
+        source: record.source,
+        ...(record.taskKey ? { taskKey: record.taskKey } : {}),
+        routeNote: record.routeNote,
+        builtin: record.builtin,
+        ...(record.builtinVersion !== undefined ? { builtinVersion: record.builtinVersion } : {}),
+        scopeMissing: h?.scopeMissing ?? false,
+        docMissing: h?.docMissing ?? false,
+        notes: h?.notes ?? [],
+        version: record.version,
+        usage: {
+          useCount: record.runCount,
+          successCount: record.successCount,
+          failCount: record.failCount,
+          consecutiveFailures: record.consecutiveFailures,
+          ...(record.lastUsedAt !== undefined ? { lastUsedAt: record.lastUsedAt } : {}),
+          ...(record.lastStatus ? { lastStatus: record.lastStatus } : {}),
+          ...(record.lastDryRun !== undefined ? { lastDryRun: record.lastDryRun } : {}),
+          ...(record.lastExitCode !== undefined ? { lastExitCode: record.lastExitCode } : {}),
+          ...(record.lastSummary ? { lastSummary: record.lastSummary } : {}),
+        },
+        ...(record.kind === 'proposal' ? { proposalStatus: record.proposalStatus } : {}),
+        ...(record.expiresAt !== undefined ? { expiresAt: record.expiresAt } : {}),
       })
     }
-    rows.sort((a, b) => a.name.localeCompare(b.name))
+    rows.sort((left, right) => left.name.localeCompare(right.name))
     return rows
   }
 
-  /** R6: edit one composite tool (description / steps / parameters / status). */
+  /** R50: pending auto proposals (accepted/rejected through the panel). */
+  listProposals(cwd?: string): ToolView[] {
+    return this.listTools(cwd).filter((tool) => tool.kind === 'proposal' && tool.proposalStatus === 'pending')
+  }
+
+  /** R50: accept a pending proposal -> a capability (knowledge, or entryDraft pending verification). */
+  async acceptProposal(_cwd: string, id: string): Promise<MutationResult> {
+    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法接受提案。' }
+    const result = await acceptCapabilityProposal(this.ctx, this.store, id)
+    return result.status === 'ok'
+      ? { status: 'ok', message: result.message, ...(result.id ? { id: result.id } : {}) }
+      : { status: 'error', message: result.message }
+  }
+
+  /** R50: decline a pending proposal (kept for audit, never re-proposed). */
+  async declineProposal(_cwd: string, id: string): Promise<MutationResult> {
+    const result = await declineCapabilityProposal(this.store, id)
+    return result.status === 'ok' ? { status: 'ok', message: result.message } : { status: 'error', message: result.message }
+  }
+
+  /** R50: enable an auto-drafted entry (human gate; becomes runnable + verified). */
+  async enableCapabilityEntry(id: string): Promise<MutationResult> {
+    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法启用执行。' }
+    const result = await enableCapabilityEntryDraft(this.ctx, this.store, id)
+    return result.status === 'ok' ? { status: 'ok', message: result.message } : { status: 'error', message: result.message }
+  }
+
+  /** R6/R50: edit one capability (definition, both faces, enabled/disabled). */
   async editTool(id: string, patch: {
     title?: string
     tags?: string[]
     description?: string
+    entry?: string
+    doc?: string
+    scope?: string
+    runnable?: boolean
+    dryRunArg?: string
+    writeConfirm?: boolean
+    routeNote?: string
+    status?: string
+    enabled?: boolean
+    body?: string
+    changelog?: string
     steps?: Array<{ tool: string; arguments: Record<string, unknown> }>
     parameters?: Array<{ name: string; step: number; key: string; description: string }>
-    status?: string
   }): Promise<MutationResult> {
-    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法修改工具。' }
-    return editCompositeTool(this.ctx, this.store, id, patch)
+    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法修改能力。' }
+    const current = capabilityRows(this.store).find((entry) => entry.id === id)
+    if (!current) return { status: 'error', message: '能力不存在。' }
+    // "启用执行" from the panel passes the drafted entry; the capability module
+    // marks entryVerified=true only through this explicit human action.
+    if (typeof patch.body === 'string') {
+      const bodyResult = await updateCapabilitySkillBody(this.store, id, patch.body)
+      if (bodyResult.status === 'error') return { status: 'error', message: bodyResult.message }
+      return { status: 'ok', message: bodyResult.message, id }
+    }
+    const result = await editCapability(this.ctx, this.store, id, patch)
+    return result.status === 'ok' ? { status: 'ok', message: result.message, id } : { status: 'error', message: result.message }
   }
 
-  /**
-   * R6+: delete one composite tool for good (unregister + durable row + the
-   * sequence signal that created it). The panel's delete button; a retired
-   * tool is deleted the same way.
-   */
+  /** R6+/R50: delete one capability (knowledge face archived, never hard-deleted). */
   async deleteTool(id: string): Promise<MutationResult> {
-    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法删除工具。' }
-    return deleteCompositeTool(this.ctx, this.store, id)
+    if (!this.ctx) return { status: 'error', message: '宿主上下文不可用，无法删除能力。' }
+    const result = await deleteCapability(this.ctx, this.store, id)
+    return result.status === 'ok' ? { status: 'ok', message: result.message, id } : { status: 'error', message: result.message }
   }
 
-  /**
-   * R45: 已生成的 skills（设置页签）：名称/路由描述/版本/加载次数/启用状态。
-   * 文件是事实来源，重启后仍在；宿主 skill 目录会自动发现它们。
-   */
+  /** R45/R50: knowledge-face snapshot (kept for the old skills surface/tests). */
   listSkills(cwd: string): SkillView[] {
-    return listSkillViews(this.store, this.wk(cwd), resolveSkillRoot(cwd))
+    const workspaceKey = this.wk(cwd)
+    return capabilityRows(this.store, workspaceKey)
+      .filter((entry) => entry.record.kind !== 'proposal')
+      .map((entry) => {
+        const record = entry.record
+        let updatedAt = record.updatedAt
+        try {
+          if (record.skillPath) {
+            const parsed = readFileSync(record.skillPath, 'utf8')
+            void parsed
+          }
+        } catch { /* missing file keeps the row value */ }
+        return {
+          name: capabilitySkillName(record.name),
+          title: record.title,
+          description: record.description,
+          ...(record.scope ? { whenToUse: '在 ' + record.scope + ' 内遇到「' + record.title + '」类任务时加载。' } : {}),
+          version: record.version,
+          useCount: record.loadCount,
+          enabled: record.enabled !== false,
+          status: entry.row.status === 'retired' ? 'retired' : 'active',
+          path: record.skillPath,
+          ...(record.source ? { source: record.source } : {}),
+          occurrences: 1,
+          updatedAt,
+          changelog: record.changelog,
+        } as SkillView
+      })
+      .sort((left, right) => left.name.localeCompare(right.name))
   }
 
-  /**
-   * R45: 启用/停用或修改 skill 的路由描述。写文件（升版 + changelog），不碰正文。
-   */
+  /** R45/R50: enable/disable or change the routing description of one capability. */
   async updateSkill(cwd: string, name: string, patch: { enabled?: boolean; description?: string }): Promise<MutationResult> {
     const workspaceKey = this.wk(cwd)
-    const scope = resolveSkillRoot(cwd)
     const trimmed = String(name ?? '').trim()
-    if (!trimmed) return { status: 'error', message: '缺少 skill 名。' }
+    if (!trimmed) return { status: 'error', message: '缺少能力名。' }
+    const logical = trimmed.replace(/^sm-|^sm_cap_/, '').replace(/_/g, '-')
+    const entry = capabilityRows(this.store, workspaceKey).find((candidate) =>
+      candidate.record.name === logical || capabilitySkillName(candidate.record.name) === trimmed || capabilityToolName(candidate.record.name) === trimmed)
+    if (!entry) return { status: 'error', message: '找不到该能力：' + trimmed }
     if (typeof patch?.description === 'string') {
-      const result = await updateSkillDescription(this.store, workspaceKey, scope, trimmed, patch.description)
+      const result = await editCapability(this.ctx, this.store, entry.id, { description: patch.description, changelog: '更新路由描述' })
       if (result.status === 'error') return { status: 'error', message: result.message }
     }
     if (typeof patch?.enabled === 'boolean') {
-      const result = await setSkillEnabled(this.store, workspaceKey, scope, trimmed, patch.enabled)
+      const result = await setCapabilityEnabled(this.ctx, this.store, entry.id, patch.enabled)
       if (result.status === 'error') return { status: 'error', message: result.message }
     }
-    return { status: 'ok', message: '已更新 skill（文件已升版，changelog 已保留）。' }
+    return { status: 'ok', message: '已更新能力（知识面与执行面已同步，事实块已刷新）。' }
   }
 
   /**
-   * R22: run one capability tool (its entry command inside its scope directory).
-   * Dry-run is the default (dryRunArg appended); a writeConfirm capability
-   * refuses a real run without an explicit confirm and answers
-   * status 'needs-confirm' WITHOUT executing anything.
+   * R22/R50: run one capability (fixed entry inside its scope). Dry-run is the
+   * default; a writeConfirm capability refuses a real run without an explicit
+   * confirm and answers status 'needs-confirm' WITHOUT executing.
    */
   async runTool(id: string, options: { dryRun?: boolean; confirm?: boolean } = {}): Promise<CapabilityRunResult> {
-    const record = this.store.toolMemory.get(id)
-    if (!record || record.kind !== 'composite' || !record.entry) {
-      return { status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '', summary: '组合工具不存在。' }
+    const parsed = capabilityRows(this.store).find((entry) => entry.id === id)
+    if (!parsed) {
+      return { status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '', summary: '能力不存在。' }
     }
-    let spec: CompositeSpec
-    try {
-      spec = JSON.parse(record.entry) as CompositeSpec
-    } catch {
-      return { status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '', summary: '工具定义损坏，无法执行。' }
-    }
-    if (spec.kind !== 'capability' || !spec.entry) {
-      return {
-        status: 'failed', stdout: '', stderr: '', durationMs: 0, dryRun: Boolean(options.dryRun), command: '',
-        summary: '只有能力（capability）可以一键执行；序列组合工具请直接调用它。',
-      }
-    }
-    const result = runCapability(spec, { dryRun: options.dryRun, confirm: options.confirm })
-    // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
-    // R26 收尾：传入 result，面板执行也记成败明细/最近一次结果。
-    if (result.status !== 'needs-confirm') void bumpCompositeUse(this.store, spec.name, result)
+    const result = runCapability(parsed.record, { dryRun: options.dryRun, confirm: options.confirm })
+    if (result.status !== 'needs-confirm') await bumpCapabilityRun(this.store, id, result)
     return result
   }
 
@@ -2265,6 +2339,27 @@ const PANEL_DESCRIPTORS = Object.freeze([
     invocation: { kind: 'direct' },
     result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
     parameters: [
+      { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R50: 接受/拒绝待处理提案（接受 -> 能力；入口草稿仍需「启用执行」）。
+    id: 'dsh-supermemory#supermemoryPanel/acceptProposal',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'acceptProposal',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    id: 'dsh-supermemory#supermemoryPanel/declineProposal',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'declineProposal',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
       { name: 'id', wire: 'id', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Id', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },

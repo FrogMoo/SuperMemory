@@ -293,7 +293,7 @@ async function runMemory(
 }
 
 const HELP = 'status 状态总览 · topicsets 话题集列表 · switch <名> 激活 · new <标题> 新建 · '
-  + 'model 模型管理 · tools 组合工具 · reqs 需求 · resume 续跑中断任务 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
+  + 'model 模型管理 · tools 能力（知识面 + 执行面） · reqs 需求 · resume 续跑中断任务 · wrap 更新梗概 · scan/export（P2） · ui 可视化管理台（Plan A）\n'
   + 'merge：存量话题集合并治理（相似簇→主集，源集 archived 不删）。/memory-merge 预览清单（dry-run 不写库）；/memory-merge apply 执行；\n'
   + '  --rename <标题>：同时把「已有主集」簇的目标集改名（dry-run 预览即最终形态；存在多个已有主集簇时请分批或用管理台）。\n'
   + 'organize：记忆集合整理（集合重排 / 合并近重复 / 清理占位）。/memory-organize 查看整理后状态；/memory-organize preview 预演不写库；apply 手动重跑；启动时已标记守卫自动执行一次。\n'
@@ -302,7 +302,7 @@ const HELP = 'status 状态总览 · topicsets 话题集列表 · switch <名> �
   + '快捷方式：每个子命令都是独立命令，输入 /memory 后可在列表里直接选择'
   + '（如 /memory-ui、/memory-status、/memory-topicsets）；也可用 /memory <子命令> <参数>。'
 
-/** R6: /memory tools — list / edit / describe / retire composite tools. */
+/** R6/R50: /memory tools — list / edit / describe / enable / retire capabilities. */
 async function toolsCommand(deps: CommandsDeps, arg: string): Promise<Result> {
   const store = deps.store
   if (!store) return { kind: 'error', text: 'SuperMemory 存储域未打开，记忆功能不可用。' }
@@ -313,20 +313,21 @@ async function toolsCommand(deps: CommandsDeps, arg: string): Promise<Result> {
   if (!verb) {
     const rows = service.listTools()
     if (rows.length === 0) {
-      return { kind: 'success', text: '（暂无组合工具；R49 起自动路径不再生成组合工具，可用 memory_toolize accept 接受有业务对象的待处理提议，或用 memory_toolize register 登记能力）' }
+      return { kind: 'success', text: '（暂无能力；R50 起自动路径只生成待接受的知识提案。用 memory_toolize register 登记能力，或 accept 接受提案）' }
     }
     const lines = rows.map((row) => [
-      `- ${row.name}（${row.status}${row.live ? '' : '，未注册'}，使用 ${row.useCount} 次）`,
+      `- ${row.name}（${row.status}${row.live ? '' : '，未注册'}，执行 ${row.useCount} 次 / 加载 ${row.loadCount ?? 0} 次，转化率 ${row.loadsToRuns ?? 0}）`,
       `  简介：${row.description || '（无）'}`,
-      `  步骤：${row.steps.join(' → ') || '（无）'}`,
-      row.parameters.length > 0 ? `  参数：${row.parameters.join('、')}` : '  参数：（无）',
+      row.entry ? `  入口：${row.entry}${row.dryRunArg ? `（默认预演 ${row.dryRunArg}）` : ''}` : '  入口：（仅知识）',
+      row.entryDraft ? `  入口草稿（未验证）：${row.entryDraft}` : '',
+      `  知识面：${row.skillPath || '（无）'}`,
       `  id=${row.id}`,
-    ].join('\n'))
+    ].filter(Boolean).join('\n'))
     return {
       kind: 'success',
-      text: ['组合工具（自行生成，可编辑）：', ...lines,
+      text: ['能力（知识面 + 执行面，可编辑）：', ...lines,
         '',
-        '编辑：/memory tools edit <id> {"description":"…","steps":[{"tool":"…","arguments":{}}],"parameters":[…]}',
+        '编辑：/memory tools edit <id> {"description":"…","body":"…"}',
         '改简介：/memory tools desc <id> <文本> · 停用：/memory tools retire <id>'].join('\n'),
     }
   }

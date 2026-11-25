@@ -88,6 +88,9 @@ export const PANEL_REMOTE = Object.freeze({
     method('deleteTool', [param('id')]),
     // R22: 一键执行能力（默认预演；writeConfirm 能力需 options.confirm=true）。
     method('runTool', [param('id'), param('options', true)]),
+    // R50: 待处理提案的接受/拒绝（接受 -> 能力；入口草稿仍需「启用执行」）。
+    method('acceptProposal', [param('cwd'), param('id')]),
+    method('declineProposal', [param('cwd'), param('id')]),
     method('sessionBadge', [param('sessionId')]),
   ]),
 })

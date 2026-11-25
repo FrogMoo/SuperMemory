@@ -663,13 +663,42 @@ function renderHubs(d) {
     + `<div class="body">${body}</div></div>`
 }
 
-/** R22: 解析一条 toolMemory 记录的能力定义；非能力返回 null。 */
+/** R22/R50: 解析一条 toolMemory 记录的统一能力定义；历史序列返回 null。 */
 function capabilitySpecOf(t) {
   try {
     const spec = JSON.parse(t.entry || '')
-    return (spec && spec.kind === 'capability' && spec.entry) ? spec : null
+    if (!spec || typeof spec !== 'object') return null
+    if (spec.schema === 'sm.capability/1') return spec
+    if (spec.kind === 'capability' && spec.entry) return spec
+    return null
   } catch { return null }
 }
+
+/** R50: 提案卡片（待接受的知识草稿；入口草稿未验证）。 */
+function proposalCard(t, spec) {
+  const expires = spec.expiresAt ? `<span class="muted">过期</span> ${fmtTime(spec.expiresAt)}` : ''
+  return `
+    <div class="list-card">
+      <div class="list-card-head">
+        <b>${esc(t.title || spec.name)}</b>
+        <span class="badge info">提案</span> ${badge(t.status)}
+        <span class="grow"></span>
+        <span class="muted">仅知识（不占 8 个上限）</span>
+      </div>
+      <div class="row-meta">${kwHtml(t.tags) || '<span class="muted">（无标签）</span>'}</div>
+      <div class="list-card-body">${esc(spec.description || t.description || '—')}</div>
+      <div class="row-meta">
+        ${spec.entryDraft ? `<span class="muted">入口草稿（未验证）</span> <code>${esc(spec.entryDraft)}</code>` : '<span class="muted">入口：暂无（接受后为仅知识能力）</span>'}
+        ${expires}
+      </div>
+      <div class="row-actions">
+        <button class="btn small primary" type="button" data-action="proposal-accept" data-id="${t.id}">接受提案</button>
+        <button class="btn small" type="button" data-action="proposal-decline" data-id="${t.id}">拒绝</button>
+        <button class="btn small danger" type="button" data-action="tool-del" data-id="${t.id}">删除</button>
+      </div>
+    </div>`
+}
+
 
 /** R18: 序列组合工具卡片（自动固化的工具序列，保持原样）。 */
 function sequenceCard(t) {
@@ -698,43 +727,54 @@ function capUsageLine(usage) {
   return `<div class="row-meta"><span class="muted">最近执行</span> ${ok ? '成功' : '失败'}${dry} · exit ${exit} · ${fmtTime(usage.lastUsedAt)} · 成功 ${usage.successCount || 0}/失败 ${usage.failCount || 0}${fail}</div>`
 }
 
-/** R22: 能力卡片 — 入口命令（可复制）/适用范围/文档/预演参数 + 运行/确认执行/启停/删除。 */
+/** R50: 统一能力卡片（知识面 + 执行面；执行/加载/转化率/成功率）。 */
 function capabilityCard(t, spec) {
-  // 写操作能力若没定义预演参数，预演无从谈起（避免把真实命令当预演跑掉）。
   const canDryRun = !(spec.writeConfirm && !spec.dryRunArg)
+  const runCount = spec.runCount === undefined ? (t.runCount ?? t.useCount ?? 0) : spec.runCount
+  const loadCount = spec.loadCount === undefined ? (t.loadCount ?? 0) : spec.loadCount
+  const conversion = loadCount > 0 ? Math.round((runCount / loadCount) * 100) / 100 : 0
+  const successRate = runCount > 0 ? Math.round(((spec.successCount || 0) / runCount) * 100) / 100 : 0
+  const knowledgeOnly = spec.kind === 'knowledge' || !spec.entry
+  const draft = spec.entryDraft && !spec.entryVerified
   return `
     <div class="list-card">
       <div class="list-card-head">
         <b>${esc(t.title || spec.name)}</b>
-        <span class="badge info">能力</span> ${badge(t.status)}
+        <span class="badge info">${knowledgeOnly ? '仅知识' : '可执行'}</span>
+        ${badge(t.status)}
+        ${spec.source === 'auto' ? '<span class="badge">自动</span>' : ''}
+        ${draft ? '<span class="badge warn">入口草稿未验证</span>' : ''}
         ${spec.writeConfirm ? '<span class="badge warn">写操作需确认</span>' : ''}
-        ${spec.runnable === false ? '<span class="badge danger">未开放执行</span>' : ''}
-        ${typeof spec.version === 'number' ? `<span class="badge" title="能力定义版本（register 同名更新 +1）">v${spec.version}</span>` : ''}
+        ${typeof spec.version === 'number' ? `<span class="badge" title="能力版本">v${spec.version}</span>` : ''}
         <span class="grow"></span>
-        <span class="muted">使用 ${t.useCount} 次</span>
+        <span class="muted">执行 ${runCount} · 加载 ${loadCount} · 转化率 ${conversion} · 成功率 ${successRate}</span>
       </div>
       <div class="row-meta">${kwHtml(t.tags) || '<span class="muted">（无标签）</span>'}</div>
-      <div class="list-card-body">${esc(t.description || '—')}</div>
+      <div class="list-card-body">${esc(spec.description || t.description || '—')}</div>
       <div class="row-meta">
-        <span class="muted">入口</span> <code>${esc(spec.entry)}</code>
-        <button class="btn small" type="button" data-action="cap-copy" data-text="${esc(spec.entry)}">复制</button>
+        <span class="muted">入口</span> ${spec.entry ? `<code>${esc(spec.entry)}</code>` : '<span class="muted">（仅知识，无执行面）</span>'}
+        ${spec.entry ? `<button class="btn small" type="button" data-action="cap-copy" data-text="${esc(spec.entry)}">复制</button>` : ''}
         ${spec.dryRunArg ? `<span class="muted">预演参数</span> <code>${esc(spec.dryRunArg)}</code>` : ''}
       </div>
+      ${draft ? `<div class="row-meta"><span class="muted">入口草稿（未验证）</span> <code>${esc(spec.entryDraft)}</code></div>` : ''}
       <div class="row-meta">
         <span class="muted">适用范围</span> <code>${esc(spec.scope || '当前目录')}</code>
         ${spec.doc ? `<span class="muted">文档</span> <code>${esc(spec.doc)}</code>` : ''}
+        ${spec.skillPath ? `<span class="muted">知识面</span> <code>${esc(spec.skillPath)}</code>` : ''}
       </div>
-      ${capUsageLine(spec.usage)}
+      ${capUsageLine(spec.usage || { lastStatus: spec.lastStatus, lastDryRun: spec.lastDryRun, lastExitCode: spec.lastExitCode, lastUsedAt: spec.lastUsedAt, successCount: spec.successCount, failCount: spec.failCount, consecutiveFailures: spec.consecutiveFailures })}
       <div class="row-actions">
-        <button class="btn small primary" type="button" data-action="cap-run" data-id="${t.id}"${canDryRun ? '' : ' disabled title="该能力未定义预演参数，无法预演；请用确认执行"'}>运行（预演）</button>
-        ${spec.writeConfirm ? `<button class="btn small danger" type="button" data-action="cap-run-confirm" data-id="${t.id}">确认执行</button>` : ''}
+        ${spec.entry ? `<button class="btn small primary" type="button" data-action="cap-run" data-id="${t.id}"${canDryRun ? '' : ' disabled title="该能力未定义预演参数，无法预演；请用确认执行"'}>预演执行</button>` : ''}
+        ${spec.entry && spec.writeConfirm ? `<button class="btn small danger" type="button" data-action="cap-run-confirm" data-id="${t.id}">确认执行</button>` : ''}
+        ${draft ? `<button class="btn small primary" type="button" data-action="cap-enable-entry" data-id="${t.id}">启用执行</button>` : ''}
         ${t.status === 'active'
           ? `<button class="btn small" type="button" data-action="tool-status" data-id="${t.id}" data-status="retired">停用</button>`
           : `<button class="btn small" type="button" data-action="tool-status" data-id="${t.id}" data-status="active">启用</button>`}
-        <button class="btn small danger" type="button" data-action="tool-del" data-id="${t.id}">删除</button>
+        <button class="btn small danger" type="button" data-action="tool-del" data-id="${t.id}">删除（归档知识面）</button>
       </div>
     </div>`
 }
+
 
 /** R22: 能力执行结果弹窗（stdout/stderr + 退出码 + 耗时）。 */
 function capRunModal() {
@@ -775,30 +815,35 @@ function capConfirmModal() {
   </div>`
 }
 
-/** R18+R22: 组合工具页签 — 能力（可一键执行）与序列组合工具（自动固化）两类卡片。 */
+/** R18+R22+R50: 能力页签 — 提案 / 可执行能力 / 仅知识能力 / 历史序列（已退役）。 */
 function renderTools(d) {
-  const seqs = []
-  const caps = []
+  const proposals = []
+  const units = []
+  const legacy = []
   for (const t of d.toolMemory || []) {
     const spec = capabilitySpecOf(t)
-    if (spec) caps.push([t, spec])
-    else seqs.push(t)
+    if (!spec) { legacy.push(t); continue }
+    if (spec.kind === 'proposal') proposals.push([t, spec])
+    else units.push([t, spec])
   }
-  if (!seqs.length && !caps.length) {
-    return '<div class="panel"><header>固化能力</header><div class="body"><div class="empty">'
-      + '暂无固化能力：可手动注册（入口命令 + 文档 + 适用范围，一键执行，默认预演，写操作需确认）；'
-      + '重复流程出现 3 次后也会自动提议固化为序列（一次调用完成确定性子序列）。'
+  if (!proposals.length && !units.length && !legacy.length) {
+    return '<div class="panel"><header>能力（知识面 + 执行面）</header><div class="body"><div class="empty">'
+      + '暂无能力：重复任务出现 3 次会先产生待接受的知识提案；接受后才创建能力并占用每根 8 个自动上限。'
+      + '也可以手动注册：给入口命令=可执行能力，不给入口=仅知识能力。'
       + '</div></div></div>'
   }
-  const capPanel = `<div class="panel"><header>能力（可一键执行） <span class="badge info">${caps.length}</span></header><div class="body">`
-    + (caps.length
-      ? `<div class="card-list">${caps.map(([t, spec]) => capabilityCard(t, spec)).join('')}</div>`
+  const proposalPanel = proposals.length
+    ? `<div class="panel"><header>待接受提案 <span class="badge info">${proposals.length}</span><span class="muted">知识草稿，不占自动上限</span></header><div class="body"><div class="card-list">${proposals.map(([t, spec]) => proposalCard(t, spec)).join('')}</div></div></div>`
+    : ''
+  const unitPanel = `<div class="panel"><header>能力（知识面 + 执行面） <span class="badge info">${units.length}</span></header><div class="body">`
+    + (units.length
+      ? `<div class="card-list">${units.map(([t, spec]) => capabilityCard(t, spec)).join('')}</div>`
       : '<div class="empty">还没有能力。用 memory_toolize register 注册，或在下面表单录入（首个样板：git 同步/提交/推送）。</div>')
-    + `<details id="cap-form" style="margin-top:10px"${state.capOpen ? " open" : ""}><summary>注册新能力</summary>
+    + `<details id="cap-form" style="margin-top:10px"${state.capOpen ? " open" : ""}><summary>注册新能力（有入口=可执行；无入口=仅知识）</summary>
       <form data-form="cap-create" class="form-inline">
         <input type="text" name="name" placeholder="能力名（git-sync-supermemory）" required style="flex:0 0 220px">
         <input type="text" name="title" placeholder="标题" style="flex:1;min-width:160px">
-        <input type="text" name="entry" placeholder="入口命令（pnpm git:sync）" required style="flex:1;min-width:220px">
+        <input type="text" name="entry" placeholder="入口命令（pnpm git:sync；留空=仅知识）" style="flex:1;min-width:220px">
         <input type="text" name="scope" placeholder="适用范围目录（仓库根，通常留空=全局）" style="flex:1;min-width:200px">
         <input type="text" name="doc" placeholder="文档路径（docs/git-sync.md）" style="flex:1;min-width:200px">
         <input type="text" name="dryRunArg" placeholder="预演参数（--dry-run）" style="flex:0 0 160px">
@@ -806,15 +851,16 @@ function renderTools(d) {
         <label class="muted"><input type="checkbox" name="writeConfirm" checked> 写操作需确认</label>
         <label class="muted"><input type="checkbox" name="runnable" checked> 可执行</label>
         <textarea name="description" placeholder="描述 + 路由：何时优先用本能力、关键坑是什么（模型据此路由）" style="min-height:56px;width:100%"></textarea>
+        <textarea name="body" placeholder="知识面正文（可选；留空生成六节骨架。事实块由插件维护，块外散文保留）" style="min-height:70px;width:100%"></textarea>
         <button class="btn primary" type="submit">注册能力</button>
       </form>
     </details></div></div>`
-  const seqPanel = seqs.length
-    ? `<div class="panel"><header>自动固化序列（重复流程的附带产物） <span class="badge info">${seqs.length}</span></header>`
-      + `<div class="body"><div class="card-list">${seqs.map(sequenceCard).join('')}</div></div></div>`
+  const legacyPanel = legacy.length
+    ? `<div class="panel"><header>历史工具序列（已退役，仅审计） <span class="badge info">${legacy.length}</span></header><div class="body"><div class="card-list">${legacy.map(sequenceCard).join('')}</div></div></div>`
     : ''
-  return capPanel + seqPanel
+  return proposalPanel + unitPanel + legacyPanel
 }
+
 
 /** R18: 信号 — repeated-flow candidates, as cards. */
 function renderSignals(d) {
@@ -999,8 +1045,23 @@ document.addEventListener('click', async (ev) => {
       await loadState()
     }); return
     case 'tool-del':
-      if (!confirm('删除该固化能力/自动固化序列不可恢复，确定？')) return
-      await run(async () => { await post('/tool/delete', { ws: state.ws, id }); toast('已删除'); await loadState() }); return
+      if (!confirm('删除该能力会归档知识面目录（不硬删，可在 <skills 根>-archive 回滚），确定？')) return
+      await run(async () => { const r = await post('/tool/delete', { ws: state.ws, id }); toast(r.message || '已删除'); await loadState() }); return
+    case 'proposal-accept': await run(async () => {
+      const r = await post('/proposal/accept', { ws: state.ws, id })
+      toast(r.message || '已接受提案')
+      await loadState()
+    }); return
+    case 'proposal-decline': await run(async () => {
+      const r = await post('/proposal/decline', { ws: state.ws, id })
+      toast(r.message || '已拒绝提案')
+      await loadState()
+    }); return
+    case 'cap-enable-entry': await run(async () => {
+      const r = await post('/tool/enable-entry', { ws: state.ws, id })
+      toast(r.message || '已启用执行')
+      await loadState()
+    }); return
     case 'cap-copy': {
       const copyText = btn.dataset.text || ''
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -1107,17 +1168,17 @@ document.addEventListener('submit', async (ev) => {
       await api('/requirement/create', { method: 'POST', body: { ws: state.ws, text, topicSetId: val('topicSetId') } })
       toast('需求已添加')
     } else if (kind === 'cap-create') {
-      // R22: 注册一个能力（入口命令 + 文档 + 适用范围，可一键执行，默认预演）。
+      // R50: 注册统一能力——有入口=可执行；无入口=仅知识（六节 SKILL.md + 事实块）。
       const name = val('name')
       const entry = val('entry')
       const description = val('description')
-      if (!name || !entry || !description) { toast('能力名、入口命令、描述为必填'); return }
+      if (!name || !description) { toast('能力名、描述为必填（入口留空=仅知识）'); return }
       await api('/tool/register', { method: 'POST', body: {
         ws: state.ws, name, title: val('title'), entry, scope: val('scope'), doc: val('doc'),
-        dryRunArg: val('dryRunArg'), tags: val('tags'), description,
+        dryRunArg: val('dryRunArg'), tags: val('tags'), description, body: val('body'),
         writeConfirm: fd.get('writeConfirm') === 'on', runnable: fd.get('runnable') === 'on',
       } })
-      toast('能力已注册')
+      toast(entry ? '能力已注册（知识面 + 执行面）' : '仅知识能力已注册')
     }
     form.reset()
     await loadState()

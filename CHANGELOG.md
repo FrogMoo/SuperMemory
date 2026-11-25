@@ -4,6 +4,26 @@
 
 ## [Unreleased]
 
+R50（2026-11-26）统一能力轮：把「固化能力」与「自动生成的 skill」合并为单一 Capability（知识面 SKILL.md + 执行面 sm_cap_<name>），彻底删除组合工具机制（不再编译/注册/重建 sm_composite_*，不再有自动 accept 编译工具）。本轮不发布、不打 tag、不升版本（v1.3.0 由 R51 发布轮做）。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 变更（行为）
+
+- 单一能力模型：tool_memory 记录 kind: capability | knowledge | proposal。旧 kind='composite' + spec.kind='capability' 惰性迁移为 capability 并改名 sm_composite_<x> → sm_cap_<x>；旧 kind='skill' 行转 knowledge（entry 为空）；旧工具序列行退役（不再注册，仅审计）。迁移幂等，启动时自动执行。
+- 执行面契约：每个可执行能力只注册一个工具 sm_cap_<name>，入参只有 dry_run / confirm（固定入口，不接受任意参数透传）；scope 外拒绝；默认预演（dryRunArg）；writeConfirm 必须 confirm=true；超时 120s、输出 8k 截断；执行后累计 runCount/success/fail/consecutiveFailures/lastStatus，连续失败提示更新事实块/文档。
+- 知识面事实源：SKILL.md 为正文事实源；自动维护只替换 <!-- sm:facts:start --> … <!-- sm:facts:end --> 事实块（入口、scope、预演参数、验证命令、涉及文件、失败坑），块外人工散文一律保留；无标记手工 skill 首次只追加事实块；bodyHash/factsHash 入库，检测到人工编辑时走 preserved（只刷事实块、升版并在 changelog 记录）。
+- 自动提案只产知识：重复任务（≥3 次、≥2 会话、30 天窗口、相似度≥0.85 丢弃）写 kind='proposal' 待接受草稿（pending 上限 20、30 天过期，不占每根 8 个自动上限）；接受时才创建能力并占用额度。高置信入口规则（规范化命令 ≥3 样本、≥2 会话、全部 exit 0、非交互、允许命令家族、无占位符/临时路径、scope=仓库根）只写 entryDraft（verified:false，永不自动执行），人工在面板「启用执行」后才 runnable=true 并注册工具。
+- 面板合并：能力列表与 skill 列表合并为单一列表（可执行/仅知识/自动/入口待验证徽标；执行次数、加载次数、转化率、成功率、最后状态；预演执行/启停/启用执行/查看知识面/改描述/删除归档）；提案单独可见可接受/拒绝。
+- 统计与转化率：skill 工具加载 sm-* 计 loadCount，执行面计 runCount；面板与 memory_toolize 输出 loadsToRuns 转化率与成功率。
+- memory_toolize：accept 只接提案；register 给 entry 产可执行能力、不给则仅知识；enabled 同时启停两个面；cleanup 退役历史序列行/清空 pending/清理宽泛信号/归档壳子 skill；返回保留 capabilities/skills 旧字段并新增统一 units、提案与退役计数。
+
+### 工程
+
+- 新增 src/capability.ts（迁移、统一记录、执行面、事实块同步、提案、高置信入口、重建/健康度）；删除 src/composite.ts。
+- 新增事实块合并与能力知识面生成（src/skill-forge.ts：bodyHash/factsHash、sm-body-hash/sm-facts-hash frontmatter、upsertCapabilitySkill、归档而非删除）。
+- 宿主/客户端 descriptor 同步（acceptProposal/declineProposal、runTool 客户端接线）；Web 管理台能力页合并为提案/能力/历史序列三段。
+- 冒烟：capability-smoke 重写为 R50-1..9（迁移、sm_cap_ 注册与 dry_run/confirm 闸门、scope 外拒绝、事实块与人工编辑、统计/转化率、内置、提案与 entryDraft、上限/过期、归档删除）；skill-smoke 增补 R50-S12/S14/S15 与 R50-1..3；workspace-scope 重写为 R50 W1–W6；webui/mechanism 断言跟随统一能力。
+- 兼容性：存储域 version 1 不变；旧行惰性迁移、可回滚（知识面归档在 <skills 根>-archive，manifest 记录原名/时间/原因）；旧 sm_composite_* 名称只在读取历史记录时映射，绝不回注册。
+
 R49（2026-11-26）修复轮：彻底关掉「工具序列自动生成组合工具」的自动入口，组合工具只能由用户显式 `memory_toolize accept` / `register` 产生；存量自动壳子与 pending 一次性清理（幂等）。全量闸门（typecheck + 七套冒烟 + build）通过。
 
 ### 修复

@@ -33,7 +33,6 @@ import { matchTopicSets, renderRecallCard, type RecallOptions } from './recall.t
 import './services.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { activeComposites, catalogFor, renderCatalog } from './toolize.ts'
 import { isHubSession, listHubBranches, listTopicSetBranches, renderHubBranchesCard } from './hub-branches.ts'
 
 export interface PreStepConfig {
@@ -187,18 +186,14 @@ export function attachPreStep(
         return decision
       }
       const items = freshItems(recallScoped(activeStore, workspaceKey, query, recallOptions(config)), state, config.repeat)
-      const recent = state.recent.map((entry) => entry.name)
-      const entries = catalogFor(recent, activeComposites(activeStore), undefined, 3)
-      const strong = entries.some((entry) => entry.hits >= 2)
-      const catalog = renderCatalog(entries)
-      // R47: budget-aware repeat card (priority: header > records > catalog >
-      // omission note). The old `clampText(text, …)` hard-sliced the assembled
-      // card; now the renderer itself degrades and says what it left out.
-      const text = renderRepeatCard(items, config.injectStyle, catalog, {
+      // R47/R50: budget-aware repeat card (priority: header > records >
+      // omission note). The old hard slice is replaced by a renderer that
+      // degrades and says what it left out. R50 removed the composite catalog.
+      const text = renderRepeatCard(items, config.injectStyle, '', {
         budget: Math.min(config.maxChars, remainingChars(state, config.repeat)),
         hint: `复取：memory_recall ${clipQueryHint(query)}`,
       })
-      if (!text || (items.length === 0 && !strong)) {
+      if (!text || items.length === 0) {
         commitScan(state, step)
         return decision
       }

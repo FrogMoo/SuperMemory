@@ -309,6 +309,19 @@ function rollSummary(
  * R49: nothing here registers a composite — memory_toolize accept is the only
  * sequence entrance.
  */
+/** Parse one recorded arguments value (events may carry a JSON string). */
+function parseArgs(value: unknown): Record<string, unknown> {
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {}
+    } catch {
+      return {}
+    }
+  }
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
 async function countSequenceSignal(
   store: Store,
   ctx: Context,
@@ -321,20 +334,36 @@ async function countSequenceSignal(
   taskText?: string,
   now: number = Date.now(),
 ): Promise<void> {
-  let tools: string[] = []
+  const tools: string[] = []
   const args: Array<Record<string, unknown>> = []
-  const { parseArgs } = await import('./composite.ts')
+  const successes: boolean[] = []
+  const callIndex = new Map<string, number>()
   try {
     const handle = await ctx.sessionPersistence.open(sessionId, 'read')
     try {
       const { events } = await handle.read(afterSeq + 1)
       for (const event of events) {
         if (event.seq > untilSeq) break
-        if (event.type !== 'tool/call') continue
-        const data = event.data as unknown as { name?: string; arguments?: unknown }
-        if (!data.name) continue
-        tools.push(data.name)
-        args.push(parseArgs(data.arguments))
+        if (event.type === 'tool/call') {
+          const data = event.data as unknown as { name?: string; arguments?: unknown; callId?: string }
+          if (!data.name) continue
+          const index = tools.length
+          tools.push(data.name)
+          args.push(parseArgs(data.arguments))
+          successes.push(false)
+          if (typeof data.callId === 'string') callIndex.set(data.callId, index)
+          continue
+        }
+        if (event.type === 'tool/result') {
+          const data = event.data as unknown as { message?: { callId?: string; isError?: boolean } }
+          const callId = data.message?.callId
+          if (typeof callId !== 'string') continue
+          const index = callIndex.get(callId)
+          if (index === undefined) continue
+          // R50: exit-0 evidence for the auto entry draft. isError absent means
+          // the host reported a normal result.
+          successes[index] = data.message?.isError !== true
+        }
       }
     } finally {
       await handle.close()
@@ -343,7 +372,7 @@ async function countSequenceSignal(
     return // a cold-read failure never breaks maintenance
   }
   if (tools.length < 2) return
-  const { recordTurnSequences, recycleIdleComposites } = await import('./toolize.ts')
+  const { recordTurnSequences, recycleIdleCapabilities } = await import('./toolize.ts')
   const toolize = {
     enabled: config.autoToolize,
     autoSkill: config.autoSkill,
@@ -360,9 +389,10 @@ async function countSequenceSignal(
   await recordTurnSequences(ctx, store, workspaceKey, tools, args, toolize, logger, undefined, {
     sessionId,
     ...(taskText ? { task: taskText } : {}),
+    successes: successes.slice(0, tools.length),
     now,
   })
-  await recycleIdleComposites(ctx, store, toolize, logger)
+  await recycleIdleCapabilities(ctx, store, toolize, logger)
 }
 
 /** Write one fact, skipping exact duplicates within the workspace. */async function rememberFact(

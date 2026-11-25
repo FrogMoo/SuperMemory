@@ -208,8 +208,8 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
   assert.ok(parsed.body.includes('## 决策清单'))
   const row = store.toolMemory.get('ws/ws-s2/skill/' + result.name)
   assert.ok(row, 'tool_memory 镜像行存在')
-  assert.equal(row.kind, 'skill')
-  assert.equal(row.entry, result.path)
+  assert.equal(row.kind, 'knowledge', 'R50 mirror row is a knowledge capability')
+  assert.equal(row.skillPath, result.path)
   assert.equal(row.status, 'active')
   const views = listSkills(store, 'ws-s2', scopeOf(root))
   assert.equal(views.length, 1)
@@ -405,20 +405,22 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
   ok('R45-S11 面板：listSkills 可见、updateSkill 启停/改描述')
 }
 
-// ---- S12 兼容：skill 行不被组合工具注册 ----
+// ---- S12/R50 兼容：历史序列行不注册，知识行只读 ----
 {
   const store = fakeStore()
   const root = tempDir()
   const first = await persistOneTask(store, 'ws-s12', root)
-  const seqSpec = { name: 'sm_composite_read_edit', description: '旧组合工具', steps: [{ tool: 'read', arguments: {} }, { tool: 'edit', arguments: {} }], parameters: [] }
+  const legacy = await import('../src/capability.ts')
   await store.toolMemory.put('tm-seq', {
-    kind: 'composite', entry: JSON.stringify(seqSpec), useCount: 2, status: 'active', title: '', tags: [], description: seqSpec.description, trigger: 'ws/ws-s12/seq/read>edit', workspaceKey: 'ws-s12', createdAt: 1,
+    kind: 'composite', entry: JSON.stringify({ name: 'sm_composite_read_edit', steps: [{ tool: 'read', arguments: {} }, { tool: 'edit', arguments: {} }], parameters: [] }), useCount: 2, status: 'active', title: '', tags: [], description: 'legacy', trigger: 'ws/ws-s12/seq/read>edit', workspaceKey: 'ws-s12', createdAt: 1,
   })
-  const actives = activeComposites(store)
-  assert.equal(actives.length, 1, 'skill 行不得进入组合工具注册')
-  assert.equal(actives[0].spec.name, 'sm_composite_read_edit')
-  assert.ok(store.toolMemory.get('ws/ws-s12/skill/' + first.name), 'skill 行仍在')
-  ok('R45-S12 兼容：kind=skill 行被 activeComposites 忽略，旧 sm_composite_* 照常工作')
+  const rows = legacy.capabilityRows(store, 'ws-s12')
+  assert.ok(rows.some((row) => legacy.capabilitySkillName(row.record.name) === first.name && row.record.kind === 'knowledge'), 'knowledge row is listed as a knowledge capability')
+  assert.ok(!rows.some((row) => row.record.name === 'read-edit'), 'legacy sequence row is not a capability')
+  const retired = await legacy.migrateCapabilities(store, { root })
+  assert.equal(store.toolMemory.get('tm-seq').status, 'retired', 'legacy sequence row retired')
+  assert.ok(retired.retiredComposites >= 1)
+  ok('R50-S12 兼容：历史序列行不注册（惰性迁移退役），知识行作为仅知识能力只读')
 }
 
 // ---- S13 手工登记 ----
@@ -458,15 +460,19 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
   await tick('s1', NOW)
   await tick('s1', NOW + 1)
   assert.equal(listSkills(store, workspaceKeyOf(project), resolveSkillRoot(project)).length, 0, '单会话重复不生成（跨会话阈值）')
+  assert.equal((await import('../src/capability.ts')).pendingProposalsOf(store, workspaceKeyOf(project)).length, 0, '单会话也不产生提案')
   await tick('s2', NOW + 2)
   const views = listSkills(store, workspaceKeyOf(project), resolveSkillRoot(project))
-  assert.equal(views.length, 1, '跨阈值 + 跨会话后生成 1 个 skill: ' + JSON.stringify(views.map((v) => v.name)))
-  assert.equal(views[0].name, 'sm-fix-skill')
-  assert.ok(views[0].path.startsWith(join(project, '.dsh', 'skills')), '落在项目 skill 目录')
-  assert.equal(views[0].version, 1)
+  assert.equal(views.length, 0, 'R50: 自动路径不直接写 SKILL.md')
+  const { pendingProposalsOf, capabilitySkillName } = await import('../src/capability.ts')
+  const pending = pendingProposalsOf(store, workspaceKeyOf(project))
+  assert.equal(pending.length, 1, '跨阈值 + 跨会话后产生 1 个待接受提案')
+  assert.equal(pending[0].record.kind, 'proposal')
+  assert.equal(capabilitySkillName(pending[0].record.name), 'sm-fix-skill', '提案按任务签名命名')
+  assert.equal(pending[0].record.runnable, false, '提案没有执行面')
   await tick('s2', NOW + 3)
-  assert.equal(listSkills(store, workspaceKeyOf(project), resolveSkillRoot(project))[0].version, 1, '再次 tick 不重复升版')
-  ok('R45-S14/R48 接线：recordTurnSequences 跨阈值+跨会话自动生成任务 skill（单会话不生成）')
+  assert.equal(pendingProposalsOf(store, workspaceKeyOf(project)).length, 1, '再次 tick 只刷新同一提案')
+  ok('R50-S14 接线：recordTurnSequences 跨阈值+跨会话只产生知识提案（不写文件、不注册工具、不重复）')
 }
 
 // ---- S15 启动扫尾 ----
@@ -479,15 +485,18 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
       ['ws/' + ws + '/seq/bash>bash>bash', { workspaceKey: ws, pattern: 'bash>bash>bash', count: 100, lastSeen: NOW, examples: [], sequence: ['bash', 'bash', 'bash'], samples: ['{"tools":["bash","bash","bash"],"args":[{},{},{}]}'], sessions: ['s1', 's2'] }],
     ],
   })
-  const { sweepSkillDrafts } = await import('../src/toolize.ts')
+  const { sweepTaskProposals } = await import('../src/toolize.ts')
   const config = { enabled: false, autoSkill: true, threshold: 3, cooldownMs: 0, maxActive: 8, minSteps: 2, minDistinctTools: 2, nearMissHint: false, recycleIdleDays: 0, skillMinSessions: 2, skillRecencyDays: 30 }
-  const created = await sweepSkillDrafts(store, config, quiet)
+  const created = await sweepTaskProposals(store, config, quiet)
   assert.equal(created, 1, '启动扫尾只补 task 信号，legacy seq 不生成')
   const views = listSkills(store, ws, resolveSkillRoot(project))
-  assert.equal(views.length, 1)
-  assert.ok(!views[0].name.includes('flow'))
-  assert.equal(await sweepSkillDrafts(store, { ...config, autoSkill: false }, quiet), 0, 'autoSkill 关闭时扫尾不动')
-  ok('R45-S15/R48 启动扫尾：task 信号补生成；legacy seq 信号永不生成')
+  assert.equal(views.length, 0, '扫尾只写提案，不写 SKILL.md')
+  const { pendingProposalsOf } = await import('../src/capability.ts')
+  const pending = pendingProposalsOf(store, ws)
+  assert.equal(pending.length, 1)
+  assert.ok(!pending[0].record.name.includes('flow'))
+  assert.equal(await sweepTaskProposals(store, { ...config, autoSkill: false }, quiet), 0, 'autoSkill 关闭时扫尾不动')
+  ok('R50-S15 启动扫尾：task 信号补生成知识提案；legacy seq 信号永不生成')
 }
 
 // ---- S16 自动增长上限 ----
@@ -720,166 +729,85 @@ async function persistOneTask(store, workspaceKey, root, options = {}) {
   ok('R48-S23 人工 register：清理跳过 manual（skippedManual），之后仍可正常升版')
 }
 
-// ---- R49：自动入口不再注册组合工具 + 宽泛序列过滤 + 存量清理 ----
+// ---- R50：自动提案（只产知识）+ 清理（历史序列行退役、提案清空） ----
 {
   const {
-    recordTurnSequences, pendingProposals, isBroadSequence, proposalVerdict,
+    cleanupToolize, clearSequenceSignals, isBroadSequence, proposalVerdict, recordTurnSequences,
   } = await import('../src/toolize.ts')
+  const { capabilityRows, liveCapabilityNames, pendingProposalsOf } = await import('../src/capability.ts')
   assert.equal(isBroadSequence(['run_code', 'run_code']), true)
   assert.equal(isBroadSequence(['bash', 'edit', 'write']), true)
-  assert.equal(isBroadSequence(['read', 'read']), true)
   assert.equal(isBroadSequence(['memory_recall', 'memory_dispatch']), true)
-  assert.equal(isBroadSequence(['sm_composite_git_sync_supermemory', 'bash']), true)
+  assert.equal(isBroadSequence(['sm_cap_git_sync_supermemory', 'bash']), true, 'sm_cap_* is a generic family too')
   assert.equal(isBroadSequence(['erp_sync_orders', 'erp_push_invoice']), false)
   assert.equal(proposalVerdict(['erp_sync_orders']).valuable, false)
-  assert.equal(proposalVerdict(['erp_sync_orders', 'erp_sync_orders']).valuable, false)
-  ok('R49-1 宽泛工具序列过滤：run_code/bash/read/edit/write/memory_*/sm_composite_* 不生成候选，业务工具序列保留')
+  ok('R50-1 宽泛工具序列表述保留（只用于清理分类）：run_code/bash/read/memory_*/sm_cap_* 不构成业务对象')
 
-  const on = {
-    enabled: true, autoSkill: false, threshold: 3, cooldownMs: 0, maxActive: 8,
+  const project = gitProject()
+  const ws = workspaceKeyOf(project)
+  const store = fakeStore()
+  const config = {
+    enabled: true, autoSkill: true, threshold: 3, cooldownMs: 0, maxActive: 8,
     minSteps: 2, minDistinctTools: 2, nearMissHint: false, recycleIdleDays: 0,
+    skillMinSessions: 2, skillRecencyDays: 30,
   }
-  const broadStore = fakeStore()
-  for (let index = 0; index < 5; index += 1) {
-    await recordTurnSequences({}, broadStore, 'ws-r49', ['run_code', 'run_code', 'run_code'], [{}, {}, {}], on, quiet, undefined, { now: NOW + index })
-  }
-  assert.equal(broadStore.toolMemory.size, 0, 'no automatic entrance may persist a composite')
-  assert.equal([...broadStore.signals.entries()].filter(([key]) => key.includes('/seq/')).length, 0,
-    'a broad sequence leaves no signal row at all')
-
-  const businessStore = fakeStore()
-  for (let index = 0; index < 3; index += 1) {
-    await recordTurnSequences({}, businessStore, 'ws-r49', ['erp_sync_orders', 'erp_push_invoice'], [{}, {}], { ...on, threshold: 2 }, quiet, undefined, { now: NOW + index })
-  }
-  assert.equal(businessStore.toolMemory.size, 0, 'even a valuable sequence is never auto-registered')
-  assert.equal(pendingProposals(businessStore).length, 1, 'a valuable sequence may leave ONE pending proposal')
-
-  const offStore = fakeStore()
-  for (let index = 0; index < 3; index += 1) {
-    await recordTurnSequences({}, offStore, 'ws-r49', ['erp_sync_orders', 'erp_push_invoice'], [{}, {}], { ...on, enabled: false, threshold: 2 }, quiet, undefined, { now: NOW + index })
-  }
-  assert.equal([...offStore.signals.entries()].filter(([key]) => key.includes('/seq/')).length, 0,
-    'with the legacy switch off the sequence pipeline writes nothing')
-  ok('R49-2 阈值跨越永不注册组合工具（宽泛/业务两类、开关开或关）；宽泛序列连信号行都不落')
-}
-
-{
-  const { acceptProposal, pendingProposals } = await import('../src/toolize.ts')
-  const key = 'ws/ws-r49/seq/erp_sync_orders>erp_push_invoice'
-  const signal = {
-    workspaceKey: 'ws-r49', pattern: 'erp_sync_orders>erp_push_invoice', count: 4, lastSeen: NOW,
-    examples: ['erp_sync_orders → erp_push_invoice'], sequence: ['erp_sync_orders', 'erp_push_invoice'],
-    samples: [JSON.stringify({ tools: ['erp_sync_orders', 'erp_push_invoice'], args: [{}, {}] })],
-    proposedAt: NOW, proposalStatus: 'pending',
-  }
-  const log = []
-  const deps = {
-    register: async (_ctx, _store, spec) => { log.push('register:' + spec.name); return () => {} },
-    persist: async (store, spec, persistKey) => {
-      log.push('persist:' + spec.name)
-      await store.toolMemory.put('tm-accept', {
-        kind: 'composite', status: 'active', trigger: persistKey, entry: JSON.stringify(spec),
-        useCount: 0, title: spec.title ?? '', tags: [], description: spec.description,
-      })
-      return 'tm-accept'
-    },
-    toolExists: () => false,
-    now: () => NOW,
-  }
-  const store = fakeStore({ signals: [[key, signal]] })
-  const accepted = await acceptProposal({}, store, key, signal, deps)
-  assert.equal(accepted.status, 'accepted')
-  assert.equal(log.length, 2, 'explicit accept registers and persists exactly once')
-  assert.ok(store.toolMemory.get('tm-accept').entry.includes('"origin":"manual"'), 'an accepted sequence is stamped origin=manual')
-  assert.equal(store.signals.get(key).proposalStatus, 'accepted')
-  const again = await acceptProposal({}, store, key, store.signals.get(key), deps)
-  assert.equal(again.status, 'accepted')
-  assert.equal(store.toolMemory.size, 1, 'accepting the same proposal twice must not leave a second row')
-
-  const broadKey = 'ws/ws-r49/seq/run_code>run_code'
-  const broadSignal = { workspaceKey: 'ws-r49', pattern: 'run_code>run_code', count: 9, lastSeen: NOW, examples: [], sequence: ['run_code', 'run_code'], samples: [], proposedAt: NOW, proposalStatus: 'pending' }
-  const broadStore = fakeStore({ signals: [[broadKey, broadSignal]] })
-  const refused = await acceptProposal({}, broadStore, broadKey, broadSignal, deps)
-  assert.equal(refused.status, 'error', 'a broad sequence is refused even on explicit accept')
-  assert.equal(broadStore.toolMemory.size, 0)
-  assert.equal(pendingProposals(broadStore).length, 0, 'a broad pending is never listed')
-  ok('R49-3 显式 accept 仍可用：注册+持久化+origin=manual、重复 accept 幂等；宽泛序列拒绝')
-}
-
-{
-  const {
-    cleanupToolize, autoSequenceComposites, pendingProposals,
-  } = await import('../src/toolize.ts')
-  const seqRow = (name, tools, extra) => ({
-    kind: 'composite', status: 'active', trigger: 'ws/ws-r49/seq/' + tools.join('>'), useCount: 0,
-    title: name, tags: [], description: name,
-    entry: JSON.stringify({ name, description: name, steps: tools.map((tool) => ({ tool, arguments: {} })), parameters: [], ...extra }),
+  const tools = ['run_code', 'run_code']
+  const args = [{}, {}]
+  const tick = (sessionId, now) => recordTurnSequences({}, store, ws, tools, args, config, quiet, undefined, {
+    sessionId, task: TASK, successes: [true, true], now,
   })
-  const capabilityRow = {
-    kind: 'composite', status: 'active', trigger: 'capability/sm_composite_git_sync_supermemory', useCount: 19,
-    title: 'git 同步/提交/推送', tags: ['git'], description: 'git sync',
-    entry: JSON.stringify({ name: 'sm_composite_git_sync_supermemory', kind: 'capability', entry: 'pnpm git:sync', description: 'git sync', steps: [], parameters: [] }),
-  }
-  const acceptedRow = seqRow('sm_composite_erp_sync_orders_e', ['erp_sync_orders', 'erp_push_invoice'], { origin: 'manual' })
-  const store = fakeStore({
+  await tick('s1', NOW)
+  await tick('s1', NOW + 1)
+  await tick('s2', NOW + 2)
+  assert.equal([...store.signals.entries()].filter(([key]) => key.includes('/seq/')).length, 0,
+    'no tool-sequence signal is written at all (R50 removed the sequence pipeline)')
+  const pending = pendingProposalsOf(store, ws)
+  assert.equal(pending.length, 1, 'a repeated TASK leaves one pending knowledge proposal')
+  assert.equal(pending[0].record.kind, 'proposal')
+  assert.equal(pending[0].record.entry, '', 'proposal has no entry')
+  assert.equal(pending[0].record.runnable, false)
+  assert.ok(!liveCapabilityNames().some((name) => name.includes('composite') || name === 'sm_cap_' + pending[0].record.name), 'nothing is registered automatically')
+  ok('R50-2 自动路径：只写一个待接受知识提案；0 条序列信号；0 个自动注册工具')
+
+  // Cleanup: legacy sequence rows retired, pending proposals cleared, real
+  // capabilities and knowledge rows untouched.
+  const legacySeq = (name, steps, trigger) => ({
+    kind: 'composite', status: 'active', title: name, tags: [], description: 'legacy', trigger,
+    entry: JSON.stringify({ name, steps: steps.map((tool) => ({ tool, arguments: {} })), parameters: [] }), useCount: 2, createdAt: 1,
+  })
+  const cleanupStore = fakeStore({
     toolMemory: [
-      ['tm-run-code', seqRow('sm_composite_run_code_run_code', ['run_code', 'run_code'], {})],
-      ['tm-memory', seqRow('sm_composite_memory_recall_memory_rec', ['memory_recall', 'memory_dispatch'], {})],
-      ['tm-capability', capabilityRow],
-      ['tm-accepted', { ...acceptedRow, trigger: 'ws/ws-r49/seq/erp_sync_orders>erp_push_invoice' }],
+      ['tm-seq-a', legacySeq('sm_composite_run_code_run_code', ['run_code', 'run_code'], 'ws/ws-r50/seq/run_code>run_code')],
+      ['tm-seq-b', legacySeq('sm_composite_memory_recall_memory_rec', ['memory_recall', 'memory_dispatch'], 'ws/ws-r50/seq/memory_recall>memory_dispatch')],
+      ['tm-cap', { kind: 'composite', status: 'active', title: '能力', tags: [], description: 'cap', trigger: 'capability/git-sync-supermemory', entry: JSON.stringify({ name: 'sm_composite_git_sync_supermemory', kind: 'capability', entry: 'pnpm git:sync', description: 'git sync', steps: [], parameters: [] }), useCount: 9, workspaceKey: 'ws-r50', createdAt: 1 }],
+      ['tm-know', { kind: 'knowledge', status: 'active', title: '知识', tags: [], description: 'knowledge', trigger: 'capability/manual', entry: JSON.stringify({ schema: 'sm.capability/1', name: 'manual', kind: 'knowledge', title: '知识', description: 'knowledge', entry: '', runnable: false, scope: '', source: 'manual' }), useCount: 0, workspaceKey: 'ws-r50', createdAt: 1 }],
+      ['tm-prop', { kind: 'proposal', status: 'active', title: '提案', tags: [], description: 'proposal', trigger: 'proposal/x', entry: JSON.stringify({ schema: 'sm.capability/1', name: 'x', kind: 'proposal', title: '提案', description: 'proposal', entry: '', proposalStatus: 'pending', draftBody: '# x' }), useCount: 0, workspaceKey: 'ws-r50', createdAt: 1 }],
     ],
     signals: [
-      ['ws/ws-r49/seq/run_code>run_code', { workspaceKey: 'ws-r49', pattern: 'run_code>run_code', count: 2706, lastSeen: NOW, examples: [], sequence: ['run_code', 'run_code'], samples: [], proposedAt: NOW, proposalStatus: 'pending' }],
-      ['ws/ws-r49/seq/bash>edit', { workspaceKey: 'ws-r49', pattern: 'bash>edit', count: 5, lastSeen: NOW, examples: [], sequence: ['bash', 'edit'], samples: [], proposalStatus: 'declined' }],
-      ['ws/ws-r49/seq/erp_sync_orders>erp_push_invoice', { workspaceKey: 'ws-r49', pattern: 'erp_sync_orders>erp_push_invoice', count: 4, lastSeen: NOW, examples: [], sequence: ['erp_sync_orders', 'erp_push_invoice'], samples: [], proposedAt: NOW, proposalStatus: 'pending' }],
+      ['ws/ws-r50/seq/run_code>run_code', { workspaceKey: 'ws-r50', pattern: 'run_code>run_code', count: 2706, lastSeen: NOW, examples: [], sequence: ['run_code', 'run_code'], samples: [], proposedAt: NOW, proposalStatus: 'pending' }],
+      ['ws/ws-r50/seq/bash>edit', { workspaceKey: 'ws-r50', pattern: 'bash>edit', count: 5, lastSeen: NOW, examples: [], sequence: ['bash', 'edit'], samples: [], proposalStatus: 'declined' }],
     ],
   })
-  assert.equal(autoSequenceComposites(store).length, 2, 'the classifier sees exactly the two auto shells')
-  const first = await cleanupToolize({ store, dropPending: true })
-  assert.equal(first.retiredCount, 2)
+  assert.equal(capabilityRows(cleanupStore).filter((row) => row.record.kind === 'proposal').length, 1, 'the pending proposal is listed before cleanup')
+  const first = await cleanupToolize({ store: cleanupStore, dropPending: true })
+  assert.equal(first.retiredCount, 2, 'both legacy sequence rows retired')
   assert.deepEqual(first.retired.map((item) => item.name).sort(), ['sm_composite_memory_recall_memory_rec', 'sm_composite_run_code_run_code'])
-  assert.equal(store.toolMemory.get('tm-run-code').status, 'retired')
-  assert.equal(store.toolMemory.get('tm-memory').status, 'retired')
-  assert.equal(store.toolMemory.get('tm-capability').status, 'active', 'a registered capability is never touched')
-  assert.equal(store.toolMemory.get('tm-accepted').status, 'active', 'an explicit accept (origin=manual) is never touched')
-  assert.equal(first.clearedProposals, 2)
-  assert.equal(first.prunedSignals, 1)
-  assert.equal(first.pendingBefore, 2)
-  assert.equal(first.pendingAfter, 0)
-  assert.equal(pendingProposals(store).length, 0)
-  assert.ok(Array.isArray(first.archived) && Array.isArray(first.archiveRoots), 'R48 cleanup fields stay backward compatible')
-  const second = await cleanupToolize({ store, dropPending: true })
+  assert.equal(cleanupStore.toolMemory.get('tm-seq-a').status, 'retired')
+  assert.equal(cleanupStore.toolMemory.get('tm-cap').status, 'active', 'a registered capability is never touched by cleanup')
+  assert.equal(cleanupStore.toolMemory.get('tm-know').status, 'active', 'knowledge rows are never touched')
+  assert.equal(first.clearedProposals, 1, 'pending proposals cleared')
+  assert.equal(first.prunedSignals, 1, 'broad sequence signal pruned')
+  assert.equal(pendingProposalsOf(cleanupStore, 'ws-r50').length, 0)
+  assert.ok(Array.isArray(first.archived) && Array.isArray(first.archiveRoots), 'backward-compatible cleanup fields')
+  const second = await cleanupToolize({ store: cleanupStore, dropPending: true })
   assert.equal(second.retiredCount, 0, 'second cleanup retires nothing')
   assert.equal(second.clearedProposals, 0, 'second cleanup clears nothing')
   assert.equal(second.prunedSignals, 0, 'second cleanup prunes nothing')
-  ok('R49-4 清理幂等：只停用自动宽泛序列组合工具（含 memory_* 序列），人工能力与显式 accept 行不动')
-  ok('R49-5 cleanup 三计数 archivedSkills/retiredComposites/clearedProposals + 向后兼容字段')
+  const signals = await clearSequenceSignals(cleanupStore, { dropAllPending: true })
+  assert.equal(signals.clearedProposals + signals.prunedSignals, 0, 'a cleared store stays clear')
+  ok('R50-3 清理：历史序列行退役、待处理提案清空、宽泛信号清理；能力/知识行不动；幂等')
 }
 
-{
-  const {
-    recordTurnSequences, cleanupToolize, clearSequenceSignals, pendingProposals,
-  } = await import('../src/toolize.ts')
-  const on = {
-    enabled: true, autoSkill: false, threshold: 2, cooldownMs: 0, maxActive: 8,
-    minSteps: 2, minDistinctTools: 2, nearMissHint: false, recycleIdleDays: 0,
-  }
-  const store = fakeStore({
-    signals: [['ws/ws-r49/seq/run_code>run_code', { workspaceKey: 'ws-r49', pattern: 'run_code>run_code', count: 10, lastSeen: NOW, examples: [], sequence: ['run_code', 'run_code'], samples: [], proposedAt: NOW, proposalStatus: 'pending' }]],
-  })
-  const swept = await cleanupToolize({ store, dropPending: true })
-  assert.equal(swept.clearedProposals, 1)
-  assert.equal(pendingProposals(store).length, 0)
-  const before = await clearSequenceSignals(store, { dropAllPending: true })
-  assert.equal(before.clearedProposals, 0, 'a cleared store stays clear (idempotent)')
-  for (let index = 0; index < 4; index += 1) {
-    await recordTurnSequences({}, store, 'ws-r49', ['bash', 'read'], [{}, {}], on, quiet, undefined, { now: NOW + index })
-    await recordTurnSequences({}, store, 'ws-r49', ['run_code', 'run_code'], [{}, {}], on, quiet, undefined, { now: NOW + index })
-  }
-  assert.equal(pendingProposals(store).length, 0, 'broad sequences never rebuild a pending proposal')
-  assert.equal([...store.signals.entries()].filter(([key]) => key.includes('/seq/')).length, 0)
-  ok('R49-6 pending 一次清空且不复发：启动扫尾清空遗留，宽泛序列不再生成任何信号/提议')
-}
 
 for (const root of roots) { try { rmSync(root, { recursive: true, force: true }) } catch { /* best effort */ } }
 console.log('\nskill-smoke: ' + passed + ' 组断言通过')

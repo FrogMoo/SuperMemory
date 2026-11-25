@@ -217,7 +217,9 @@ export interface ToolView {
    * detail view (entry / doc / scope / routing / how it runs) instead of only
    * the description. Sequence tools leave these empty.
    */
-  kind?: 'sequence' | 'capability'
+  kind?: 'sequence' | 'capability' | 'knowledge' | 'proposal'
+  /** R50: 逻辑名（工具名/skill 名之外的稳定名）。 */
+  logicalName?: string
   entry?: string
   doc?: string
   scope?: string
@@ -225,6 +227,26 @@ export interface ToolView {
   dryRunArg?: string
   writeConfirm?: boolean
   routeNote?: string
+  /** R50 统一能力：入口草稿（未验证）、启停、知识面文件与统计。 */
+  entryDraft?: string
+  entryVerified?: boolean
+  enabled?: boolean
+  loadCount?: number
+  runCount?: number
+  loadsToRuns?: number
+  successRate?: number
+  successCount?: number
+  failCount?: number
+  consecutiveFailures?: number
+  lastStatus?: 'completed' | 'failed'
+  lastUsedAt?: number
+  lastDryRun?: boolean
+  lastSummary?: string
+  skillPath?: string
+  source?: string
+  taskKey?: string
+  proposalStatus?: 'pending' | 'accepted' | 'declined'
+  expiresAt?: number
   /** R22: maintenance signals mirrored from the host's capabilityHealthOf. */
   builtin?: boolean
   builtinVersion?: number
@@ -383,6 +405,16 @@ export interface SessionChatView {
  * builtin / scopeMissing / docMissing / notes); a missing field is simply
  * omitted — never printed as "undefined".
  */
+function kindLabel(
+  kind: ToolView['kind'] | undefined,
+  t: (key: string, params?: Record<string, string | number>) => string,
+): string {
+  if (kind === 'capability') return t('tool.kind.capability')
+  if (kind === 'knowledge') return t('tool.kind.knowledge')
+  if (kind === 'proposal') return t('tool.kind.proposal')
+  return t('tool.kind.sequence')
+}
+
 function capabilityDetail(
   tool: ToolView,
   t: (key: string, params?: Record<string, string | number>) => string,
@@ -395,8 +427,7 @@ function capabilityDetail(
     ))
   }
   const code = (key: string, value: string): ReactNode => h('code', { key, className: 'sm-code' }, value)
-  row('kind', t('tool.detail.kind'),
-    tool.kind === 'capability' ? t('tool.kind.capability') : t('tool.kind.sequence'))
+  row('kind', t('tool.detail.kind'), kindLabel(tool.kind, t))
   if (tool.version !== undefined) {
     row('version', t('tool.detail.version'),
       `v${tool.version}`
@@ -410,6 +441,13 @@ function capabilityDetail(
     row('lastUsed', t('tool.detail.lastUsed'), fmtTime(tool.usage?.lastUsedAt))
   }
   if (tool.entry) row('entry', t('tool.detail.entry'), code('code', tool.entry))
+  if (tool.entryDraft) {
+    row('entryDraft', t('tool.detail.entryDraft'),
+      h('span', null, code('code', tool.entryDraft),
+        tool.entryVerified ? null : h('span', { key: 'w', className: 'sm-warn' }, t('tool.detail.unverified'))))
+  }
+  if (tool.skillPath) row('skill', t('tool.detail.skill'), code('code', tool.skillPath))
+  if (tool.kind === 'proposal' && tool.expiresAt !== undefined) row('expires', t('tool.detail.expires'), fmtTime(tool.expiresAt))
   if (tool.doc) {
     row('doc', t('tool.detail.doc'),
       h('span', null, code('code', tool.doc),
@@ -432,7 +470,10 @@ function capabilityDetail(
   }
   const usage = tool.usage
   const stats = [
-    `${t('tool.uses')} ${tool.useCount}`,
+    `${t('tool.runCount')} ${tool.runCount ?? tool.useCount}`,
+    `${t('tool.loadCount')} ${tool.loadCount ?? 0}`,
+    `${t('tool.conversion')} ${tool.loadsToRuns ?? 0}`,
+    `${t('tool.successRate')} ${tool.successRate ?? 0}`,
     usage ? `${t('tool.detail.success')} ${usage.successCount} / ${t('tool.detail.fail')} ${usage.failCount}` : null,
     usage && usage.consecutiveFailures >= 2 ? `${t('tool.detail.streak')} ${usage.consecutiveFailures}` : null,
     usage?.lastStatus
@@ -490,6 +531,20 @@ export interface PanelApi {
   listTools(cwd?: string): Promise<ToolView[]>
   editTool(id: string, patch: Record<string, unknown>): Promise<MutationResult>
   deleteTool(id: string): Promise<MutationResult>
+  /** R50: 预演/执行能力（默认预演；writeConfirm 需 options.confirm=true）。 */
+  runTool(id: string, options?: { dryRun?: boolean; confirm?: boolean }): Promise<{
+    status: 'completed' | 'failed' | 'needs-confirm'
+    exitCode?: number
+    stdout: string
+    stderr: string
+    durationMs: number
+    dryRun: boolean
+    command: string
+    summary: string
+  }>
+  /** R50: 接受/拒绝待处理提案。 */
+  acceptProposal(cwd: string, id: string): Promise<MutationResult>
+  declineProposal(cwd: string, id: string): Promise<MutationResult>
   sessionBadge(sessionId: string): Promise<SessionBadge>
   listHubSessions(cwd: string): Promise<HubSessionView[]>
   /** R19 协同②: the branches one hub started (name / state / set / shared). */
@@ -2072,7 +2127,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // -------------------------------------------------------------------------
   // R39: 「中枢权限」页签 —— 动态目录（每次调用即时生成，按来源分组，默认拒绝）。
   // 宿主工具定义不带来源字段，所以分组是「可解释的推断」：定义自带来源字段优先
-  // （标为非推断），否则 mcp__<server>__ / memory_* / sm_composite_* / schedule_*
+  // （标为非推断），否则 mcp__<server>__ / memory_* / sm_cap_* / schedule_*
   // 依次判定，其余归宿主内置/未归属。白名单有、运行时无的条目单列失效组并可
   // 一键清理；枚举失败时宿主回退内置清单并告警（页面不白屏），默认路径始终动态。
   // -------------------------------------------------------------------------
@@ -2330,9 +2385,12 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
               },
                 h('span', { key: 'caret', className: 'sm-caret' }, expandedTool === tool.id ? '▾' : '▸'),
                 h('span', { key: 'title', className: 'sm-title' }, tool.title || tool.name),
-                h('span', { key: 'kind', className: 'sm-badge' },
-                  tool.kind === 'capability' ? t('tool.kind.capability') : t('tool.kind.sequence')),
-                h('span', { key: 'status', className: 'sm-badge' }, tool.status),
+                h('span', { key: 'kind', className: 'sm-badge' }, kindLabel(tool.kind, t)),
+                tool.source === 'auto' ? h('span', { key: 'auto', className: 'sm-badge' }, t('tool.badge.auto')) : null,
+                tool.entryDraft && !tool.entryVerified
+                  ? h('span', { key: 'draft', className: 'sm-badge' }, t('tool.badge.draft'))
+                  : null,
+                h('span', { key: 'status', className: 'sm-badge' }, tool.enabled === false ? 'retired' : tool.status),
                 h('span', { key: 'live', className: 'sm-badge' }, tool.live ? t('tool.live') : t('tool.offline')),
               ),
               tagChips(tool.tags),
@@ -2368,23 +2426,53 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                 : h('div', { key: 'desc' },
                     h('div', { className: 'sm-body-text' }, tool.description || '—'),
                     h('div', { className: 'sm-actions' },
-                      h(Button, {
-                        key: 'edit', label: t('tool.desc.edit'),
-                        onClick: () => setEditingTool({ id: tool.id, title: tool.title, tags: tool.tags, description: tool.description }),
-                      }),
-                      // A retired tool had no way back through the old UI: the
-                      // enable button re-registers it (status -> active).
-                      tool.status === 'active'
+                      tool.kind === 'proposal'
                         ? h(Button, {
-                            key: 'retire', variant: 'danger', label: t('tool.retire'),
-                            onClick: () => void run(async () => api.editTool(tool.id, { status: 'retired' }), () => void refreshTools()),
+                            key: 'accept', variant: 'primary', label: t('tool.accept'),
+                            onClick: () => void run(async () => api.acceptProposal(cwd, tool.id), () => void refreshTools()),
                           })
-                        : h(Button, {
-                            key: 'enable', variant: 'primary', label: t('tool.enable'),
-                            onClick: () => void run(async () => api.editTool(tool.id, { status: 'active' }), () => void refreshTools()),
-                          }),
-                      // Delete is destructive and irreversible, so it asks once
-                      // inline (no native dialog inside the shell).
+                        : null,
+                      tool.kind === 'proposal'
+                        ? h(Button, {
+                            key: 'decline', label: t('tool.decline'),
+                            onClick: () => void run(async () => api.declineProposal(cwd, tool.id), () => void refreshTools()),
+                          })
+                        : null,
+                      tool.kind === 'capability' && tool.entry
+                        ? h(Button, {
+                            key: 'preview', label: t('tool.preview'),
+                            onClick: () => void run(async () => {
+                              const result = await api.runTool(tool.id)
+                              const detail = [result.summary, result.stdout ? result.stdout.slice(0, 1200) : '', result.stderr ? result.stderr.slice(0, 800) : '']
+                                .filter(Boolean).join('\n')
+                              return { status: result.status === 'failed' ? 'error' as const : 'ok' as const, message: detail }
+                            }),
+                          })
+                        : null,
+                      tool.entryDraft && !tool.entryVerified
+                        ? h(Button, {
+                            key: 'enableRun', variant: 'primary', label: t('tool.enableRun'),
+                            onClick: () => void run(async () => api.editTool(tool.id, { entry: tool.entryDraft, changelog: '人工启用执行（入口草稿已验证）' }), () => void refreshTools()),
+                          })
+                        : null,
+                      tool.kind !== 'proposal'
+                        ? h(Button, {
+                            key: 'edit', label: t('tool.desc.edit'),
+                            onClick: () => setEditingTool({ id: tool.id, title: tool.title, tags: tool.tags, description: tool.description }),
+                          })
+                        : null,
+                      tool.kind !== 'proposal'
+                        ? (tool.status === 'active'
+                            ? h(Button, {
+                                key: 'retire', variant: 'danger', label: t('tool.retire'),
+                                onClick: () => void run(async () => api.editTool(tool.id, { status: 'retired' }), () => void refreshTools()),
+                              })
+                            : h(Button, {
+                                key: 'enable', variant: 'primary', label: t('tool.enable'),
+                                onClick: () => void run(async () => api.editTool(tool.id, { status: 'active' }), () => void refreshTools()),
+                              }))
+                        : null,
+                      // Delete archives the knowledge face (never hard-deletes).
                       confirmDeleteTool === tool.id
                         ? h(Button, {
                             key: 'delYes', variant: 'danger', label: t('tool.deleteConfirm'),
@@ -2399,8 +2487,18 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
                         : null,
                     ),
                   ),
-              h('div', { className: 'sm-sub' }, `${t('tool.steps')}：${tool.steps.join(' → ') || '—'}`),
-              h('div', { className: 'sm-sub' }, `${t('tool.params')}：${tool.parameters.join('、') || '—'} · ${t('tool.uses')}：${tool.useCount}`),
+              tool.steps.length > 0
+                ? h('div', { className: 'sm-sub' }, t('tool.steps') + '：' + tool.steps.join(' → '))
+                : h('div', { className: 'sm-sub' },
+                    t('tool.detail.entry') + '：' + (tool.entry || '—')
+                    + ' · ' + t('tool.detail.scope') + '：' + (tool.scope || '—')
+                    + ' · ' + t('tool.detail.skill') + '：' + (tool.skillPath || '—')),
+              h('div', { className: 'sm-sub' },
+                t('tool.runCount') + '：' + (tool.runCount ?? tool.useCount)
+                + ' · ' + t('tool.loadCount') + '：' + (tool.loadCount ?? 0)
+                + ' · ' + t('tool.conversion') + '：' + (tool.loadsToRuns ?? 0)
+                + ' · ' + t('tool.successRate') + '：' + (tool.successRate ?? 0)
+                + ' · ' + t('tool.detail.last') + '：' + (tool.lastStatus ?? '—')),
               // R26: 能力卡片显示定义版本与使用明细（成败/连续失败/最近一次执行）。
               // R28 需求②: 再补上增加时间与最后使用时间（缺字段显示 —）。
               tool.version !== undefined || tool.usage?.lastStatus
@@ -2576,7 +2674,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
 
   const settingsView: ReactNode = h('div', { key: 'settings' },
     modelDefaultsCard(),
-    skillsCard(),
     h('div', { key: 'policyTitle', className: 'sm-section-title' }, t('settings.policy.title')),
     hubPolicyView,
   )

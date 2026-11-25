@@ -3,11 +3,11 @@
  *
  * 背景（2026-11-18）：git-sync 能力原先由中枢在插件重载后经 memory_toolize
  * register 手工录入——清库或全新安装后插件不带这个能力，定义也只存在于
- * store 里、不随代码维护。内置能力把定义收进源码：rebuildComposites 启动
+ * store 里、不随代码维护。内置能力把定义收进源码：rebuildCapabilities 启动
  * 重建时与 store 合并（缺失→播种、旧版→升级、现场更新→保留），能力定义从此
  * 随插件代码一起被维护（改入口/文档/路由描述 = 改这个文件 + version+1）。
  *
- * 合并/升级策略（mergeBuiltinCapabilities，src/composite.ts）：
+ * 合并/升级策略（mergeBuiltinCapabilities，src/capability.ts）：
  * - store 缺失        → 播种（落库 + 注册），版本 = 内置版本；
  * - store 版本 < 内置  → 升级：用内置定义覆盖 entry/doc/scope/routeNote/
  *                       dryRunArg/writeConfirm/runnable/title/description/tags，
@@ -26,7 +26,7 @@
 import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { CapabilityInput } from './composite.ts'
+import type { CapabilityInput } from './capability.ts'
 
 /**
  * 从插件自身位置推导出**本仓库根目录**。
@@ -91,7 +91,7 @@ export const BUILTIN_CAPABILITIES: readonly BuiltinCapability[] = Object.freeze(
     name: 'git-sync-supermemory',
     version: 6,
     title: 'git 同步/提交/推送（SuperMemory 仓库）',
-    // 描述是模型的路由依据，硬上限 500 字符（composite.ts buildCapabilitySpec）：
+    // 描述是模型的路由依据，硬上限 500 字符（capability.ts buildCapabilityRecord）：
     // v4 描述 725 字被该上限静默拒绝 → mergeBuiltinCapabilities 跳过播种
     // （report.seeded=[]）→ capability-smoke C3 / workspace-scope W5 失败。
     // 修改描述后务必重新计数，并把细节（凭据键/恢复流程）留在 docs 里。

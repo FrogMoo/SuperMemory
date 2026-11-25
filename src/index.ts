@@ -407,19 +407,20 @@ export async function apply(ctx: Context, config: Config) {
 
   // R49 boot order matters: cleanup runs BEFORE the rebuild, so a legacy
   // auto-generated sequence composite is retired while it is still unregistered
-  // and rebuildComposites never brings it back. Idempotent — safe on every start.
+  // and rebuildCapabilities never brings it back. Idempotent — safe on every start.
   if (store) {
     void (async () => {
       try {
-        const { cleanupToolize, sweepSkillDrafts } = await import('./toolize.ts')
+        const { cleanupToolize, sweepTaskProposals } = await import('./toolize.ts')
         const { discoverSkillRoots } = await import('./skill-forge.ts')
         const toolize = toolizeConfig(config)
-        // R49: autoComposite/autoToolize now only govern pending proposals, never
-        // registration; with both off (the default) stale pending rows are cleared.
+        // R50: cleanup retires legacy sequence rows and archives shell skills.
+        // Pending KNOWLEDGE proposals must SURVIVE a reload (panel accept/reject,
+        // 30-day expiry) — only the explicit memory_toolize cleanup clears them.
         const cleanup = await cleanupToolize({
           store,
           roots: discoverSkillRoots({ store, cwd: process.cwd() }),
-          dropPending: !toolize.enabled,
+          dropPending: false,
         })
         if (cleanup.retiredCount > 0) {
           logger.info('supermemory: retired ' + cleanup.retiredCount + ' legacy auto sequence composite(s): '
@@ -433,14 +434,14 @@ export async function apply(ctx: Context, config: Config) {
           logger.info('supermemory: archived ' + cleanup.archivedCount + ' legacy shell skill(s) under '
             + cleanup.archiveRoots.filter((root) => root.archived > 0).map((root) => root.root).join(', '))
         }
-        // R48: durable TASK signatures that already crossed the thresholds are
-        // fixated as task skills at boot (files survive restarts).
-        await sweepSkillDrafts(store, toolize, logger)
-        const { rebuildComposites } = await import('./composite.ts')
-        const count = await rebuildComposites(ctx, store)
-        if (count > 0) logger.info('supermemory: rebuilt ' + count + ' composite tool(s)')
+        // R50: durable TASK signatures that already crossed become pending
+        // knowledge proposals (never files, never tools).
+        await sweepTaskProposals(store, toolize, logger)
+        const { rebuildCapabilities } = await import('./capability.ts')
+        const count = await rebuildCapabilities(ctx, store)
+        if (count > 0) logger.info('supermemory: rebuilt ' + count + ' capability tool(s) (sm_cap_*)')
       } catch (error) {
-        logger.warn(`supermemory: composite rebuild failed: ${String(error).slice(0, 200)}`)
+        logger.warn(`supermemory: capability rebuild failed: ${String(error).slice(0, 200)}`)
       }
     })()
   }

@@ -39,9 +39,11 @@ import { newId, workspaceKeyOf, type Store } from './store.ts'
 import { listHubSessions } from './hub-sessions.ts'
 import { listWorkspaceBranches } from './hub-branches.ts'
 import {
-  bumpCompositeUse, capabilityAppliesToWorkspace, deleteCompositeTool, editCompositeTool,
-  registerCapability, runCapability, type CompositeSpec,
-} from './composite.ts'
+  acceptProposal as acceptCapabilityProposal, bumpCapabilityRun, capabilityAppliesToWorkspace,
+  declineProposal as declineCapabilityProposal, deleteCapability, editCapability,
+  enableCapabilityEntryDraft, readCapabilityRow, registerCapability, runCapability,
+  setCapabilityEnabled,
+} from './capability.ts'
 
 /** Route prefix owned by this module (a host web-server named prefix route). */
 const PREFIX = '/supermemory'
@@ -633,26 +635,47 @@ async function handleApi(
     case 'tool/run': {
       const id = text(body.id)
       const record = store.toolMemory.get(id)
-      if (!record || record.kind !== 'composite' || !record.entry) return fail('组合工具不存在')
-      // 工作区隔离：能力记录按适用范围落到工作区。
-      if (!toolRowInWorkspace(record, ws)) return fail('工具不属于当前工作区')
-      let spec: CompositeSpec
-      try {
-        spec = JSON.parse(record.entry) as CompositeSpec
-      } catch {
-        return fail('工具定义损坏，无法执行')
-      }
-      if (spec.kind !== 'capability' || !spec.entry) return fail('只有能力（capability）可以一键执行；序列组合工具请直接调用')
-      const result = runCapability(spec, {
+      if (!record) return fail('能力不存在')
+      if (!toolRowInWorkspace(record, ws)) return fail('能力不属于当前工作区')
+      const parsed = readCapabilityRow(record, id)
+      if (!parsed) return fail('能力定义损坏，无法执行')
+      if (parsed.record.kind !== 'capability' || !parsed.record.entry) return fail('该能力仅知识，没有执行面')
+      const result = runCapability(parsed.record, {
         ...(body.dryRun === undefined ? {} : { dryRun: Boolean(body.dryRun) }),
         ...(body.confirm === undefined ? {} : { confirm: Boolean(body.confirm) }),
       })
-      // 实际执行过（含非零退出）才计数；needs-confirm 没有执行，不计。
-      // R26 收尾：传入 result，管理台执行也记成败明细/最近一次结果。
-      if (result.status !== 'needs-confirm') void bumpCompositeUse(store, spec.name, result)
-      logger.info(`supermemory: webui ran capability ${spec.name} (${result.status}, exit ${result.exitCode ?? '-'})`)
-      // needs-confirm 也返回 200：前端据此弹二次确认框，再带 confirm=true 重试。
+      if (result.status !== 'needs-confirm') await bumpCapabilityRun(store, id, result)
+      logger.info(`supermemory: webui ran capability ${parsed.record.name} (${result.status}, exit ${result.exitCode ?? '-'})`)
       return sendJson(res, 200, { ok: true, ...result })
+    }
+    case 'tool/enable-entry': {
+      if (!ctx) return fail('宿主上下文不可用，无法启用执行。')
+      const id = text(body.id)
+      const existing = store.toolMemory.get(id)
+      if (!existing) return fail('能力不存在')
+      if (!toolRowInWorkspace(existing, ws)) return fail('能力不属于当前工作区')
+      const result = await enableCapabilityEntryDraft(ctx, store, id)
+      if (result.status === 'error') return fail(result.message)
+      return sendJson(res, 200, { ok: true, message: result.message })
+    }
+    case 'proposal/accept': {
+      if (!ctx) return fail('宿主上下文不可用，无法接受提案。')
+      const id = text(body.id)
+      const existing = store.toolMemory.get(id)
+      if (!existing) return fail('提案不存在')
+      if (!toolRowInWorkspace(existing, ws)) return fail('提案不属于当前工作区')
+      const result = await acceptCapabilityProposal(ctx, store, id)
+      if (result.status === 'error') return fail(result.message)
+      return sendJson(res, 200, { ok: true, message: result.message, id: result.id, entryDraft: Boolean(result.entryDraft) })
+    }
+    case 'proposal/decline': {
+      const id = text(body.id)
+      const existing = store.toolMemory.get(id)
+      if (!existing) return fail('提案不存在')
+      if (!toolRowInWorkspace(existing, ws)) return fail('提案不属于当前工作区')
+      const result = await declineCapabilityProposal(store, id)
+      if (result.status === 'error') return fail(result.message)
+      return sendJson(res, 200, { ok: true, message: result.message })
     }
     case 'tool/status': {
       if (!ctx) return fail('宿主上下文不可用，无法修改工具状态。')
@@ -660,23 +683,23 @@ async function handleApi(
       const status = body.status === 'active' || body.status === 'retired' ? body.status : undefined
       if (!status) return fail('status 必须是 active 或 retired')
       const existing = store.toolMemory.get(id)
-      if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
-      if (!toolRowInWorkspace(existing, ws)) return fail('工具不属于当前工作区')
-      const result = await editCompositeTool(ctx, store, id, { status })
+      if (!existing) return fail('能力不存在')
+      if (!toolRowInWorkspace(existing, ws)) return fail('能力不属于当前工作区')
+      const result = await setCapabilityEnabled(ctx, store, id, status === 'active')
       if (result.status === 'error') return fail(result.message)
-      logger.info(`supermemory: webui tool ${id} -> ${status}`)
-      return sendJson(res, 200, { ok: true })
+      logger.info(`supermemory: webui capability ${id} -> ${status}`)
+      return sendJson(res, 200, { ok: true, message: result.message })
     }
     case 'tool/delete': {
       if (!ctx) return fail('宿主上下文不可用，无法删除工具。')
       const id = text(body.id)
       const existing = store.toolMemory.get(id)
-      if (!existing || existing.kind !== 'composite') return fail('组合工具不存在')
-      if (!toolRowInWorkspace(existing, ws)) return fail('工具不属于当前工作区')
-      const result = await deleteCompositeTool(ctx, store, id)
+      if (!existing) return fail('能力不存在')
+      if (!toolRowInWorkspace(existing, ws)) return fail('能力不属于当前工作区')
+      const result = await deleteCapability(ctx, store, id)
       if (result.status === 'error') return fail(result.message)
-      logger.info(`supermemory: webui deleted tool ${id}`)
-      return sendJson(res, 200, { ok: true })
+      logger.info(`supermemory: webui deleted capability ${id}`)
+      return sendJson(res, 200, { ok: true, message: result.message })
     }
     default:
       return sendJson(res, 404, { ok: false, error: `unknown api route: ${route}` })
@@ -725,12 +748,9 @@ function findWsOfTopicSet(map: Map<string, Set<string>>, topicSetId: string): st
  * 无 scope = 全局。
  */
 function toolRowInWorkspace(record: ToolMemory, ws: string): boolean {
-  let scope: string | undefined
-  try {
-    const spec = JSON.parse(record.entry) as { kind?: string; scope?: string }
-    if (spec.kind === 'capability') scope = spec.scope
-  } catch { /* a broken row stays global */ }
-  return capabilityAppliesToWorkspace({ scope }, ws, record.workspaceKey)
+  const parsed = readCapabilityRow(record)
+  if (!parsed) return true // legacy sequence rows are retired/global
+  return capabilityAppliesToWorkspace(parsed.record, ws, record.workspaceKey)
 }
 
 function buildState(store: Store, ws: string) {

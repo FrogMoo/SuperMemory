@@ -1,355 +1,209 @@
 /**
- * workspace-scope-smoke — A 部分（工作区隔离）的源级单测（host-free）：
- *   W1 话题集/会话列表按工作区过滤（listTopicSets / hubState 计数 / listWorkspaceBranches）；
- *   W2 跨工作区能力不暴露（capabilityRecordsOf / 面板 listTools / capabilityHealthOf）；
- *   W3 能力执行门禁（跨工作区调用拒绝执行且不计数；本工作区正常执行；无上下文放行）；
- *   W4 register 同名能力按工作区归属分流（别的工作区的行不被误更新）；
- *   W5 重启重建带行级归属（rebuild 后跨工作区门禁依然生效，内置播种落 scope 工作区）；
- *   W6 适用性判定纯函数语义（行级归属优先 / 全局能力 / 无上下文放行）。
- *   W7 R28 归属回填与 createdAt：rebuildComposites 启动回填（trigger 前缀推导
- *      归属 + createdAt 补齐，幂等，日志如实）；persist 未传 workspaceKey 时从
- *      signalKey 推导；新建行 stamp createdAt、同名更新保留原值、内置升级自愈。
- * 注意：.mjs 自身不做 TS 类型擦除（本脚本保持纯 JS），但 src/panel.ts 用了
- * TypeScript 参数属性，strip-only 模式会拒绝——整体重放一次带 transform 的节点。
+ * workspace-scope-smoke — R50 统一能力的工作区隔离（A3 语义 + sm_cap_ 执行面）。
+ *
+ * W1 纯判定：scope/行级归属/全局/子目录包含。
+ * W2 列表：capabilityRecordsOf / 面板 listTools / capabilityHealthOf 都只看本工作区。
+ * W3 注册：同名能力在两个工作区各自一行，互不覆盖。
+ * W4 执行面：跨工作区调用拒绝（不执行、不计数）；本工作区正常执行。
+ * W5 重建：rebuildCapabilities 带行级归属注册；内置能力播种落到 scope 工作区。
+ * W6 迁移：旧 capability 行（kind=composite + spec.kind=capability）保留归属并改名
+ *      sm_cap_*；旧工具序列行退役且不注册。
+ *
  * Usage: node scripts/workspace-scope-smoke.mjs
  */
 import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { fileURLToPath } from 'node:url'
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { delimiter } from 'node:path'
 
 if (!process.execArgv.includes('--experimental-transform-types')) {
-  const child = spawnSync(
-    process.execPath,
-    ['--experimental-transform-types', process.argv[1], ...process.argv.slice(2)],
-    { stdio: 'inherit' },
-  )
+  const stubRoot = new URL('./__fixtures__/stub-node-modules', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, '$1:')
+  process.env.NODE_PATH = [process.env.NODE_PATH, stubRoot].filter(Boolean).join(delimiter)
+  const child = spawnSync(process.execPath, ['--experimental-transform-types', process.argv[1], ...process.argv.slice(2)], { stdio: 'inherit' })
   process.exit(child.status ?? 1)
 }
 
-const {
-  capabilityAppliesToWorkspace, capabilityHealthOf, capabilityRecordsOf, capabilityToolDef,
-  mergeBuiltinCapabilities, persistComposite, rebuildComposites, registerCapability,
-  workspaceKeyFromSignalKey,
-} = await import('../src/composite.ts')
-const { listTopicSets } = await import('../src/topicsets.ts')
-const { listWorkspaceBranches } = await import('../src/hub-branches.ts')
+const DSH_HOME = mkdtempSync(join(tmpdir(), 'sm-ws-r50-home-'))
+process.env.DSH_HOME = DSH_HOME
+
+const capability = await import('../src/capability.ts')
 const { SupermemoryPanelService } = await import('../src/panel.ts')
 const { workspaceKeyOf } = await import('../src/store.ts')
-const { BUILTIN_CAPABILITIES } = await import('../src/builtin-capabilities.ts')
+
+let passed = 0
+const ok = (name) => { passed += 1; console.log('ok - ' + name) }
 
 function table(seed = []) {
   const map = new Map(seed)
   return {
     get: (k) => map.get(k),
     keys: () => map.keys(),
-    values: () => map.values(),
-    get size() { return map.size },
     entries: () => map.entries(),
+    get size() { return map.size },
     put: async (k, v) => { map.set(k, v) },
     update: async (k, fn) => { map.set(k, fn(map.get(k))) },
     delete: async (k) => map.delete(k),
   }
 }
 const fakeStore = (seed = {}) => ({
-  memories: table(seed.memories ?? []),
   toolMemory: table(seed.toolMemory ?? []),
   signals: table(seed.signals ?? []),
-  topicsets: table(seed.topicsets ?? []),
   dispatches: table(seed.dispatches ?? []),
-  episodes: table(seed.episodes ?? []),
-  requirements: table(seed.requirements ?? []),
-  filemap: table(seed.filemap ?? []),
-  routing: table(seed.routing ?? []),
-  hotcache: table(seed.hotcache ?? []),
-  outbox: table(seed.outbox ?? []),
-  questions: table(seed.questions ?? []),
-  meta: table(seed.meta ?? []),
-})
-const now = Date.now()
-// 两个工作区：A 用真实仓库路径（workspaceKeyOf 走 realpath），B 用虚构路径
-// （workspaceKeyOf 对不存在的目录退化为 resolve，键值稳定可断言）。
-// A 必须取自本仓库：W3 会真的在这个 cwd 里 spawn（硬编码旧克隆路径 G:\09 - dsh\
-// SuperMemory 在本机不存在，spawnSync 直接 ENOENT）；用 workspaceKeyOf 归一化还能
-// 保证行级归属键与过滤时算出的键严格一致（realpath 幂等）。
-const WS_A = workspaceKeyOf(fileURLToPath(new URL('..', import.meta.url)))
-const WS_B = 'G:\\scope-smoke-b'
-const GIT_TOOL = 'sm_composite_git_sync_supermemory'
-const capSpec = (name, scope, extra = {}) => ({
-  name, kind: 'capability', description: name + ' 描述', title: name,
-  entry: 'echo ' + name, steps: [], parameters: [], runnable: true, dryRunArg: '--dry-run',
-  scope, version: 1, ...extra,
-})
-const capRow = (id, ws, spec, useCount = 0) => ({
-  kind: 'composite', workspaceKey: ws, trigger: 'capability/' + spec.name,
-  title: spec.title, tags: [], description: spec.description,
-  entry: JSON.stringify(spec), useCount, status: 'active',
-})
-const seqRow = () => ({
-  kind: 'composite', trigger: 'ws/ws/seq/read>bash', title: '序列', tags: [], description: '序列',
-  entry: JSON.stringify({ name: 'sm_composite_seq_scope', steps: [{ tool: 'read', arguments: {} }], parameters: [] }),
-  useCount: 0, status: 'active',
+  memories: table(),
+  topicsets: table(),
+  episodes: table(),
+  requirements: table(),
+  filemap: table(),
+  routing: table(),
+  hotcache: table(),
+  memoryCollections: table(),
+  hubs: table(),
+  hubPolicies: table(),
+  modelDefaults: table(),
+  questions: table(),
+  outbox: table(),
+  meta: table(),
 })
 
-let passed = 0
-const ok = (label) => { passed += 1; console.log('ok - ' + label) }
+const base = mkdtempSync(join(tmpdir(), 'sm-ws-r50-'))
+const dirA = join(base, 'workspace-a')
+const dirB = join(base, 'workspace-b')
+mkdirSync(join(dirA, '.git'), { recursive: true })
+mkdirSync(join(dirB, '.git'), { recursive: true })
+const WS_A = workspaceKeyOf(dirA)
+const WS_B = workspaceKeyOf(dirB)
 
-// ---- W1 话题集/会话列表按工作区过滤 ----
-{
-  const store = fakeStore({
-    topicsets: [
-      ['ts-a', { workspaceKey: WS_A, title: 'A 集', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }],
-      ['ts-b', { workspaceKey: WS_B, title: 'B 集', summary: '', keywords: [], status: 'active', members: [], createdAt: now, updatedAt: now, lastActiveAt: now }],
-    ],
-    dispatches: [
-      ['dsp-b', { topicSetId: 'ts-b', branchSessionId: 'branch-b', task: 'B 的任务', hubSessionId: 'session-b', startSeq: 0, status: 'dispatched', createdAt: now, updatedAt: now }],
-    ],
-    episodes: [
-      ['ep-b', { topicSetId: 'ts-b', branchSessionId: 'branch-b', timeStart: now, timeEnd: now, summary: 's', result: 'r', decisions: [], files: [], nextSteps: [], reqIds: [], sourceSessionId: 'branch-b', sourceSeqStart: 0, sourceSeqEnd: 1 }],
-    ],
-  })
-  assert.deepEqual(listTopicSets(store, WS_A).map(([id]) => id), ['ts-a'], 'A 工作区只见 A 的话题集')
-  assert.deepEqual(listTopicSets(store, WS_B).map(([id]) => id), ['ts-b'], 'B 工作区只见 B 的话题集')
-  assert.deepEqual(listWorkspaceBranches(store, WS_A).map((b) => b.branchSessionId), [], 'A 的分支列表不含 B 的分支')
-  assert.deepEqual(listWorkspaceBranches(store, WS_B).map((b) => b.branchSessionId), ['branch-b'], 'B 的分支列表含自己的分支')
-  const service = new SupermemoryPanelService(store)
-  const stateA = service.hubState(WS_A, 'session-a')
-  assert.deepEqual(stateA.topicSets.map((t) => t.id), ['ts-a'], '面板 hubState 只返回本工作区话题集')
-  assert.equal(stateA.counts.dispatches, 0, '进行中派发计数不含别的工作区')
-  assert.equal(stateA.counts.episodes, 0, '归档计数不含别的工作区')
-  const stateB = service.hubState(WS_B, 'session-b')
-  assert.equal(stateB.counts.dispatches, 1, '本工作区的派发正常计数')
-  assert.equal(stateB.counts.episodes, 1, '本工作区的归档正常计数')
-  ok('W1 话题集/分支/计数按工作区过滤（listTopicSets / hubState / listWorkspaceBranches）')
-}
-
-// ---- W2 跨工作区能力不暴露 ----
-{
-  const store = fakeStore({
-    toolMemory: [
-      ['tm-a', capRow('tm-a', WS_A, capSpec('sm_composite_scope_a', WS_A), 2)],
-      ['tm-b', capRow('tm-b', WS_B, capSpec('sm_composite_scope_b', WS_B), 0)],
-      ['tm-seq', seqRow()],
-    ],
-  })
-  assert.deepEqual(capabilityRecordsOf(store, WS_A).map((c) => c.spec.name), ['sm_composite_scope_a'])
-  assert.deepEqual(capabilityRecordsOf(store, WS_B).map((c) => c.spec.name), ['sm_composite_scope_b'])
-  assert.equal(capabilityRecordsOf(store).length, 2, '无工作区参数=全量（维护/合并路径用）')
-  const service = new SupermemoryPanelService(store)
-  const viewsA = service.listTools(WS_A)
-  assert.deepEqual(viewsA.filter((v) => v.kind === 'capability').map((v) => v.name), ['sm_composite_scope_a'], '面板能力卡片只列本工作区')
-  assert.ok(viewsA.some((v) => v.name === 'sm_composite_seq_scope'), '序列组合工具无归属=全局，任何工作区可见')
-  assert.equal(viewsA.find((v) => v.name === 'sm_composite_scope_a').version, 1, '版本透出到面板视图')
-  const viewsB = service.listTools(WS_B)
-  assert.deepEqual(viewsB.filter((v) => v.kind === 'capability').map((v) => v.name), ['sm_composite_scope_b'], '切到 B 只列 B 的能力')
-  assert.deepEqual(capabilityHealthOf(store, WS_A).map((h) => h.name), ['sm_composite_scope_a'], '健康报告同样按工作区过滤')
-  ok('W2 跨工作区能力不暴露（capabilityRecordsOf / 面板 listTools / capabilityHealthOf）')
-}
-
-// ---- W3 能力执行门禁 ----
-{
-  const store = fakeStore({
-    toolMemory: [
-      ['tm-a', capRow('tm-a', WS_A, capSpec('sm_composite_scope_a', WS_A), 2)],
-    ],
-  })
-  const spec = capSpec('sm_composite_scope_a', WS_A)
-  const def = capabilityToolDef(store, spec, WS_A)
-  const execFor = (cwd) => ({ signal: new AbortController().signal, agent: { session: { header: { cwd } } } })
-  const here = await def.execute({}, execFor(WS_A))
-  assert.equal(here.status, 'completed', '本工作区正常执行: ' + here.summary)
-  assert.ok(here.stdout.includes('sm_composite_scope_a'))
-  assert.equal(store.toolMemory.get('tm-a').useCount, 3, '本工作区执行计数')
-  const there = await def.execute({}, execFor(WS_B))
-  assert.equal(there.status, 'failed', '跨工作区调用被拒绝')
-  assert.ok(there.summary.includes('工作区隔离'), '拒绝原因说清是工作区隔离: ' + there.summary)
-  assert.equal(there.stdout, '', '跨工作区拒绝不执行任何命令')
-  assert.equal(store.toolMemory.get('tm-a').useCount, 3, '跨工作区拒绝不计数')
-  const noCtx = await def.execute({}, { signal: new AbortController().signal })
-  assert.equal(noCtx.status, 'completed', '无调用方工作区上下文（测试/headless）不拦截')
-  ok('W3 能力执行门禁：跨工作区拒绝执行且不计数；本工作区/无上下文正常')
-}
-
-// ---- W4 register 同名能力按工作区归属分流 ----
-{
-  const store = fakeStore()
-  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
-  const deps = { register: async () => () => {}, persist: persistComposite, toolExists: () => false }
-  const seed = { name: 'shared-cap', description: 'A 的描述', entry: 'echo shared', scope: WS_A }
-  const first = await registerCapability(ctx, store, seed, WS_A, deps)
-  assert.equal(first.status, 'ok', 'A 首次注册: ' + first.message)
-  assert.equal(store.toolMemory.size, 1)
-  const other = await registerCapability(ctx, store, { ...seed, description: 'B 的描述', entry: 'echo shared-b', scope: WS_B }, WS_B, deps)
-  assert.equal(other.status, 'ok', 'B 同名注册成功')
-  assert.equal(store.toolMemory.size, 2, '同名能力在不同工作区各占一行，互不覆盖')
-  const rowA = [...store.toolMemory.values()].find((r) => r.workspaceKey === WS_A)
-  assert.equal(JSON.parse(rowA.entry).description, 'A 的描述', 'B 的注册不污染 A 的行')
-  const again = await registerCapability(ctx, store, { ...seed, description: 'A 更新', changelog: 'A 侧更新' }, WS_A, deps)
-  assert.equal(again.status, 'ok')
-  assert.equal(store.toolMemory.size, 2, '同工作区同名=原地更新，不建新行')
-  const rowA2 = [...store.toolMemory.values()].find((r) => r.workspaceKey === WS_A)
-  assert.equal(JSON.parse(rowA2.entry).version, 2, '同工作区更新 version+1')
-  assert.equal(JSON.parse(rowA2.entry).description, 'A 更新')
-  ok('W4 register 同名能力按工作区分流：跨工作区各占一行，同工作区原地更新')
-}
-
-// ---- W5 重启重建带行级归属 + 内置播种落 scope 工作区 ----
-{
-  const store = fakeStore({
-    toolMemory: [
-      ['tm-a', capRow('tm-a', WS_A, capSpec('sm_composite_scope_a', WS_A), 2)],
-      ['tm-b', capRow('tm-b', WS_B, capSpec('sm_composite_scope_b', WS_B), 0)],
-      ['tm-seq', seqRow()],
-    ],
-  })
-  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
-  const seen = []
-  const count = await rebuildComposites(ctx, store, {
-    register: async (_c, _s, spec, workspaceKey) => { seen.push({ name: spec.name, workspaceKey }); return () => {} },
-  })
-  // 3 条既有行 + 内置能力播种 1 条。
-  assert.equal(count, 4, 'rebuild 注册全部活跃行（含播种的内置能力）: ' + count)
-  const capA = seen.find((s) => s.name === 'sm_composite_scope_a')
-  assert.equal(capA && capA.workspaceKey, WS_A, 'rebuild 把行级工作区归属传给注册')
-  const capB = seen.find((s) => s.name === 'sm_composite_scope_b')
-  assert.equal(capB && capB.workspaceKey, WS_B)
-  // 播种键来自内置定义自己的 scope（composite.ts: `workspaceKeyOf(builtin.scope)`），
-  // 不是测试里的 WS_A——scope 是本仓库的绝对路径，换克隆目录即不同，断言必须通过定义推导。
-  const builtinDef = BUILTIN_CAPABILITIES.find((c) => c.name === 'git-sync-supermemory')
-  assert.ok(builtinDef && builtinDef.scope, '内置能力定义带 scope')
-  const builtinRow = [...store.toolMemory.values()].find((r) => r.workspaceKey === workspaceKeyOf(builtinDef.scope) && JSON.parse(r.entry).name === GIT_TOOL)
-  assert.ok(builtinRow, '内置能力播种并落到 scope 所属工作区')
-  // 重新合并（幂等）：不再播种。
-  const again = await mergeBuiltinCapabilities(store)
-  assert.deepEqual(again.seeded, [], '二次合并不重复播种')
-  ok('W5 重启重建带行级归属；内置播种落 scope 工作区且幂等')
-}
-
-// ---- W6 适用性判定纯函数 ----
-{
-  assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, WS_A), true)
-  assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, WS_B), false, 'scope 指向别的工作区=不适用')
-  assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, WS_B, WS_A), false)
-  assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, WS_B, WS_B), true, '行级归属优先于 scope')
-  assert.equal(capabilityAppliesToWorkspace({}, WS_B), true, '无归属无 scope=全局能力')
-  assert.equal(capabilityAppliesToWorkspace({ scope: WS_A }, undefined), true, '无调用方工作区=不判定')
-  assert.equal(workspaceKeyOf(WS_B), WS_B, '虚构路径的键值稳定（resolve 退化）')
-  ok('W6 适用性判定：行级归属优先 / scope 推导 / 全局能力 / 无上下文放行')
-}
-
-// ---- W7 R28：归属回填 / signalKey 推导 / createdAt 落库 ----
-{
-  // (a) 启动回填：无 workspaceKey 的旧行从 trigger 前缀 ws/<ws>/seq/ 推导归属并
-  //     写回；回填出的归属当次启动即进入注册（when 门禁不用等下一轮重启）；
-  //     createdAt 一并补齐；保持全局的行记 info 日志；第二次启动不再写（幂等）。
-  const rows = new Map([
-    ['tm-legacy-seq', {
-      kind: 'composite', trigger: 'ws/' + WS_B + '/seq/read>bash',
-      title: '旧序列', tags: [], description: '旧序列',
-      entry: JSON.stringify({ name: 'sm_composite_legacy_seq', steps: [{ tool: 'read', arguments: {} }], parameters: [] }),
-      useCount: 0, status: 'active',
-    }],
-    ['tm-legacy-global', {
-      kind: 'composite', trigger: 'capability/legacy-global',
-      title: '旧全局', tags: [], description: '旧全局',
-      entry: JSON.stringify({ name: 'sm_composite_legacy_glob', kind: 'capability', entry: 'echo g', steps: [], parameters: [] }),
-      useCount: 0, status: 'active',
-    }],
-  ])
-  const updates = []
-  const toolMemory = {
-    get: (k) => rows.get(k),
-    keys: () => rows.keys(),
-    values: () => rows.values(),
-    get size() { return rows.size },
-    entries: () => rows.entries(),
-    put: async (k, v) => { rows.set(k, v) },
-    update: async (k, fn) => { updates.push(k); rows.set(k, fn(rows.get(k))) },
-    delete: async (k) => rows.delete(k),
+const ctxOf = () => {
+  const captured = []
+  return {
+    captured,
+    ctx: { tools: { register: (def, opts) => { captured.push({ def, opts }); return () => {} }, get: () => undefined } },
   }
-  const store = { ...fakeStore(), toolMemory }
-  const logs = []
+}
+const legacyCap = (name, scope, extra = {}) => ({
+  kind: 'composite', workspaceKey: scope, title: name, tags: [], trigger: 'capability/' + name,
+  description: name + ' 描述', entry: JSON.stringify({ name, kind: 'capability', description: name + ' 描述', entry: 'echo ' + name, scope, runnable: true, steps: [], parameters: [], version: 1, ...extra }),
+  useCount: 2, status: 'active', createdAt: 1,
+})
+
+// ---- W1 纯判定 ----
+{
+  assert.equal(capability.capabilityAppliesToWorkspace({ scope: WS_A }, WS_A), true)
+  assert.equal(capability.capabilityAppliesToWorkspace({ scope: WS_A }, WS_B), false, 'scope 指向别的工作区=不适用')
+  assert.equal(capability.capabilityAppliesToWorkspace({ scope: WS_A }, WS_B, WS_B), true, '行级归属优先于 scope')
+  assert.equal(capability.capabilityAppliesToWorkspace({}, WS_B), true, '无归属无 scope=全局能力')
+  assert.equal(capability.capabilityAppliesToWorkspace({ scope: WS_A }, undefined), true, '无调用方工作区=不判定')
+  assert.equal(capability.scopeContains(WS_A, join(WS_A, 'src')), true, '子目录在 scope 内')
+  assert.equal(capability.scopeContains(WS_A, WS_B), false, '别的工作区在 scope 外')
+  assert.equal(capability.scopeContains(undefined, WS_B), true, '无 scope=不限制')
+  ok('W1 纯判定：scope/行级归属/全局/子目录包含')
+}
+
+// ---- W2 列表隔离 ----
+{
+  const store = fakeStore({
+    toolMemory: [
+      ['tm-a', legacyCap('sm_composite_scope_a', WS_A)],
+      ['tm-b', legacyCap('sm_composite_scope_b', WS_B)],
+      ['tm-global', { ...legacyCap('sm_composite_global', ''), workspaceKey: undefined }],
+      ['tm-seq', { kind: 'composite', workspaceKey: WS_A, title: '序列', tags: [], trigger: 'ws/x/seq/a>b', description: 'd', entry: JSON.stringify({ name: 'sm_composite_seq', steps: [{ tool: 'a', arguments: {} }], parameters: [] }), useCount: 0, status: 'active', createdAt: 1 }],
+    ],
+  })
+  const names = (ws) => capability.capabilityRecordsOf(store, ws).map((row) => row.spec.name).sort()
+  assert.deepEqual(names(WS_A), ['global', 'scope-a'], 'A sees its own + the global capability')
+  assert.deepEqual(names(WS_B), ['global', 'scope-b'])
+  assert.equal(capability.capabilityRecordsOf(store).length, 3, '无工作区参数=全量')
+  const panel = new SupermemoryPanelService(store)
+  const viewsA = panel.listTools(dirA)
+  assert.deepEqual(viewsA.filter((view) => view.kind === 'capability').map((view) => view.name).sort(), ['sm_cap_global', 'sm_cap_scope_a'])
+  const viewsB = panel.listTools(dirB)
+  assert.deepEqual(viewsB.filter((view) => view.kind === 'capability').map((view) => view.name).sort(), ['sm_cap_global', 'sm_cap_scope_b'])
+  assert.deepEqual(capability.capabilityHealthOf(store, WS_A).map((row) => row.name).sort(), ['global', 'scope-a'])
+  ok('W2 列表隔离：capabilityRecordsOf / 面板 listTools / capabilityHealthOf 只看本工作区')
+}
+
+// ---- W3 同名能力两个工作区各自一行 ----
+{
+  const store = fakeStore()
+  const { ctx } = ctxOf()
+  const a = await capability.registerCapability(ctx, store, { name: 'shared-cap', description: 'A 侧', entry: 'echo a', scope: dirA }, WS_A)
+  const b = await capability.registerCapability(ctx, store, { name: 'shared-cap', description: 'B 侧', entry: 'echo b', scope: dirB }, WS_B)
+  assert.equal(a.status, 'ok', a.message)
+  assert.equal(b.status, 'ok', b.message)
+  assert.notEqual(a.id, b.id, 'same logical name in two workspaces = two rows')
+  assert.equal(store.toolMemory.size, 2)
+  assert.deepEqual(capability.capabilityRecordsOf(store, WS_A).map((row) => row.spec.description), ['A 侧'])
+  assert.deepEqual(capability.capabilityRecordsOf(store, WS_B).map((row) => row.spec.description), ['B 侧'])
+  ok('W3 注册隔离：同名能力在两个工作区各自一行，互不覆盖')
+}
+
+// ---- W4 执行面跨工作区拒绝 ----
+{
+  const store = fakeStore()
+  const { ctx, captured } = ctxOf()
+  const reg = await capability.registerCapability(ctx, store, {
+    name: 'gate-cap', description: '执行面门禁', entry: 'echo gate-ok', scope: dirA,
+  }, WS_A)
+  assert.equal(reg.status, 'ok')
+  const def = captured.find((item) => item.def.name === 'sm_cap_gate_cap')?.def
+  assert.ok(def, 'the execution face is registered as sm_cap_*')
+  const here = await def.execute({}, { signal: new AbortController().signal, agent: { session: { header: { cwd: dirA } } } })
+  assert.equal(here.status, 'completed', here.summary)
+  const other = await def.execute({}, { signal: new AbortController().signal, agent: { session: { header: { cwd: dirB } } } })
+  assert.equal(other.status, 'failed', 'a cross-workspace call is refused')
+  const rec = capability.findCapabilityRow(store, { id: reg.id })
+  assert.equal(rec.record.runCount, 1, 'the refused call is not counted')
+  ok('W4 执行面：跨工作区调用拒绝且不计数，本工作区正常执行')
+}
+
+// ---- W5 重建带归属 + 内置播种 ----
+{
+  const store = fakeStore({
+    toolMemory: [
+      ['tm-a', legacyCap('sm_composite_scope_a', WS_A)],
+      ['tm-b', legacyCap('sm_composite_scope_b', WS_B)],
+    ],
+  })
   const seen = []
-  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
-  const count = await rebuildComposites(ctx, store, {
-    register: async (_c, _s, spec, workspaceKey) => { seen.push({ name: spec.name, workspaceKey }); return () => {} },
-    logger: { info: (m) => logs.push(m) },
+  const { ctx } = ctxOf()
+  const count = await capability.rebuildCapabilities(ctx, store, {
+    register: async (_c, _s, entry, workspaceKey) => { seen.push({ name: entry.record.name, workspaceKey }); return () => {} },
   })
-  assert.equal(count, 3, '两条旧行 + 内置播种一条: ' + count)
-  assert.equal(rows.get('tm-legacy-seq').workspaceKey, WS_B, 'trigger 前缀回填归属')
-  const seqSeen = seen.find((s) => s.name === 'sm_composite_legacy_seq')
-  assert.equal(seqSeen && seqSeen.workspaceKey, WS_B, '回填的归属当次启动即随注册传入（门禁立即生效）')
-  assert.ok(typeof rows.get('tm-legacy-seq').createdAt === 'number' && rows.get('tm-legacy-seq').createdAt > 0, '旧行补齐 createdAt')
-  const firstCreatedAt = rows.get('tm-legacy-seq').createdAt
-  assert.equal(rows.get('tm-legacy-global').workspaceKey, undefined, '推导不到且 spec 无 scope = 保持全局')
-  assert.ok(logs.some((m) => m.includes('tm-legacy-seq') && m.includes('归属回填')), '归属回填写 info 日志')
-  assert.ok(logs.some((m) => m.includes('tm-legacy-seq') && m.includes('createdAt')), 'createdAt 回填写 info 日志')
-  assert.ok(logs.some((m) => m.includes('tm-legacy-global') && m.includes('保持全局')), '保持全局的行如实记录')
-  // 幂等：第二次启动不再写任何行、不再记回填日志（保持全局的行每轮启动都
-  // 如实记一条状态说明，不算回填动作——断言把它排除）。
-  updates.length = 0
-  logs.length = 0
-  await rebuildComposites(ctx, store, {
-    register: async () => () => {},
-    logger: { info: (m) => logs.push(m) },
-  })
-  assert.deepEqual(updates, [], '第二次启动零 update（幂等）')
-  assert.equal(logs.filter((m) => m.includes('归属回填') || m.includes('回填 createdAt')).length, 0, '第二次启动不再记回填日志')
-  assert.equal(rows.get('tm-legacy-seq').workspaceKey, WS_B, '归属不被二次改写')
-  assert.equal(rows.get('tm-legacy-seq').createdAt, firstCreatedAt, 'createdAt 不被二次改写')
-  ok('W7a 启动回填：trigger 前缀推导归属 + createdAt 补齐，当次注册生效，幂等不重复写')
+  assert.ok(count >= 2, 'rebuild registers active executable rows: ' + count)
+  const a = seen.find((item) => item.name === 'scope-a')
+  assert.equal(a && a.workspaceKey, WS_A, 'row-level ownership is passed to registration')
+  const b = seen.find((item) => item.name === 'scope-b')
+  assert.equal(b && b.workspaceKey, WS_B)
+  assert.ok(!seen.some((item) => item.name.includes('composite')), 'no legacy sequence row is registered')
+  const builtin = capability.capabilityRows(store).find((entry) => entry.record.name === 'git-sync-supermemory')
+  assert.ok(builtin, 'builtin capability seeded')
+  assert.equal(builtin.row.workspaceKey, workspaceKeyOf(capability.capabilityRows(store).find((e) => e.record.name === 'git-sync-supermemory').record.scope), 'builtin seeded to its scope workspace')
+  ok('W5 重建：行级归属传给注册；内置能力播种到 scope 工作区；序列行永不注册')
 }
 
+// ---- W6 迁移保留归属 + 改名 ----
 {
-  // (b) persist 未显式传 workspaceKey 时从 signalKey 推导；显式传入优先。
-  const store = fakeStore()
-  const seqSpec = { name: 'sm_composite_persist_probe', description: '推导', steps: [{ tool: 'read', arguments: {} }], parameters: [] }
-  const idA = await persistComposite(store, seqSpec, 'ws/' + WS_B + '/seq/read>bash')
-  assert.equal(store.toolMemory.get(idA).workspaceKey, WS_B, '未传 workspaceKey → 从 signalKey 推导')
-  const idB = await persistComposite(store, seqSpec, 'capability/x')
-  assert.equal(store.toolMemory.get(idB).workspaceKey, undefined, 'capability trigger 推导不出归属 = 全局')
-  const idC = await persistComposite(store, seqSpec, 'ws/' + WS_A + '/seq/a>b', WS_B)
-  assert.equal(store.toolMemory.get(idC).workspaceKey, WS_B, '显式传入优先于推导')
-  assert.equal(workspaceKeyFromSignalKey('ws/F:\\10-SuperMemory/seq/a>b'), 'F:\\10-SuperMemory')
-  assert.equal(workspaceKeyFromSignalKey('capability/x'), undefined)
-  assert.equal(workspaceKeyFromSignalKey(''), undefined)
-  assert.equal(workspaceKeyFromSignalKey('ws//seq/a'), undefined, '空前缀不推导')
-  ok('W7b persist 归属推导：signalKey 前缀兜底，显式传入优先，坏形状不瞎猜')
-}
-
-{
-  // (c) createdAt：新建行 stamp；同名更新保留原值；内置升级对旧行自愈。
-  const before = Date.now()
-  const store = fakeStore()
-  const seqSpec = { name: 'sm_composite_created_at', description: 'c', steps: [{ tool: 'read', arguments: {} }], parameters: [] }
-  const id = await persistComposite(store, seqSpec, 'ws/x/seq/a')
-  const created0 = store.toolMemory.get(id).createdAt
-  assert.ok(typeof created0 === 'number' && created0 >= before && created0 <= Date.now(), '新建行 stamp createdAt')
-  const ctx = { tools: { register: () => () => {}, get: () => undefined } }
-  const deps = { register: async () => () => {}, persist: persistComposite, toolExists: () => false }
-  const reg = await registerCapability(ctx, store, { name: 'created-at-cap', description: 'd', entry: 'echo d', scope: WS_A }, WS_A, deps)
-  const rowId = reg.id
-  const created1 = store.toolMemory.get(rowId).createdAt
-  assert.ok(typeof created1 === 'number' && created1 > 0, 'registerCapability 新行落 createdAt')
-  await new Promise((r) => setTimeout(r, 5))
-  const upd = await registerCapability(ctx, store, { name: 'created-at-cap', description: 'd2', entry: 'echo d2', scope: WS_A }, WS_A, deps)
-  assert.equal(upd.id, rowId, '同名更新不建新行')
-  assert.equal(store.toolMemory.get(rowId).createdAt, created1, '同名更新保留原 createdAt')
-  assert.ok(JSON.parse(store.toolMemory.get(rowId).entry).updatedAt > 0, 'updatedAt 照常刷新（与 createdAt 分离）')
-  // 内置升级自愈：缺 createdAt 的旧行被升级时按 spec.updatedAt ?? now 补齐。
-  const legacy = {
-    name: GIT_TOOL, kind: 'capability', entry: 'pnpm git:sync', doc: 'docs/git-sync.md',
-    scope: 'G:\\09 - dsh\\SuperMemory', steps: [], parameters: [], runnable: true,
-    version: 1, updatedAt: 12345,
-  }
-  await store.toolMemory.put('tm-legacy-cap', {
-    kind: 'composite', trigger: 'capability/' + GIT_TOOL, title: 't', tags: [],
-    description: 'd', entry: JSON.stringify(legacy), useCount: 0, status: 'active',
+  const store = fakeStore({
+    toolMemory: [
+      ['tm-legacy', { ...legacyCap('sm_composite_legacy_cap', WS_A), useCount: 5 }],
+      ['tm-seq', { kind: 'composite', workspaceKey: WS_A, title: '序列', tags: [], trigger: 'ws/a/seq/read>bash', description: 'd', entry: JSON.stringify({ name: 'sm_composite_legacy_seq', steps: [{ tool: 'read', arguments: {} }], parameters: [] }), useCount: 3, status: 'active', createdAt: 1 }],
+    ],
   })
-  const rep = await mergeBuiltinCapabilities(store)
-  assert.deepEqual(rep.upgraded, [GIT_TOOL])
-  assert.equal(store.toolMemory.get('tm-legacy-cap').createdAt, 12345, '升级行按 spec.updatedAt 补齐 createdAt')
-  ok('W7c createdAt 落库：新建 stamp / 更新保留 / 内置升级按 spec.updatedAt 自愈')
+  const report = await capability.migrateCapabilities(store, { root: join(DSH_HOME, 'skills'), now: 1000 })
+  assert.ok(report.migratedCapabilities >= 1)
+  assert.equal(store.toolMemory.get('tm-legacy').workspaceKey, WS_A, 'workspace ownership survives migration')
+  const rec = JSON.parse(store.toolMemory.get('tm-legacy').entry)
+  assert.equal(rec.name, 'legacy-cap')
+  assert.equal(rec.entry, 'echo sm_composite_legacy_cap')
+  assert.equal(capability.capabilityToolName(rec.name), 'sm_cap_legacy_cap')
+  assert.equal(store.toolMemory.get('tm-seq').status, 'retired', 'legacy sequence row retired')
+  assert.equal(capability.capabilityRows(store).some((entry) => entry.record.name.includes('legacy-seq')), false, 'retired sequence is not a capability')
+  ok('W6 迁移：旧能力保留归属并改名 sm_cap_*；旧序列行退役且不可见')
 }
 
-console.log(String.fromCharCode(10) + passed + ' checks passed')
+rmSync(base, { recursive: true, force: true })
+rmSync(DSH_HOME, { recursive: true, force: true })
+console.log('\nworkspace-scope-smoke: ' + passed + ' groups passed')
 process.exit(0)

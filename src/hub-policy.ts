@@ -482,7 +482,7 @@ const sourceSlug = (value: string): string =>
  *   1. a declared field on the definition (never inferred);
  *   2. `mcp__<server>__<tool>` → that MCP server;
  *   3. `memory_*` → this plugin;
- *   4. `sm_composite_*` → the composite/capability family;
+ *   4. `sm_cap_*` → the capability family (legacy `sm_composite_*` is read the same way; R50 never registers those names);
  *   5. `schedule_*` → the host scheduling plugin;
  *   6. everything else (including names nobody reviewed) → host/未归属.
  * Every rule except (1) is an inference and is reported as one.
@@ -512,8 +512,12 @@ export function inferHubToolSource(name: string, declared?: string): HubCatalogS
   if (toolName.startsWith('memory_')) {
     return { id: HUB_CATALOG_GROUPS.supermemory, label: 'SuperMemory 插件', kind: 'supermemory', inferred: true, hint: '按 memory_* 前缀推断（本插件注册）' }
   }
+  if (toolName.startsWith('sm_cap_')) {
+    return { id: HUB_CATALOG_GROUPS.composite, label: '固化能力（SuperMemory）', kind: 'composite', inferred: true, hint: '按 sm_cap_* 前缀推断（统一能力：知识面 + 执行面）' }
+  }
+  // Historical catalog rows may still carry the pre-R50 prefix; read-only mapping.
   if (toolName.startsWith('sm_composite_')) {
-    return { id: HUB_CATALOG_GROUPS.composite, label: '固化能力（SuperMemory）', kind: 'composite', inferred: true, hint: '按 sm_composite_* 前缀推断（memory_toolize 固化）' }
+    return { id: HUB_CATALOG_GROUPS.composite, label: '固化能力（SuperMemory，旧名）', kind: 'composite', inferred: true, hint: '历史记录中的 sm_composite_* 前缀：只做读侧映射，不再注册' }
   }
   if (toolName.startsWith('schedule_')) {
     return { id: HUB_CATALOG_GROUPS.schedule, label: '调度', kind: 'schedule', inferred: true, hint: '按 schedule_* 前缀推断（宿主调度插件）' }

@@ -100,6 +100,10 @@ function buildApi(ctx: Context): PanelApi | undefined {
     listTools: (cwd) => call('listTools', cwd),
     editTool: (id, patch) => call('editTool', id, patch),
     deleteTool: (id) => call('deleteTool', id),
+    // R50: 统一能力的执行面（默认预演）与提案接受/拒绝。
+    runTool: (id, options) => call('runTool', id, options),
+    acceptProposal: (cwd, id) => call<MutationResult>('acceptProposal', cwd, id),
+    declineProposal: (cwd, id) => call<MutationResult>('declineProposal', cwd, id),
     listAgentPresets: () => call('listAgentPresets'),
     listModelCatalog: () => call('listModelCatalog'),
     listPermissions: () => call('listPermissions'),

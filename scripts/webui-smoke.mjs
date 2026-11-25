@@ -399,13 +399,20 @@ ok('404 / 405 / HEAD edges')
     writeConfirm: true, runnable: true, tags: ['git', '冒烟'],
   }))).json()
   assert.equal(reg.ok, true, 'register must succeed: ' + (reg.error || ''))
-  assert.equal(reg.name, 'sm_composite_webui_registered')
+  assert.equal(reg.name, 'webui-registered', 'logical name; tool name is sm_cap_webui_registered')
   const regRow = store.toolMemory.get(reg.id)
   assert.equal(JSON.parse(regRow.entry).kind, 'capability')
   assert.equal(regRow.workspaceKey, ws)
-  const bad = await fetch(base + '/api/tool/register', json({ ws, name: 'x', description: 'd', entry: '' }))
+  // R50: an empty entry is a valid KNOWLEDGE-ONLY capability (not a 400).
+  const knowledge = await fetch(base + '/api/tool/register', json({ ws, name: 'x', description: 'd', entry: '' }))
+  assert.equal(knowledge.status, 200, 'knowledge-only registration (no entry) is valid')
+  const knowledgeRow = await knowledge.json()
+  assert.equal(store.toolMemory.get(knowledgeRow.id).kind, 'knowledge')
+  await fetch(base + '/api/tool/delete', json({ ws, id: knowledgeRow.id }))
+  const bad = await fetch(base + '/api/tool/register', json({ ws, name: '', description: '', entry: '' }))
   assert.equal(bad.status, 400)
-  ok('R22-3 tool/register：落库（kind=composite + spec.kind=capability，按工作区隔离），非法入参 400')
+  assert.equal(regRow.kind, 'capability', 'R50 row kind is capability')
+  ok('R22-3 tool/register：落库（R50 统一能力，按工作区隔离），非法入参 400')
 
   // 启停 + 删除 + 未知 id + 序列工具不可一键执行
   const st = await (await fetch(base + '/api/tool/status', json({ ws, id: 'tm-cap', status: 'retired' }))).json()
@@ -419,7 +426,7 @@ ok('404 / 405 / HEAD edges')
   store.toolMemory.put('tm-seq', { kind: 'composite', title: '序列', tags: [], trigger: '', description: 'd', entry: JSON.stringify({ name: 'sm_composite_seq', steps: [{ tool: 'read', arguments: {} }], parameters: [] }), useCount: 0, status: 'active' })
   const seqRun = await (await fetch(base + '/api/tool/run', json({ ws, id: 'tm-seq' }))).json()
   assert.equal(seqRun.ok, false)
-  assert.match(seqRun.error, /只有能力/)
+  assert.match(seqRun.error, /能力定义损坏|仅知识|没有执行面/)
   ok('R22-4 tool/status 停用 + tool/delete 删除 + 未知 id 拒绝 + 序列工具不可一键执行')
 
   // R22 需求③：面板 listTools 必须把一条能力的完整定义带出来（入口命令、文档、
@@ -442,7 +449,7 @@ ok('404 / 405 / HEAD edges')
     })
     const { SupermemoryPanelService } = await import('../src/panel.ts')
     const rows = new SupermemoryPanelService(store).listTools(cwd)
-    const row = rows.find((tool) => tool.name === 'sm_composite_webui_detail')
+    const row = rows.find((tool) => tool.name === 'sm_cap_webui_detail')
     assert.ok(row, 'the panel lists the capability for its workspace')
     assert.equal(row.kind, 'capability')
     assert.equal(row.entry, 'echo detail')
@@ -456,7 +463,7 @@ ok('404 / 405 / HEAD edges')
     assert.equal(row.docMissing, false)
     assert.equal(row.scopeMissing, false)
     assert.ok(Array.isArray(row.notes), 'health notes ship with the row')
-    const badRow = rows.find((tool) => tool.name === 'sm_composite_webui_bad')
+    const badRow = rows.find((tool) => tool.name === 'sm_cap_webui_bad')
     assert.ok(badRow, 'a capability whose scope vanished is still listed (row-level ownership wins)')
     assert.equal(badRow.scopeMissing, true)
     assert.ok(badRow.notes.some((note) => note.includes('适用范围目录不存在')), 'the health note explains the missing scope')
@@ -484,16 +491,21 @@ ok('404 / 405 / HEAD edges')
       assert.equal(snapshot.memories.find((row) => row.id === 'mem-collected').collectionTitle, 'git 同步 记忆',
         '面板快照同样带集合上下文')
       // ToolView.createdAt：旧行（未回填）读作 undefined，新行原样透出。
+      await store.toolMemory.put('tm-legacy-time', {
+        kind: 'composite', workspaceKey: ws, title: '旧能力', tags: [], trigger: '', description: 'd',
+        entry: JSON.stringify({ name: 'sm_composite_legacy_time', kind: 'capability', entry: 'echo t', description: '旧能力', steps: [], parameters: [] }),
+        useCount: 0, status: 'active',
+      })
       const legacy = new SupermemoryPanelService(store).listTools(cwd)
-      const seeded = legacy.find((tool) => tool.id === 'tm-1')
+      const seeded = legacy.find((tool) => tool.name === 'sm_cap_legacy_time')
       assert.equal(seeded.createdAt, undefined,
         '没有 createdAt 的旧行读作 undefined（客户端显示 —）')
       await store.toolMemory.put('tm-stamped', {
         kind: 'composite', workspaceKey: ws, title: '带时间', tags: [], trigger: '', description: 'd',
-        entry: JSON.stringify({ name: 'sm_composite_stamped', kind: 'sequence', steps: [], parameters: [] }),
+        entry: JSON.stringify({ name: 'sm_composite_stamped', kind: 'capability', entry: 'echo s', description: '带时间', steps: [], parameters: [] }),
         useCount: 0, status: 'active', createdAt: now,
       })
-      const stamped = new SupermemoryPanelService(store).listTools(cwd).find((tool) => tool.name === 'sm_composite_stamped')
+      const stamped = new SupermemoryPanelService(store).listTools(cwd).find((tool) => tool.name === 'sm_cap_stamped')
       assert.equal(stamped.createdAt, now, '有 createdAt 的行原样透出')
       ok('R27-3 面板数据契约：MemoryView 带集合上下文（未归集不设）+ ToolView 透出 createdAt')
     }

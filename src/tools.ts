@@ -1480,34 +1480,32 @@ ${listText}` : listText
 
   disposers.push(ctx.tools.register(tools.defineTool({
     name: 'memory_toolize',
-    description: '重复工作的固化入口（R45 起以 skill 为主）：① 列出待处理提议、已注册能力与已生成的 skill；'
-      + '② 接受/拒绝提议（accept 是 R49 之后唯一能把工具序列编译成组合工具的入口：只接受「有业务对象」的待处理提议，宽泛工具序列如 run_code>run_code 永远不生成候选）；'
-      + '③ register 注册重复工作的经验——不给 entry 时产出 DSH skill（name/title/description/whenToUse/body，写入 <仓库>/.dsh/skills，同名更新 version+1 并保留 changelog，模型目录可路由）；给 entry 时仍注册"能力"（capability：入口命令 + 文档 + 适用范围 + 默认预演/写操作确认，向后兼容）；'
-      + '④ name + enabled 启用/停用已生成的 skill；⑤ refresh-builtin 刷新内置能力并返回差异报告与健康度；'
-      + '⑥ cleanup 一次性清理存量：停用自动生成的工具序列组合工具、清空待处理提议与宽泛序列信号、归档历史「工具序列壳子」skill（搬到 <skills 根>-archive 并写 manifest，可回滚；人工/manual 能力与 skill 一律不动；幂等）。'
-      + '为什么用 skill：技能正文讲「何时用/怎么判断/有哪些坑」，比固定流水线更容易在同类任务里被模型想起来；组合工具只保留给固定短子序列的一次调用。'
-      + 'skill 文件是事实来源（重启后仍在，由宿主 skill 目录发现），tool_memory 行只镜像版本/使用计数/启用状态。'
+    description: '重复工作的固化入口（R50 单一能力：知识面 SKILL.md + 执行面 sm_cap_<name>）：'
+      + '① 列出待接受提案、能力与仅知识草稿；② accept/decline 处理提案（接受后创建能力；高置信入口草稿必须人工「启用执行」才会 runnable）；'
+      + '③ register 注册/更新能力：给 entry 产可执行能力（固定入口，默认预演、写操作 confirm=true），不给 entry 则仅知识（六节 SKILL.md，事实块自动维护）；'
+      + '④ enabled + name 同时启停知识面与执行面；⑤ refresh-builtin 刷新内置能力与健康度；⑥ cleanup 清理历史工具序列行/待处理提案/宽泛序列信号并归档工具序列壳子 skill（幂等、可回滚）。'
+      + '执行面绝不自动执行；能力连续失败时更新事实块/文档而不是绕过闸门。'
       + CAPABILITY_ROUTING_RULES,
     parameters: {
-      accept: { type: 'boolean', description: '接受第一个待处理提议并生成组合工具' },
-      decline: { type: 'boolean', description: '拒绝（不再提示）第一个待处理提议' },
-      register: { type: 'boolean', description: '注册重复工作的经验：缺省产出 skill；同时给 entry 时产出可执行能力' },
-      skill: { type: 'boolean', description: 'register 时强制产出 skill（即使提供了 entry）；false 则强制走能力注册' },
-      body: { type: 'string', description: 'skill 正文（Markdown）：触发条件/决策清单/步骤/关键坑/验证/反例；缺省生成同名骨架' },
-      whenToUse: { type: 'string', description: 'skill 的额外路由提示（何时加载它；短而具体）' },
-      enabled: { type: 'boolean', description: '配合 name：启用/停用已生成的 skill（不传其他字段时生效）' },
-      name: { type: 'string', description: '逻辑名（字母/数字/-/_，如 git-sync-supermemory）：skill 名派生为 sm-<name>，能力工具名派生为 sm_composite_<name>' },
+      accept: { type: 'boolean', description: '接受一个待处理提案（缺省第一个；可用 name 指定）' },
+      decline: { type: 'boolean', description: '拒绝一个待处理提案（缺省第一个；可用 name 指定）' },
+      register: { type: 'boolean', description: '注册/更新能力：给 entry 产可执行能力；不给 entry 产仅知识能力' },
+      skill: { type: 'boolean', description: 'register 时强制仅知识（即使给了 entry 也不注册执行面）' },
+      body: { type: 'string', description: '知识面正文（Markdown 六节）；缺省生成骨架。事实块由插件自动维护，块外散文保留' },
+      whenToUse: { type: 'string', description: '保留参数（R48 兼容）：知识面何时加载由 description 表达' },
+      enabled: { type: 'boolean', description: '配合 name：同时启用/停用知识面与执行面' },
+      name: { type: 'string', description: '逻辑名（字母/数字/-/_，如 git-sync-supermemory）：工具名派生 sm_cap_git_sync_supermemory，skill 名派生 sm-git-sync-supermemory' },
       title: { type: 'string', description: '标题（人类可读）' },
-      description: { type: 'string', description: '路由描述（skill/capability 共用）：写清「何时用/何时优先用它」，这是模型路由依据，短而具体' },
-      entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（在 scope 目录内经 shell 执行）' },
+      description: { type: 'string', description: '路由描述（知识面/执行面共用）：写清「何时用/何时优先用它」，这是模型路由依据，短而具体' },
+      entry: { type: 'string', description: '入口命令，如 "pnpm git:sync"（固定入口，不接受任意参数透传）' },
       doc: { type: 'string', description: '文档路径（相对仓库根），如 "docs/git-sync.md"' },
       scope: { type: 'string', description: '适用范围：入口命令的执行目录，如 "F:\\10-SuperMemory"（通常是仓库根）' },
-      runnable: { type: 'boolean', description: '是否允许执行；缺省 true' },
+      runnable: { type: 'boolean', description: '是否允许执行；缺省 true（有 entry 时）' },
       dryRunArg: { type: 'string', description: '预演参数，如 "--dry-run"；定义后默认预演执行' },
       writeConfirm: { type: 'boolean', description: 'true=真实执行可能写远端/改状态，必须显式 confirm=true' },
       tags: { type: 'array', description: '标签（3–8 个短词，检索索引）', items: { type: 'string' } },
-      refreshBuiltin: { type: 'boolean', description: '刷新内置能力：store 缺失则播种、旧于内置版本则升级（现场更新保留），并返回差异报告与各能力健康度' },
-      cleanup: { type: 'boolean', description: 'R49：一次性清理存量并返回分别计数 archivedSkills / retiredComposites / clearedProposals——停用自动生成的工具序列组合工具（人工能力不动）、清空待处理提议与宽泛序列信号、归档工具序列壳子 skill（移到 <skills 根>-archive，可回滚）；幂等，可重复执行' },
+      refreshBuiltin: { type: 'boolean', description: '刷新内置能力：store 缺失则播种、旧于内置版本则升级（现场更新保留），并返回差异报告与各能力健康度（含执行/加载次数与转化率）' },
+      cleanup: { type: 'boolean', description: 'R50 清理：退役历史工具序列行（不注册）、清空待处理提案、清理宽泛序列信号、归档工具序列壳子 skill（移到 <skills 根>-archive，可回滚）；幂等' },
       changelog: { type: 'string', description: 'register 同名更新时的一行变更说明（写入 changelog，最新在前；缺省自动生成）' },
     },
     output: {
@@ -1528,13 +1526,13 @@ ${listText}` : listText
             },
           },
           archivedCount: { type: 'integer' },
-          /** R49 counts: archived shell skills / retired auto composites / cleared proposals. */
           archivedSkills: { type: 'integer' },
           retiredComposites: { type: 'integer' },
           clearedProposals: { type: 'integer' },
           prunedSignals: { type: 'integer' },
           pendingBefore: { type: 'integer' },
           pendingAfter: { type: 'integer' },
+          expiredProposals: { type: 'integer' },
           retired: { type: 'array', items: { type: 'string' } },
           archiveRoots: {
             type: 'array',
@@ -1559,16 +1557,74 @@ ${listText}` : listText
               additionalProperties: false,
             },
           },
-          tool: { type: 'string' },
-          message: { type: 'string' },
-          capabilities: {
+          proposals: {
             type: 'array',
             items: {
               type: 'object',
               properties: {
                 name: { type: 'string', required: true },
                 title: { type: 'string' },
-                entry: { type: 'string', required: true },
+                description: { type: 'string', required: true },
+                version: { type: 'integer' },
+                taskKey: { type: 'string' },
+                source: { type: 'string' },
+                entryDraft: { type: 'string' },
+                entryVerified: { type: 'boolean' },
+                expiresAt: { type: 'integer' },
+              },
+              additionalProperties: false,
+            },
+          },
+          units: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string', required: true },
+                name: { type: 'string', required: true },
+                logicalName: { type: 'string', required: true },
+                kind: { type: 'string', required: true },
+                title: { type: 'string' },
+                description: { type: 'string' },
+                badges: { type: 'array', items: { type: 'string' } },
+                entry: { type: 'string' },
+                entryDraft: { type: 'string' },
+                entryVerified: { type: 'boolean' },
+                doc: { type: 'string' },
+                scope: { type: 'string' },
+                runnable: { type: 'boolean' },
+                enabled: { type: 'boolean' },
+                status: { type: 'string' },
+                version: { type: 'integer' },
+                loadCount: { type: 'integer' },
+                runCount: { type: 'integer' },
+                loadsToRuns: { type: 'number' },
+                successRate: { type: 'number' },
+                successCount: { type: 'integer' },
+                failCount: { type: 'integer' },
+                consecutiveFailures: { type: 'integer' },
+                lastStatus: { type: 'string' },
+                skillPath: { type: 'string' },
+                source: { type: 'string' },
+                taskKey: { type: 'string' },
+                builtin: { type: 'boolean' },
+                notes: { type: 'array', items: { type: 'string' } },
+              },
+              additionalProperties: false,
+            },
+          },
+          tool: { type: 'string' },
+          message: { type: 'string' },
+          entryDraft: { type: 'boolean' },
+          capabilities: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', required: true },
+                logicalName: { type: 'string' },
+                title: { type: 'string' },
+                entry: { type: 'string' },
                 doc: { type: 'string' },
                 scope: { type: 'string' },
                 runnable: { type: 'boolean' },
@@ -1576,9 +1632,14 @@ ${listText}` : listText
                 writeConfirm: { type: 'boolean' },
                 status: { type: 'string' },
                 useCount: { type: 'integer' },
+                runCount: { type: 'integer' },
+                loadCount: { type: 'integer' },
+                loadsToRuns: { type: 'number' },
                 version: { type: 'integer' },
                 lastStatus: { type: 'string' },
                 live: { type: 'boolean' },
+                entryDraft: { type: 'string' },
+                entryVerified: { type: 'boolean' },
               },
               additionalProperties: false,
             },
@@ -1593,6 +1654,7 @@ ${listText}` : listText
                 description: { type: 'string', required: true },
                 version: { type: 'integer' },
                 useCount: { type: 'integer' },
+                loadCount: { type: 'integer' },
                 enabled: { type: 'boolean' },
                 status: { type: 'string' },
                 path: { type: 'string' },
@@ -1616,10 +1678,17 @@ ${listText}` : listText
                   type: 'object',
                   properties: {
                     name: { type: 'string', required: true },
+                    kind: { type: 'string' },
                     builtin: { type: 'boolean' },
                     builtinVersion: { type: 'integer' },
                     version: { type: 'integer' },
                     entry: { type: 'string' },
+                    entryDraft: { type: 'string' },
+                    entryVerified: { type: 'boolean' },
+                    runCount: { type: 'integer' },
+                    loadCount: { type: 'integer' },
+                    loadsToRuns: { type: 'number' },
+                    successRate: { type: 'number' },
                     useCount: { type: 'integer' },
                     successCount: { type: 'integer' },
                     failCount: { type: 'integer' },
@@ -1642,11 +1711,18 @@ ${listText}` : listText
       render: (_args, value) => {
         const v = value as {
           status: string
+          proposals?: Array<{ name: string; description: string; entryDraft?: string }>
           pending?: Array<{ pattern: string; count: number }>
+          units?: Array<{
+            name: string; logicalName?: string; kind: string; badges?: string[]; version?: number
+            loadCount?: number; runCount?: number; loadsToRuns?: number; successRate?: number
+            lastStatus?: string; entry?: string; entryDraft?: string; notes?: string[]
+          }>
+          capabilities?: Array<{ name: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string; runCount?: number; loadCount?: number }>
+          skills?: Array<{ name: string; version?: number; loadCount?: number; useCount?: number; enabled?: boolean }>
           tool?: string
           message?: string
-          capabilities?: Array<{ name: string; title?: string; entry: string; dryRunArg?: string; writeConfirm?: boolean; status?: string }>
-          skills?: Array<{ name: string; title?: string; description: string; version?: number; useCount?: number; enabled?: boolean; status?: string; path?: string; source?: string; occurrences?: number }>
+          entryDraft?: boolean
           archived?: Array<{ name: string; root: string; archivePath: string }>
           archivedCount?: number
           archivedSkills?: number
@@ -1655,28 +1731,16 @@ ${listText}` : listText
           prunedSignals?: number
           pendingBefore?: number
           pendingAfter?: number
+          expiredProposals?: number
           retired?: string[]
           archiveRoots?: Array<{ root: string; scanned?: number; archived?: number }>
           builtin?: {
-            seeded: string[]
-            upgraded: string[]
-            current: string[]
-            localNewer: string[]
+            seeded: string[]; upgraded: string[]; current: string[]; localNewer: string[]
             health: Array<{
-              name: string
-              builtin?: boolean
-              builtinVersion?: number
-              version?: number
-              entry?: string
-              useCount?: number
-              successCount?: number
-              failCount?: number
-              consecutiveFailures?: number
-              lastStatus?: string
-              docMissing?: boolean
-              scopeMissing?: boolean
-              live?: boolean
-              notes?: string[]
+              name: string; builtin?: boolean; builtinVersion?: number; version?: number; entry?: string
+              runCount?: number; loadCount?: number; loadsToRuns?: number; successRate?: number
+              useCount?: number; successCount?: number; failCount?: number; consecutiveFailures?: number
+              lastStatus?: string; docMissing?: boolean; scopeMissing?: boolean; live?: boolean; notes?: string[]
             }>
           }
         }
@@ -1689,7 +1753,9 @@ ${listText}` : listText
             if (b.current.length) parts.push('已最新：' + b.current.join('、'))
             if (b.localNewer.length) parts.push('现场更新（保留）：' + b.localNewer.join('、'))
             for (const h of b.health) {
-              const head = `- ${h.name}${h.builtin ? '（内置）' : ''} v${h.version ?? 0}：使用 ${h.useCount ?? 0}（成功 ${h.successCount ?? 0}/失败 ${h.failCount ?? 0}，连续失败 ${h.consecutiveFailures ?? 0}）`
+              const head = '- ' + h.name + (h.builtin ? '（内置）' : '') + ' v' + (h.version ?? 0)
+                + '：执行 ' + (h.runCount ?? h.useCount ?? 0) + ' / 加载 ' + (h.loadCount ?? 0)
+                + '（转化率 ' + (h.loadsToRuns ?? 0) + '，成功率 ' + (h.successRate ?? 0) + '，连续失败 ' + (h.consecutiveFailures ?? 0) + '）'
               parts.push(head + (h.notes && h.notes.length ? '\n  ' + h.notes.join('\n  ') : ''))
             }
           }
@@ -1700,30 +1766,32 @@ ${listText}` : listText
           const counts: string[] = []
           const skillCount = v.archivedSkills ?? v.archivedCount ?? archived.length
           if (skillCount > 0) counts.push('归档壳子 skill ' + skillCount + ' 个')
-          if ((v.retiredComposites ?? 0) > 0) counts.push('停用自动组合工具 ' + (v.retiredComposites ?? 0) + ' 个' + (v.retired?.length ? '（' + v.retired.join('、') + '）' : ''))
-          if ((v.clearedProposals ?? 0) > 0) counts.push('清空待处理提议 ' + (v.clearedProposals ?? 0) + ' 条')
+          if ((v.retiredComposites ?? 0) > 0) counts.push('退役历史工具序列行 ' + (v.retiredComposites ?? 0) + ' 个' + (v.retired?.length ? '（' + v.retired.join('、') + '）' : ''))
+          if ((v.clearedProposals ?? 0) > 0) counts.push('清空待处理提案 ' + (v.clearedProposals ?? 0) + ' 条')
+          if ((v.expiredProposals ?? 0) > 0) counts.push('过期提案 ' + (v.expiredProposals ?? 0) + ' 条')
           if ((v.prunedSignals ?? 0) > 0) counts.push('清理宽泛序列信号 ' + (v.prunedSignals ?? 0) + ' 条')
-          const head = counts.length > 0 ? '已清理：' + counts.join('；') + '。' : '没有需要清理的自动生成物（人工/manual 能力与 skill 未改动）。'
+          const head = counts.length > 0 ? '已清理：' + counts.join('；') + '。' : '没有需要清理的自动生成物（人工/manual 能力与知识面未改动）。'
           const tail = 'pending ' + (v.pendingBefore ?? 0) + ' → ' + (v.pendingAfter ?? 0)
-          const lines = archived.map((entry) => `- ${entry.name} → ${entry.archivePath}（原根：${entry.root}）`)
+          const lines = archived.map((entry) => '- ' + entry.name + ' → ' + entry.archivePath + '（原根：' + entry.root + '）')
           return [{ type: 'text', text: [head + ' ' + tail, ...(lines.length > 0 ? ['归档明细（未删除，可在 <skills 根>-archive 回滚；manifest 已记录原名/时间/原因）：', ...lines] : [])].join('\n') }]
         }
         if (v.status === 'listed') {
-          const list = (v.pending ?? []).map((p) => `- ${p.pattern}（${p.count} 次）`).join('\n')
-          const caps = (v.capabilities ?? []).map((c) =>
-            `- ${c.name}：${c.entry}${c.dryRunArg ? `（默认预演 ${c.dryRunArg}）` : ''}${c.writeConfirm ? '（写操作需 confirm=true）' : ''}${c.status === 'retired' ? '（已停用）' : ''}`).join('\n')
-          const skills = (v.skills ?? []).map((s) =>
-            `- ${s.name}（v${s.version ?? 1}，加载 ${s.useCount ?? 0} 次，${s.enabled === false ? '已停用' : '启用中'}）：${s.description}`).join('\n')
+          const proposals = (v.proposals ?? []).map((p) => '- ' + p.name + '：' + p.description + (p.entryDraft ? '（入口草稿 ' + p.entryDraft + '，未验证）' : '（仅知识）'))
+          const units = (v.units ?? []).map((u) => '- ' + u.name + ' [' + (u.kind === 'knowledge' ? '仅知识' : u.kind === 'capability' ? '可执行' : '提案') + ']'
+            + (u.badges ?? []).map((badge) => ' [' + badge + ']').join('')
+            + ' v' + (u.version ?? 1) + '：执行 ' + (u.runCount ?? 0) + ' / 加载 ' + (u.loadCount ?? 0)
+            + '（转化率 ' + (u.loadsToRuns ?? 0) + '，成功率 ' + (u.successRate ?? 0) + '）'
+            + (u.lastStatus ? '，最后 ' + u.lastStatus : '') + (u.entry ? '，入口 ' + u.entry : '')
+            + (u.entryDraft ? '，入口草稿 ' + u.entryDraft + '（未验证）' : ''))
           const parts: string[] = []
-          if (list) parts.push(`待处理提议：\n${list}`)
-          if (caps) parts.push(`已注册能力：\n${caps}`)
-          if (skills) parts.push(`已生成 skills：\n${skills}`)
-          return [{ type: 'text', text: parts.length > 0 ? parts.join('\n\n') : '（没有待处理的工具化提议，也没有已注册的能力或 skill）' }]
+          if (proposals.length > 0) parts.push('待接受提案：\n' + proposals.join('\n'))
+          if (units.length > 0) parts.push('能力（知识面 + 执行面）：\n' + units.join('\n'))
+          return [{ type: 'text', text: parts.length > 0 ? parts.join('\n\n') : '（没有待接受提案，也没有已注册的能力或知识草稿）' }]
         }
-        if (v.status === 'accepted') return [{ type: 'text', text: `已固化为组合工具 ${v.tool}。` }]
-        if (v.status === 'registered') return [{ type: 'text', text: v.message ?? `已注册能力 ${v.tool}。` }]
-        if (v.status === 'declined') return [{ type: 'text', text: '已拒绝该提议。' }]
-        if (v.status === 'none') return [{ type: 'text', text: '（没有待处理的工具化提议）' }]
+        if (v.status === 'accepted') return [{ type: 'text', text: '已接受提案：' + (v.tool ?? '') + '。' + (v.entryDraft ? '入口草稿未验证：请在面板点「启用执行」后才会 runnable=true。' : '已创建仅知识能力。') }]
+        if (v.status === 'registered') return [{ type: 'text', text: v.message ?? ('已注册能力 ' + (v.tool ?? '') + '。') }]
+        if (v.status === 'declined') return [{ type: 'text', text: '已拒绝该提案。' }]
+        if (v.status === 'none') return [{ type: 'text', text: '（没有待接受的提案）' }]
         return [{ type: 'text', text: v.message ?? '操作失败。' }]
       },
     },
@@ -1752,21 +1820,29 @@ ${listText}` : listText
       },
       exec: ToolExec,
     ) {
-      // A3: 本会话的工作区（能力列表/健康报告只覆盖适用于它的能力）。
       const cwd = exec.agent?.session?.header?.cwd
       const workspaceKey = cwd ? workspaceKeyOf(cwd) : undefined
-      // R26: 刷新内置能力（播种缺失/升级旧版/现场保留）+ 差异报告 + 健康度信号。
+      const {
+        capabilityRows, capabilityHealthOf, capabilityLogicalName, capabilityToolName,
+        mergeBuiltinCapabilities, registerCapability, registerCapabilityTool, liveCapabilityNames,
+        setCapabilityEnabled, acceptProposal, declineProposal, pendingProposalsOf,
+      } = await import('./capability.ts')
       if (args.refreshBuiltin) {
-        const { capabilityRecordsOf, capabilityHealthOf, mergeBuiltinCapabilities, registerComposite } = await import('./composite.ts')
-        const report = await mergeBuiltinCapabilities(store, { ctx, register: registerComposite })
-        // A3: 健康信号按当前工作区过滤；别的工作区的能力只报数量不列明细。
+        const report = await mergeBuiltinCapabilities(store, { logger: deps.logger })
+        // Re-register changed/seed rows (runtime refresh: the model sees new semantics now).
+        for (const changed of report.changed) {
+          const current = capabilityRows(store).find((entry) => entry.record.name === changed.record.name)
+          if (current && current.record.kind === 'capability' && current.record.entry && current.record.runnable !== false) {
+            try { await registerCapabilityTool(ctx, store, current, current.row.workspaceKey) } catch { /* boot re-registers */ }
+          }
+        }
         const health = capabilityHealthOf(store, workspaceKey)
-        const otherWorkspace = Math.max(0, capabilityRecordsOf(store).length - health.length)
-        deps.logger.info(`supermemory: refresh-builtin (seeded ${report.seeded.length}, upgraded ${report.upgraded.length}, current ${report.current.length}, local-newer ${report.localNewer.length})`)
+        const otherWorkspace = Math.max(0, capabilityRows(store).filter((entry) => entry.record.kind !== 'proposal').length - health.length)
+        deps.logger.info('supermemory: refresh-builtin (seeded ' + report.seeded.length + ', upgraded ' + report.upgraded.length + ', current ' + report.current.length + ')')
         return {
           status: 'refreshed' as const,
-          message: `内置能力已刷新：播种 ${report.seeded.length}、升级 ${report.upgraded.length}、已最新 ${report.current.length}、现场更新保留 ${report.localNewer.length}。`
-            + (otherWorkspace > 0 ? `另有 ${otherWorkspace} 个能力属于其他工作区，本工作区不暴露。` : ''),
+          message: '内置能力已刷新：播种 ' + report.seeded.length + '、升级 ' + report.upgraded.length + '、已最新 ' + report.current.length + '、现场更新保留 ' + report.localNewer.length + '。'
+            + (otherWorkspace > 0 ? '另有 ' + otherWorkspace + ' 个能力属于其他工作区，本工作区不暴露。' : ''),
           builtin: {
             seeded: report.seeded,
             upgraded: report.upgraded,
@@ -1774,11 +1850,18 @@ ${listText}` : listText
             localNewer: report.localNewer,
             health: health.map((h) => ({
               name: h.name,
+              kind: h.kind,
               builtin: h.builtin,
               ...(h.builtinVersion !== undefined ? { builtinVersion: h.builtinVersion } : {}),
               version: h.version,
               entry: h.entry,
-              useCount: h.useCount,
+              ...(h.entryDraft ? { entryDraft: h.entryDraft } : {}),
+              entryVerified: h.entryVerified,
+              runCount: h.runCount,
+              loadCount: h.loadCount,
+              loadsToRuns: h.loadsToRuns,
+              successRate: h.successRate,
+              useCount: h.runCount,
               successCount: h.successCount,
               failCount: h.failCount,
               consecutiveFailures: h.consecutiveFailures,
@@ -1791,8 +1874,6 @@ ${listText}` : listText
           },
         }
       }
-      // R49: 一次性清理存量——停用自动生成的工具序列组合工具、清空待处理提议与
-      // 宽泛序列信号、归档 R48 的壳子 skill。人工能力/manual skill 不动；幂等。
       if (args.cleanup) {
         const { cleanupToolize } = await import('./toolize.ts')
         const { discoverSkillRoots } = await import('./skill-forge.ts')
@@ -1801,11 +1882,11 @@ ${listText}` : listText
           roots: discoverSkillRoots({ store, cwd, dshHome: process.env.DSH_HOME }),
           dropPending: true,
         })
-        deps.logger.info('supermemory: cleanup retired ' + result.retiredCount + ' composite(s), cleared '
+        deps.logger.info('supermemory: cleanup retired ' + result.retiredCount + ' legacy sequence row(s), cleared '
           + result.clearedProposals + ' proposal(s), archived ' + result.archivedCount + ' shell skill(s)')
         return {
           status: 'cleaned' as const,
-          message: '已清理：停用自动组合工具 ' + result.retiredCount + '，清空待处理提议 ' + result.clearedProposals
+          message: '已清理：退役历史工具序列行 ' + result.retiredCount + '，清空待处理提案 ' + result.clearedProposals
             + '，归档壳子 skill ' + result.archivedCount + '（扫描 ' + result.scannedSkills + ' 个文件）。',
           archived: result.archived.map((entry) => ({ name: entry.name, root: entry.root, archivePath: entry.archivePath })),
           archivedCount: result.archivedCount,
@@ -1815,125 +1896,150 @@ ${listText}` : listText
           prunedSignals: result.prunedSignals,
           pendingBefore: result.pendingBefore,
           pendingAfter: result.pendingAfter,
+          expiredProposals: result.expiredProposals,
           retired: result.retired.map((item) => item.name),
           archiveRoots: result.archiveRoots.map((root) => ({ root: root.root, scanned: root.scanned, archived: root.archived })),
         }
       }
-      // R45: 启用/停用已生成的 skill（只给 name + enabled，不动定义）。
       if (args.enabled !== undefined && args.name && !args.register && !args.accept && !args.decline && !args.refreshBuiltin
         && !args.body && !args.description && !args.entry && !args.skill) {
-        const { resolveSkillRoot, setSkillEnabled } = await import('./skill-forge.ts')
-        const scope = resolveSkillRoot(cwd)
-        const result = await setSkillEnabled(store, workspaceKey ?? 'unknown', scope, String(args.name), Boolean(args.enabled))
+        const logical = capabilityLogicalName(String(args.name))
+        const target = capabilityRows(store, workspaceKey).find((entry) => entry.record.name === logical || entry.id === String(args.name))
+        if (!target) return { status: 'error' as const, message: '找不到该能力：' + args.name }
+        const result = await setCapabilityEnabled(ctx, store, target.id, Boolean(args.enabled))
         if (result.status === 'error') return { status: 'error' as const, message: result.message }
-        deps.logger.info('supermemory: skill ' + result.name + (args.enabled ? ' enabled' : ' disabled'))
-        return { status: 'registered' as const, tool: result.name, message: result.message + '（文件：' + (result.path ?? '') + '）' }
+        deps.logger.info('supermemory: capability ' + target.record.name + (args.enabled ? ' enabled' : ' disabled'))
+        return { status: 'registered' as const, tool: target.record.name, message: result.message }
       }
-      // R45: register 默认产出 skill（重复工作的经验），只有显式给 entry 且未强制
-      // skill 时才走旧的能力注册——后者保持向后兼容（git-sync 等可执行入口）。
       if (args.register) {
-        const wantSkill = args.skill === true || (args.skill !== false && !args.entry)
-        if (wantSkill) {
-          if (!args.name || !args.description) {
-            return { status: 'error' as const, message: 'register skill 需要 name 与 description（description 是模型路由依据，写清「何时用」）。' }
-          }
-          const { draftSkillFromManual, persistSkillDraft, resolveSkillRoot, workspaceSkillToken } = await import('./skill-forge.ts')
-          const scope = resolveSkillRoot(cwd)
-          const wsKey = workspaceKey ?? workspaceKeyOf(cwd)
-          const draft = draftSkillFromManual({
-            name: String(args.name),
-            title: args.title,
-            description: String(args.description),
-            whenToUse: args.whenToUse,
-            body: args.body,
-            tags: args.tags,
-          }, scope.shared ? { sharedToken: workspaceSkillToken(wsKey) } : {})
-          const result = await persistSkillDraft(store, wsKey, draft, {
-            root: scope.root,
-            ...(args.changelog ? { changelog: String(args.changelog) } : {}),
-          })
-          if (result.status === 'error') return { status: 'error' as const, message: result.message }
-          deps.logger.info('supermemory: skill ' + draft.name + ' registered via memory_toolize (' + result.status + ', v' + result.version + ')')
-          return {
-            status: 'registered' as const,
-            tool: draft.name,
-            message: '已' + (result.status === 'created' ? '生成' : result.status === 'unchanged' ? '确认' : '更新') + ' skill '
-              + draft.name + ' v' + result.version + '（' + scope.note + '）：' + (result.path ?? ''),
-          }
+        if (!args.name || !args.description) {
+          return { status: 'error' as const, message: 'register 需要 name 与 description（description 是模型路由依据，写清「何时用」）。' }
         }
-        const { registerCapability } = await import('./composite.ts')
+        const wantKnowledge = args.skill === true || !args.entry
         const ws = workspaceKey ?? (args.scope ? workspaceKeyOf(args.scope) : undefined)
         const result = await registerCapability(ctx, store, {
-          name: String(args.name ?? ''),
-          title: args.title,
-          description: String(args.description ?? ''),
-          entry: String(args.entry ?? ''),
-          doc: args.doc,
-          scope: args.scope,
-          runnable: args.runnable,
-          dryRunArg: args.dryRunArg,
-          writeConfirm: args.writeConfirm,
-          tags: args.tags,
-          changelog: args.changelog,
+          name: String(args.name),
+          ...(args.title ? { title: args.title } : {}),
+          description: String(args.description),
+          ...(wantKnowledge ? {} : { entry: String(args.entry) }),
+          ...(args.doc ? { doc: args.doc } : {}),
+          ...(args.scope ? { scope: args.scope } : {}),
+          ...(args.runnable !== undefined ? { runnable: args.runnable } : {}),
+          ...(args.dryRunArg ? { dryRunArg: args.dryRunArg } : {}),
+          ...(args.writeConfirm !== undefined ? { writeConfirm: args.writeConfirm } : {}),
+          ...(args.tags ? { tags: args.tags } : {}),
+          ...(args.body ? { body: args.body } : {}),
+          ...(args.changelog ? { changelog: args.changelog } : {}),
+          source: 'manual',
         }, ws)
         if (result.status === 'error') return { status: 'error' as const, message: result.message }
-        deps.logger.info(`supermemory: capability ${result.name} registered via memory_toolize`)
+        deps.logger.info('supermemory: capability ' + result.name + ' registered via memory_toolize')
         return { status: 'registered' as const, tool: result.name, message: result.message }
       }
-      // R49: only valuable (business-object) proposals are listed/accepted; a
-      // broad tool order never reaches this surface.
-      const { pendingProposals, acceptProposal } = await import('./toolize.ts')
-      const pending: Array<[string, Signal]> = pendingProposals(store)
+      const pending = pendingProposalsOf(store, workspaceKey)
       if (!args.accept && !args.decline) {
-        const { capabilityRecordsOf, liveCompositeSpecs } = await import('./composite.ts')
-        const { listSkills, resolveSkillRoot } = await import('./skill-forge.ts')
-        const scope = resolveSkillRoot(cwd)
-        const skillScope = workspaceKey ? scope : { ...scope, shared: false }
-        // A3: 只列出适用于当前工作区的能力（行级归属或 scope 推导）。
+        const rows = capabilityRows(store, workspaceKey).filter((entry) => entry.record.kind !== 'proposal')
+        const health = new Map(capabilityHealthOf(store, workspaceKey).map((row) => [row.id, row]))
+        const unitOf = (entry: (typeof rows)[number]) => {
+          const record = entry.record
+          const h = health.get(entry.id)
+          const name = record.kind === 'capability' ? capabilityToolName(record.name) : ('sm-' + record.name)
+          const badges = [record.kind === 'capability' ? '可执行' : '仅知识', ...(record.source === 'auto' ? ['自动'] : []), ...(entry.record.entryDraft && !entry.record.entryVerified ? ['入口待验证'] : [])]
+          return {
+            id: entry.id,
+            name,
+            logicalName: record.name,
+            kind: record.kind,
+            title: record.title,
+            description: record.description,
+            badges,
+            entry: record.entry,
+            entryDraft: entry.record.entryDraft,
+            entryVerified: entry.record.entryVerified,
+            doc: record.doc,
+            scope: record.scope,
+            runnable: record.runnable !== false,
+            enabled: record.enabled !== false,
+            status: entry.row.status,
+            version: record.version,
+            loadCount: record.loadCount,
+            runCount: record.runCount,
+            loadsToRuns: h?.loadsToRuns ?? 0,
+            successRate: h?.successRate ?? 0,
+            successCount: record.successCount,
+            failCount: record.failCount,
+            consecutiveFailures: record.consecutiveFailures,
+            ...(record.lastStatus ? { lastStatus: record.lastStatus } : {}),
+            skillPath: record.skillPath,
+            source: record.source,
+            ...(record.taskKey ? { taskKey: record.taskKey } : {}),
+            builtin: record.builtin,
+            notes: h?.notes ?? [],
+          }
+        }
+        const units = rows.map(unitOf)
         return {
           status: 'listed' as const,
-          pending: pending.map(([, s]) => ({ pattern: s.pattern, count: s.count })),
-          capabilities: capabilityRecordsOf(store, workspaceKey).map((c) => ({
-            name: c.spec.name,
-            title: c.spec.title,
-            entry: c.spec.entry,
-            doc: c.spec.doc,
-            scope: c.spec.scope,
-            runnable: c.spec.runnable !== false,
-            dryRunArg: c.spec.dryRunArg,
-            writeConfirm: Boolean(c.spec.writeConfirm),
-            status: c.status,
-            useCount: c.useCount,
-            ...(typeof c.spec.version === 'number' ? { version: c.spec.version } : {}),
-            ...(c.spec.usage?.lastStatus ? { lastStatus: c.spec.usage.lastStatus } : {}),
-            live: liveCompositeSpecs.has(c.spec.name),
+          proposals: pending.map((entry) => ({
+            name: entry.record.name,
+            title: entry.record.title,
+            description: entry.record.description,
+            version: entry.record.version,
+            ...(entry.record.taskKey ? { taskKey: entry.record.taskKey } : {}),
+            source: entry.record.source,
+            entryDraft: entry.record.entryDraft,
+            entryVerified: entry.record.entryVerified,
+            ...(entry.record.expiresAt !== undefined ? { expiresAt: entry.record.expiresAt } : {}),
           })),
-          skills: listSkills(store, workspaceKey ?? 'unknown', skillScope).map((s) => ({
-            name: s.name,
-            title: s.title,
-            description: s.description,
-            version: s.version,
-            useCount: s.useCount,
-            enabled: s.enabled,
-            status: s.status,
-            path: s.path,
-            ...(s.source ? { source: s.source } : {}),
-            occurrences: s.occurrences,
+          units,
+          capabilities: units.filter((unit) => unit.kind === 'capability').map((unit) => ({
+            name: unit.name,
+            logicalName: unit.logicalName,
+            title: unit.title,
+            entry: unit.entry,
+            doc: unit.doc,
+            scope: unit.scope,
+            runnable: unit.runnable,
+            dryRunArg: rows.find((entry) => entry.id === unit.id)?.record.dryRunArg,
+            writeConfirm: Boolean(rows.find((entry) => entry.id === unit.id)?.record.writeConfirm),
+            status: unit.status,
+            useCount: unit.runCount,
+            runCount: unit.runCount,
+            loadCount: unit.loadCount,
+            loadsToRuns: unit.loadsToRuns,
+            version: unit.version,
+            ...(unit.lastStatus ? { lastStatus: unit.lastStatus } : {}),
+            live: liveCapabilityNames().includes(unit.name),
+            entryDraft: unit.entryDraft,
+            entryVerified: unit.entryVerified,
+          })),
+          skills: units.map((unit) => ({
+            name: 'sm-' + unit.logicalName,
+            title: unit.title,
+            description: unit.description,
+            version: unit.version,
+            useCount: unit.loadCount,
+            loadCount: unit.loadCount,
+            enabled: unit.enabled,
+            status: unit.status,
+            path: unit.skillPath,
+            source: unit.source,
+            occurrences: 1,
           })),
         }
       }
       if (pending.length === 0) return { status: 'none' as const }
-      const [key, signal] = pending[0]
+      const logical = args.name ? capabilityLogicalName(String(args.name)) : undefined
+      const target = (logical ? pending.find((entry) => entry.record.name === logical) : undefined) ?? pending[0]
       if (args.decline) {
-        await store.signals.update(key, (r) => ({ ...r, proposalStatus: 'declined' }))
+        const result = await declineProposal(store, target.id)
+        if (result.status === 'error') return { status: 'error' as const, message: result.message }
         return { status: 'declined' as const }
       }
-      // R49: acceptProposal is the only sequence-composite entrance; it refuses
-      // broad sequences (defence in depth) and stamps origin:'manual'.
-      const result = await acceptProposal(ctx, store, key, signal)
+      const result = await acceptProposal(ctx, store, target.id)
       if (result.status === 'error') return { status: 'error' as const, message: result.message }
-      deps.logger.info(`supermemory: composite tool ${result.tool} registered via memory_toolize`)
-      return { status: 'accepted' as const, ...(result.tool ? { tool: result.tool } : {}) }
+      deps.logger.info('supermemory: accepted proposal ' + (result.name ?? target.record.name))
+      return { status: 'accepted' as const, ...(result.name ? { tool: result.name } : {}), message: result.message, entryDraft: Boolean(result.entryDraft) }
     },
   })))
 

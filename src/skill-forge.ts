@@ -120,6 +120,9 @@ export interface ParsedSkill {
   taskKey?: string
   /** Hash of the generated body we last wrote (detects human edits). */
   renderedHash?: string
+  /** R50: hash of the prose (facts block excluded) and of the facts block. */
+  bodyHash?: string
+  factsHash?: string
   changelog: string[]
   body: string
 }
@@ -168,6 +171,9 @@ const META = {
   renderedHash: 'sm-rendered-hash',
   changelog: 'sm-changelog',
   enabled: 'sm-enabled',
+  // R50 统一能力：事实块哈希与散文哈希（行级也镜像，用于检测人工编辑）。
+  bodyHash: 'sm-body-hash',
+  factsHash: 'sm-facts-hash',
 } as const
 
 /** Short deterministic hash (FNV-1a, base36) for stable names. */
@@ -495,7 +501,7 @@ export function renderSkillBody(draft: SkillDraft): string {
 }
 
 /** Full SKILL.md text: YAML frontmatter + body. */
-export function renderSkillMarkdown(draft: SkillDraft, meta: { version: number; updatedAt: number; renderedHash: string; changelog: string[]; enabled: boolean }): string {
+export function renderSkillMarkdown(draft: SkillDraft, meta: { version: number; updatedAt: number; renderedHash: string; changelog: string[]; enabled: boolean; bodyHash?: string; factsHash?: string }): string {
   const q = (value: string): string => JSON.stringify(String(value ?? ''))
   const lines = [
     '---',
@@ -510,6 +516,8 @@ export function renderSkillMarkdown(draft: SkillDraft, meta: { version: number; 
     META.occurrences + ': ' + String(Math.max(0, draft.source.occurrences)),
     ...(draft.taskKey ? [META.taskKey + ': ' + q(draft.taskKey)] : []),
     META.renderedHash + ': ' + q(meta.renderedHash),
+    ...(meta.bodyHash ? [META.bodyHash + ': ' + q(meta.bodyHash)] : []),
+    ...(meta.factsHash ? [META.factsHash + ': ' + q(meta.factsHash)] : []),
     META.changelog + ': ' + JSON.stringify(meta.changelog.slice(0, SKILL_CHANGELOG_MAX)),
     '---',
     '',
@@ -571,6 +579,8 @@ export function parseSkillMarkdown(text: string, fallbackName = ''): ParsedSkill
     occurrences: num(META.occurrences, 0),
     ...(str(META.taskKey) ? { taskKey: str(META.taskKey) } : {}),
     ...(str(META.renderedHash) ? { renderedHash: str(META.renderedHash) } : {}),
+    ...(str(META.bodyHash) ? { bodyHash: str(META.bodyHash) } : {}),
+    ...(str(META.factsHash) ? { factsHash: str(META.factsHash) } : {}),
     changelog,
     body: raw.slice(match[0].length).trim(),
   }
@@ -725,7 +735,7 @@ export function draftSkillFromCapability(
   const body = [
     '# ' + title,
     '',
-    '> 由 SuperMemory 从重复执行的能力沉淀（已反复执行）。能力本身仍由 sm_composite_* 工具一键执行；本 skill 说明何时优先用它、以及失败时怎么判断。',
+    '> 由 SuperMemory 从重复执行的能力沉淀（已反复执行）。能力本身由 sm_cap_* 工具一键执行；本 skill 说明何时优先用它、以及失败时怎么判断。',
     '',
     '## 何时用（触发条件）',
     '',
@@ -1019,15 +1029,23 @@ async function putSkillRow(
   // mirrors what the panel needs: title/tags/description/path/useCount/status.
   const row: ToolMemory = {
     workspaceKey,
-    kind: 'skill',
+    kind: 'knowledge',
     title: draft.title,
     tags: draft.tags.slice(0, 8),
     trigger: draft.source.key ?? ('skill/' + draft.name),
     description: clipDescription(draft.description),
-    entry: path,
+    entry: '',
     useCount,
     status,
     createdAt,
+    skillPath: path,
+    enabled: status === 'active',
+    loadCount: 0,
+    runCount: 0,
+    source: draft.source.kind === 'manual' ? 'manual' : 'auto',
+    ...(draft.taskKey ? { taskKey: draft.taskKey } : {}),
+    entryDraft: '',
+    entryVerified: false,
   }
   await store.toolMemory.put(key, row)
 }
@@ -1518,6 +1536,354 @@ export async function bumpSkillUse(store: Store, workspaceKey: string, name: str
   if (!row || row.kind !== 'skill') return false
   await store.toolMemory.update(key, (record) => ({ ...record, useCount: record.useCount + 1 }))
   return true
+}
+
+
+// ---------------------------------------------------------------------------
+// R50 事实块（facts block）与统一能力知识面
+//
+// 知识面的正文以 SKILL.md 文件为事实来源：六节人工散文（何时用/决策/步骤/
+// 关键坑/验证/反例）由人或首次生成写定，自动维护只替换两块标记之间的「事实
+// 块」（入口、scope、预演参数、验证命令、涉及文件、失败坑）。块外散文一律保留；
+// 没有标记的手工 skill 首次只追加事实块，不改正文。bodyHash 用于检测人工编辑
+// （散文是否被改过），factsHash 用于判断事实是否过期。
+// ---------------------------------------------------------------------------
+
+/** One capability's fact block content (all fields optional; absent = 待补充). */
+export interface CapabilityFacts {
+  /** 入口命令（可执行能力）。 */
+  entry?: string
+  /** 适用范围目录。 */
+  scope?: string
+  /** 预演参数。 */
+  dryRunArg?: string
+  /** 真实执行是否写远端/改状态。 */
+  writeConfirm?: boolean
+  /** 验证命令（来自真实样本或能力文档）。 */
+  verify?: string[]
+  /** 涉及文件（文档/技能文件/样本里真实出现的文件）。 */
+  files?: string[]
+  /** 失败坑（来自 changelog/健康信号/真实样本）。 */
+  pitfalls?: string[]
+  /** 历史命令（知识草稿来自重复任务时）。 */
+  commands?: string[]
+}
+
+export const FACTS_START = '<!-- sm:facts:start -->'
+export const FACTS_END = '<!-- sm:facts:end -->'
+
+/** Render the deterministic facts block (marker included, no surrounding prose). */
+export function renderFactsBlock(facts: CapabilityFacts): string {
+  const lines: string[] = [FACTS_START, '### 事实（自动维护）', '']
+  const bullet = (label: string, value: string): void => {
+    lines.push('- ' + label + '：' + value)
+  }
+  const inline = (values: Array<string | undefined>): string => values.filter((value): value is string => Boolean(value && value.trim())).join(' · ')
+  if (facts.entry) bullet('入口', '`' + facts.entry + '`')
+  else bullet('入口', '仅知识（无入口命令）')
+  if (facts.scope) bullet('适用范围', '`' + facts.scope + '`')
+  if (facts.dryRunArg) bullet('预演参数', '`' + facts.dryRunArg + '`（默认预演）')
+  if (facts.writeConfirm !== undefined) bullet('写操作确认', facts.writeConfirm ? '真实执行必须 confirm=true' : '非写操作')
+  if (facts.verify && facts.verify.length > 0) bullet('验证命令', facts.verify.map((item) => '`' + item + '`').join('、'))
+  if (facts.commands && facts.commands.length > 0) bullet('历史命令', facts.commands.map((item) => '`' + item + '`').join('、'))
+  if (facts.files && facts.files.length > 0) bullet('涉及文件', facts.files.map((item) => '`' + item + '`').join('、'))
+  if (facts.pitfalls && facts.pitfalls.length > 0) bullet('失败坑', inline(facts.pitfalls))
+  lines.push(FACTS_END)
+  return lines.join('\n')
+}
+
+/** Stable hash of the fact block (order-normalised input). */
+export function factsHashOf(facts: CapabilityFacts): string {
+  return shortHash(JSON.stringify({
+    entry: facts.entry ?? '',
+    scope: facts.scope ?? '',
+    dryRunArg: facts.dryRunArg ?? '',
+    writeConfirm: facts.writeConfirm === undefined ? null : facts.writeConfirm,
+    verify: [...(facts.verify ?? [])],
+    commands: [...(facts.commands ?? [])],
+    files: [...(facts.files ?? [])],
+    pitfalls: [...(facts.pitfalls ?? [])],
+  }), 8)
+}
+
+/** Split a body into prose and the facts block (no marker = hasBlock false). */
+export function splitFactsBlock(body: string): { prose: string; facts: string; hasBlock: boolean } {
+  const text = String(body ?? '')
+  const start = text.indexOf(FACTS_START)
+  const end = text.indexOf(FACTS_END)
+  if (start < 0 || end < start) return { prose: text.trim(), facts: '', hasBlock: false }
+  const prose = (text.slice(0, start) + text.slice(end + FACTS_END.length)).trim()
+  return { prose, facts: text.slice(start, end + FACTS_END.length), hasBlock: true }
+}
+
+/** Replace (or append) the facts block; prose is never rewritten. */
+export function applyFactsBlock(body: string, block: string): string {
+  const split = splitFactsBlock(body)
+  const head = split.prose.trim()
+  if (split.hasBlock) return (head ? head + '\n\n' : '') + block
+  const section = '## 事实（自动维护）'
+  const existing = head.includes(section)
+  if (existing) {
+    // A previous generator wrote the section without markers: append the block
+    // at the end instead of deleting anything the human wrote there.
+    return (head ? head + '\n\n' : '') + block
+  }
+  return (head ? head + '\n\n' : '') + section + '\n\n' + block
+}
+
+/** Hash of the human prose (facts block excluded) — detects human edits. */
+export function bodyHashOf(body: string): string {
+  return shortHash(splitFactsBlock(body).prose.replace(/\s+/g, ' ').trim(), 8)
+}
+
+/** Draft/definition shape consumed by the unified capability knowledge face. */
+export interface CapabilitySkillInput {
+  /** Logical capability name, e.g. git-sync-supermemory. */
+  name: string
+  title: string
+  description: string
+  entry?: string
+  entryDraft?: string
+  scope?: string
+  doc?: string
+  dryRunArg?: string
+  writeConfirm?: boolean
+  runnable?: boolean
+  taskKey?: string
+  tags?: string[]
+  source?: string
+  version?: number
+  routeNote?: string
+  /** Extra facts from real samples (commands/files/verification/pitfalls). */
+  facts?: CapabilityFacts
+}
+
+/** `git-sync-supermemory` → skill `sm-git-sync-supermemory`, tool `sm_cap_git_sync_supermemory`. */
+export function capabilitySkillNames(name: string): { skillName: string; toolName: string } {
+  const slug = kebabCase(String(name ?? '').replace(/^sm_cap_|^sm_composite_|^sm-/, ''), 40) || 'capability'
+  return { skillName: 'sm-' + slug, toolName: 'sm_cap_' + slug.replace(/-/g, '_') }
+}
+
+/** Six-section prose for a capability skill (no facts block; facts are appended). */
+export function renderCapabilityProse(input: CapabilitySkillInput): string {
+  const entry = input.entry || input.entryDraft || ''
+  const lines: string[] = []
+  lines.push('# ' + input.title)
+  lines.push('')
+  lines.push('> 由 SuperMemory 固化为单一能力：本文件是知识面（何时用、怎么判断），执行面是 '
+    + (input.runnable && input.entry ? '工具 `' + capabilitySkillNames(input.name).toolName + '`' : '未开放（仅知识）') + '。')
+  lines.push('> 自动维护只刷新文末「事实」块；块外散文可以手工编辑，不会被自动覆盖。')
+  lines.push('')
+  lines.push('## 何时用（触发条件）')
+  lines.push('')
+  lines.push('- ' + (input.description || '待补充：写清什么任务下加载它。'))
+  if (input.routeNote) lines.push('- ' + input.routeNote)
+  if (input.scope) lines.push('- 当前工作区在适用范围 `' + input.scope + '` 内，且已有该能力的入口（或仅需要这套判断）。')
+  lines.push('')
+  lines.push('## 决策清单')
+  lines.push('')
+  lines.push('1. 先确认本能力与当前任务同类（对象/目录/文件族一致），再看事实块里的入口与范围。')
+  lines.push('2. ' + (input.writeConfirm
+    ? '真实执行可能写远端/改状态：先默认预演，确认真实执行时必须显式 confirm=true。'
+    : '先默认预演（有 dryRunArg 时自动附加），确认输出与退出码符合预期后再实跑。'))
+  lines.push('3. 连续失败或事实块与现状不符时，更新能力定义（version+1、changelog 记录原因），不要手敲命令绕过。')
+  lines.push('4. 完成后按「验证方式」核对，并把新发现的坑补进本文件（自动刷新只动事实块）。')
+  lines.push('')
+  lines.push('## 步骤纲要')
+  lines.push('')
+  lines.push('1. 读取事实块，确认入口、scope、预演参数与验证命令。')
+  lines.push('2. ' + (input.entry
+    ? '调用 `' + capabilitySkillNames(input.name).toolName + '`（固定入口 `' + input.entry + '`，不接受任意参数透传）。'
+    : '按事实块里的判断推进；本能力没有执行面，不要凭空执行命令。'))
+  lines.push('3. 失败时按「关键坑」停下判断，不要机械重试。')
+  lines.push('')
+  lines.push('## 关键坑')
+  lines.push('')
+  lines.push('- scope 外的会话不会执行该能力（工作区隔离）；先确认当前目录在适用范围。')
+  if (input.writeConfirm) lines.push('- writeConfirm 能力没有 confirm=true 时只返回「需要确认」，不会执行。')
+  lines.push('- 连续失败时先更新能力定义/事实块，不要绕过闸门。')
+  lines.push('')
+  lines.push('## 验证方式')
+  lines.push('')
+  if (input.doc) lines.push('- 详细流程见 `' + input.doc + '`；执行结果看 exitCode/stdout/stderr，而不是「命令似乎跑了」。')
+  else lines.push('- 看入口命令的 exitCode/stdout/stderr；没有可观察结果就不要宣称完成。')
+  lines.push('- 事实块与文件内容不一致时，以文件/命令输出为准并更新事实块。')
+  lines.push('')
+  lines.push('## 反例（不要这样用）')
+  lines.push('')
+  lines.push('- 一次性任务、对象不同、或当前工作区不在 scope 内：不要套用。')
+  lines.push('- 把知识面当免确认快捷方式：写操作仍需 confirm 与验证。')
+  return lines.join('\n')
+}
+
+/** Deterministic six-section + facts bundle for one capability. */
+export function buildCapabilitySkill(input: CapabilitySkillInput): {
+  name: string
+  title: string
+  description: string
+  whenToUse?: string
+  prose: string
+  body: string
+  facts: CapabilityFacts
+  factsBlock: string
+  bodyHash: string
+  factsHash: string
+} {
+  const names = capabilitySkillNames(input.name)
+  const extra = input.facts ?? {}
+  const union = (left: string[] | undefined, right: string[] | undefined): string[] => [...new Set([...(left ?? []), ...(right ?? [])])]
+  const facts: CapabilityFacts = {
+    ...(input.entry ? { entry: input.entry } : {}),
+    ...(input.scope ? { scope: input.scope } : {}),
+    ...(input.dryRunArg ? { dryRunArg: input.dryRunArg } : {}),
+    ...(input.writeConfirm !== undefined ? { writeConfirm: input.writeConfirm } : {}),
+    verify: union(input.entry ? [input.entry] : [], extra.verify),
+    commands: [...(extra.commands ?? [])],
+    files: union(input.doc ? [input.doc] : [], extra.files),
+    pitfalls: union(
+      input.entry ? ['scope 外拒绝执行；连续失败先更新能力定义/事实块，不要绕过闸门。'] : ['仅知识能力：没有执行面，不要凭空执行命令。'],
+      extra.pitfalls,
+    ),
+  }
+  const factsBlock = renderFactsBlock(facts)
+  const prose = renderCapabilityProse(input)
+  const body = applyFactsBlock(prose, factsBlock)
+  return {
+    name: names.skillName,
+    title: input.title,
+    description: clipDescription(input.description),
+    ...(input.scope ? { whenToUse: '在 ' + input.scope + ' 内遇到「' + input.title + '」类任务时加载。' } : {}),
+    prose,
+    body,
+    facts,
+    factsBlock,
+    bodyHash: bodyHashOf(body),
+    factsHash: factsHashOf(facts),
+  }
+}
+
+/**
+ * Write/update one capability's SKILL.md using facts-block merge.
+ *
+ * - existing file: prose kept, facts block replaced;
+ * - no markers (manual skill): prose kept, block appended (first touch);
+ * - changed description/facts: version+1 + changelog;
+ * - human-edited prose: status 'preserved' (only the facts block is refreshed).
+ */
+export async function upsertCapabilitySkill(options: {
+  store: Store
+  workspaceKey: string
+  root: string
+  input: CapabilitySkillInput
+  draftBody?: string
+  now?: number
+  changelog?: string
+  previousBodyHash?: string
+}): Promise<SkillWriteResult & { bodyHash?: string; factsHash?: string; body?: string; factsBlock?: string }> {
+  const now = options.now ?? Date.now()
+  const bundle = buildCapabilitySkill(options.input)
+  const found = findSkillFile(options.root, bundle.name)
+  const factsBlock = bundle.factsBlock
+  const nextProse = found ? splitFactsBlock(found.parsed.body).prose : String(options.draftBody ?? '').trim() || bundle.prose
+  const bodyHash = bodyHashOf(nextProse)
+  const nextBody = applyFactsBlock(nextProse, factsBlock)
+  const description = clipDescription(options.input.description || bundle.description)
+  const path = join(options.root, bundle.name, 'SKILL.md')
+  const humanEdited = Boolean(found && options.previousBodyHash && bodyHashOf(found.parsed.body) !== options.previousBodyHash)
+  if (found && found.parsed.body === nextBody && found.parsed.description === description) {
+    return { status: 'unchanged', name: bundle.name, version: found.parsed.version, path, message: '内容与事实块均未变化，未升版。', bodyHash, factsHash: bundle.factsHash, body: nextBody, factsBlock }
+  }
+  let version = found ? found.parsed.version + 1 : Math.max(1, Number(options.input.version) || 1)
+  const line = String(options.changelog ?? '').trim().slice(0, 200)
+    || (found ? '刷新事实块/路由描述（正文人工散文保留）' : '生成能力知识面（六节 + 事实块）')
+  const changelog = [versionLine(version, line), ...(found?.parsed.changelog ?? [])].slice(0, SKILL_CHANGELOG_MAX)
+  const draft: SkillDraft = {
+    name: bundle.name,
+    title: options.input.title,
+    description,
+    ...(bundle.whenToUse ? { whenToUse: bundle.whenToUse } : {}),
+    tags: (options.input.tags ?? ['skill', 'capability']).slice(0, 8),
+    body: nextBody,
+    ...(options.input.taskKey ? { taskKey: options.input.taskKey } : {}),
+    source: { kind: 'capability', key: 'capability/' + options.input.name, label: options.input.title, occurrences: 1 },
+  }
+  try {
+    writeFileAtomic(path, renderSkillMarkdown(draft, {
+      version,
+      updatedAt: now,
+      renderedHash: skillContentHash(description, nextBody),
+      changelog,
+      enabled: found?.parsed.enabled !== false,
+      bodyHash,
+      factsHash: bundle.factsHash,
+    }))
+  } catch (error) {
+    return { status: 'error', name: bundle.name, version, path, message: '写入 SKILL.md 失败：' + String(error).slice(0, 160) }
+  }
+  return {
+    status: found ? (humanEdited ? 'preserved' : 'updated') : 'created',
+    name: bundle.name,
+    version,
+    path,
+    message: humanEdited ? '检测到人工编辑，保留正文，仅刷新事实块（已升版）。' : (found ? '已刷新事实块并升版。' : '已生成知识面。'),
+    bodyHash,
+    factsHash: bundle.factsHash,
+    body: nextBody,
+    factsBlock,
+  }
+}
+
+/** Read one skill body (for panel "view skill"). */
+export function readSkillBody(root: string, name: string): string | undefined {
+  const found = findSkillFile(root, name)
+  return found?.parsed.body
+}
+
+/** One archived capability skill directory. */
+export interface ArchivedCapabilitySkill {
+  root: string
+  name: string
+  from: string
+  archivePath: string
+  archivedAt: number
+  reason: string
+}
+
+/**
+ * Archive one capability skill directory (never hard-delete). Idempotent: a
+ * missing directory reports undefined, an existing archive target gets a suffix.
+ */
+export async function archiveCapabilitySkill(root: string, name: string, options: { now?: number; reason?: string } = {}): Promise<ArchivedCapabilitySkill | undefined> {
+  if (!isSkillName(name)) return undefined
+  const from = join(root, name)
+  if (!existsSync(from)) return undefined
+  const archiveDir = archiveDirForRoot(root)
+  mkdirSync(archiveDir, { recursive: true })
+  const now = options.now ?? Date.now()
+  let target = join(archiveDir, name)
+  if (existsSync(target)) target = join(archiveDir, name + '-cap-' + shortHash(from + ':' + now, 4))
+  try { renameSync(from, target) } catch { return undefined }
+  const record: ArchivedCapabilitySkill = {
+    root,
+    name,
+    from,
+    archivePath: target,
+    archivedAt: now,
+    reason: options.reason ?? '能力删除：知识面目录归档（可回滚，不硬删）',
+  }
+  const manifestFile = join(archiveDir, 'manifest.json')
+  const manifest = readArchiveManifest(manifestFile)
+  manifest.entries.push({
+    name,
+    archivePath: target,
+    version: 0,
+    description: '',
+    archivedAt: now,
+    reason: record.reason,
+    from,
+  })
+  try { writeFileAtomic(manifestFile, JSON.stringify({ version: 1, entries: manifest.entries.slice(-500) }, null, 2)) } catch { /* archive dir moved */ }
+  return record
 }
 
 /** Register input for a manual skill (memory_toolize register without entry). */

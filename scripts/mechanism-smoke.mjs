@@ -30,13 +30,14 @@ const {
 } = await import('../src/inrequest.ts')
 const {
   proposalVerdict, isBroadSequence, cleanupToolize,
-  longestPrefixMatch, pickCompositeMatch, catalogFor, renderCatalog,
 } = await import('../src/toolize.ts')
-// R22 能力（capability）：数据模型 / 执行安全闸 / 注册-持久化-重建 / 面板一键执行。
+// R22/R50 能力（capability）：统一记录 / 执行安全闸 / 注册-持久化-重建 / 面板一键执行。
 const {
-  buildCapabilitySpec, capabilityToolName, isValidCapabilityName, runCapability,
-  registerCapability, capabilityRecordsOf, rebuildComposites, persistComposite,
-} = await import('../src/composite.ts')
+  buildCapabilityRecord, capabilityToolName, capabilityToolDef, capabilityRecordsOf,
+  capabilityRows, deleteCapability, editCapability, isValidCapabilityName, liveCapabilityToolNames,
+  registerCapability, registerCapabilityTool, rebuildCapabilities, runCapability,
+  highConfidenceEntryDraft,
+} = await import('../src/capability.ts')
 
 const repeat = { enabled: true, everySteps: 3, maxCardsPerRequest: 4, maxCharsPerRequest: 6000, dedupe: true, hotSignal: true }
 const toolize = { enabled: true, threshold: 3, cooldownMs: 60000, maxActive: 8, minSteps: 2, minDistinctTools: 2, nearMissHint: true, recycleIdleDays: 0 }
@@ -143,10 +144,11 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 
 {
   const items = [{ memoryId: 'm1', text: '构建命令是 pnpm build', score: 2, createdAt: now, keywords: [] }]
-  const text = renderRepeatCard(items, 'gentle', renderCatalog([{ name: 'sm_composite_read_edit', steps: ['read', 'edit'], description: 'd', parameters: ['p0_path'], hits: 2 }]))
+  const hintBlock = '[SuperMemory 提示]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
+  const text = renderRepeatCard(items, 'gentle', hintBlock)
   assert.ok(text.includes('过程内补充'), 'repeat card must be distinguishable from the opening card')
-  assert.ok(text.includes('可用组合工具'), 'catalog block must be present')
-  assert.ok(text.includes('sm_composite_read_edit'), 'catalog must name the composite')
+  assert.ok(text.includes('可用能力'), 'hint block must be present')
+  assert.ok(text.includes('sm_cap_read_edit'), 'hint block names the capability')
   assert.ok(buildQuery({ baseQuery: 'a', toolText: 'b' }, 10) === 'a' + String.fromCharCode(10) + 'b')
   assert.equal(extractPaths('open G:/repo/src/a.ts and ./b/c.ts').length >= 1, true)
   assert.equal(memoryOverlap('构建命令 pnpm build', memories.entries(), 10) >= 3, true)
@@ -159,7 +161,7 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 // above (A6) keeps rendering everything.
 {
   const { charCount } = await import('../src/clip.ts')
-  const catalog = renderCatalog([{ name: 'sm_composite_read_edit', steps: ['read', 'edit'], description: 'd', parameters: ['p0_path'], hits: 2 }])
+  const catalog = '[SuperMemory 提示]\n- 可用能力 sm_cap_read_edit：先预演再实跑'
   const longText = '这条结论说明构建与发布流程的关键约束。'.repeat(30)
   const items = [
     { memoryId: 'r1', title: '结论甲', text: longText, score: 9, createdAt: now, keywords: ['构建', '闸门'] },
@@ -168,13 +170,13 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   const hint = '复取：memory_recall 「构建命令」'
   const tight = renderRepeatCard(items, 'gentle', catalog, { budget: 420, hint })
   assert.ok(charCount(tight) <= 420, 'R47: the repeat card must stay inside its budget (' + charCount(tight) + ')')
-  assert.ok(!tight.includes('sm_composite_read_edit'), 'R47: the catalog is shed before a memory body is cut')
+  assert.ok(!tight.includes('sm_cap_read_edit'), 'R47: the hint block is shed before a memory body is cut')
   assert.ok(tight.includes('【结论甲】') && tight.includes('｜标签: 构建、闸门'), 'R47: title and tags stay whole')
   assert.ok(/…（原文 \d+ 字，已省略 \d+ 字，复取：memory_recall 「结论甲」）/.test(tight),
     'R47: a clipped body names its size and how to re-fetch it')
   assert.ok(/…（已省略 \d+ 项/.test(tight), 'R47: the shed records are counted')
   const roomy = renderRepeatCard([{ memoryId: 'r3', title: '结论丙', text: '短结论：构建走 pnpm。', score: 9, createdAt: now, keywords: [] }], 'gentle', catalog, { budget: 900, hint })
-  assert.ok(roomy.includes('sm_composite_read_edit') && charCount(roomy) <= 900,
+  assert.ok(roomy.includes('sm_cap_read_edit') && charCount(roomy) <= 900,
     'R47: the catalog still rides along when the budget has room')
   ok('R47-8 过程内补充卡预算化：整卡 ≤ 预算、目录先于正文牺牲、正文句界省略带复取线索、丢卡计数')
 }
@@ -186,11 +188,11 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
   assert.equal(isBroadSequence(['bash', 'edit']), true)
   assert.equal(isBroadSequence(['read', 'edit', 'write']), true)
   assert.equal(isBroadSequence(['memory_recall', 'memory_dispatch']), true, 'memory_* is generic')
-  assert.equal(isBroadSequence(['sm_composite_git_sync_supermemory', 'bash']), true, 'a composite itself is generic')
+  assert.equal(isBroadSequence(['sm_cap_git_sync_supermemory', 'bash']), true, 'a capability tool itself is generic')
   assert.equal(isBroadSequence(['erp_sync_orders', 'erp_push_invoice']), false, 'a business-object sequence stays a candidate')
   assert.equal(proposalVerdict(['erp_sync_orders', 'erp_sync_orders']).valuable, false, 'one repeated tool is not a flow')
   assert.equal(proposalVerdict(['erp_sync_orders']).valuable, false)
-  ok('B1 R49 宽泛序列过滤：run_code/bash/read/edit/write/memory_*/sm_composite_* 永不成为候选，业务序列保留')
+  ok('B1 R50 宽泛序列表述（仅清理分类）：run_code/bash/read/edit/write/memory_*/sm_cap_* 不构成业务对象，业务序列保留')
 }
 
 {
@@ -214,17 +216,12 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 }
 
 {
-  const spec = { name: 'sm_composite_read_edit', description: 'd', steps: [{ tool: 'read', arguments: { path: 'a' } }, { tool: 'edit', arguments: {} }], parameters: [{ name: 'p0_path', step: 0, key: 'path', description: 'path' }] }
-  const candidates = [{ id: 'tm-1', spec, useCount: 2 }]
-  const live = new Set(['sm_composite_read_edit'])
-  assert.equal(longestPrefixMatch(['x', 'read', 'edit'], ['read', 'edit', 'test']), 2)
-  const match = pickCompositeMatch(['read', 'edit'], candidates, live)
-  assert.equal(match.hits, 2, 'a two-step prefix must be detected')
-  assert.equal(pickCompositeMatch(['read', 'edit'], candidates, new Set()), undefined, 'a non-live composite is never advertised')
-  const catalog = catalogFor(['read', 'edit'], candidates, live, 3)
-  assert.equal(catalog[0].hits, 2)
-  assert.ok(renderCatalog(catalog).includes('建议直接调用它'))
-  ok('B4 组合工具前缀匹配与结构化目录（只列已注册工具）')
+  assert.equal(capabilityToolName('read-edit'), 'sm_cap_read_edit')
+  assert.equal(capabilityToolName('git-sync-supermemory'), 'sm_cap_git_sync_supermemory')
+  assert.equal(isValidCapabilityName('read-edit'), true)
+  assert.equal(isValidCapabilityName('bad name'), false)
+  assert.equal(liveCapabilityToolNames.has('sm_composite_read_edit'), false, 'no legacy composite name is live')
+  ok('B4 命名：执行面统一 sm_cap_<name>；旧 sm_composite_* 不再注册')
 }
 
 
@@ -1203,7 +1200,6 @@ const fakeCtx = (services) => ({
 // readers, the option-carrying session creation and the composite-tool delete
 // must behave (and degrade) without a DSH host.
 const { SupermemoryPanelService } = await import('../src/panel.ts')
-const { deleteCompositeTool } = await import('../src/composite.ts')
 
 const serviceCtx = (services = {}) => ({
   get: (name) => services[name],
@@ -1545,29 +1541,22 @@ const serviceCtx = (services = {}) => ({
 }
 
 {
-  // deleteCompositeTool: durable row + trigger signal + live registration.
-  const disposed = []
-  const spec = { name: 'sm_composite_a_b', description: 'd', steps: [{ tool: 'a', arguments: {} }], parameters: [] }
+  // R50 deleteCapability: durable row removed, knowledge face archived (if any),
+  // unknown id refused, a broken capability row is refused rather than guessed.
+  const spec = { schema: 'sm.capability/1', name: 'a-b', kind: 'capability', title: 'AB', description: 'd', entry: 'echo ab', runnable: true, steps: [], parameters: [] }
   const store = fakeStore({
-    toolMemory: [['tm-1', { kind: 'composite', trigger: 'ws/ws/seq/a>b', description: 'd', entry: JSON.stringify(spec), useCount: 0, status: 'retired' }]],
-    signals: [['ws/ws/seq/a>b', { workspaceKey: 'ws', pattern: 'a>b', count: 3, lastSeen: now, examples: [], sequence: ['a', 'b'], samples: [], proposedAt: now, proposalStatus: 'accepted' }]],
+    toolMemory: [['tm-1', { kind: 'capability', trigger: 'capability/a-b', description: 'd', entry: JSON.stringify(spec), useCount: 0, status: 'active' }]],
   })
-  const missing = await deleteCompositeTool(serviceCtx(), store, 'tm-nope')
-  assert.equal(missing.status, 'error', 'an unknown tool is refused')
-  const done = await deleteCompositeTool(serviceCtx(), store, 'tm-1')
+  const missing = await deleteCapability(serviceCtx(), store, 'tm-nope')
+  assert.equal(missing.status, 'error', 'an unknown capability is refused')
+  const done = await deleteCapability(serviceCtx(), store, 'tm-1')
   assert.equal(done.status, 'ok')
   assert.equal(store.toolMemory.size, 0, 'the durable row is gone')
-  assert.equal(store.signals.size, 0, 'the creating signal is gone (a repeat must cross the threshold again)')
-  // A LIVE registration is unregistered through the same dispose path the
-  // retire button uses (editCompositeTool); the real registerComposite needs
-  // the host @deepseek-ai/dsh-tools module, which this host-free smoke cannot
-  // import, so the live branch is covered by the panel retire flow instead.
-  const broken = fakeStore({ toolMemory: [['tm-3', { kind: 'composite', trigger: '', description: 'd', entry: '{oops', useCount: 0, status: 'active' }]] })
-  const brokenResult = await deleteCompositeTool(serviceCtx(), broken, 'tm-3')
-  assert.equal(brokenResult.status, 'ok', 'a broken definition still deletes')
-  assert.equal(broken.toolMemory.size, 0, 'the broken row is gone too')
-  assert.deepEqual(disposed, [], 'no live registration exists to dispose in this smoke')
-  ok('F4 组合工具删除：行 + 信号 + 损坏定义均可删除，未知 id 拒绝')
+  const broken = fakeStore({ toolMemory: [['tm-3', { kind: 'capability', trigger: '', description: 'd', entry: '{oops', useCount: 0, status: 'active' }]] })
+  const brokenResult = await deleteCapability(serviceCtx(), broken, 'tm-3')
+  assert.equal(brokenResult.status, 'error', 'a broken definition is not deleted blindly')
+  assert.equal(broken.toolMemory.size, 1, 'the broken row is kept for inspection')
+  ok('F4 能力删除：行删除 + 未知 id 拒绝；损坏定义不盲删')
 }
 
 
@@ -1660,8 +1649,8 @@ const presetCtx = (overrides = {}) => ({
     ['mem-b', { workspaceKey: WS, title: '杂项', keywords: [], text: '构建命令写在文档里', status: 'active', sourceSessionId: 's', sourceSeq: 2, createdAt: now2 - 1000, updatedAt: now2 - 1000 }],
   ])
   store.toolMemory = table([['tm-1', {
-    kind: 'composite', title: '发布流程', tags: ['bash', 'test'], trigger: 'ws/x/seq', description: '组合工具：bash → test',
-    entry: JSON.stringify({ name: 'sm_composite_a', steps: [{ tool: 'bash', arguments: {} }], parameters: [] }), useCount: 3, status: 'active',
+    kind: 'capability', title: '发布流程', tags: ['bash', 'test'], trigger: 'capability/release-flow', description: '能力：bash → test',
+    entry: JSON.stringify({ schema: 'sm.capability/1', name: 'release-flow', kind: 'capability', title: '发布流程', description: '能力：bash → test', tags: ['bash', 'test'], entry: 'echo release', runnable: true, steps: [], parameters: [] }), useCount: 3, status: 'active',
   }]])
 
   const service = new SupermemoryPanelService(store, serviceCtx({}))
@@ -2565,17 +2554,16 @@ const { groupRelayText } = await import('../src/group.ts')
   ok('R21-3 组 relay：送达完整 result 而非 400 字梗概')
 }
 
-// ---- R22 能力（capability）：流程固化为受管能力，可一键执行 ----
-// 序列组合工具回答"按什么顺序调哪些工具"；能力回答"这件事现在怎么做"——
-// 入口命令 + 文档 + 适用范围 + 路由描述，落库后可被模型与管理台一键执行
-// （默认预演，写操作二次确认）。
+// ---- R22/R50 能力（capability）：统一记录（知识面 + 执行面） ----
+// 一个记录两个投影：SKILL.md（知识面）+ sm_cap_<name>（执行面，固定入口，
+// 默认预演、写操作 confirm=true）。
 {
   assert.equal(isValidCapabilityName('git-sync-supermemory'), true)
   assert.equal(isValidCapabilityName('bad name'), false)
   assert.equal(isValidCapabilityName(''), false)
   assert.equal(isValidCapabilityName('-lead'), false)
-  assert.equal(capabilityToolName('git-sync-supermemory'), 'sm_composite_git_sync_supermemory')
-  const built = buildCapabilitySpec({
+  assert.equal(capabilityToolName('git-sync-supermemory'), 'sm_cap_git_sync_supermemory')
+  const built = buildCapabilityRecord({
     name: 'git-sync-supermemory',
     title: 'git 同步/提交/推送（SuperMemory 仓库）',
     description: '本仓库 git 同步/提交/推送的固化流程：先判断工作区，再走入口命令。',
@@ -2588,30 +2576,33 @@ const { groupRelayText } = await import('../src/group.ts')
     tags: ['git', '同步', '推送', '流程固化'],
   })
   assert.equal(built.status, 'ok')
-  assert.equal(built.spec.kind, 'capability')
-  assert.equal(built.spec.name, 'sm_composite_git_sync_supermemory')
-  assert.equal(built.spec.entry, 'pnpm git:sync')
-  assert.equal(built.spec.doc, 'docs/git-sync.md')
-  assert.equal(built.spec.scope, 'G:\\09 - dsh\\SuperMemory')
-  assert.equal(built.spec.runnable, true)
-  assert.equal(built.spec.dryRunArg, '--dry-run')
-  assert.equal(built.spec.writeConfirm, true)
-  assert.deepEqual(built.spec.tags, ['git', '同步', '推送', '流程固化'])
-  assert.deepEqual(built.spec.steps, [], 'a capability carries no steps')
-  assert.equal(buildCapabilitySpec({ name: 'x', description: 'd', entry: '' }).status, 'error', 'entry is required')
-  assert.equal(buildCapabilitySpec({ name: 'x', description: '', entry: 'pnpm git:sync' }).status, 'error', 'description is required')
-  assert.equal(buildCapabilitySpec({ name: 'bad name', description: 'd', entry: 'e' }).status, 'error', 'the name must be a legal slug')
-  assert.equal(buildCapabilitySpec({ name: 'x', description: 'd', entry: 'e' }).spec.runnable, true, 'runnable defaults to true')
-  ok('K1 能力数据模型：命名规则/字段默认值/缺 entry 缺描述非法名均拒绝')
+  assert.equal(built.record.kind, 'capability')
+  assert.equal(built.record.name, 'git-sync-supermemory', 'logical name, not the tool name')
+  assert.equal(capabilityToolName(built.record.name), 'sm_cap_git_sync_supermemory')
+  assert.equal(built.record.entry, 'pnpm git:sync')
+  assert.equal(built.record.doc, 'docs/git-sync.md')
+  assert.equal(built.record.scope, 'G:\\09 - dsh\\SuperMemory')
+  assert.equal(built.record.runnable, true)
+  assert.equal(built.record.dryRunArg, '--dry-run')
+  assert.equal(built.record.writeConfirm, true)
+  assert.deepEqual(built.record.tags, ['git', '同步', '推送', '流程固化'])
+  assert.equal(built.record.entryVerified, true)
+  // R50: no entry = knowledge-only capability (valid, not an error).
+  const knowledge = buildCapabilityRecord({ name: 'notes', description: '仅知识' })
+  assert.equal(knowledge.status, 'ok')
+  assert.equal(knowledge.record.kind, 'knowledge')
+  assert.equal(knowledge.record.entry, '')
+  assert.equal(knowledge.record.runnable, false)
+  assert.equal(buildCapabilityRecord({ name: 'x', description: '' }).status, 'error', 'description is required')
+  assert.equal(buildCapabilityRecord({ name: 'bad name', description: 'd' }).status, 'error', 'the name must be a legal slug')
+  ok('K1 能力数据模型：逻辑名/sm_cap_ 工具名/仅知识（无 entry）/非法名缺描述拒绝')
 }
 
 {
-  const spec = {
-    name: 'sm_composite_cap_echo', kind: 'capability', description: 'd',
-    entry: 'echo capability-dry-run-marker', steps: [], parameters: [],
-    runnable: true, dryRunArg: '--dry-run',
-  }
-  const r = runCapability(spec, {})
+  const rec = buildCapabilityRecord({
+    name: 'cap-echo', description: 'd', entry: 'echo capability-dry-run-marker', dryRunArg: '--dry-run',
+  }).record
+  const r = runCapability(rec, {})
   assert.equal(r.status, 'completed', 'echo must succeed: ' + r.summary)
   assert.equal(r.exitCode, 0)
   assert.equal(r.dryRun, true, 'a defined dryRunArg makes dry-run the default')
@@ -2622,47 +2613,40 @@ const { groupRelayText } = await import('../src/group.ts')
 }
 
 {
-  // 写操作闸门：无 confirm 拒绝执行且不跑命令；confirm=true 才真跑。
-  const writeSpec = {
-    name: 'sm_composite_gate_test', kind: 'capability', description: 'd',
-    entry: 'echo gate-should-not-run', steps: [], parameters: [],
-    runnable: true, writeConfirm: true,
-  }
-  const blocked = runCapability(writeSpec, {})
+  const write = buildCapabilityRecord({
+    name: 'gate-test', description: 'd', entry: 'echo gate-should-not-run', writeConfirm: true,
+  }).record
+  const blocked = runCapability(write, {})
   assert.equal(blocked.status, 'needs-confirm', 'a write capability without confirm must be refused')
   assert.equal(blocked.stdout, '', 'nothing may be executed')
   assert.equal(blocked.dryRun, false)
-  const allowed = runCapability(writeSpec, { confirm: true })
+  const allowed = runCapability(write, { confirm: true })
   assert.equal(allowed.status, 'completed')
   assert.ok(allowed.stdout.includes('gate-should-not-run'), 'confirm=true really runs it')
   assert.equal(allowed.dryRun, false)
-  // 预演缺省：定义了 dryRunArg 时默认预演，无需 confirm。
-  const dry = runCapability({ ...writeSpec, dryRunArg: '--dry-run' }, {})
+  const dry = runCapability({ ...write, dryRunArg: '--dry-run' }, {})
   assert.equal(dry.status, 'completed')
   assert.equal(dry.dryRun, true)
   assert.ok(dry.command.includes('--dry-run'), 'the dry-run arg is appended')
-  // 写操作能力没有预演参数时，预演必须拒绝——不能把真实命令当预演跑掉。
-  const noDry = runCapability(writeSpec, { dryRun: true })
+  const noDry = runCapability(write, { dryRun: true })
   assert.equal(noDry.status, 'failed')
   assert.ok(noDry.summary.includes('无法预演'))
   assert.equal(noDry.stdout, '', 'still nothing executed')
-  // runnable=false 直接拒绝；非能力定义拒绝。
-  const off = runCapability({ ...writeSpec, runnable: false }, { confirm: true })
+  const off = runCapability({ ...write, runnable: false }, { confirm: true })
   assert.equal(off.status, 'failed')
   assert.ok(off.summary.includes('未开放执行'))
-  assert.equal(runCapability({ name: 'x', description: 'd', steps: [], parameters: [] }).status, 'failed')
-  ok('K3 执行安全闸：写操作需 confirm、默认预演、无预演参数拒绝预演、未开放执行拒绝')
+  const knowledge = buildCapabilityRecord({ name: 'k', description: 'd' }).record
+  assert.equal(runCapability(knowledge, { confirm: true }).status, 'failed')
+  ok('K3 执行安全闸：写操作需 confirm、默认预演、无预演参数拒绝预演、未开放执行/仅知识拒绝')
 }
 
 {
-  // 注册 → 持久化 → 重启重建拾取 → 同名更新（不重复建行）→ 宿主冲突拒绝。
+  // 注册 → 持久化 → 重启重建拾取 → 同名更新（不重复建行）。
   const registered = []
   const store = fakeStore()
   const ctx = { tools: { register: () => () => {}, get: () => undefined } }
   const deps = {
-    register: async (c, s, spec) => { registered.push(spec.name); return () => {} },
-    persist: persistComposite,
-    toolExists: () => false,
+    register: async (c, s, entry) => { registered.push(entry.record.name); return () => {} },
   }
   const seed = {
     name: 'git-sync-supermemory',
@@ -2670,59 +2654,47 @@ const { groupRelayText } = await import('../src/group.ts')
     description: '本仓库 git 同步/提交/推送的固化流程。',
     entry: 'pnpm git:sync',
     doc: 'docs/git-sync.md',
-    scope: 'G:\\09 - dsh\\SuperMemory',
     runnable: true,
     dryRunArg: '--dry-run',
     writeConfirm: true,
     tags: ['git', '同步'],
   }
-  const first = await registerCapability(ctx, store, seed, 'ws-cap', deps)
+  const first = await registerCapability(ctx, store, seed, undefined, deps)
   assert.equal(first.status, 'ok', 'register must succeed: ' + first.message)
-  assert.equal(first.name, 'sm_composite_git_sync_supermemory')
+  assert.equal(first.name, 'git-sync-supermemory')
   assert.equal(store.toolMemory.size, 1, 'the capability must be persisted')
   const [, row] = [...store.toolMemory.entries()][0]
-  assert.equal(row.kind, 'composite', 'the row stays kind=composite (domain schema unchanged)')
-  assert.equal(row.workspaceKey, 'ws-cap', 'the capability is scoped to its workspace')
-  const spec = JSON.parse(row.entry)
-  assert.equal(spec.kind, 'capability')
-  assert.equal(spec.entry, 'pnpm git:sync')
-  assert.equal(spec.writeConfirm, true)
-  assert.deepEqual(registered, ['sm_composite_git_sync_supermemory'], 'the live tool is registered once')
-  // 重启：rebuildComposites 必须拾取能力记录。
+  assert.equal(row.kind, 'capability', 'R50 row kind is capability')
+  const rec = JSON.parse(row.entry)
+  assert.equal(rec.schema, 'sm.capability/1')
+  assert.equal(rec.entry, 'pnpm git:sync')
+  assert.equal(rec.writeConfirm, true)
+  assert.deepEqual(registered, ['git-sync-supermemory'], 'the live tool is registered once')
   const rebuilt = []
-  const count = await rebuildComposites(ctx, store, { register: async (c, s, sp) => { rebuilt.push(sp); return () => {} } })
-  assert.equal(count, 1)
-  assert.equal(rebuilt[0].kind, 'capability', 'rebuild picks up the capability')
-  assert.equal(rebuilt[0].name, 'sm_composite_git_sync_supermemory')
-  // 重注册同名能力 = 原地更新。
-  const again = await registerCapability(ctx, store, { ...seed, description: '更新后的路由描述' }, 'ws-cap', deps)
+  const count = await rebuildCapabilities(ctx, store, { register: async (c, s, entry) => { rebuilt.push(entry.record.name); return () => {} } })
+  assert.ok(count >= 1)
+  assert.ok(rebuilt.includes('git-sync-supermemory'), 'rebuild picks up the capability')
+  const sizeBefore = store.toolMemory.size
+  const again = await registerCapability(ctx, store, { ...seed, description: '更新后的路由描述' }, undefined, deps)
   assert.equal(again.status, 'ok')
-  assert.equal(store.toolMemory.size, 1, 're-registering the same name updates in place')
-  assert.equal(JSON.parse([...store.toolMemory.entries()][0][1].entry).description, '更新后的路由描述')
-  // 与宿主既有工具冲突 → 拒绝（且不落库）。用默认 deps，让冲突检查走
-  // ctx.tools.get 这条真实路径（注入缝的 toolExists 恒 false，测不到冲突）。
-  const clashCtx = { tools: { register: () => () => {}, get: (n) => (n === 'sm_composite_other_cap' ? {} : undefined) } }
-  const clash = await registerCapability(clashCtx, store, { ...seed, name: 'other-cap' }, 'ws-cap')
-  assert.equal(clash.status, 'error')
-  assert.ok(clash.message.includes('已被占用'))
-  assert.equal(store.toolMemory.size, 1, 'a refused register persists nothing')
-  // capabilityRecordsOf 列出能力（供 memory_toolize list / 控制台）。
+  assert.equal(store.toolMemory.size, sizeBefore, 're-registering the same name updates in place')
   const caps = capabilityRecordsOf(store)
-  assert.equal(caps.length, 1)
-  assert.equal(caps[0].spec.entry, 'pnpm git:sync')
-  assert.equal(caps[0].useCount, 0)
-  ok('K4 能力注册→持久化→重启重建拾取→同名原地更新→宿主冲突拒绝→列表')
+  const own = caps.find((cap) => cap.spec.name === 'git-sync-supermemory')
+  assert.ok(own, 'capabilityRecordsOf lists the capability')
+  assert.equal(own.spec.entry, 'pnpm git:sync')
+  assert.equal(own.spec.description, '更新后的路由描述')
+  ok('K4 能力注册→持久化→重启重建拾取→同名原地更新→列表')
 }
 
 {
-  // 面板 runTool：能力可跑且计数、needs-confirm 不计数、序列工具拒绝一键执行。
-  const capSpec = {
-    name: 'sm_composite_panel_cap', kind: 'capability', description: '面板执行冒烟', title: '面板能力',
-    entry: 'echo panel-capability-ok', steps: [], parameters: [], runnable: true, dryRunArg: '--dry-run',
-  }
+  // 面板 runTool：能力可跑且计数、needs-confirm 不计数、仅知识/历史序列不可一键执行。
+  const capabilityEntry = (spec) => JSON.stringify({
+    schema: 'sm.capability/1', kind: 'capability', title: '面板能力', runnable: true,
+    steps: [], parameters: [], ...spec,
+  })
   const store = fakeStore({ toolMemory: [['tm-cap', {
-    kind: 'composite', workspaceKey: 'ws', title: '面板能力', tags: ['git'], trigger: 'capability/x',
-    description: '面板执行冒烟', entry: JSON.stringify(capSpec), useCount: 0, status: 'active',
+    kind: 'capability', workspaceKey: 'ws', title: '面板能力', tags: ['git'], trigger: 'capability/panel-cap',
+    description: '面板执行冒烟', entry: capabilityEntry({ name: 'panel-cap', description: '面板执行冒烟', entry: 'echo panel-capability-ok', dryRunArg: '--dry-run' }), useCount: 0, status: 'active',
   }]] })
   const service = new SupermemoryPanelService(store, serviceCtx())
   const views = service.listTools()
@@ -2733,34 +2705,30 @@ const { groupRelayText } = await import('../src/group.ts')
   assert.equal(r.status, 'completed')
   assert.ok(r.stdout.includes('panel-capability-ok'))
   assert.equal(r.dryRun, true)
-  assert.equal(store.toolMemory.get('tm-cap').useCount, 1, 'a real run bumps the durable counter')
+  assert.equal(JSON.parse(store.toolMemory.get('tm-cap').entry).runCount, 1, 'a real run bumps runCount')
   const wstore = fakeStore({ toolMemory: [['tm-w', {
-    kind: 'composite', title: '写能力', tags: [], trigger: '', description: 'd',
-    entry: JSON.stringify({ ...capSpec, name: 'sm_composite_panel_w', writeConfirm: true }), useCount: 0, status: 'active',
+    kind: 'capability', title: '写能力', tags: [], trigger: 'capability/panel-w', description: 'd',
+    entry: capabilityEntry({ name: 'panel-w', description: 'd', entry: 'echo panel-w-ok', writeConfirm: true }), useCount: 0, status: 'active',
   }]] })
   const wservice = new SupermemoryPanelService(wstore, serviceCtx())
-  // 预演缺省仍在（dryRunArg 已定义）：直接调用是预演，不计确认流程。
   const dryFirst = await wservice.runTool('tm-w')
-  assert.equal(dryFirst.status, 'completed')
-  assert.equal(dryFirst.dryRun, true)
-  assert.equal(wstore.toolMemory.get('tm-w').useCount, 1)
-  // 显式要求实跑（dryRun:false）但没有 confirm → needs-confirm，不执行。
+  assert.equal(dryFirst.status, 'needs-confirm', 'writeConfirm without dryRunArg cannot be previewed; it asks for confirm')
   const blocked = await wservice.runTool('tm-w', { dryRun: false })
   assert.equal(blocked.status, 'needs-confirm')
-  assert.equal(wstore.toolMemory.get('tm-w').useCount, 1, 'needs-confirm does not count as use')
-  // confirm=true = 确认真实执行（自动脱离预演缺省）。
+  assert.equal(JSON.parse(wstore.toolMemory.get('tm-w').entry).runCount ?? 0, 0, 'needs-confirm does not count as use')
   const ran = await wservice.runTool('tm-w', { confirm: true })
   assert.equal(ran.status, 'completed')
   assert.equal(ran.dryRun, false, 'confirm=true really runs')
-  assert.equal(wstore.toolMemory.get('tm-w').useCount, 2)
+  assert.equal(JSON.parse(wstore.toolMemory.get('tm-w').entry).runCount, 1)
   const sstore = fakeStore({ toolMemory: [['tm-s', {
-    kind: 'composite', title: '序列', tags: [], trigger: '', description: 'd',
+    kind: 'composite', title: '历史序列', tags: [], trigger: 'ws/ws/seq/a>b', description: 'd',
     entry: JSON.stringify({ name: 'sm_composite_s', steps: [{ tool: 'read', arguments: {} }], parameters: [] }), useCount: 0, status: 'active',
   }]] })
   const seqResult = await new SupermemoryPanelService(sstore, serviceCtx()).runTool('tm-s')
-  assert.equal(seqResult.status, 'failed', 'a sequence composite is not one-click runnable')
-  ok('K5 面板执行：能力可跑且计数、needs-confirm 不计数、序列工具拒绝一键执行')
+  assert.equal(seqResult.status, 'failed', 'a legacy sequence row is not one-click runnable')
+  ok('K5 面板执行：能力可跑且计数、needs-confirm 不计数、历史序列/仅知识不可执行')
 }
+
 
 // ---- requirement E: interrupted dispatch preservation + resume ----
 // 插件被中断/关闭时分支会话保留（不 kill/abort/delete），恢复后扫描台账列出
