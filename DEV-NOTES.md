@@ -3993,3 +3993,100 @@ R52 的迁移在插件启动时执行，旧进程还在时不会迁移；**不�
 - GitHub 前端若被阻断，latest/稳定 URL 的 HEAD/GET 不可用，按 docs/git-sync.md §12 以 API 证据代替。
 
 
+
+---
+
+## 67. R54：R52 验收 3 个 P2 修复 + v1.3.2 发布轮（2026-11-26）
+
+### 67.1 定级与范围
+
+- 版本 **1.3.1 → 1.3.2**，定级 **patch**：只修 R52 只读验收发现的 3 个 P2（版本元数据回退、健康统计口径矛盾、注入卡提示语用机器名），补 R54 断言；存储域 `supermemory` version 1 不变，无破坏性迁移。
+- **v1.3.0 / v1.3.1 的 tag、Release 与三资产原样保留**（不覆盖、不改名、不动字节）。
+
+### 67.2 三项 P2 的根因与修法
+
+**P2-1 版本元数据回退（按 P1 处理：同能力出现两份版本账本）**
+
+- 现象：live `.dsh/capabilities/git-sync-supermemory.md` = `sm-version: 6` + changelog 仅 `v6`；归档 `.dsh/skills-archive/sm-git-sync-supermemory/SKILL.md` = `sm-version: 8` + `v7/v8`。正文没丢，版本号回退 2 版。
+- 根因：R52 迁移是「先归档、后生成」。当旧 skill 目录在**更早的启动**里已被归档、而新 `.dsh/capabilities/<name>.md` 尚未存在时，`migrateCapabilityDocs` 的 `oldExists` 为假（没有可复制的旧文件），于是后续 refresh 只能按能力记录的 `version`（6）新建 live 文件；归档里的 v8 不再被任何代码路径看到。`upsertCapabilitySkill` 的旧规则 `found ? found+1 : input.version` 也只信记录，不会取 max。
+- 修法：
+  1. 新增 `reconcileCapabilityVersions`（capability.ts）：对每个未退役能力取 **max(记录版本, live 文件 sm-version, 归档 sm-version)**，归档位置同时扫描 `<capabilities 根>-archive/<name>.md` 与 `<skills 根>-archive/sm-<name>[-cap-*]/SKILL.md`；live 文件缺失时先恢复归档文件；
+  2. 需要升版本时用 `adoptCapabilityDocVersion`（skill-forge.ts）重写 live 文件：正文与事实块逐字节保留，只在 changelog 前置 `v8: R52 迁移到 .dsh/capabilities，保留归档版本（源自归档 sm-<name>）`，并把归档的旧 changelog（v7/v6）合并保留；
+  3. 记录同步写回 `version` 与 changelog 首行；`upsertCapabilitySkill` 版本规则改为「不低于文件与记录二者」，`syncCapabilitySkill` 把渲染后的文件版本回写记录，保证**后续单调**；
+  4. 版本账本语义统一为「记录与知识面共用的单调账本」；内置定义的版本另行落在 `builtinVersion`，`mergeBuiltinCapabilities` 的升级判断 = `record.version < builtin.version || builtinVersion < builtin.version`（否则恢复出来的 v8 会挡住内置 v7 升级），升级时版本取 `max(record.version, builtin.version)`，绝不回退。
+- 幂等：第二次启动 `versionsReconciled=0`、文件与记录都不变。
+
+**P2-2 健康统计口径矛盾**
+
+- 现象：units 显示 `runCount=0`、`loadsToRuns=0`，但 `successCount=13`、`failCount=9`、`consecutiveFailures=2`、`lastStatus=failed`。
+- 根因：旧版把成败计数放在记录里的 `usage` 对象；归一化（`normalizeCapabilityRecord`）只搬来分子（success/fail），没有补 `runCount` 分母，`runCount` 落到 0。面板同时显示分子与分母，读数自相矛盾。
+- 修法（**选择「保留历史」而不是清空 legacy**，理由：13/9 是真实执行史，清空会丢成功率分母，也无法再从任何介质恢复；把旧 success/fail 计入 runCount 可保留历史成功率，代价只是 runCount 首次会跳变）：
+  - `reconcileCapabilityHealth(record)`：`runCount = max(runCount, success + fail)`；`consecutiveFailures` 不超过 `failCount`（failCount=0 → 0）；`lastStatus` 与最近结果一致（streak>0 → failed；streak 归零且成功过 → completed；缺失且有运行 → 按成功与否）；
+  - 迁移里写回记录（`report.healthReconciled`）；`capabilityHealthOf` 读投影也先对账，面板在迁移落盘前就不矛盾，并给中性说明「历史统计已校正（R54）」；
+  - 只影响派生读数，不改执行/路由。
+
+**P2-3 注入卡「何时用」用机器名**
+
+- 现象：卡片提示语以机器名 `git-sync-supermemory` 作主语，而 `units.title` 是人话标题「git 同步/提交/推送（SuperMemory 仓库）」。
+- 根因：`renderCapabilityIndex` 直接照抄调用方传入的 `whenToUse`；该句的模板用了 `record.title` 但调用方/历史数据可能传入以 name 为主的句子，渲染层没有兜底。
+- 修法：新增 `capabilityIndexHint`，卡片「何时用」**优先 title** 建句（有 scope 时保留「在 <scope> 内…」前缀）；调用方句子已包含 title 时沿用；无 title 才退回 description/whenToUse。prestep 同时传 `scope`，渲染规则收敛到渲染器一处。
+
+### 67.3 迁移幂等证据（live 数据等价 fixture，真跑）
+
+用 live store 里 git-sync 那一行 + 真实 live 文件 + 真实归档文件搭等价目录（workspaceKey 指向临时仓库），跑两次 `migrateCapabilities`：
+
+```
+BEFORE  live-file sm-version=6  changelog=["v6: 内置能力播种：生成知识面"] | record version=6 runCount=0 success=13 fail=9 | archived sm-version=8
+PASS1   versionsReconciled=1 healthReconciled=1 movedDocs=0 changed=true
+AFTER1  live-file sm-version=9  record version=9 runCount=22 lastStatus=failed builtin=true builtinVersion=6
+        units: runCount=22 loadsToRuns=5.5 successRate=0.5909… lastStatus=failed
+PASS2   versionsReconciled=0 healthReconciled=0 movedDocs=0 changed=false | file sm-version=9 record version=9
+```
+
+读法：v6 → 恢复归档 v8，同一次启动的常规事实块刷新再升到 v9（changelog 里 `v8: R52 迁移…` 与 `v9: 刷新事实块…` 都在）；记录同步到 9 且 `builtinVersion=6` 仍跟踪内置定义；第二次启动零改动。health 由 0/13/9 折算为 runCount 22（successRate 13/22、loadsToRuns 22/4）。
+
+### 67.4 新增断言（capability-smoke 14 → 17 组）
+
+- `R54-1`：live v6 + 归档 v8 → 文件 8、changelog 追加迁移行、归档 v7 历史保留、记录版本 8；`record=6/file=8` → 结果 8；二次 `changed=false`。
+- `R54-2`：legacy 0/13/9/streak2/failed → runCount 22、loadsToRuns 5.5、successRate 13/22、lastStatus failed；streak 归零 → completed；迁移写回、二次 0 改动。
+- `R54-3`：卡片含人类标题、不含「机器名」主语；无 title 退 description；prestep 传 scope 的接线断言。
+
+### 67.5 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 **13 文件 917.73 kB**（入口 `supermemory.js` 547.99 kB；capability chunk `capability-D5JJ1r3a.js`、skill-forge `skill-forge-BnMEUOcU.js`），client `lib/client.js` 179.66 kB，wrap 后 **173927 B**（客户端本版无源码改动）。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **111** / webui **35** / client-sim `SIM SMOKE OK` / capability **17** 组 / workspace-scope **6** 组 / skill **27** 组。
+
+### 67.6 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.2.zip` | 2,022,653 | `aa460f02966d2a4290593a324ee386afb02b91cb1a9d5b49a7ea061ff7f30992` |
+| `dsh-supermemory-1.3.2.tgz` | 805,378 | `3e6a14105be23e541a3cce3b0a03f4970e1e84baf194cc3d0c4ae4a89d02bcc0` |
+| `dsh-supermemory.tgz`（稳定别名） | 805,378 | 同上（字节一致） |
+
+- tgz（npm-pack 结构）：**95 条目**；`package/package.json`（version=1.3.2）、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml` 齐全；**反斜杠路径 0**；含 `capability-D5JJ1r3a.js` / `skill-forge-BnMEUOcU.js` / `toolize-DXkUszkA.js` 与对应源码。
+- zip（手动安装）：**908 条目**、解压后 `package.json` = 1.3.2、`lib/` + 内置 `node_modules/` + `scripts/install-into-dsh.mjs` + README/CHANGELOG/INSTALL 齐全，CHANGELOG 含 `[1.3.2]`、INSTALL 含「升级到 1.3.2 后要做什么」；条目分隔符为 `\`（Windows 手动安装专用）。
+- 安装自检：临时空目录 `pnpm add F:/10-SuperMemory/release/dsh-supermemory-1.3.2.tgz` → exit 0，安装版本 **1.3.2**，`main = lib/supermemory.js`，`lib/` 含新 chunk。
+
+### 67.7 提交、tag 与双推（按 docs/git-sync.md）
+
+- 单条提交（3 个 P2 修复 + R54 测试 + 版本号 + CHANGELOG/README/INSTALL/DEV-NOTES + `lib/` 构建产物；`release/` 二进制按 `.gitignore` 不入库），提交信息写文件后 `git commit -F`。
+- 附注 tag `v1.3.2`（标注：v1.3.2 — R54 修复 R52 验收 P2：版本单调/健康口径/注入卡标题）。
+- 双推 `pnpm git:sync`（GitHub 首位 + Gitee）推 main 与 tag；逐端核验 **main commit + tag 对象 SHA + tag 指向 commit** 三者一致。GitHub git 面若被阻断，改用 `scripts/github-api-release.mjs`（R51 已修 `^{commit}` 的 cmd 转义）走 API 补推与 Release。
+- Release：三资产（版本 zip、版本 tgz、稳定别名 tgz）上传，`state=uploaded`、`digest` 与本地 sha256 一致；核验 `/releases/latest` = v1.3.2、稳定 URL `HEAD/GET` 200 且 sha256 一致；前端被阻断时按 docs/git-sync.md §12 用 `api.github.com` 资产端点并注明。
+
+### 67.8 用户验收（必须完全退出并重启 DSH Desktop）
+
+1. 「固化能力」面板 git-sync 的版本 ≥ 8（本机预期 v9），运行次数 = 成功 + 失败（预期 22 = 13 + 9），`lastStatus` 与连续失败数一致；可选说明「历史统计已校正（R54）」。
+2. 文件 `.dsh/capabilities/git-sync-supermemory.md` 的 changelog 含 `v8: R52 迁移到 .dsh/capabilities，保留归档版本…`；再次重启该文件不再改写。
+3. 新会话（中枢/分支）注入卡「[SuperMemory 可用能力]」该行显示「git 同步/提交/推送（SuperMemory 仓库）」而非机器名作主语。
+4. 本版无存储结构变更；如需回滚，重装 v1.3.1 并重启即可（版本账本只会前进，不会妨碍旧版读取）。
+
+### 67.9 剩余风险
+
+- 恢复只扫描 `.dsh/capabilities-archive/` 与 `.dsh/skills-archive/`；更早的手工备份需人工放回，之后由对账接管。
+- 恢复出来的知识面版本可能高于内置定义版本（v8 > v6），这是双账本的预期结果：内置升级判断改看 `builtinVersion`，面板「现场版本新于内置」提示只在没有 `builtinVersion` 的本地维护行出现。
+- 统计折算是一次性的读数修正，不重算历史成功率之外的任何指标；`runCount` 首次会从 0 跳到 22。
+- GitHub 前端若被阻断，latest/稳定 URL 的 HEAD/GET 不可用，按 docs/git-sync.md §12 以 API 证据代替。
+

@@ -184,6 +184,9 @@ export function attachPreStep(
                 name: entry.record.name,
                 title: entry.record.title,
                 description: entry.record.description,
+                // R54: the renderer prefers the human title and rebuilds the
+                // sentence itself; scope is passed so the sentence keeps it.
+                ...(entry.record.scope ? { scope: entry.record.scope } : {}),
                 ...(entry.record.scope
                   ? { whenToUse: '在 ' + entry.record.scope + ' 内遇到「' + entry.record.title + '」类任务时加载。' }
                   : {}),

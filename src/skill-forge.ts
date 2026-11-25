@@ -693,6 +693,126 @@ export function readCapabilityDocBody(root: string, name: string): string | unde
 }
 
 /**
+ * R54: sm-version of ONE knowledge-face file (0 when missing/unparsable).
+ *
+ * The version ledger is monotonic: a migration may only ever raise it. Callers
+ * take max(record.version, current file, archived files) — see
+ * `archivedCapabilityDocFiles` and `adoptCapabilityDocVersion`.
+ */
+export function readSkillVersionAt(file: string): number {
+  const path = String(file ?? '').trim()
+  if (!path || !existsSync(path)) return 0
+  try {
+    const parsed = parseSkillMarkdown(readFileSync(path, 'utf8'), '')
+    return parsed && Number.isFinite(parsed.version) ? Math.max(0, Math.floor(parsed.version)) : 0
+  } catch { return 0 }
+}
+
+/**
+ * R54: archived knowledge-face files that can restore one capability's version.
+ *
+ * The R52 move copied <skills root>/sm-<name>/SKILL.md to
+ * <capabilities root>/<name>.md and archived the directory FIRST in some boot
+ * orders. When the live file was then regenerated from the (older) record
+ * version, the file version regressed 8 → 6 while the archive still carried 8.
+ * Discovery looks in both archive locations so `reconcileCapabilityVersions`
+ * can restore the highest version instead of trusting the live file alone.
+ */
+export function archivedCapabilityDocFiles(root: string, name: string, skillsRoot?: string): string[] {
+  const out: string[] = []
+  const slug = capabilityDocFileName(name).replace(/\.md$/, '')
+  const docArchive = archiveDirForRoot(root)
+  try {
+    if (existsSync(docArchive)) {
+      for (const entry of readdirSync(docArchive)) {
+        if (!entry.endsWith('.md')) continue
+        const base = entry.slice(0, -3)
+        if (base === slug || base.startsWith(slug + '-cap-')) out.push(join(docArchive, entry))
+      }
+    }
+  } catch { /* an unreadable archive contributes nothing */ }
+  if (skillsRoot) {
+    const skillsArchive = archiveDirForRoot(skillsRoot)
+    const skillName = capabilitySkillNames(name).skillName
+    try {
+      if (existsSync(skillsArchive)) {
+        for (const entry of readdirSync(skillsArchive)) {
+          if (entry !== skillName && !entry.startsWith(skillName + '-cap-') && !entry.startsWith(skillName + '-dup-')) continue
+          const file = join(skillsArchive, entry, 'SKILL.md')
+          if (existsSync(file)) out.push(file)
+        }
+      }
+    } catch { /* same */ }
+  }
+  return out
+}
+
+/**
+ * R54: rewrite one capability knowledge face at a MONOTONIC version.
+ *
+ * Only metadata changes: the prose is byte-identical, the facts block is kept,
+ * and the migration is recorded in the file changelog. Idempotent — repeating
+ * the call with the same version+line reports 'unchanged' and writes nothing,
+ * which is what makes the boot migration safe to run on every start.
+ */
+export function adoptCapabilityDocVersion(options: {
+  path: string
+  name: string
+  title: string
+  tags?: string[]
+  version: number
+  /** One changelog line explaining WHY the version moved (newest first). */
+  changelogLine: string
+  /** Optional extra history (e.g. the archived file's changelog), oldest text last. */
+  extraChangelog?: string[]
+  now?: number
+}): { status: 'adopted' | 'unchanged' | 'error'; version: number; path: string; bodyHash?: string; factsHash?: string; message: string } {
+  const path = String(options.path ?? '').trim()
+  const version = Math.max(1, Math.floor(Number(options.version) || 1))
+  const line = String(options.changelogLine ?? '').trim().slice(0, 200)
+  if (!path || !existsSync(path)) return { status: 'error', version, path, message: '知识面文件不存在：' + (path || '（未生成）') }
+  let parsed: ParsedSkill | undefined
+  try { parsed = parseSkillMarkdown(readFileSync(path, 'utf8'), capabilitySkillNames(options.name).skillName) } catch { parsed = undefined }
+  if (!parsed) return { status: 'error', version, path, message: '知识面文件解析失败：' + path }
+  const history = [...new Set([line, ...(options.extraChangelog ?? []), ...parsed.changelog].filter(Boolean))]
+  if (parsed.version >= version && parsed.changelog[0] === line) {
+    return { status: 'unchanged', version: parsed.version, path, ...(parsed.bodyHash ? { bodyHash: parsed.bodyHash } : {}), ...(parsed.factsHash ? { factsHash: parsed.factsHash } : {}), message: '版本已对齐，未改写。' }
+  }
+  const nextVersion = Math.max(parsed.version, version)
+  const draft: SkillDraft = {
+    name: parsed.name,
+    title: options.title || parsed.name,
+    description: parsed.description,
+    ...(parsed.whenToUse ? { whenToUse: parsed.whenToUse } : {}),
+    tags: (options.tags && options.tags.length > 0 ? options.tags : ['skill', 'capability']).slice(0, 8),
+    body: parsed.body,
+    ...(parsed.taskKey ? { taskKey: parsed.taskKey } : {}),
+    source: { kind: 'capability', key: 'capability/' + options.name, label: options.title, occurrences: Math.max(1, parsed.occurrences) },
+  }
+  try {
+    writeFileAtomic(path, renderSkillMarkdown(draft, {
+      version: nextVersion,
+      updatedAt: options.now ?? Date.now(),
+      renderedHash: skillContentHash(parsed.description, parsed.body),
+      changelog: history,
+      enabled: parsed.enabled,
+      ...(parsed.bodyHash ? { bodyHash: parsed.bodyHash } : {}),
+      ...(parsed.factsHash ? { factsHash: parsed.factsHash } : {}),
+    }))
+  } catch (error) {
+    return { status: 'error', version, path, message: '写入知识面失败：' + String(error).slice(0, 160) }
+  }
+  return {
+    status: 'adopted',
+    version: nextVersion,
+    path,
+    ...(parsed.bodyHash ? { bodyHash: parsed.bodyHash } : {}),
+    ...(parsed.factsHash ? { factsHash: parsed.factsHash } : {}),
+    message: '知识面版本对齐为 v' + nextVersion + '。',
+  }
+}
+
+/**
  * Archive one capability knowledge FILE (never hard-delete): move
  * `<root>/<name>.md` to `<root>-archive/<name>.md` and append a manifest row.
  * Idempotent: a missing file reports undefined; an existing target gets a suffix.
@@ -1967,7 +2087,11 @@ export async function upsertCapabilitySkill(options: {
   if (found && found.parsed.body === nextBody && found.parsed.description === description) {
     return { status: 'unchanged', name: bundle.name, version: found.parsed.version, path, message: '内容与事实块均未变化，未升版。', bodyHash, factsHash: bundle.factsHash, body: nextBody, factsBlock }
   }
-  let version = found ? found.parsed.version + 1 : Math.max(1, Number(options.input.version) || 1)
+  // R54: the version ledger is monotonic — never regress below either the file's
+  // own sm-version or the record's version, even when a doc was recreated from a
+  // stale record (the R52 regression: live v6 vs archived v8).
+  const recordedVersion = Math.max(1, Number(options.input.version) || 1)
+  let version = found ? Math.max(found.parsed.version, recordedVersion) + 1 : recordedVersion
   const line = String(options.changelog ?? '').trim().slice(0, 200)
     || (found ? '刷新事实块/路由描述（正文人工散文保留）' : '生成能力知识面（六节 + 事实块）')
   const changelog = [versionLine(version, line), ...(found?.parsed.changelog ?? [])].slice(0, SKILL_CHANGELOG_MAX)

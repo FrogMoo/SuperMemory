@@ -563,6 +563,151 @@ const legacyCapSpec = {
   ok('R52-3 接线：能力索引仅 hub/branch；sm_cap_doc 已注册；面板正文编辑器走 editTool(id,{body})')
 }
 
+
+// ---- R54-1 版本单调：max(record, live file, archive)；迁移写入 changelog；二次幂等 ----
+{
+  const { parseSkillMarkdown } = await import('../src/skill-forge.ts')
+  const project = join(root, 'r54-version-repo')
+  mkdirSync(join(project, '.git'), { recursive: true })
+  const wsR54 = workspaceKeyOf(project)
+  const capRoot = join(project, '.dsh', 'capabilities')
+  const skillsRoot = join(project, '.dsh', 'skills')
+  mkdirSync(capRoot, { recursive: true })
+  mkdirSync(skillsRoot, { recursive: true })
+  const facts = '<!-- sm:facts:start -->\n## 事实（自动维护）\n\n- 入口：echo hi\n<!-- sm:facts:end -->'
+  const body = '# 版本能力\n\n## 何时用（触发条件）\n\n- 做 R54 版本测试时。\n\n## 关键坑\n\n- 版本不许回退。\n\n' + facts
+  const docText = (version, changelog) => '---\nname: sm-r54-cap\ndescription: "版本测试"\nsm-enabled: true\n'
+    + 'sm-version: ' + version + '\nsm-updated-at: 1\nsm-source: "capability"\nsm-occurrences: 1\n'
+    + 'sm-body-hash: "b1"\nsm-facts-hash: "f1"\nsm-changelog: ' + JSON.stringify(changelog) + '\n---\n\n' + body + '\n'
+  const docPath = join(capRoot, 'r54-cap.md')
+  // The R52 regression: live file v6, archived pre-R52 skill file v8.
+  writeFileSync(docPath, docText(6, ['v6: 内置能力播种：生成知识面']), 'utf8')
+  const archiveDir = join(skillsRoot + '-archive', 'sm-r54-cap')
+  mkdirSync(archiveDir, { recursive: true })
+  writeFileSync(join(archiveDir, 'SKILL.md'), docText(8, ['v8: 内置能力播种：生成知识面', 'v7: 刷新事实块/路由描述（正文人工散文保留）', 'v6: 内置能力播种：生成知识面']), 'utf8')
+  const record = {
+    schema: 'sm.capability/1', name: 'r54-cap', kind: 'capability', title: '版本能力', description: '版本测试',
+    tags: [], entry: 'echo hi', entryDraft: '', entryVerified: true, doc: '', scope: project, runnable: true,
+    enabled: true, dryRunArg: '', writeConfirm: false, routeNote: '', source: 'migrated', taskKey: '',
+    version: 6, updatedAt: 1, changelog: ['v6: 定义'], skillPath: docPath, bodyHash: 'b1', factsHash: 'f1', facts: {},
+  }
+  const store = fakeStore({ toolMemory: [
+    ['tm-r54-cap', { kind: 'capability', status: 'active', workspaceKey: wsR54, title: '版本能力', tags: [], trigger: 'capability/r54-cap', description: '版本测试', entry: JSON.stringify(record), useCount: 0, createdAt: 1 }],
+  ] })
+  const first = await capability.reconcileCapabilityVersions(store, { now: 1000 })
+  assert.equal(first.changed, true, 'a regressed live file is reconciled')
+  assert.equal(first.entries[0].version, 8, 'max(record 6, file 6, archive 8) = 8')
+  const adoptedText = readFileSync(docPath, 'utf8')
+  const adopted = parseSkillMarkdown(adoptedText, 'sm-r54-cap')
+  assert.equal(adopted.version, 8, 'live file version is restored to 8')
+  assert.ok(adopted.changelog[0].includes('R52 迁移到 .dsh/capabilities') && adopted.changelog[0].includes('保留归档版本'), 'migration is written into the file changelog')
+  assert.ok(adopted.changelog.some((line) => line.startsWith('v7:')), 'archived changelog history is preserved')
+  assert.ok(adoptedText.includes('# 版本能力') && adoptedText.includes('<!-- sm:facts:start -->'), 'prose and facts block are byte-preserved')
+  const adoptedRow = capability.readCapabilityRow(store.toolMemory.get('tm-r54-cap'), 'tm-r54-cap')
+  assert.equal(adoptedRow.record.version, 8, 'record version is written back')
+  assert.ok(adoptedRow.record.changelog[0].includes('R52 迁移到 .dsh/capabilities'), 'record changelog records the restore')
+  const second = await capability.reconcileCapabilityVersions(store, { now: 2000 })
+  assert.equal(second.changed, false, 'second reconcile is unchanged (idempotent)')
+  assert.equal(second.reconciled, 0)
+
+  // record=6 / file=8 (no archive): adopt the file version with a changelog line.
+  const adoptProject = join(root, 'r54-adopt-repo')
+  mkdirSync(join(adoptProject, '.git'), { recursive: true })
+  const wsAdopt = workspaceKeyOf(adoptProject)
+  const adoptRoot = join(adoptProject, '.dsh', 'capabilities')
+  mkdirSync(adoptRoot, { recursive: true })
+  const adoptPath = join(adoptRoot, 'r54-adopt.md')
+  writeFileSync(adoptPath, docText(8, ['v8: 内置能力播种：生成知识面']).replace(/sm-r54-cap/g, 'sm-r54-adopt'), 'utf8')
+  const adoptRecord = { ...record, name: 'r54-adopt', title: '对齐能力', skillPath: adoptPath }
+  const adoptStore = fakeStore({ toolMemory: [
+    ['tm-r54-adopt', { kind: 'capability', status: 'active', workspaceKey: wsAdopt, title: '对齐能力', tags: [], trigger: 'capability/r54-adopt', description: '版本测试', entry: JSON.stringify(adoptRecord), useCount: 0, createdAt: 1 }],
+  ] })
+  const adopted2 = await capability.reconcileCapabilityVersions(adoptStore, { now: 1000 })
+  assert.equal(adopted2.changed, true, 'record 6 + file 8 is reconciled')
+  const adopted2Text = parseSkillMarkdown(readFileSync(adoptPath, 'utf8'), 'sm-r54-adopt')
+  assert.equal(adopted2Text.version, 8, 'result version is 8')
+  assert.ok(adopted2Text.changelog[0].startsWith('v8:'), 'changelog is appended at v8')
+  const adopted2Row = capability.readCapabilityRow(adoptStore.toolMemory.get('tm-r54-adopt'), 'tm-r54-adopt')
+  assert.equal(adopted2Row.record.version, 8, 'record follows the file version')
+  assert.equal((await capability.reconcileCapabilityVersions(adoptStore, { now: 2000 })).changed, false, 'repeat is unchanged')
+  ok('R54-1 版本单调：max(record, file, archive)；归档 v8 恢复 + changelog；record=6/file=8 → 8；二次幂等')
+}
+
+// ---- R54-2 健康口径：runCount=success+fail、lastStatus 一致、迁移写回、幂等 ----
+{
+  const project = join(root, 'r54-health-repo')
+  mkdirSync(join(project, '.git'), { recursive: true })
+  const wsHealth = workspaceKeyOf(project)
+  const legacy = {
+    schema: 'sm.capability/1', name: 'r54-health', kind: 'capability', title: '健康口径', description: '健康统计测试',
+    tags: [], entry: 'echo hi', entryDraft: '', entryVerified: true, doc: '', scope: project, runnable: true,
+    enabled: true, dryRunArg: '', writeConfirm: false, routeNote: '', source: 'migrated', taskKey: '',
+    version: 2, updatedAt: 1, changelog: ['v2: 定义'], skillPath: '', bodyHash: '', factsHash: '', facts: {},
+    loadCount: 4, runCount: 0, successCount: 13, failCount: 9, consecutiveFailures: 2, lastStatus: 'failed',
+  }
+  const direct = capability.reconcileCapabilityHealth(legacy)
+  assert.equal(direct.changed, true, 'legacy split counters are reconciled')
+  assert.equal(direct.record.runCount, 22, 'runCount = success + fail (history preserved)')
+  assert.equal(direct.record.successCount, 13)
+  assert.equal(direct.record.failCount, 9)
+  assert.equal(direct.record.lastStatus, 'failed', 'lastStatus agrees with the failure streak')
+  assert.equal(direct.legacyFolded, true)
+  assert.equal(capability.reconcileCapabilityHealth(direct.record).changed, false, 'reconcile is idempotent')
+  const successAfterFail = capability.reconcileCapabilityHealth({
+    ...legacy, runCount: 0, successCount: 3, failCount: 1, consecutiveFailures: 0, lastStatus: 'failed',
+  })
+  assert.equal(successAfterFail.record.runCount, 4)
+  assert.equal(successAfterFail.record.lastStatus, 'completed', 'a cleared streak means the last run succeeded')
+  const coherent = { ...legacy, runCount: 4, successCount: 3, failCount: 1, consecutiveFailures: 0, lastStatus: 'completed' }
+  assert.equal(capability.reconcileCapabilityHealth(coherent).changed, false, 'a coherent reading is untouched')
+
+  const store = fakeStore({ toolMemory: [
+    ['tm-r54-health', { kind: 'capability', status: 'active', workspaceKey: wsHealth, title: '健康口径', tags: [], trigger: 'capability/r54-health', description: '健康统计测试', entry: JSON.stringify(legacy), useCount: 0, loadCount: 4, runCount: 0, createdAt: 1 }],
+  ] })
+  const report = await capability.migrateCapabilities(store, { now: 1000 })
+  assert.ok(report.healthReconciled >= 1, 'migration folds the legacy counters: ' + JSON.stringify(report))
+  const persisted = capability.readCapabilityRow(store.toolMemory.get('tm-r54-health'), 'tm-r54-health')
+  assert.equal(persisted.record.runCount, 22, 'migration writes runCount back to the row')
+  assert.equal(persisted.record.lastStatus, 'failed')
+  const health = capability.capabilityHealthOf(store, wsHealth).find((row) => row.name === 'r54-health')
+  assert.equal(health.runCount, 22)
+  assert.equal(health.loadsToRuns, 5.5, '22 runs / 4 loads — no more 0/0 contradiction')
+  assert.equal(health.successRate, 13 / 22, 'success rate keeps its real denominator')
+  assert.ok(health.notes.some((note) => note.includes('历史统计已校正')) || health.successCount === 13, 'the reading is internally coherent')
+  const second = await capability.migrateCapabilities(store, { now: 2000 })
+  assert.equal(second.healthReconciled, 0, 'second migration reconciles nothing (idempotent)')
+  ok('R54-2 健康口径：runCount=success+fail；lastStatus 与最近结果一致；迁移写回；二次幂等')
+}
+
+// ---- R54-3 注入卡：何时用优先 title，无 title 退 description/whenToUse ----
+{
+  const rows = [
+    {
+      name: 'git-sync-supermemory', title: 'git 同步/提交/推送（SuperMemory 仓库）', description: '机器名描述',
+      scope: 'F:\\10-SuperMemory', whenToUse: '在 F:\\10-SuperMemory 内遇到「git-sync-supermemory」类任务时加载。',
+      entry: 'pnpm git:sync', runnable: true, enabled: true, kind: 'capability', status: 'active',
+    },
+    { name: 'no-title-cap', title: '', description: '当任务需要处理无标题能力的同类改动时加载', entry: '', runnable: false, enabled: true, kind: 'knowledge', status: 'active' },
+  ]
+  const card = capability.renderCapabilityIndex(rows, { maxItems: 8, budget: 1600 })
+  const gitLine = card.text.split('\n').find((line) => line.startsWith('- git-sync-supermemory '))
+  assert.ok(gitLine, 'the capability is indexed')
+  assert.ok(gitLine.includes('「git 同步/提交/推送（SuperMemory 仓库）」'), 'the hint uses the human title: ' + gitLine)
+  assert.ok(!gitLine.includes('「git-sync-supermemory」'), 'the machine name is never the subject of the hint')
+  const fallbackLine = card.text.split('\n').find((line) => line.startsWith('- no-title-cap '))
+  assert.ok(fallbackLine.includes('无标题能力'), 'a row without a title falls back to description/whenToUse')
+  const kept = capability.capabilityIndexHint({
+    name: 'x', title: '人类标题', description: 'd', scope: 'F:\\ws',
+    whenToUse: '在 F:\\ws 内遇到「人类标题」类任务时加载。',
+  })
+  assert.equal(kept, '在 F:\\ws 内遇到「人类标题」类任务时加载。', 'a sentence that already names the title keeps its scope')
+  assert.ok(capability.capabilityIndexHint({ ...rows[0], title: '' }).length > 0, 'no title → description/whenToUse fallback')
+  const { readFileSync: read } = await import('node:fs')
+  const prestepSrc = read(new URL('../src/prestep.ts', import.meta.url), 'utf8')
+  assert.ok(prestepSrc.includes('scope: entry.record.scope'), 'prestep passes scope to the title-first renderer')
+  ok('R54-3 注入卡：何时用优先 title、机器名不再当主语；无 title 退 description/whenToUse')
+}
+
 rmSync(root, { recursive: true, force: true })
 console.log('\ncapability-smoke: ' + passed + ' groups passed')
 process.exit(0)

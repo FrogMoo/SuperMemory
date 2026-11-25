@@ -39,8 +39,9 @@ import { BUILTIN_CAPABILITIES } from './builtin-capabilities.ts'
 import { charCount, clipAtBoundary } from './clip.ts'
 import { CAPABILITY_ROUTING_RULES } from './route.ts'
 import {
-  archiveCapabilityDoc, archiveCapabilitySkill, archiveShellSkills, bodyHashOf, buildCapabilitySkill,
-  capabilityDocPath, capabilitySkillNames, isShellIdentity, parseSkillMarkdown,
+  adoptCapabilityDocVersion, archiveCapabilityDoc, archiveCapabilitySkill, archiveShellSkills,
+  archivedCapabilityDocFiles, bodyHashOf, buildCapabilitySkill, capabilityDocFileName, capabilityDocPath,
+  capabilitySkillNames, isShellIdentity, parseSkillMarkdown, readSkillVersionAt,
   resolveCapabilityRoot, resolveSkillRoot, splitFactsBlock, upsertCapabilitySkill,
   type CapabilityFacts,
 } from './skill-forge.ts'
@@ -448,6 +449,10 @@ export interface CapabilityMigrationReport {
   archivedDocDirs: number
   /** R52: manual/third-party skill files deliberately left in the skill root. */
   skippedManualDocs: number
+  /** R54: knowledge-face versions restored/raised to max(record, file, archive). */
+  versionsReconciled: number
+  /** R54: legacy health counters folded into a coherent runCount/lastStatus. */
+  healthReconciled: number
   changed: boolean
 }
 
@@ -603,6 +608,177 @@ export async function migrateCapabilityDocs(store: Store, options: {
 }
 
 /**
+ * R54: per-row migration report for the version/health reconciliations.
+ */
+export interface VersionReconcileReport {
+  reconciled: number
+  changed: boolean
+  entries: Array<{ name: string; version: number; path?: string; restoredFrom?: string }>
+}
+
+/** R54: one-line explanation written into the knowledge face when a version is restored. */
+export function versionRestoreLine(version: number, restoredFrom?: string): string {
+  if (!restoredFrom) return 'v' + version + ': 知识面版本与能力记录对齐（R54 单调化）'
+  let source = ''
+  try { source = basename(dirname(restoredFrom)) } catch { source = '' }
+  return 'v' + version + ': R52 迁移到 .dsh/capabilities，保留归档版本' + (source ? '（源自归档 ' + source + '）' : '')
+}
+
+/**
+ * R54: enforce the monotonic knowledge-face version ledger.
+ *
+ * R52's migration could regenerate `.dsh/capabilities/<name>.md` from a stale
+ * record version (6) while the pre-R52 archive still carried the newer file
+ * (8) — the live document then regressed two versions. The rule is now
+ * max(record.version, live file version, every archived version); when the max
+ * comes from somewhere else, the live file is rewritten AT that version (prose
+ * untouched) and the restoration is recorded in both the file and the record.
+ * Idempotent: a second pass finds every ledger aligned and reports changed=false.
+ */
+export async function reconcileCapabilityVersions(store: Store, options: {
+  capabilityRoot?: string
+  skillsRoot?: string
+  now?: number
+  logger?: { info: (msg: string) => void }
+} = {}): Promise<VersionReconcileReport> {
+  const now = options.now ?? Date.now()
+  const report: VersionReconcileReport = { reconciled: 0, changed: false, entries: [] }
+  for (const entry of capabilityRows(store)) {
+    const record = entry.record
+    if (record.kind === 'proposal' || entry.row.status === 'retired') continue
+    const owned = entry.row.workspaceKey ?? (record.scope ? workspaceKeyOf(record.scope) : undefined)
+    let root = options.capabilityRoot
+    let skillsRoot = options.skillsRoot
+    const usable = owned && owned !== 'unknown' && isAbsolute(owned) && existsSync(owned)
+    if (!root && usable) {
+      try { root = resolveCapabilityRoot(owned).root } catch { root = undefined }
+    }
+    if (!skillsRoot && usable) {
+      try { skillsRoot = resolveSkillRoot(owned).root } catch { skillsRoot = undefined }
+    }
+    if (!root) continue
+    const livePath = String(record.skillPath ?? '').trim()
+    const docPath = livePath && existsSync(livePath) ? livePath : capabilityDocPath(root, record.name)
+    const archived = archivedCapabilityDocFiles(root, record.name, skillsRoot)
+      .map((file) => ({ file, version: readSkillVersionAt(file) }))
+      .filter((row) => row.version > 0)
+      .sort((left, right) => right.version - left.version)
+    if (!existsSync(docPath)) {
+      // No live face at all: restore the best archived copy so its version and
+      // changelog survive, then align below.
+      if (archived.length === 0) continue
+      try {
+        mkdirSync(dirname(docPath), { recursive: true })
+        copyFileSync(archived[0].file, docPath)
+      } catch { continue }
+    }
+    const fileVersion = readSkillVersionAt(docPath)
+    const preserved = Math.max(record.version, fileVersion, archived[0]?.version ?? 0)
+    if (preserved <= record.version && preserved <= fileVersion) continue
+    const restoredFrom = (archived[0] && archived[0].version > Math.max(record.version, fileVersion)) ? archived[0].file : undefined
+    const line = versionRestoreLine(preserved, restoredFrom)
+    let restoredHistory: string[] = []
+    if (restoredFrom) {
+      try {
+        const parsed = parseSkillMarkdown(readFileSync(restoredFrom, 'utf8'), capabilitySkillNames(record.name).skillName)
+        restoredHistory = parsed?.changelog ?? []
+      } catch { restoredHistory = [] }
+    }
+    const adopted = adoptCapabilityDocVersion({
+      path: docPath,
+      name: record.name,
+      title: record.title,
+      tags: record.tags,
+      version: preserved,
+      changelogLine: line,
+      ...(restoredHistory.length > 0 ? { extraChangelog: restoredHistory } : {}),
+      now,
+    })
+    if (adopted.status === 'error') {
+      options.logger?.info('supermemory: capability version reconcile failed ' + record.name + ': ' + adopted.message)
+      continue
+    }
+    // The record follows the restored ledger, so later boots (and the builtin
+    // merge) never fall back to the stale number.
+    const next: CapabilityRecord = {
+      ...record,
+      version: adopted.version,
+      updatedAt: now,
+      changelog: (record.changelog[0] === line ? record.changelog : [line, ...record.changelog]).slice(0, CHANGELOG_MAX),
+      skillPath: docPath,
+      ...(adopted.bodyHash ? { bodyHash: adopted.bodyHash } : {}),
+      ...(adopted.factsHash ? { factsHash: adopted.factsHash } : {}),
+    }
+    // A row that mirrors a builtin definition keeps tracking that definition's
+    // version separately; R54's restored ledger must not block future upgrades.
+    const builtin = BUILTIN_CAPABILITIES.find((candidate) => capabilityLogicalName(candidate.name) === record.name)
+    if (builtin) {
+      next.builtin = true
+      next.builtinVersion = builtin.version
+    }
+    await saveCapabilityRecord(store, next, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
+    report.reconciled += 1
+    report.changed = true
+    report.entries.push({ name: record.name, version: adopted.version, path: docPath, ...(restoredFrom ? { restoredFrom } : {}) })
+    options.logger?.info('supermemory: capability version reconciled ' + record.name + ' -> v' + adopted.version + (restoredFrom ? '（恢复归档版本）' : ''))
+  }
+  return report
+}
+
+/** R54: one coherent health reading for a record (legacy stats folded in). */
+export interface HealthReconcileResult {
+  record: CapabilityRecord
+  changed: boolean
+  /** True when legacy success/fail counters had been kept OUTSIDE runCount. */
+  legacyFolded: boolean
+}
+
+/**
+ * R54: make the health counters tell ONE story.
+ *
+ * Legacy rows can carry successCount=13 / failCount=9 / consecutiveFailures=2 /
+ * lastStatus='failed' while runCount stayed 0 (the old `usage` object was
+ * carried into the record without its denominator). The panel then renders
+ * "0 runs, 0 loads→runs, 13 successes, 9 failures", which reads as a bug.
+ *
+ * Chosen rule (documented in CHANGELOG/DEV-NOTES): PRESERVE the history instead
+ * of discarding it — runCount = max(runCount, successCount + failCount), the
+ * success rate keeps its real denominator, and lastStatus is forced to agree
+ * with the most recent outcome (a non-zero consecutive-failure streak means the
+ * last run failed). Everything is derived, so the pass is idempotent.
+ */
+export function reconcileCapabilityHealth(record: CapabilityRecord): HealthReconcileResult {
+  const successCount = Math.max(0, Number(record.successCount) || 0)
+  const failCount = Math.max(0, Number(record.failCount) || 0)
+  const runs = successCount + failCount
+  const previousRuns = Math.max(0, Number(record.runCount) || 0)
+  const runCount = Math.max(previousRuns, runs)
+  const legacyFolded = runs > previousRuns
+  // A streak can never exceed the recorded failures; no failures means no streak.
+  const consecutiveFailures = failCount === 0
+    ? 0
+    : Math.min(Math.max(0, Number(record.consecutiveFailures) || 0), failCount)
+  let lastStatus: 'completed' | 'failed' | undefined = record.lastStatus
+  if (consecutiveFailures > 0) lastStatus = 'failed'
+  else if (lastStatus === 'failed' && successCount > 0) lastStatus = 'completed'
+  else if (!lastStatus && runCount > 0) lastStatus = successCount > 0 ? 'completed' : 'failed'
+  const changed = runCount !== record.runCount
+    || consecutiveFailures !== record.consecutiveFailures
+    || lastStatus !== record.lastStatus
+  if (!changed) return { record, changed: false, legacyFolded: false }
+  return {
+    record: {
+      ...record,
+      runCount,
+      consecutiveFailures,
+      ...(lastStatus ? { lastStatus } : {}),
+    },
+    changed: true,
+    legacyFolded,
+  }
+}
+
+/**
  * Lazy, idempotent migration: convert every legacy row exactly once.
  *
  * R51 order is load-bearing: shell skills are ARCHIVED (and their mirror rows
@@ -626,7 +802,8 @@ export async function migrateCapabilities(store: Store, options: {
     migratedCapabilities: 0, migratedKnowledge: 0, retiredComposites: 0,
     linkedSkills: 0, generatedSkills: 0, expiredProposals: 0,
     archivedShells: 0, retiredShellUnits: 0, dedupedKnowledge: 0,
-    movedDocs: 0, archivedDocDirs: 0, skippedManualDocs: 0, changed: false,
+    movedDocs: 0, archivedDocDirs: 0, skippedManualDocs: 0,
+    versionsReconciled: 0, healthReconciled: 0, changed: false,
   }
   // R51: archive shell skill directories before migrating rows. archiveShellSkills
   // also retires their mirror rows (kind skill/knowledge) when a store is given.
@@ -739,6 +916,31 @@ export async function migrateCapabilities(store: Store, options: {
   } catch (error) {
     options.logger?.info('supermemory: capability doc migration failed: ' + String(error).slice(0, 160))
   }
+  // R54: the knowledge-face version ledger is monotonic. Take the max of the
+  // record, the live file and every archived copy, then rewrite the live file AT
+  // that version with the restoration recorded in its changelog (idempotent).
+  try {
+    const versions = await reconcileCapabilityVersions(store, {
+      now,
+      ...(options.capabilityRoot ? { capabilityRoot: options.capabilityRoot } : {}),
+      ...(options.root ? { skillsRoot: options.root } : {}),
+      ...(options.logger ? { logger: options.logger } : {}),
+    })
+    report.versionsReconciled = versions.reconciled
+    if (versions.changed) report.changed = true
+  } catch (error) {
+    options.logger?.info('supermemory: capability version reconcile failed: ' + String(error).slice(0, 160))
+  }
+  // R54: fold legacy success/fail counters into runCount so the health reading
+  // (runCount / loadsToRuns / successRate / lastStatus) is internally coherent.
+  for (const entry of capabilityRows(store)) {
+    if (entry.record.kind === 'proposal' || entry.row.status === 'retired') continue
+    const health = reconcileCapabilityHealth(entry.record)
+    if (!health.changed) continue
+    await saveCapabilityRecord(store, health.record, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
+    report.healthReconciled += 1
+    report.changed = true
+  }
   // R51: one record, two faces. A knowledge row that mirrors the exact SKILL.md
   // of an executable capability is a duplicate left by R50's row + file walks;
   // retire it instead of listing it as a second unit.
@@ -828,6 +1030,9 @@ export async function syncCapabilitySkill(
     skillPath: result.path ?? record.skillPath,
     bodyHash: result.bodyHash ?? record.bodyHash,
     factsHash: result.factsHash ?? record.factsHash,
+    // R54: mirror the file's (now monotonic) version into the record so the two
+    // ledgers never drift and the next boot never "restores" a stale number.
+    version: Math.max(record.version, Math.floor(Number(result.version) || 0)),
   }
   if (result.status !== 'error') {
     await saveCapabilityRecord(store, next, { id: entry.id, workspaceKey: entry.row.workspaceKey, createdAt: entry.row.createdAt })
@@ -1034,6 +1239,7 @@ export interface CapabilityIndexInput {
   name: string
   title: string
   description: string
+  scope?: string
   whenToUse?: string
   entry?: string
   runnable?: boolean
@@ -1042,6 +1248,28 @@ export interface CapabilityIndexInput {
   enabled?: boolean
   kind?: string
   status?: string
+}
+
+/**
+ * R54: the index line's「何时用」sentence prefers the human TITLE.
+ *
+ * R52 rendered whatever `whenToUse` the caller passed, so a hint that named the
+ * MACHINE name (git-sync-supermemory) contradicted the human title shown by the
+ * panel (「git 同步/提交/推送（SuperMemory 仓库）」). The card now derives the
+ * subject from `title`; a supplied sentence is kept only when it already names
+ * that title (it usually also carries the scope), and rows without a title fall
+ * back to description/whenToUse exactly as before.
+ */
+export function capabilityIndexHint(row: CapabilityIndexInput): string {
+  const title = String(row.title ?? '').trim()
+  const name = String(row.name ?? '').trim()
+  const supplied = String(row.whenToUse ?? '').replace(/\s+/g, ' ').trim()
+  if (title && title !== name) {
+    if (supplied && supplied.includes(title)) return supplied
+    const scope = String(row.scope ?? '').trim()
+    return scope ? '在 ' + scope + ' 内遇到「' + title + '」类任务时加载。' : '遇到「' + title + '」类任务时加载。'
+  }
+  return supplied || String(row.description ?? '').replace(/\s+/g, ' ').trim()
 }
 
 /** 徽标：可执行 / 仅知识 / 入口待验证。 */
@@ -1069,7 +1297,7 @@ export function renderCapabilityIndex(rows: CapabilityIndexInput[], options: {
   const header = '[SuperMemory 可用能力]（仅中枢/分支会话注入；正文按需读取）'
   const footer = '正文用 sm_cap_doc 加载：sm_cap_doc { name: "<能力名>" }；第三方 skill 仍走宿主 skill 目录。'
   const lines = eligible.map((row) => {
-    const hint = String(row.whenToUse || row.description || '').replace(/\s+/g, ' ').trim()
+    const hint = capabilityIndexHint(row)
     const clipped = clipAtBoundary(hint, 80) || hint.slice(0, 80)
     return '- ' + row.name + ' [' + capabilityIndexBadge(row) + ']：' + clipped
   })
@@ -1632,8 +1860,15 @@ export async function mergeBuiltinCapabilities(store: Store, options: { logger?:
       report.changed.push(synced)
       continue
     }
-    if (existing.record.version >= builtin.version) {
-      if (existing.record.version > builtin.version) report.localNewer.push(existing.record.name)
+    // R54: the restored knowledge-face ledger may sit ABOVE the builtin
+    // definition version (a v8 document for a v6 definition is legitimate). The
+    // definition lineage is tracked separately in builtinVersion, so upgrades are
+    // still applied when the builtin definition itself moved forward.
+    const builtinSeen = existing.record.builtinVersion
+    const definitionOlder = existing.record.version < builtin.version
+      || (builtinSeen !== undefined && builtinSeen < builtin.version)
+    if (!definitionOlder) {
+      if (builtinSeen === undefined && existing.record.version > builtin.version) report.localNewer.push(existing.record.name)
       else report.current.push(existing.record.name)
       continue
     }
@@ -1650,7 +1885,8 @@ export async function mergeBuiltinCapabilities(store: Store, options: { logger?:
       consecutiveFailures: existing.record.consecutiveFailures,
       ...(existing.record.lastUsedAt !== undefined ? { lastUsedAt: existing.record.lastUsedAt } : {}),
       ...(existing.record.lastStatus ? { lastStatus: existing.record.lastStatus } : {}),
-      version: builtin.version,
+      // Never downgrade a restored knowledge-face version on upgrade.
+      version: Math.max(existing.record.version, builtin.version),
       updatedAt: Date.now(),
       changelog: [...(builtin.changelog ?? []), ...existing.record.changelog].slice(0, CHANGELOG_MAX),
       builtin: true,
@@ -1742,7 +1978,11 @@ export interface CapabilityHealth {
 export function capabilityHealthOf(store: Store, workspaceKey?: string): CapabilityHealth[] {
   const out: CapabilityHealth[] = []
   for (const entry of capabilityRows(store, workspaceKey)) {
-    const record = entry.record
+    if (entry.record.kind === 'proposal') continue
+    // R54: project ONE coherent reading even before the boot migration writes the
+    // legacy counters back — the panel must never show "0 runs, 13 successes".
+    const health = reconcileCapabilityHealth(entry.record)
+    const record = health.record
     if (record.kind === 'proposal') continue
     const builtin = BUILTIN_CAPABILITIES.find((candidate) => capabilityLogicalName(candidate.name) === record.name)
     const scopeMissing = Boolean(record.scope && !existsSync(record.scope))
@@ -1756,8 +1996,12 @@ export function capabilityHealthOf(store: Store, workspaceKey?: string): Capabil
     if (record.loadCount > 0 && record.runCount === 0) notes.push('有加载无执行：检查知识面是否说清执行面入口')
     if (record.kind === 'capability' && !liveCapabilityToolNames.has(capabilityToolName(record.name))) notes.push('执行面未注册（重启或 refresh-builtin 后生效）')
     if (record.entryDraft && !record.entryVerified) notes.push('入口草稿未验证：人工在面板点「启用执行」后才会 runnable=true')
-    if (builtin && record.version < builtin.version) notes.push('现场版本旧于内置 v' + builtin.version + '：memory_toolize refresh-builtin 可升级')
-    if (builtin && record.version > builtin.version) notes.push('现场版本新于内置 v' + builtin.version + '（本地维护中）')
+    if (health.changed) notes.push('历史统计已校正（R54：runCount=success+fail，lastStatus 与最近结果一致）')
+    // R54: the builtin DEFINITION version is tracked by builtinVersion; the
+    // restored knowledge-face ledger may legitimately sit above it.
+    const builtinSeen = record.builtinVersion
+    if (builtin && (builtinSeen !== undefined ? builtinSeen < builtin.version : record.version < builtin.version)) notes.push('现场版本旧于内置 v' + builtin.version + '：memory_toolize refresh-builtin 可升级')
+    if (builtin && builtinSeen === undefined && record.version > builtin.version) notes.push('现场版本新于内置 v' + builtin.version + '（本地维护中）')
     const successRate = record.runCount > 0 ? record.successCount / record.runCount : 0
     const loadsToRuns = record.loadCount > 0 ? record.runCount / record.loadCount : 0
     out.push({

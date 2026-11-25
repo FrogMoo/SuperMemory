@@ -2,6 +2,32 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.3.2] - 2026-11-26
+
+修复轮（R54）：修掉 R52 只读验收发现的 3 个 P2（版本元数据回退、健康统计口径矛盾、注入卡提示语用机器名），并为每一项补上回归断言。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 修复（R54：R52 验收 P2）
+
+- **P2-1 知识面版本回退（按 P1 处理）**。根因：R52 的迁移是「先归档、后生成」，当旧 `sm-<name>/SKILL.md` 在更早的启动里已被归档、而 `.dsh/capabilities/<name>.md` 尚不存在时，重渲染只看能力记录的 `version`（6），生成的 live 文件就是 `sm-version: 6`、changelog 只剩 `v6`，而归档文件仍是 `v8` —— 同一能力出现两份版本账本且回退 2 版。修法：新增版本对账 `reconcileCapabilityVersions`，在启动迁移里取 `max(记录版本, live 文件 sm-version, 归档文件 sm-version)`；需要恢复时按该版本重写 live 文件（正文/事实块逐字节保留）并把 `v8: R52 迁移到 .dsh/capabilities，保留归档版本（源自归档 …）` 写入文件 changelog 与记录 changelog，然后写回记录与文件；`upsertCapabilitySkill` 的版本规则改为「不低于文件与记录二者」，`syncCapabilitySkill` 把文件版本回写记录，从而保证后续单调。重复启动 versionsReconciled=0、文件与记录不变（幂等）。
+- **P2-2 健康统计口径矛盾**。根因：旧版把 `successCount/failCount/consecutiveFailures/lastStatus` 放在 `usage` 对象里，迁到统一记录时只保留了分子，没有补齐 `runCount` 分母，于是面板出现「runCount=0 / loadsToRuns=0，但 successCount=13、failCount=9、consecutiveFailures=2、lastStatus=failed」。修法（选择**保留历史**而不是清空）：迁移时把旧成功率折算进分母 —— `runCount = max(runCount, success + fail)`，连续性失败不超过 `failCount`，`lastStatus` 强制与最近一次结果一致（失败 streak > 0 → failed；streak 归零且成功过 → completed），并写回记录；`capabilityHealthOf` 的读投影同样先对账，因此面板在迁移落盘前也不会自相矛盾。面板会新增一条中性说明「历史统计已校正（R54）」。
+- **P2-3 注入卡提示语用机器名**。根因：`renderCapabilityIndex` 直接照抄调用方给的 `whenToUse`，当该句以机器名 `git-sync-supermemory` 作主语时，卡片与面板里的人类标题（「git 同步/提交/推送（SuperMemory 仓库）」）相互矛盾。修法：新增 `capabilityIndexHint`，卡片「何时用」**优先用 title** 重建句子（保留 scope 前缀）；调用方给的句子只有在已经包含该 title 时才沿用；没有 title 时退回 `description`/老 `whenToUse`（与原行为一致）。prestep 同时把 `scope` 传给渲染器。
+
+### 测试（R54 新增断言）
+
+- R54-1：live v6 + 归档 v8 → 结果 8、文件 changelog 追加迁移行、归档 v7 历史保留、记录版本写回；`record=6 / file=8` → 结果 8 且 changelog 追加；二次对账 `changed=false`。
+- R54-2：legacy 统计（0 运行 / 13 成功 / 9 失败 / streak 2 / failed）→ `runCount=22`、`loadsToRuns=5.5`、`successRate=13/22`、`lastStatus=failed`；streak 归零后 lastStatus=completed；迁移写回且二次迁移 0 改动。
+- R54-3：卡片含人类标题、不含「机器名」主语；无 title 退 description；prestep 传 scope 的接线断言。
+
+### 变更
+
+- 版本 1.3.1 → 1.3.2（patch：仅修复与测试，存储域 `supermemory` version 1 不变，无破坏性迁移）。
+- 版本账本的语义明确为「记录与知识面共用的单调账本」：内置定义的版本另行记录在 `builtinVersion`，因此 `memory_toolize refresh-builtin` 的升级判断不会被恢复出来的知识面版本（如 v8 > 内置 v6）挡住。
+
+### 已知限制
+
+- 三项修复都在插件启动迁移里执行：**升级后仍需完全退出并重启 DSH Desktop**（不是禁用/启用插件、也不是刷新窗口）。
+- 恢复只读取两类归档：`.dsh/capabilities-archive/<name>.md` 与 `.dsh/skills-archive/sm-<name>/SKILL.md`；更早的手工备份不在扫描范围内，需要人工放回。
+
 ## [1.3.1] - 2026-11-26
 
 发布轮（R53）：发布 R52「能力知识面移出公用 skill 目录 + 按需读取 + 索引注入 + 面板正文编辑器」，并修掉 R51 遗留的发布脚本 Windows `cmd.exe` 转义缺陷。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。

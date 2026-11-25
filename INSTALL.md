@@ -45,13 +45,13 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.1.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.2.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.1`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.3.1`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.2`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.3.2`
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
@@ -84,6 +84,16 @@ node scripts/install-into-dsh.mjs
 ## 升级
 
 下载新版本 Release 包 → 解压到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向更新到新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
+
+### 升级到 1.3.2 后要做什么（R54：版本/统计/卡片修复）
+
+1. **仍然必须完全退出并重启 DSH Desktop**（不是禁用/启用插件，也不是刷新窗口）：三项修复都在插件启动时的迁移里执行。
+2. **知识面版本不再回退**：启动时取 `max(能力记录版本, 当前文件 sm-version, 归档 sm-version)`。如果你曾遇到「面板/文件显示 v6、归档却是 v8」，重启后该能力的知识面会恢复到 `v8` 及以上，并在 changelog 里留下 `v8: R52 迁移到 .dsh/capabilities，保留归档版本（源自归档 …）`；再次重启不会再改写（幂等）。
+3. **统计口径一致**：历史遗留的「运行次数 0、却记录 13 次成功 / 9 次失败」会在迁移时折算为 `runCount = success + fail`（历史成功率保留），`lastStatus` 与最近一次结果一致；面板不再出现「0 次运行 / 有成功率」的矛盾读数。
+4. **注入卡用人类标题**：`[SuperMemory 可用能力]` 卡的「何时用」优先使用能力标题（如「git 同步/提交/推送（SuperMemory 仓库）」），不再拿机器名当主语；没有标题时才退回描述。
+5. 验证：重启后看「固化能力」面板该能力版本 ≥ 8、运行次数 = 成功 + 失败；新会话里注入卡首行应显示标题而不是 `git-sync-supermemory`。
+
+> 本版无存储结构变更（存储域 `supermemory` version 1 不变），不需要清理数据；回滚只需重装旧版包并重启。
 
 ### 升级到 1.3.1 后要做什么（R52：能力知识面迁移）
 
