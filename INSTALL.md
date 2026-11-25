@@ -45,13 +45,13 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.0.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.1.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.0`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.3.0`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.1`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.3.1`
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
@@ -84,6 +84,14 @@ node scripts/install-into-dsh.mjs
 ## 升级
 
 下载新版本 Release 包 → 解压到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向更新到新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
+
+### 升级到 1.3.1 后要做什么（R52：能力知识面迁移）
+
+1. **完全退出并重启 DSH Desktop**——不是仅禁用/启用插件，也不是刷新窗口。知识面迁移在插件启动时执行：旧 `<skills 根>/sm-*/SKILL.md` 复制到 `.dsh/capabilities/<name>.md`，旧目录整体移到 `<skills 根>-archive/`（写 manifest，可回滚）。**旧进程还在时迁移不会执行**。
+2. 重启后检查两处：项目仓库（或用户级）`.dsh/skills` 下**不再有 `sm-*` 目录**；`.dsh/capabilities/` 下**出现 `<name>.md`**（例如 `git-sync-supermemory.md`）。第三方 skill（`ego-browser`、`office` 等）不受影响。
+3. 打开「侧边栏 → SuperMemory 面板 → 固化能力」：模型每调用一次 `sm_cap_doc({ name })`，该能力**加载次数（loadCount）** +1；点开任一能力可编辑正文并保存，事实块 `<!-- sm:facts:start/end -->` 会被保留、版本号 +1。
+
+> 迁移幂等：重复启动不会重复搬移；需要回滚时把 `skills-archive/<name>` 移回 `.dsh/skills/<name>` 并把面板里的能力重新指向该目录即可（归档 manifest 记录原名/来源/时间/原因）。
 
 ## 卸载
 

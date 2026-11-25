@@ -364,3 +364,56 @@ git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一�
 
 网络恢复后 GitHub 半边自动回归 `pnpm git:sync` 正常路径，无需任何配置改动；本机 `~/.ssh/id_ed25519` 如需启用 SSH 备用通道，需先在 GitHub 账号 Settings → SSH keys 注册。
 
+## 12. GitHub 前端被阻断时的发布核验（2026-11-26，v1.3.1 轮）
+
+### 12.1 故障形态
+
+github.com 的**网页面/前端**（`https://github.com/...`，含 `releases/latest` 页面与
+`/releases/latest/download/<asset>` 稳定直链）与 `api.github.com` 是**两个独立的网络面**：
+前者可能连接超时/被重置，后者与 `uploads.github.com` 仍可达（与 §11.1 的 git 阻断同源）。
+表现：对稳定 URL 的 `HEAD`/`GET` 无响应或超时——**这不等于发布失败**，只是前端面不可达。
+
+### 12.2 替代核验流程（API + 下载校验）
+
+1. **取 latest 与资产清单**（token 从 GCM 取，不落盘）：
+
+   ```bash
+   TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p')
+   curl -s -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
+     https://api.github.com/repos/FrogMoo/SuperMemory/releases/latest
+   ```
+
+   核对 `tag_name`（必须是 `vX.Y.Z`）、`assets[].name/size/digest`。GitHub 对上传资产返回
+   `digest: "sha256:<hex>"`，可直接与本地 `sha256sum release/<asset>` 比对。
+
+2. **按 asset id 下载字节**（等价于稳定 URL 的字节，不经过前端）：
+
+   ```bash
+   curl -sL -H "Authorization: Bearer $TOKEN" -H 'Accept: application/octet-stream' \
+     -o /tmp/dsh-supermemory.tgz \
+     https://api.github.com/repos/FrogMoo/SuperMemory/releases/assets/<asset-id>
+   sha256sum /tmp/dsh-supermemory.tgz
+   ```
+
+   注意 API 会 302 到 `objects.githubusercontent.com`，必须跟随重定向（`-L`）；该域若单独被阻断，
+   只能等网络恢复后回归前端 URL，或人工在 Release 页面下载。
+
+3. **三方口径一致才算有效**：API 的 `digest` == 下载文件 sha256 == 本地 `release/` 同名字节 sha256；
+   同时 `assets` 含稳定别名 `dsh-supermemory.tgz`。
+
+4. **tag 指向的 API 证据**（前端被阻断时仍可核）：
+
+   ```bash
+   curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/repos/FrogMoo/SuperMemory/git/refs/tags/vX.Y.Z
+   # object.sha = 附注 tag 对象；再取 /git/tags/<object.sha>，其 object.sha = 目标 commit
+   ```
+
+5. **网络恢复后回归**：对稳定 URL 做 `HEAD`+`GET`，记录状态码、字节数、sha256、耗时；与 API 证据并列。
+
+### 12.3 记录口径
+
+交付里同时写清：API 返回的 `tag_name` / 每资产 `digest` 与 `size` / 下载文件 sha256 与耗时；
+若前端可用再补 `HEAD`/`GET` 状态。**不要**因为 `HEAD` 失败就判定发布失败或重传资产——
+先验证 `api.github.com` 面，再决定是否需要重试前端。
+
+

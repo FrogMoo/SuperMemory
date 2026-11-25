@@ -18,6 +18,7 @@
 //   node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]
 //   node scripts/github-api-release.mjs 4509e3c                                  # 只推提交
 //   node scripts/github-api-release.mjs 4509e3c --tag v1.0.0 --notes notes.md    # 提交+tag+Release
+//   node scripts/github-api-release.mjs --self-check --tag v1.3.1               # 离线自检（不触网/不读令牌）
 //                                                                                 # 资产默认释放 zip + tgz：
 //                                                                                 # release/dsh-supermemory-<版本>.zip
 //                                                                                 # release/dsh-supermemory-<版本>.tgz
@@ -36,15 +37,28 @@ const NL = String.fromCharCode(10)
 const TAB = String.fromCharCode(9)
 const NUL = String.fromCharCode(0)
 
+// argv-array git helpers: execFileSync never spawns a shell, so '^' in X^{commit}
+// (and '~' in HEAD~2) reaches git literally even under Windows cmd.exe. R51
+// recorded the bug this replaces: execSync('git rev-parse ' + tag + '^{commit}')
+// ran via cmd.exe, which ate the caret -> rev-parse saw "<tag>{commit}" ->
+// "ambiguous argument". Same for user-supplied commit-ish values below.
+const gitArgs = (args) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }).trim()
+/** Peel any commit-ish (branch/tag/annotated tag/HEAD~1) to a commit SHA, shell-free. */
+const resolveCommit = (ref) => gitArgs(['rev-parse', '--verify', ref + '^{commit}'])
+
 const log = (...a) => console.log('[gh-api]', ...a)
 const fail = (...a) => { console.error('[gh-api] FATAL:', ...a); process.exit(1) }
 
 // ---------- 参数 ----------
 const argv = process.argv.slice(2)
+// Offline self-check mode: proves the tag / commit-ish resolution path works on
+// this host without shell quoting (the R51 bug: cmd.exe ate '^' in X^{commit}).
+const selfCheckMode = argv.includes('--self-check') || argv.includes('--dry-run')
 const commitish = argv[0]
-if (!commitish || commitish.startsWith('--')) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]')
+if (!selfCheckMode && (!commitish || commitish.startsWith('--'))) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]')
 function argValue(name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined }
 const tagName = argValue('--tag')
+if (selfCheckMode) { selfCheck(tagName); process.exit(0) }
 const notesFile = argValue('--notes')
 const assetPaths = []
 for (let i = 1; i < argv.length; i += 1) {
@@ -120,7 +134,7 @@ function isoFromGitDate(epochSec, tz) {
 }
 function identWithDate(id) { return { name: id.name, email: id.email, date: isoFromGitDate(id.epoch, id.tz) } }
 
-const commit = git('git rev-parse ' + commitish).trim()
+const commit = resolveCommit(commitish)
 const commitRaw = git('git cat-file commit ' + commit)
 const local = {
   commit,
@@ -139,11 +153,11 @@ if (tagName) {
   const tagger = parseIdent(tagRaw.split(NL).find((l) => l.startsWith('tagger ')))
   tag = {
     name: tagName,
-    sha: git('git rev-parse ' + tagName).trim(),
+    sha: gitArgs(['rev-parse', '--verify', tagName]),
     message: afterBlank(tagRaw),
     tagger: identWithDate(tagger),
   }
-  const tagTarget = git('git rev-parse ' + tagName + '^{commit}').trim()
+  const tagTarget = resolveCommit(tagName)
   if (tagTarget !== local.commit) fail('tag ' + tagName + ' 指向 ' + tagTarget + '，与要推送的提交 ' + local.commit + ' 不一致')
   log('本地 tag', tag.sha, '->', tagTarget)
 }
@@ -276,3 +290,35 @@ if (tag) {
 } else {
   log('完成（仅提交快进，未建 tag/Release）')
 }
+
+/**
+ * Offline self-check for the release-critical tag/commit resolution path.
+ * Runs no network call and never reads the GCM token; exits non-zero on any
+ * mismatch so it can guard the final push in a cmd.exe or bash shell alike.
+ */
+function selfCheck(tag) {
+  if (!tag) fail('--self-check 需要 --tag <vX.Y.Z>（离线校验附注 tag 与提交解析）')
+  const objectType = gitArgs(['cat-file', '-t', tag])
+  if (objectType !== 'tag') fail('--self-check: ' + tag + ' 的对象类型是 ' + objectType + '（需要附注 tag，不是轻量标签）')
+  const tagObject = gitArgs(['rev-parse', '--verify', tag])
+  const viaPeel = resolveCommit(tag)
+  const viaTilde = gitArgs(['rev-parse', '--verify', tag + '~0'])
+  if (viaPeel !== viaTilde) fail('--self-check: ^{commit} 与 ~0 解析不一致: ' + viaPeel + ' vs ' + viaTilde)
+  const head = gitArgs(['rev-parse', '--verify', 'HEAD'])
+  let ancestor = true
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', viaPeel, 'HEAD'], { cwd: ROOT, stdio: 'ignore' })
+  } catch {
+    ancestor = false
+  }
+  const commitsAfter = Number(gitArgs(['rev-list', '--count', viaPeel + '..HEAD']))
+  const subject = gitArgs(['for-each-ref', '--format=%(subject)', 'refs/tags/' + tag])
+  log('self-check tag     :', tag, '(annotated object ' + tagObject.slice(0, 10) + ')')
+  log('self-check target  :', viaPeel)
+  log('self-check resolve : ^{commit} == ~0 == ' + viaPeel.slice(0, 10) + ' (argv array, no shell)')
+  log('self-check head    :', head.slice(0, 10), 'tag-is-ancestor=' + ancestor, 'commits-after-tag=' + commitsAfter)
+  log('self-check subject :', subject)
+  log('self-check PASS（离线；未触网、未读 GCM 令牌；cmd.exe 的 ^ 转义已由 argv 数组绕过）')
+  if (!ancestor) log('注意：tag 目标不是 HEAD 的祖先（校验历史 tag 时属正常）')
+}
+

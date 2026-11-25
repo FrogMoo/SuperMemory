@@ -3907,3 +3907,89 @@ R50/R51 的「单一能力」把知识面写成 `<skills 根>/sm-<name>/SKILL.md
    `sm_cap_doc({name:"<能力名>"})` 能拿到正文，面板该能力的 loadCount +1。
 3. 面板「固化能力」展开任一能力，改正文并「保存正文」：散文更新、事实块仍在、version+1。
 
+---
+
+## 66. R53：v1.3.1 发布轮（R52 收口 + 发布脚本 cmd 转义修复）（2026-11-26）
+
+### 66.1 定级与范围
+
+- 版本 **1.3.0 → 1.3.1**，定级 **patch**：本轮发布 R52（能力知识面移出公用 skill 目录、`sm_cap_doc` 按需读取、
+  注入索引、面板正文编辑器）并修 R51 遗留的发布脚本缺陷；存储域 `supermemory` version 1 不变，
+  无破坏性迁移，旧知识面迁移幂等且可回滚。
+- 发布内容 = R52 提交 `bc95182` 的源码/构建产物 + 本轮版本号/文档/脚本修复；**v1.3.0 的 tag、Release
+  与三资产原样保留**（不覆盖、不改名）。
+
+### 66.2 发布脚本修复与自检（R51 遗留）
+
+- 根因（R51 记录）：`scripts/github-api-release.mjs` 用 `execSync('git rev-parse ' + tag + '^{commit}')`
+  解析 tag 目标；Windows 下 `execSync` 走 `cmd.exe`，`^` 是 cmd 转义符，命令实际变成
+  `git rev-parse <tag>{commit}` → `ambiguous argument`。
+- 修法：新增 `gitArgs(args)` = `execFileSync('git', [...argv])`（**不经过 shell**）与
+  `resolveCommit(ref)`（统一 `--verify <ref>^{commit}`）；commit-ish 入参、tag 对象 SHA、tag 目标全部改走它。
+- 脚本级自检：`node scripts/github-api-release.mjs --self-check --tag <vX.Y.Z>`（`--dry-run` 为同义别名）——
+  **离线**、不触网、不读 GCM 令牌；校验附注 tag 对象类型、`^{commit}` 与 `~0` 解析一致、与 HEAD 的
+  祖先关系/提交数、tag 标题；任一不符 exit 1。
+- 实测（bash 与 `cmd.exe` 各跑一次均 PASS）：`v1.3.0` → tag 对象 `e3dcf7d282`、目标
+  `1c20d1c45a`、`commits-after-tag=1`。
+- 文档：`docs/git-sync.md` 新增 **§12**「GitHub 前端被阻断时的发布核验」——改用 `api.github.com` 的
+  `releases/latest` + `releases/assets/<id>`（`Accept: application/octet-stream`，`-L` 跟随 302）
+  取 `digest`/大小、下载后本地 sha256 复核，并用 `git/refs/tags` + `git/tags` 补 tag 对象证据；
+  明确「HEAD 失败 ≠ 发布失败，前端与 API 是两个网络面」。
+
+### 66.3 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 **13 文件 903.30 kB**（入口 `supermemory.js` 547.93 kB + capability/
+  skill-forge/hub-sessions 等 chunk；**无 composite chunk**），client `lib/client.js` 179.66 kB，
+  wrap 后 **173927 B**（客户端 wrap 已更新）。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **111** / webui **35** / client-sim `SIM SMOKE OK` /
+  capability **14** 组 / workspace-scope **6** 组 / skill **27** 组（含 R52-1/2/3）。
+
+### 66.4 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.1.zip` | 2,016,314 | `bd1bf7f9da83c8ee387b7a15ee7e0b5fc87d882a9b938df62b08c4455cf7cd6f` |
+| `dsh-supermemory-1.3.1.tgz` | 795,857 | `d746a0fae79aadfdc7738cf39c77cf1280a4464f42443493f2bab881c8d05ca8` |
+| `dsh-supermemory.tgz`（稳定别名） | 795,857 | 同上（字节一致） |
+
+- tgz（npm-pack 结构）：**95 条目**；`package/package.json`（version=1.3.1）、`package/lib/supermemory.js`、
+  `package/lib/client.js`、`package/cordis.patch.yml` 均在；**反斜杠路径 0**；含 R52 的 capability 相关
+  chunk `lib/capability-OcwhseP9.js`、`lib/skill-forge-D0ZnC2RD.js`、`lib/toolize-C6tLi8WJ.js`
+  与对应 `src/capability.ts` 等源码。
+- zip（手动安装）：906 文件、解压后 `package.json` = 1.3.1，`lib/`、内置 `node_modules/`
+  （`@deepseek-ai/*` 等）、`scripts/install-into-dsh.mjs`、README/CHANGELOG/INSTALL 齐全，CHANGELOG 含
+  `[1.3.1]`、INSTALL 含「升级到 1.3.1 后要做什么」。zip 由 PowerShell `Compress-Archive` 产出，
+  条目分隔符为 `\`，仅用于 **Windows 手动安装**；面板安装走 tgz。
+- 安装自检：临时空目录 `pnpm add F:\10-SuperMemory\release\dsh-supermemory-1.3.1.tgz` → exit 0，
+  安装版本 **1.3.1**、`main = lib/supermemory.js`、`lib/` 下含 `capability-OcwhseP9.js` 等 chunk。
+
+### 66.5 提交、tag 与双推（按 docs/git-sync.md）
+
+- 单条提交（版本号 + CHANGELOG/README/INSTALL/docs/DEV-NOTES + 脚本修复 + `lib/` 构建产物；
+  `release/` 二进制按 `.gitignore` 不入库），提交信息写文件后 `git commit -F`。
+- 附注 tag `v1.3.1`（标注：v1.3.1 — R52 能力知识面独立存放 + sm_cap_doc/索引注入/正文编辑器 + 发布脚本 cmd 转义修复）。
+- 双推 `pnpm git:sync`（GitHub 首位 + Gitee）推 main 与 tag；核验本地/GitHub/Gitee 的 main 与
+  tag 对象 SHA + 指向 commit 三者一致（tag 对象 SHA 与指向 commit 都要比）。
+
+### 66.6 用户验收（必须完全退出并重启 DSH Desktop）
+
+R52 的迁移在插件启动时执行，旧进程还在时不会迁移；**不是禁用/启用插件，也不是刷新窗口**。
+
+1. 新会话 `available_skills` 不再出现任何 `sm-*` 能力（ego-browser/office 等第三方不受影响）；
+   项目/用户级 `.dsh/skills` 下无 `sm-*` 目录，`.dsh/capabilities/<name>.md` 出现（如
+   `git-sync-supermemory.md`），旧目录在 `skills-archive/` + manifest（可回滚）。
+2. 中枢/分支会话可见「[SuperMemory 可用能力]」精简索引（≤8 条）；对其中一个调用
+   `sm_cap_doc({ name })` 拿到正文后，面板该能力的 **loadCount +1**。
+3. 面板「固化能力」展开任一能力 → 改正文 →「保存正文」：散文更新、`<!-- sm:facts:start/end -->`
+   事实块保留、版本 +1。
+
+### 66.7 剩余风险
+
+- 历史手工改过 frontmatter（不再是 `sm-source: capability`）的旧 `sm-*` 知识面会被迁移跳过，
+  仍留在 `.dsh/skills`；需人工在面板保存正文或手动迁移。
+- 索引卡只给名称/何时用，模型多一次 `sm_cap_doc` 调用才见正文（loadCount 即转化率分母）。
+- zip 条目为 Windows 分隔符，跨平台解压会坏；面板安装只用 tgz。
+- GitHub 前端若被阻断，latest/稳定 URL 的 HEAD/GET 不可用，按 docs/git-sync.md §12 以 API 证据代替。
+
+

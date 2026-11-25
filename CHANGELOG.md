@@ -2,6 +2,34 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.3.1] - 2026-11-26
+
+发布轮（R53）：发布 R52「能力知识面移出公用 skill 目录 + 按需读取 + 索引注入 + 面板正文编辑器」，并修掉 R51 遗留的发布脚本 Windows `cmd.exe` 转义缺陷。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 新增（R52：能力知识面独立存放）
+
+- **知识面路径迁移**：固化能力正文从 `<skills 根>/sm-<name>/SKILL.md` 迁到 `<仓库根>/.dsh/capabilities/<name>.md`（无 git 根时 `<DSH_HOME>/capabilities/<workspace-token>/<name>.md`）。`.dsh/capabilities` 不在任何宿主 skill provider 的扫描根内，文件名也不是 `SKILL.md`，因此**公用 `available_skills` 不再出现任何 `sm-*` 能力**；第三方便携 skill（ego-browser/office 等）原样保留。
+- **幂等迁移 + 可回滚**：启动时 `migrateCapabilityDocs()` 只处理 frontmatter 带 `sm-source: capability` 的旧文件：先复制到新路径，再把旧目录整体移到 `<skills 根>-archive/sm-<name>` 并写 manifest（原名/来源/时间/原因，可回滚）；二次启动 moved=0、archived=0。人工/第三方/task skill 字节不动。
+- **`sm_cap_doc` 按需读取**：入参 `name`（逻辑名 / `sm_cap_*` / `sm-*` 均可）与可选 `section`（只取某个二级小节）；返回正文、事实块、`entry/scope/dryRunArg/writeConfirm/whenToUse`、二级标题与 `loadCount`。只返回 enabled 且未退役的能力（可执行能力还要求 `runnable=true`）；不存在/停用/文件缺失/解析失败都是结构化错误，不返回半截正文。每次成功加载 `loadCount+1`，接入转化率统计。
+- **中枢/分支注入「可用能力」索引**：pre-step 只对 hub/branch 会话注入（普通 shell 会话不注入），每行 `- <name> [可执行|仅知识|入口待验证]：<何时用>`，默认最多 8 条、1600 字符，超预算按行降级并写「… 省略 N 条」；`recall.capabilityIndex.enabled` / `maxItems`（硬上限 8）/ `maxChars` 可配置，关闭后不注入。
+- **固化能力面板正文编辑器**：列表行可展开编辑知识面正文（`editTool(id,{body})` → `updateCapabilitySkillBody`），保存时按事实块规则保留 `<!-- sm:facts:start --> … <!-- sm:facts:end -->`、版本 +1，路径展示指向 `.dsh/capabilities/<name>.md`。
+- **提示与文案**：`HUB_ROLE_TEXT`、`CAPABILITY_ROUTING_RULES`、README、INSTALL 与 locales 中「用宿主 skill 工具加载能力」的说法统一改为 `sm_cap_doc`。
+
+### 修复（R53：发布脚本）
+
+- `scripts/github-api-release.mjs`：`git rev-parse <tag>^{commit}` 在 Windows 下经 `execSync` 走 `cmd.exe` 时，`^` 被当成 cmd 转义符吃掉（命令变成 `rev-parse <tag>{commit}`，报 ambiguous argument）。改为 `execFileSync('git', [...参数数组])`（不经过 shell），commit-ish 与 tag 目标统一用 `^{commit}` 解析；新增 `--self-check --tag <vX.Y.Z>` 离线自检（tag 对象类型、`^{commit}` 与 `~0` 两式结果一致、tag 目标与当前 HEAD 的关系、祖先关系），不触网、不读令牌。
+- `docs/git-sync.md` 新增 §12：GitHub 前端（github.com）被阻断、`HEAD/GET /releases/latest/download/...` 不可用时的替代核验流程——改用 `api.github.com` 的 `releases/latest` 与 `releases/assets/<id>`（`Accept: application/octet-stream`）取资产 digest/大小，下载后本地 sha256 复核。
+
+### 变更
+
+- 版本 1.3.0 → 1.3.1（patch：R52 行为/界面变更 + 发布脚本修复；存储域 `supermemory` version 1 不变，无破坏性迁移）。
+
+### 已知限制
+
+- 迁移只在插件启动时执行：升级后必须**完全退出并重启 DSH Desktop**（不是禁用/启用插件、也不是刷新窗口）。
+- 历史上手工改过 frontmatter、不再是 `sm-source: capability` 的旧 `sm-*` 知识面会被迁移跳过，仍留在 `.dsh/skills`；需要人工在面板保存正文或手动迁移。
+- 索引卡只给名称与「何时用」，模型要多一次 `sm_cap_doc` 调用才看到正文。
+
 ## [1.3.0] - 2026-11-26
 
 发布轮：R50「单一能力（知识面 SKILL.md + 执行面 sm_cap_<name>）」、R49「关闭组合工具自动入口」与 R51「历史工具序列壳子不再被重新收编」合并发布。自本版起组合工具机制彻底删除，模型可见工具只剩 `sm_cap_*`。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
