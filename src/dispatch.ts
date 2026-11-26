@@ -23,6 +23,7 @@ import {
 } from './title.ts'
 import { sessionTitleOf } from './session-title/resolve.ts'
 import { ensureMemberTitle } from './session-title/member.ts'
+import { syncDispatchTitle } from './session-title/durable.ts'
 import { applySessionTitle } from './session-title/gate.ts'
 import { dispatchSource } from './chat-card.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
@@ -593,6 +594,9 @@ async function dispatchOne(
     // R41 需求③b: the branch title is the task itself — no topic-set prefix and
     // no 「R31：」lead-in; the host title and the member title read the same.
     const named = await ensureMemberTitle(store, topicSetId, { sessionId: branchSessionId, kind }, topicSet.title, task, { taskOnly: true })
+    // A CONTINUE reuses the branch's stable title: the new dispatch row must
+    // carry it too, or the newest-row projection would rename the branch card.
+    await syncDispatchTitle(store, dispatchId, named)
     const applied = await applySessionTitle({ ctx, store, logger }, {
       sessionId: branchSessionId,
       kind: 'branch',

@@ -1035,6 +1035,7 @@ const fakeCtx = (services) => ({
   const {
     applySessionTitle, attachSessionTitles, deferTitleTask, renameSession, resetAutoTitle,
     migrateSessionTitles, reconcileSessionTitle, resolveSessionTitle, sessionTitleOf, ensureMemberTitle,
+    finalizeHubTitleFromMessage, startupSessionTitles, syncDispatchTitle,
   } = await import('../src/session-title/index.ts')
   const {
     clipTitleBytes, composeHubTitle, composeBranchTitle, validateManualTitle, TITLE_MAX_BYTES,
@@ -1770,6 +1771,103 @@ const fakeCtx = (services) => ({
     assert.equal(H.titles.has('session-cold-ops'), false, 'cold ops never write the host')
     ok('R59-19 live 修复/deferred 对齐；legacy locked 无 autoTitle 时从镜像/主题恢复；冷重命名与 reset 均 needsOpen 不写宿主')
   }
+
+  // R59-20: C — the panel's first-message path (same gate call as the panel).
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    H.live('session-panel-msg')
+    seedHub(store, 'session-panel-msg')
+    const deps = { ctx: H.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-panel-msg', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    const first = await finalizeHubTitleFromMessage(deps, 'session-panel-msg', '面板首条消息主题')
+    assert.equal(first.outcome, 'host')
+    assert.equal(H.titles.get('session-panel-msg'), WS_LABEL + ' · 面板首条消息主题')
+    assert.equal(store.sessionTitles.get('session-panel-msg').state, 'named')
+    const writesBefore = titleWrites.length
+    const second = await finalizeHubTitleFromMessage(deps, 'session-panel-msg', '另一个主题')
+    assert.equal(second.outcome, 'already', 'a named hub is finalized once')
+    assert.equal(titleWrites.length, writesBefore)
+    assert.equal(H.titles.get('session-panel-msg'), WS_LABEL + ' · 面板首条消息主题')
+    ok('R59-20 面板首条消息：finalizeHubTitleFromMessage 延迟写、首个主题生效、第二次 no-op')
+  }
+
+  // R59-21: E — a RELOAD (startup pass twice) never rewrites names or a lock.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    H.live('session-reload')
+    seedHub(store, 'session-reload')
+    const deps = { ctx: H.ctx, store, logger: quiet }
+    await applySessionTitle(deps, {
+      sessionId: 'session-reload', workspaceKey: WORKSPACE, kind: 'hub', topicText: '重载后保持不变', source: 'first-message',
+    })
+    const named = H.titles.get('session-reload')
+    await store.meta.put('session-titles', {
+      sessionTitlesMigrationVersion: 1,
+      sessionTitlesProcessedIds: ['session-reload'],
+      sessionTitlesPendingIds: [],
+    })
+    H.live('session-reload-locked')
+    seedHub(store, 'session-reload-locked')
+    H.titles.set('session-reload-locked', '人工名字')
+    await store.sessionTitles.put('session-reload-locked', {
+      workspaceKey: WORKSPACE, sessionId: 'session-reload-locked', kind: 'hub', state: 'user-locked',
+      desiredTitle: WS_LABEL + ' · 锁定前自动', autoTitle: WS_LABEL + ' · 锁定前自动', desiredFull: '', topic: '',
+      lastWrittenTitle: '人工名字', source: 'manual', attempts: 0, lastError: '', lockedReason: 'manual',
+      createdAt: now, updatedAt: now,
+    })
+    const writesBefore = titleWrites.length
+    const first = await startupSessionTitles(deps)
+    const second = await startupSessionTitles(deps)
+    assert.equal(titleWrites.length, writesBefore, 'a reload writes no host title')
+    assert.equal(H.titles.get('session-reload'), named, 'the named title is stable')
+    assert.equal(H.titles.get('session-reload-locked'), '人工名字', 'a lock survives reload')
+    assert.equal(store.sessionTitles.get('session-reload-locked').state, 'user-locked')
+    assert.ok(first.migration && second.migration, 'the startup pass reports its migration half')
+    ok('R59-21 重载：startupSessionTitles 两次不改名、不覆盖 user-locked（迁移 marker + reconcile 幂等）')
+  }
+
+  // R59-22: G — a CONTINUE keeps the branch's stable title in every copy.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    const stable = '稳定的分支标题'
+    await store.topicsets.put('ts-cont', {
+      workspaceKey: WORKSPACE, title: '协作', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-cont', kind: 'fork', title: stable, summary: '', status: 'live', modelOverridden: false, lastActiveAt: now }],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    })
+    const dispatchRow = (task, title) => ({
+      topicSetId: 'ts-cont', branchSessionId: 'branch-cont', task, hubSessionId: 'session-hub-cont',
+      startSeq: 0, status: 'delivered', title, tags: [], capability: 'full', createdAt: now, updatedAt: now,
+    })
+    await store.dispatches.put('dsp-old', dispatchRow('旧任务', stable))
+    // The continue dispatch is recorded with the NEW task's title first (as
+    // dispatchOne does), then aligned to the branch's stable title.
+    await store.dispatches.put('dsp-cont', dispatchRow('全新任务', '全新任务标题'))
+    await store.sessionTitles.put('branch-cont', {
+      workspaceKey: WORKSPACE, sessionId: 'branch-cont', kind: 'branch', state: 'named',
+      desiredTitle: stable, autoTitle: stable, desiredFull: stable, topic: '旧任务',
+      lastWrittenTitle: stable, source: 'dispatch', attempts: 0, lastError: '', lockedReason: '',
+      createdAt: now, updatedAt: now,
+    })
+    H.live('branch-cont')
+    H.titles.set('branch-cont', stable)
+    const memberTitle = await ensureMemberTitle(store, 'ts-cont', { sessionId: 'branch-cont', kind: 'fork' }, '协作', '全新任务', { taskOnly: true })
+    assert.equal(memberTitle, stable, 'a reused branch keeps its member title')
+    assert.equal(await syncDispatchTitle(store, 'dsp-cont', memberTitle), true)
+    assert.equal(store.dispatches.get('dsp-cont').title, stable, 'the continue dispatch carries the stable title')
+    const writesBefore = titleWrites.length
+    const applied = await applySessionTitle({ ctx: H.ctx, store, logger: quiet }, {
+      sessionId: 'branch-cont', kind: 'branch', topicText: '全新任务', source: 'dispatch',
+    })
+    assert.equal(applied.outcome, 'already', 'continue never renames the host')
+    assert.equal(titleWrites.length, writesBefore)
+    assert.equal(H.titles.get('branch-cont'), stable)
+    assert.equal(store.topicsets.get('ts-cont').members[0].title, stable)
+    ok('R59-22 分支 continue：member/dispatch 保持稳定标题、宿主不自动改名')
+  }
 }
 
 // ---- R59-10: the panel create path writes through the same gate ----
@@ -1802,7 +1900,12 @@ const fakeCtx = (services) => ({
   assert.equal(titles.get(created.id), '10-SuperMemory · 新会话', 'the panel create writes the provisional name through the gate')
   assert.equal(store.hubs.get(created.id)?.title, '10-SuperMemory · 新会话', 'the hub mirror holds the same string')
   assert.equal(store.sessionTitles.get(created.id)?.state, 'provisional', 'the durable row is provisional until the first message')
-  ok('R59-10 面板 createHubSession 走 gate：空中枢 provisional，宿主与 hub_sessions 同串')
+  // D: the same path WITH a composer message writes the FINAL title immediately.
+  const createdWithMessage = await panel.createHubSession('F:/10-SuperMemory', {}, 'R59 面板首条消息主题')
+  assert.equal(createdWithMessage.status, 'ok')
+  assert.equal(titles.get(createdWithMessage.id), '10-SuperMemory · 面板首条消息主题', 'the R59 round token is stripped by the policy')
+  assert.equal(store.sessionTitles.get(createdWithMessage.id)?.state, 'named')
+  ok('R59-10 面板 createHubSession 走 gate：空中枢 provisional；带 firstMessage 直接 final；宿主与 hub_sessions 同串')
 }
 
 

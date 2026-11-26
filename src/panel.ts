@@ -22,6 +22,7 @@ import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { ensureMemberTitle } from './session-title/member.ts'
 import { applySessionTitle } from './session-title/gate.ts'
 import { resolveSessionTitle } from './session-title/resolve.ts'
+import { finalizeHubTitleFromMessage } from './session-title/observe.ts'
 import { renameSessionWithDurables, resetSessionWithDurables, titleKindOf } from './session-title/durable.ts'
 import { isSessionLive, readHostTitle } from './session-title/host.ts'
 import { reconcileSessionTitle } from './session-title/reconcile.ts'
@@ -1663,16 +1664,7 @@ export class SupermemoryPanelService {
     const ctx = this.ctx
     if (!ctx) return
     try {
-      const record = this.store?.hubs?.get?.(sessionId)
-      if (!record) return
-      await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
-        sessionId,
-        workspaceKey: record.workspaceKey,
-        kind: 'hub',
-        topicText: text,
-        source: 'panel',
-        defer: true,
-      })
+      await finalizeHubTitleFromMessage({ ctx, store: this.store, logger: panelTitleLogger }, sessionId, text, 'panel')
     } catch { /* naming is best-effort; the message already went through */ }
   }
 

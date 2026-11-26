@@ -14,10 +14,10 @@ import type { TitleDeps } from './types.ts'
 export * from './types.ts'
 export { applySessionTitle, renameSession, resetAutoTitle, claimHostWrite, pendingWrite, takeOwnWrite, clearPendingWrite } from './gate.ts'
 export { deferTitleTask, retryReentrant, MAX_TITLE_WRITE_ATTEMPTS } from './defer.ts'
-export { attachSessionTitleObserver, firstUserMessageSeq, contentText } from './observe.ts'
+export { attachSessionTitleObserver, firstUserMessageSeq, contentText, finalizeHubTitleFromMessage } from './observe.ts'
 export { ensureMemberTitle, type MemberTitleOptions } from './member.ts'
 export {
-  syncDurableTitles, titleKindOf, renameSessionWithDurables, resetSessionWithDurables,
+  syncDurableTitles, syncDispatchTitle, titleKindOf, renameSessionWithDurables, resetSessionWithDurables,
   type DurableSync, type TitleMutationResult,
 } from './durable.ts'
 export { reconcileSessionTitle, reconcileTitles, type ReconcileSummary } from './reconcile.ts'

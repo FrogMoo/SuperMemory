@@ -22,7 +22,7 @@ import { applySessionTitle, takeOwnWrite } from './gate.ts'
 import { reconcileSessionTitle } from './reconcile.ts'
 import { hubRecord, ensureTitleRow, mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
 import { isNeutralTitle } from './policy.ts'
-import type { TitleDeps } from './types.ts'
+import type { TitleDeps, TitleResult, TitleSource } from './types.ts'
 import type { SessionTitleRow } from '../schema.ts'
 
 /** Join one message's text blocks. */
@@ -195,6 +195,31 @@ async function onUserMessage(deps: TitleDeps, sessionId: string, seq: number, te
     workspaceKey: row?.workspaceKey || record?.workspaceKey || '',
     topicText: text,
     source: 'first-message',
+    defer: true,
+  })
+}
+
+/**
+ * R59 Phase 1b-2: the PANEL's first-message path, extracted so both the panel
+ * and the tests use the exact same gate call (one deferred write, only while
+ * the hub title carries no topic; the gate owns every guard).
+ *
+ * @returns the gate result; `skipped/no-hub` when the session has no plugin hub record.
+ */
+export async function finalizeHubTitleFromMessage(
+  deps: TitleDeps,
+  sessionId: string,
+  text: string,
+  source: TitleSource = 'panel',
+): Promise<TitleResult> {
+  const record = hubRecord(deps.store, sessionId)
+  if (!record) return { outcome: 'skipped', title: '', reason: 'no-hub' }
+  return applySessionTitle(deps, {
+    sessionId,
+    workspaceKey: record.workspaceKey,
+    kind: 'hub',
+    topicText: text,
+    source,
     defer: true,
   })
 }

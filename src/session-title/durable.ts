@@ -63,6 +63,31 @@ export async function syncDurableTitles(
   return counts
 }
 
+/**
+ * Align ONE dispatch row's title with the branch's stable durable title. A
+ * CONTINUE/resume creates a new dispatch row; without this alignment the
+ * newest row would carry the new task's title and the branch card/list would
+ * silently rename a branch whose host/member title never changed.
+ *
+ * @returns true when the row was rewritten.
+ */
+export async function syncDispatchTitle(
+  store: Store | undefined,
+  dispatchId: string,
+  title: string,
+): Promise<boolean> {
+  const final = String(title ?? '').trim()
+  if (!store || !dispatchId || !final) return false
+  const row = store.dispatches.get(dispatchId)
+  if (!row || row.title === final) return false
+  try {
+    await store.dispatches.update(dispatchId, (record) => ({ ...record, title: final, updatedAt: Date.now() }))
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** The session's naming kind (explicit > stored row > plugin id prefix). */
 export function titleKindOf(store: Store | undefined, sessionId: string, explicit?: TitleKind): TitleKind {
   if (explicit && explicit !== 'other') return explicit
