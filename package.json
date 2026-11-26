@@ -1,8 +1,8 @@
 {
   "name": "@frogmoo/dsh-supermemory",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与统一能力（知识面 SKILL.md + 执行面 sm_cap_*）。",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"

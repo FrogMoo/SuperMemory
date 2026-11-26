@@ -1,46 +1,21 @@
-版权所有 (c) 2026 Zry（GitHub: FrogMoo）
-
-保留所有权利 (All Rights Reserved)。
-
-本软件及其源代码、文档、构建产物（以下统称「本软件」）为作者个人项目，
-按「专有软件」方式保护：未获得作者事先书面许可，任何个人或组织不得：
-
-1. 复制、分发、再许可本软件的全部或部分；
-2. 以本软件为基础提供商业服务；
-3. 移除、修改本声明或随本软件分发的版本/许可信息。
-
-允许的行为：
-
-- 为个人自用目的下载、安装、运行本软件；
-- 在遵守上述限制的前提下阅读源代码、提交 issue 与 pull request
-  （合并与否由作者自行决定，合并不构成任何明示或默示的许可授予）。
-
-本软件按「现状」提供，不附带任何形式的明示或默示担保，包括但不限于
-对适销性、特定用途适用性及不侵权的担保。在任何情况下，作者均不对因使用
-或无法使用本软件而产生的任何索赔、损害或其他责任负责。
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
-
----
+MIT License
 
 Copyright (c) 2026 Zry (GitHub: FrogMoo)
 
-All Rights Reserved.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This software, including its source code, documentation and build
-artifacts (the "Software"), is a personal project distributed under a
-proprietary license. Without prior written permission from the author,
-no person or organization may:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-1. copy, redistribute or sublicense the Software, in whole or in part;
-2. offer commercial services based on the Software;
-3. remove or alter this notice or any version/license information
-   distributed with the Software.
-
-You may: download, install and run the Software for your own personal
-use; read the source code; and file issues or pull requests (merged at
-the author's sole discretion; merging grants no express or implied
-license).
-
-IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY ARISING FROM THE USE OF OR INABILITY TO USE THE SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

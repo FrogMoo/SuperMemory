@@ -1322,6 +1322,8 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.equal(pkg.scripts['package-release'], 'node scripts/package-release.mjs', 'R58⑤: pnpm package-release is wired')
   assert.equal(pkg.name, '@frogmoo/dsh-supermemory', 'R59: the package publishes under its scoped name')
   assert.equal(pkg.private, undefined, 'R59: a publishable package declares no private flag')
+  assert.equal(pkg.license, 'MIT', 'R59b: the published package is MIT-licensed')
+  assert.ok(readFileSync('LICENSE', 'utf8').startsWith('MIT License'), 'R59b: LICENSE is the MIT text')
   assert.deepEqual(pkg.publishConfig, { access: 'public', registry: 'https://registry.npmjs.org/' },
     'R59: publishConfig scopes the publish to the public npm registry')
   // The bundle row's module specifier must equal the package name, or a

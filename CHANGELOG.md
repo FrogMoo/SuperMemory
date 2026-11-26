@@ -2,6 +2,34 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.4.1] - 2026-11-26
+
+发布轮（R59b）：**许可证改为 MIT**（此前是自定义专有「保留所有权利」声明），并把版本抬到 **1.4.1** 作为 **npm 首发版本**。
+
+### 变更（许可与首发版本）
+
+- `LICENSE`：整篇替换为标准 **MIT 全文**，署名沿用原文 `Copyright (c) 2026 Zry (GitHub: FrogMoo)`（未丢署名）。
+- `package.json`：`license` 由 `UNLICENSED` 改为 **`MIT`**；`version` 1.4.0 → **1.4.1**；其余字段（`name` / `publishConfig` / `files` / `scripts` / `dsh` / `engines`）一律不变。
+- **版本策略**：v1.4.0 的提交、附注 tag 与 GitHub Release 已经推到远端且指向「专有许可」的那次提交，按约定**不移动、不删除、不重建**；许可变更与 npm 首发改由 1.4.1 承载。npm registry 上此前没有任何版本（v1.4.0 的 publish 曾被 2FA 403 拦下），因此 **1.4.1 就是 npm 上的首个版本**。
+- 文档：README / INSTALL / `docs/release.md` 里「1.4.0 起可用 npm」的说明补注「npm 首发 1.4.1」；CHANGELOG 历史条目保持原样（当时确实是专有许可）。
+- 未改动：包名、文件清单、发布资产名约定（`dsh-supermemory-<版本>.zip/.tgz`）、存储域 `supermemory`、工具/远程协议。
+
+### 测试（R59b 新增断言）
+
+- core-smoke：`pkg.license === 'MIT'`，且 `LICENSE` 文本以 `MIT License` 开头。
+
+### 闸门（本轮实测）
+
+- `pnpm build` **exit 0**（lib 产物与 1.4.0 逐字节相同：包名未变，wrapper id 仍为 `@frogmoo/dsh-supermemory`）。
+- `pnpm typecheck` **exit 0**（宿主 + client 双工程，0 错）。
+- `pnpm smoke` **exit 0**：core **43** / mechanism **120** / webui **35** / client-sim **OK** / capability **20 组** / workspace-scope **6 组** / skill **27 组断言**。
+- `npm pack --dry-run`：版本 **1.4.1**、license **MIT**、**20 条目**（`lib/` 14 文件 + package.json / cordis.patch.yml / README / LICENSE / CHANGELOG / INSTALL），**不含** `src/`、`scripts/`、`node_modules/`、`release/`。
+
+### 发布方式
+
+- GitHub：提交 + 附注 tag `v1.4.1` + **source-only** Release（不上传自建资产，仅 GitHub 自动生成的源码归档）。
+- npm：由仓库维护者在自己的终端执行 `npm publish --access public`（需 2FA OTP）；本仓库不代为发布。
+
 ## [1.4.0] - 2026-11-26
 
 发布轮（R59）：**包身份迁移到可发布的 scoped 名 `@frogmoo/dsh-supermemory`（1.4.0）**，为发布到公共 npm registry 做准备——只有 registry 来源在 DSH 插件页才会出现「版本 → 重新检查 / 可更新到 x」。功能、工具协议、存储域（`supermemory` v1）均未变。

@@ -154,7 +154,7 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
 - **DSH 插件面板（推荐，安装 main 最新源码）**：在「插件 → 安装插件」填 Git 仓库地址
   `https://github.com/FrogMoo/SuperMemory`。DSH 安装器接受 `kind=git`，会 clone 默认分支并安装；
   **不要填**裸 `FrogMoo/SuperMemory`（会被当成 npm 包名）、Release 页面 URL 或 `.zip` 资产。
-- **npm 包（1.4.0 起，发布后可用）**：面板里填包名 `@frogmoo/dsh-supermemory`（或带版本
+- **npm 包（scoped 名自 1.4.0 起；npm 首发 1.4.1）**：面板里填包名 `@frogmoo/dsh-supermemory`（或带版本
   `@frogmoo/dsh-supermemory@^1.4.0`）。只有以 **registry 来源**安装时，插件页的「版本 → 重新检查 /
   可更新到 x」才会出现；Git / 本地目录 / tgz 来源在 DSH 0.2.2 里没有版本检查入口（详见 INSTALL.md）。
   注意：**npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory` 是两回事**，

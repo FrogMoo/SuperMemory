@@ -1,6 +1,6 @@
 # Release 发布流程（SuperMemory）
 
-> 适用范围：本仓库的版本发布。npm 包名是 `@frogmoo/dsh-supermemory`（1.4.0 起，
+> 适用范围：本仓库的版本发布。npm 包名是 `@frogmoo/dsh-supermemory`（scoped 名自 1.4.0 起，npm 首发 1.4.1，
 > 可发布到公共 registry），GitHub 仓库名仍是 `FrogMoo/SuperMemory`，本地自建资产名仍是
 > `dsh-supermemory-<版本>.zip/.tgz` —— 三者刻意保持不同，别互相替换。
 >
