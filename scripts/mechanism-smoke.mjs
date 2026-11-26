@@ -3556,7 +3556,7 @@ const { detachIdleBranches, releasableBranches, branchHandles } = await import('
   const panelSrc = readFileSync('src/panel.ts', 'utf8')
   assert.equal((panelSrc.match(/source: \{ kind: 'supermemory' \}/g) || []).length, 0,
     'no human-initiated panel delivery is left on the private kind')
-  ok('R25-1 归属形态：派发/续跑/面板输入 kind=user；recall/notice/relay 卡仍是 supermemory 上下文')
+  ok('R25-1 归属形态：派发/续跑/面板输入 kind=user；历史 recall/notice/relay 卡仍是 supermemory 上下文（R57 起新卡用注册 label 作 kind）')
 }
 
 {
@@ -3848,7 +3848,7 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
 
 // ---- R56: 上下文注入卡标题统一（注册表 + 命名约定 + 旧标题归零） ----
 {
-  const { injectionTitle, injectionTitles, INJECTION_TITLES, INJECTION_TITLE_PATTERN } = await import('../src/injection-titles.ts')
+  const { injectionTitle, injectionLabel, injectionTitles, INJECTION_TITLES, INJECTION_TITLE_PATTERN } = await import('../src/injection-titles.ts')
   const { renderCard } = await import('../src/route.ts')
   const { renderRecallCard } = await import('../src/recall.ts')
   const { renderRepeatCard } = await import('../src/inrequest.ts')
@@ -3952,10 +3952,131 @@ const { collectBranchRestoreTargets, restoreBranchSessions, renderBranchRestoreS
   for (const old of OLD_TITLES) {
     assert.equal(libText.includes(old), false, 'R56: the built product still carries ' + old + ' — run pnpm build first')
   }
-  for (const title of [injectionTitle('topic'), injectionTitle('memory'), injectionTitle('branch'), injectionTitle('capability')]) {
-    assert.equal(libText.includes(title), true, 'R56: the built product carries ' + title + ' — run pnpm build first')
+  // R57: the bracketed title is composed at runtime ('[' + label + ']'), so the
+  // durable literal in the bundle is the registered LABEL — assert that.
+  for (const label of [injectionLabel('topic'), injectionLabel('memory'), injectionLabel('branch'), injectionLabel('capability')]) {
+    assert.equal(libText.includes(label), true, 'R56/R57: the built product carries the registered label ' + label + ' — run pnpm build first')
   }
   ok('R56-4 旧标题归零：src/ 无旧标题、渲染处无手写 [supermemory- 标题（传输前缀白名单）、构建产物同步新标题')
+}
+
+
+// ---- R57: 卡片标题（宿主「上下文注入 <label>」）按内容区分，label 与首行同源 ----
+{
+  const {
+    injectionLabel, injectionTitle, injectionTitles, INJECTION_TITLES,
+    INJECTION_LABEL_PATTERN,
+  } = await import('../src/injection-titles.ts')
+  const { injectionSource } = await import('../src/source.ts')
+  const { isDispatchInput } = await import('../src/observe.ts')
+  const { readFileSync: readR57 } = await import('node:fs')
+  const { join: joinR57 } = await import('node:path')
+  const { fileURLToPath: urlR57 } = await import('node:url')
+
+  // R57-1 每类注入的卡片 label（= source.kind）精确匹配注册表裸名
+  const EXPECTED_LABELS = {
+    memory: 'supermemory-相关记忆',
+    memoryRepeat: 'supermemory-相关记忆补充',
+    topic: 'supermemory-相关话题',
+    topicCandidate: 'supermemory-相关话题候选',
+    branch: 'supermemory-相关分支会话',
+    capability: 'supermemory-相关能力',
+    hubRole: 'supermemory-hub-role',
+    pluginPrompt: 'supermemory-plugin-prompt',
+    notice: 'supermemory-notice',
+  }
+  assert.deepEqual(Object.keys(INJECTION_TITLES).sort(), Object.keys(EXPECTED_LABELS).sort(),
+    'R57: every registered kind is covered by the label contract')
+  for (const [kind, label] of Object.entries(EXPECTED_LABELS)) {
+    assert.equal(injectionLabel(kind), label, 'R57: the card label of ' + kind)
+    assert.match(injectionLabel(kind), INJECTION_LABEL_PATTERN, 'R57: ' + kind + ' label follows the convention')
+    assert.equal(injectionLabel(kind).includes('[') || injectionLabel(kind).includes(']'), false,
+      'R57: the label carries no brackets (the host adds the 上下文注入 prefix)')
+    assert.equal(injectionTitle(kind), '[' + label + ']', 'R57: the content header wraps the SAME label')
+  }
+  assert.equal(new Set(Object.values(EXPECTED_LABELS)).size, Object.keys(EXPECTED_LABELS).length,
+    'R57: every injection has a distinct card label')
+  ok('R57-1 九类注入的卡片 label 精确匹配注册表裸名（label 与内容首行同源、彼此唯一、无方括号）')
+
+  // R57-2 注入 source 的 kind 就是 label：宿主按 source.kind 渲染卡片标题
+  for (const kind of Object.keys(INJECTION_TITLES)) {
+    const source = injectionSource(kind)
+    assert.equal(source.kind, injectionLabel(kind), 'R57: source.kind is the card label for ' + kind)
+  }
+  const recallSource = injectionSource('memory', { form: 'recall' })
+  assert.equal(recallSource.kind, 'supermemory-相关记忆')
+  assert.equal(recallSource.form, 'recall')
+  const noticeLike = injectionSource('branch')
+  assert.equal(noticeLike.form, undefined, 'R57: no notice form → the host appends no summary segment')
+  assert.equal(Object.keys(noticeLike).length, 1, 'R57: a branch card source carries only its label')
+  const item57 = { memoryId: 'm-r57', title: 'R57 结论', text: '注入卡标题按内容区分', score: 3, createdAt: 1, keywords: ['注入'] }
+  const { renderRecallCard } = await import('../src/recall.ts')
+  assert.equal(String(renderRecallCard([item57], 'plain', [])).split(String.fromCharCode(10))[0], injectionTitle('memory'),
+    'R57: the recall card first line is the same label the host shows')
+  const { renderHubBranchesCard } = await import('../src/hub-branches.ts')
+  const branchCard57 = renderHubBranchesCard([{ branchSessionId: 'b-r57', title: '分支甲', status: 'working', topicSetTitle: '话题甲', lastActivityAt: 1, tags: [], hubs: ['h'], shared: false, dispatches: 1 }], { now: 2 })
+  assert.equal(branchCard57.split(String.fromCharCode(10))[0].startsWith(injectionTitle('branch')), true,
+    'R57: the branch card first line is the branch label')
+  assert.equal(branchCard57.startsWith(injectionTitle('branch') + ' '), true)
+  const msg = (source) => ({ id: 'u', role: 'user', content: [{ type: 'text', text: 'x' }], source })
+  for (const kind of ['memory', 'memoryRepeat', 'topic', 'topicCandidate']) {
+    assert.equal(isDispatchInput(msg(injectionSource(kind, { form: 'recall' }))), false,
+      'R57: a label-kind card is never a dispatch input (' + kind + ')')
+  }
+  assert.equal(isDispatchInput(msg(injectionSource('branch'))), false,
+    'R57: a label-kind notice card is never a dispatch input')
+  ok('R57-2 注入 source.kind = 卡片 label：与内容首行同一注册项；label 卡不会被当成派发输入')
+
+  // R57-3 注入调用参数（不是只看内容首行）：渲染处必须按卡传 kind，且不得手写 kind
+  const srcRoot57 = urlR57(new URL('../src/', import.meta.url))
+  const read57 = (name) => readR57(joinR57(srcRoot57, name), 'utf8')
+  const prestepSrc = read57('prestep.ts')
+  const routeSrc = read57('route.ts')
+  // The injection CALL PARAMETERS (not just the content): each card site names
+  // its registered kind, and one shared builder turns it into source.kind.
+  for (const [call, what] of [
+    ["build(card, 'memory')", 'opening recall card'],
+    ["build(text, 'memoryRepeat')", 'in-process repeat card'],
+    ["buildNotice(branchesCard, 'branch')", 'hub branch card'],
+    ["buildNotice(capabilityCard, 'capability')", 'capability index card'],
+  ]) {
+    assert.ok(prestepSrc.includes(call), 'R57: prestep passes the ' + what + ' kind (' + call + ')')
+  }
+  assert.ok(prestepSrc.includes('injectionSource(kind'), 'R57: prestep builds every card source through the registry helper')
+  for (const kind of ['topic', 'topicCandidate']) {
+    assert.ok(routeSrc.includes("injectionSource('" + kind + "'"),
+      'R57: route passes the ' + kind + ' kind into the card source')
+  }
+  for (const [name, text] of [['prestep.ts', prestepSrc], ['route.ts', routeSrc]]) {
+    assert.equal(text.includes("kind: 'supermemory'"), false,
+      'R57: ' + name + ' must not hand-write kind: supermemory as a card label')
+    assert.ok(text.includes("from './source.ts'"), 'R57: ' + name + ' builds sources through the registry helper')
+  }
+  assert.equal(prestepSrc.includes("form: 'notice'"), false,
+    'R57: the notice cards no longer carry the summary-bearing form (title shows the label alone)')
+  ok('R57-3 渲染接线：prestep 传 memory/memoryRepeat/branch/capability、route 传 topic/topicCandidate，且不再手写 supermemory kind')
+
+  // R57-4 旧卡片标题归零：旧公告 summary 不再出现在产品面（测试期望串与历史文档除外）
+  const { readdirSync: readdir57 } = await import('node:fs')
+  const walk57 = (dir) => readdir57(dir, { withFileTypes: true })
+    .flatMap((entry) => entry.isDirectory() ? walk57(joinR57(dir, entry.name)) : [joinR57(dir, entry.name)])
+  const productFiles = [
+    ...walk57(srcRoot57).filter((path) => path.endsWith('.ts') || path.endsWith('.tsx')),
+    ...walk57(urlR57(new URL('../lib/', import.meta.url))).filter((path) => path.endsWith('.js')),
+  ]
+  const OLD_LABELS = ['SuperMemory 中枢分支概览']
+  for (const path of productFiles) {
+    const text = readR57(path, 'utf8')
+    for (const old of OLD_LABELS) {
+      assert.equal(text.includes(old), false, 'R57: old card title segment ' + old + ' was left in ' + path)
+    }
+  }
+  const libText57 = productFiles.filter((path) => path.endsWith('.js'))
+    .map((path) => readR57(path, 'utf8')).join(String.fromCharCode(10))
+  for (const label of ['supermemory-相关记忆', 'supermemory-相关分支会话', 'supermemory-相关能力']) {
+    assert.equal(libText57.includes(label), true, 'R57: the built product labels a card ' + label + ' — run pnpm build first')
+  }
+  ok('R57-4 旧卡片标题归零：src/ 与 lib/ 无「SuperMemory 中枢分支概览」，构建产物带新标签')
 }
 
 console.log(String.fromCharCode(10) + passed + ' checks passed')

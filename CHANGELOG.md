@@ -2,6 +2,33 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.3.5] - 2026-11-26
+
+发布轮（R57）：**上下文注入卡的折叠标题（宿主「上下文注入 <label>」的 label）按内容区分**。R56 改的是卡片内容首行；宿主的 label 仍取消息 `source.kind`（一律 `supermemory`），所以 GUI 里所有注入卡的折叠标题只有「上下文注入 supermemory」一种（分支卡再叠加旧 summary「SuperMemory 中枢分支概览」）。本轮让每类注入用**自己的注册 label 作 `source.kind`**：卡片标题即 `上下文注入 supermemory-相关记忆 / 相关话题 / 相关分支会话 / 相关能力 …`，与内容首行同一注册项（同 kind 同源）。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。
+
+### 变更（R57：卡片标题按内容区分）
+
+- **根因（宿主行为，已用 DSH 0.2.2 产物核实）**：`dsh-client-ui-chat/src/client/conversation-nodes/event-projection.ts:60` 的 `contextProducer(source)` 在 default 分支把 `label` 直接取为 `source.kind`（宿主注释：「keep an unknown producer visible by its durable kind」）；`src/client/chat/ContextInjectionRow.tsx:57` 的标题前缀是固定文案「上下文注入」（locale `message.contextInjection`；role `recall` 时为「跨会话召回」），`:69` 渲染 `producer.label`，`:70-73` 只在 `form='notice'` 时追加 `source.summary`。宿主产物里 `supermemory` 字面量为 **0**——没有特判，卡片标题能否区分完全取决于 `source.kind`，**不需要改 DSH asar**。
+- **注册表新增 label 访问函数**：`src/injection-titles.ts` 增 `injectionLabel(kind)`、`INJECTION_LABEL_PATTERN`，`injectionTitles()` 每行带 `label`；`injectionTitle(kind)` 保持 `'[' + label + ']'`。模块注释写清「卡片标题（label）/ 内容首行」两层命名与宿主证据。
+- **新增 `injectionSource(kind, form?)`**（`src/source.ts`）：注入 source 的 `kind` 一律取 `injectionLabel(kind)`；九个 label 同时合并进 `MessageSourceMap` 类型（宿主「未知 producer 按 durable kind 显示」的合并扩展点，类型与运行时一致）。
+- **接线**：`src/prestep.ts`（相关记忆 `memory`、过程内补充 `memoryRepeat`、分支卡 `branch`、能力索引 `capability`）与 `src/route.ts`（相关话题 `topic`、相关话题候选 `topicCandidate`）全部改走 `injectionSource`；两个文件不再出现 `kind: 'supermemory'` 作为卡片 label。
+- **分支卡去掉旧 summary**：原 `form: 'notice'` + `summary: 'SuperMemory 中枢分支概览'` 会在标题后再追加一段；label 已命名卡片，改为纯 label source（GUI 标题即「上下文注入 supermemory-相关分支会话」）。能力索引卡同理。
+- **不动的部分**：relay/派发/续跑等消息传输头，以及 relay/派发消息的 `source.kind`（`observe.ts` 用 kind `supermemory` + `deliveryId` 确认投递；这些卡由插件自己的客户端卡片渲染，不走宿主注入行）；中枢角色提示与插件提示是 systemPrompt（没有卡片行），中断公告是 relay 卡——三者仍由注册表统一持有名字。
+- **历史消息不回写**：升级前写入的 `source.kind='supermemory'` 保持原样显示「上下文注入 supermemory」。
+
+### 测试（R57 新增断言）
+
+- **R57-1** 九类注入的卡片 label 精确匹配注册表裸名、彼此唯一、无方括号；内容首行 = `[label]`（同一注册项）。
+- **R57-2** `injectionSource(kind).kind === injectionLabel(kind)`；分支卡 source 只带 label（无 form/summary，宿主不会再追加 summary 段）；label 卡不会被 `isDispatchInput` 认成派发输入。
+- **R57-3** 注入**调用参数**断言：`prestep.ts` 传 memory/memoryRepeat/branch/capability、`route.ts` 传 topic/topicCandidate；两文件不得手写 `kind: 'supermemory'` 且都经 `injectionSource` 构造；prestep 不再声明 notice form。
+- **R57-4** 旧卡片标题段 `SuperMemory 中枢分支概览` 在 `src/` 与 `lib/` 为 0；构建产物携带新 label。
+- 既有断言更新：R56-4 的构建产物断言改查 **label** 字面量（方括号标题在运行时拼接，bundle 里的持久字面量是 label）；client-sim 增加 label-kind context 行仍委托宿主渲染的用例。
+
+### 变更（版本）
+
+- 版本 1.3.4 → 1.3.5（patch：卡片标题/呈现变化，无行为变更与存储结构变更；存储域 `supermemory` version 1 不变）。
+- 升级后需**完全退出并重启 DSH Desktop**（不是禁用/启用插件、也不是刷新窗口）才能看到新卡片标题。
+
 ## [1.3.4] - 2026-11-26
 
 发布轮（R56）：统一**上下文注入卡标题**命名并固化成约定。四类注入卡改名，全部标题改由注册表 `src/injection-titles.ts` 产出——渲染处不再手写标题字符串，新增注入卡必须「登记 → 渲染 → 测试 → 文档」。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。

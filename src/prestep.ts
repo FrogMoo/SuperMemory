@@ -36,6 +36,7 @@ import { workspaceKeyOf } from './store.ts'
 import { isHubSession, listHubBranches, listTopicSetBranches, renderHubBranchesCard } from './hub-branches.ts'
 import { capabilityRows, renderCapabilityIndex } from './capability.ts'
 import { resolveRole } from './role.ts'
+import { injectionSource } from './source.ts'
 
 export interface PreStepConfig {
   enabled: boolean
@@ -95,21 +96,27 @@ export function attachPreStep(
     }
     return createMessage
   }
-  const build = async (text: string) => {
+  // R57: the source kind IS the card label the host renders as
+  // 「上下文注入 <label>」 (dsh-client-ui-chat contextProducer → label = kind),
+  // so each injection passes its registry kind and the card title follows the
+  // content's first line without a second naming source.
+  const build = async (text: string, kind: 'memory' | 'memoryRepeat') => {
     const factory = await ensureFactory()
     return factory({
       content: [{ type: 'text', text }],
-      source: { kind: 'supermemory', form: 'recall' },
+      source: injectionSource(kind, { form: 'recall' }),
     })
   }
-  // R19 协同②: the hub↔branch card is a NOTICE, not recall: it is context about
-  // the hub's own delegates, and `form: 'notice'` keeps observe.ts from mistaking
-  // it for a dispatch input (isDispatchInput excludes recall/notice).
-  const buildNotice = async (text: string) => {
+  // R19 协同②: the hub↔branch/capability cards are NOTICE-style context about the
+  // hub's own delegates; R57 gives each its own label so the collapsed rows read
+  // 「上下文注入 supermemory-相关分支会话」 vs 「上下文注入 supermemory-相关能力」.
+  // No notice form is declared: it would require a summary line the host appends
+  // to the title, and the label already names the card.
+  const buildNotice = async (text: string, kind: 'branch' | 'capability') => {
     const factory = await ensureFactory()
     return factory({
       content: [{ type: 'text', text }],
-      source: { kind: 'supermemory', form: 'notice', summary: 'SuperMemory 中枢分支概览' },
+      source: injectionSource(kind),
     })
   }
 
@@ -209,13 +216,13 @@ export function attachPreStep(
         if (!card && !branchesCard && !capabilityCard) return decision
         const appended = []
         if (card) {
-          const message = await build(card)
+          const message = await build(card, 'memory')
           // Code points, the same unit the card budget counts in.
           commitCard(state, step, items, charCount(card))
           appended.push(message)
         }
-        if (branchesCard) appended.push(await buildNotice(branchesCard))
-        if (capabilityCard) appended.push(await buildNotice(capabilityCard))
+        if (branchesCard) appended.push(await buildNotice(branchesCard, 'branch'))
+        if (capabilityCard) appended.push(await buildNotice(capabilityCard, 'capability'))
         return { ...decision, messages: [...messages, ...appended] }
       }
       // Tool continuation: requirement A repeat path.
@@ -241,7 +248,7 @@ export function attachPreStep(
         commitScan(state, step)
         return decision
       }
-      const message = await build(text)
+      const message = await build(text, 'memoryRepeat')
       commitCard(state, step, items, charCount(text))
       return { ...decision, messages: [...messages, message] }
     } catch (error) {

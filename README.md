@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的跨会话记忆插件：把「结论性事实、话题集、派发归档、固化能力」持久化到存储域，让中枢/分支会话协同工作跨会话可续、可追溯、可召回。
 
-- **包名**：`dsh-supermemory`　**版本**：`1.3.4`（最新 Release，tag `v1.3.4`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
+- **包名**：`dsh-supermemory`　**版本**：`1.3.5`（最新 Release，tag `v1.3.5`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
 - **宿主要求**：DSH `>=0.2.0 <0.3.0`（见 `package.json` 的 `engines.dsh`）
 - **产物形态**：ESM。宿主半边 `lib/supermemory.js`，浏览器半边 `lib/client.js`（DSH 侧边栏/主区面板）
 - **存储**：DSH `storageDomain` 域 `supermemory`（version 1），表定义集中在 `src/schema.ts`；所有业务表按工作区隔离（`workspaceKey`，决策 D4）
@@ -40,23 +40,28 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 
 `/memory` 带子命令，每个子命令也可直接输 `/memory-<名>`：`ui`（管理台）· `status`（状态总览）· `topicsets` · `switch` · `new` · `model` · `tools`（能力：知识面 + 执行面）· `reqs`（未完成需求）· `resume`（续跑）· `wrap`（话题集梗概）· `scan` · `export` · `titles`（标题补正）· `merge`（话题集合并治理）· `organize`（记忆集合整理）· `help`。
 
-### 2.3 上下文注入卡标题（R56）
+### 2.3 上下文注入卡标题（R56 / R57）
 
-每张注入到模型上下文的卡片都以统一的方括号标题开头，标题**只能**来自 `src/injection-titles.ts`（渲染处禁止手写标题字符串）：
+每张注入到模型上下文的卡片有**两层**可见名字，都来自同一条注册项 `src/injection-titles.ts`（渲染处禁止手写名字）：
 
-| 卡 | 标题 | 何时出现 |
-|---|---|---|
-| 相关话题 | `[supermemory-相关话题]` | 激活/命中话题集时的上下文卡 |
-| 相关话题候选 | `[supermemory-相关话题候选]` | 关键词命中但**不切换**的提示卡（相关话题族子卡） |
-| 相关记忆 | `[supermemory-相关记忆]` | 每个请求开头的召回卡 |
-| 相关记忆补充 | `[supermemory-相关记忆补充]` | 同一请求内后来发现的相关记忆 |
-| 相关分支会话 | `[supermemory-相关分支会话]` | 中枢的关联分支 + 命中话题集的分支清单 |
-| 相关能力 | `[supermemory-相关能力]` | 中枢/分支会话的固化能力精简索引 |
-| 中枢角色提示 | `[supermemory-hub-role]` | 中枢会话的角色提示（功能性卡） |
-| 插件提示 | `[supermemory-plugin-prompt]` | 记忆使用约定（功能性卡） |
-| 中断公告 | `[supermemory-notice]` | 重启后发现被中断任务（功能性卡） |
+1. **卡片标题**（GUI 折叠行「上下文注入 **<label>**」的 label）：注入消息的 `source.kind` = `injectionLabel(kind)`，由 `injectionSource(kind, form?)` 统一构造（`src/source.ts`）。DSH 的 Chat 行把 `source.kind` 直接当 label 渲染，所以不同 kind = 不同卡片标题。
+2. **内容首行标题**：`[<label>]` = `injectionTitle(kind)`。
 
-**命名约定**：相关内容类用 `supermemory-相关<主题>`；功能性卡用 `supermemory-<功能>`（小写 kebab）。**新增注入卡四步**：① 在注册表登记常量与 kind；② 渲染处只调用 `injectionTitle(kind)`；③ 补断言（精确标题 + 约定正则 + 旧标题归零）；④ 在 DEV-NOTES 写一节。
+| 卡 | 卡片标题（label / source.kind） | 内容首行 | 何时出现 |
+|---|---|---|---|
+| 相关话题 | `supermemory-相关话题` | `[supermemory-相关话题]` | 激活/命中话题集时的上下文卡 |
+| 相关话题候选 | `supermemory-相关话题候选` | `[supermemory-相关话题候选]` | 关键词命中但**不切换**的提示卡（相关话题族子卡） |
+| 相关记忆 | `supermemory-相关记忆` | `[supermemory-相关记忆]` | 每个请求开头的召回卡 |
+| 相关记忆补充 | `supermemory-相关记忆补充` | `[supermemory-相关记忆补充]` | 同一请求内后来发现的相关记忆 |
+| 相关分支会话 | `supermemory-相关分支会话` | `[supermemory-相关分支会话]` | 中枢的关联分支 + 命中话题集的分支清单 |
+| 相关能力 | `supermemory-相关能力` | `[supermemory-相关能力]` | 中枢/分支会话的固化能力精简索引 |
+| 中枢角色提示 | `supermemory-hub-role`¹ | `[supermemory-hub-role]` | 中枢会话的角色提示（功能性卡） |
+| 插件提示 | `supermemory-plugin-prompt`¹ | `[supermemory-plugin-prompt]` | 记忆使用约定（功能性卡） |
+| 中断公告 | `supermemory-notice`¹ | `[supermemory-notice]` | 重启后发现被中断任务（功能性卡） |
+
+¹ 这三项是 systemPrompt / relay 卡，不出现在宿主的「上下文注入 <label>」折叠行（relay 卡由插件自己的客户端卡片渲染），注册表仍统一持有它们的名字。
+
+**命名约定**：相关内容类用 `supermemory-相关<主题>`；功能性卡用 `supermemory-<功能>`（小写 kebab）。**新增注入卡四步**：① 在注册表登记常量与 kind；② 渲染处 `injectionTitle(kind)` 出首行、`injectionSource(kind)` 出 source；③ 补断言（精确 label + source.kind + 约定正则 + 旧标题归零）；④ 在 DEV-NOTES 写一节。
 
 **例外**：`[supermemory-relay <id>]` / `[supermemory-group-relay <id>]` / `[supermemory-dispatch <id>]` / `[supermemory-resume <id>]` / `[supermemory-questions]` / `[supermemory-panel-reply]` / `[supermemory-topic-set]` 是会话间传输的**消息头**（携带 id、relay 管线解析），不属于注入卡，不要改名。
 

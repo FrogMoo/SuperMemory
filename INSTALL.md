@@ -45,13 +45,13 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 ### 1. 下载并解压 Release 包
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.4.zip`）；
+- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.5.zip`）；
 - 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
 
 解压到任意**无空格、无中文**的路径，例如：
 
-- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.4`
-- macOS/Linux：`~/Apps/dsh-supermemory-1.3.4`
+- Windows：`C:\Users\<你>\Apps\dsh-supermemory-1.3.5`
+- macOS/Linux：`~/Apps/dsh-supermemory-1.3.5`
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
@@ -84,6 +84,15 @@ node scripts/install-into-dsh.mjs
 ## 升级
 
 下载新版本 Release 包 → 解压到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向更新到新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
+
+### 升级到 1.3.5 后要做什么（R57：注入卡折叠标题按内容区分）
+
+1. **完全退出并重启 DSH Desktop**（不是禁用/启用插件，也不是刷新窗口）——卡片标题由消息 `source.kind` 决定，只有新注入的消息才带新 label。
+2. **卡片标题（折叠行）现在按内容区分**：应分别看到「上下文注入 **supermemory-相关记忆**」「上下文注入 **supermemory-相关话题**」「上下文注入 **supermemory-相关分支会话**」「上下文注入 **supermemory-相关能力**」；同族还有「上下文注入 **supermemory-相关话题候选**」与「上下文注入 **supermemory-相关记忆补充**」。
+3. **内容首行不变**：仍是 `[supermemory-相关记忆]` 等 R56 标题（与卡片标题同一注册项，无两套名字）。
+4. **分支卡不再追加「SuperMemory 中枢分支概览」**：折叠行只显示 label；展开仍是完整分支清单。
+5. **历史消息**：升级前已写入的注入卡仍显示旧的「上下文注入 supermemory」（不改写历史日志）；relay 消息头（`[supermemory-relay …]` 等）与 relay 卡片保持原样。
+6. 本版无存储结构变更、无行为变更；回滚只需重装旧版包并重启。
 
 ### 升级到 1.3.4 后要做什么（R56：注入卡标题统一）
 

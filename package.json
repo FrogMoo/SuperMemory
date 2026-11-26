@@ -1,6 +1,6 @@
 {
   "name": "dsh-supermemory",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与统一能力（知识面 SKILL.md + 执行面 sm_cap_*）。",
   "private": true,
   "license": "UNLICENSED",

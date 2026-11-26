@@ -384,10 +384,16 @@ for (const descriptor of mountedDescriptors) {
     'the delegated node reaches the shipped view unchanged (node.data.content)')
 
   // Goal / schedule trigger cards and context injections delegate with `t`.
+  // R57: our injection cards now carry one registered label as source.kind
+  // (the host renders `上下文注入 <label>`); the plugin's chat card must still
+  // delegate those rows to the shipped injection renderer, never swallow them.
   for (const [key, cell, source] of [
     ['turn-trigger', triggerCell, { kind: 'goal' }],
     ['turn-trigger', triggerCell, { kind: 'schedule' }],
     ['context', contextCell, { kind: 'supermemory', form: 'recall' }],
+    ['context', contextCell, { kind: 'supermemory-相关记忆', form: 'recall' }],
+    ['context', contextCell, { kind: 'supermemory-相关分支会话' }],
+    ['context', contextCell, { kind: 'supermemory-相关能力' }],
     ['steering', steeringCell, { kind: 'user' }],
   ]) {
     const env = cell.entry.options.inject().smCardEnv

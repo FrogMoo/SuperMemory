@@ -4307,3 +4307,152 @@ R56-4 把这份白名单写进断言：渲染处除这 7 类传输前缀外，�
 
 
 
+
+## 70. R57：上下文注入卡的卡片标题（宿主「上下文注入 <label>」）按内容区分 + v1.3.5 发布轮（2026-11-26）
+
+### 70.1 需求与根因
+
+R56 统一的是**卡片内容首行**（`[supermemory-相关记忆]` 等）。用户在 GUI 里看到的折叠标题却只有两种：
+
+```
+上下文注入 supermemory
+上下文注入 supermemory · SuperMemory 中枢分支概览
+```
+
+原因是宿主的折叠行标题由**消息 source 的 kind** 决定，而本插件所有注入卡都把 `source.kind` 写成笼统的 `supermemory`；「中枢分支概览」是那张 notice 卡的 `source.summary`，被宿主追加在 label 之后。所以 R56 的改名对 GUI 卡片标题完全不可见。
+
+R57 的落法：**每类注入的 `source.kind` = 该卡的注册 label**，卡片标题即「上下文注入 <label>」；内容首行仍是 `[<label>]` ——两者同一条注册项、同一个 kind（同源，不维护两套名字）。不修改 DSH asar。
+
+### 70.2 宿主证据（DSH 0.2.2 产物，文件:行）
+
+以下证据取自运行中的 `app.asar` 内 `@deepseek-ai/dsh-client-ui-chat` 包（该包同时携带 `src/`，行号可核对）：
+
+| 位置 | 事实 |
+|---|---|
+| `src/client/conversation-nodes/event-projection.ts:60-76` | `contextProducer(source)`：`default: return { role: 'inject', label: kind }`——宿主注释写明「MessageSourceMap is merge-extensible; keep an unknown producer visible by its durable kind」，即 **label 就是 source.kind**。只有 `session-reference` / `agent-instructions` / `skill-invocation` 三种已知 kind 会换成别的 label。 |
+| `src/client/conversation-nodes/event-projection.ts:38-53` | `KNOWN_FORMS` = instructions / catalog / snapshot / notice / relay / recall；未知 form 退化为 opaque 呈现。 |
+| `src/client/chat/ContextInjectionRow.tsx:57` | 折叠行 `title` 固定为 locale 文案——role `recall` → `message.contextRecall`，否则 `message.contextInjection`；卡与卡之间**只有 label 段不同**。 |
+| `src/client/chat/ContextInjectionRow.tsx:63` | `producer.label === null` 时不渲染来源段；kind 是字符串就一定有 label。 |
+| `src/client/chat/ContextInjectionRow.tsx:69` | `<span data-context-source>{producer.label}</span>`——GUI 标题里的「supermemory」就是 `source.kind`。 |
+| `src/client/chat/ContextInjectionRow.tsx:70-73` | 仅当 `contextBody` 给出 `summary`（即 `form='notice'` 且 `source.summary` 非空）才追加第二段——旧「SuperMemory 中枢分支概览」即此段。 |
+| `src/client/locale.ts:141` | `'message.contextInjection': '上下文注入'`（其余语种同键）。 |
+
+结论：
+
+1. **宿主支持任意 label**（merge-extensible，默认按 durable kind 显示），因此「不同注入用不同卡片标题」= 不同 `source.kind`，**不需要改 DSH asar**，也不需要把 label 编码进 metadata/summary。
+2. `summary` 只对 `form='notice'` 生效，且受限 120 字（`CONTEXT_SUMMARY_MAX_CHARS`）；R57 把分支/能力卡改为纯 label source（无 form、无 summary），折叠标题只显示 label。
+3. 宿主产物对整个 `app.asar` grep `supermemory` = **0**：宿主没有对本插件的任何特判，我们只借用合并扩展点。
+4. `createUserMessage`（`@deepseek-ai/dsh-llm` `src/message.ts:246`）不做 source.kind 白名单校验，任意注册 kind 都能落库并原样投影到 GUI。
+
+### 70.3 两层命名与注册表
+
+| 层 | 产物 | 来源 |
+|---|---|---|
+| 卡片标题（宿主折叠行） | 「上下文注入 **<label>**」 | 消息 `source.kind` = `injectionLabel(kind)`（`injectionSource` 构造） |
+| 内容首行标题 | `[<label>]` | `injectionTitle(kind)` |
+
+注册表 `src/injection-titles.ts`：
+
+| 位置 | 内容 |
+|---|---|
+| `src/injection-titles.ts:1` | 模块注释：两层命名 + 宿主证据 + 命名约定 + relay 例外 |
+| `src/injection-titles.ts:52` | `INJECTION_TITLES`：9 个 kind 的裸名（卡片 label） |
+| `src/injection-titles.ts:77` | `InjectionLabel`：裸名联合类型 |
+| `src/injection-titles.ts:80` | `INJECTION_LABEL_PATTERN`：`^supermemory-(相关.+|[a-z][a-z-]*)` + `$`（裸名，无方括号） |
+| `src/injection-titles.ts:83` | `INJECTION_TITLE_PATTERN`：带方括号的约定正则 |
+| `src/injection-titles.ts:91` | **新增** `injectionLabel(kind)`：卡片 label（= `source.kind`） |
+| `src/injection-titles.ts:96` | `injectionTitle(kind)`：`'[' + label + ']'`（内容首行） |
+| `src/injection-titles.ts:101` | `injectionTitles()`：每行带 `kind / label / title` |
+
+source 构造 `src/source.ts`：
+
+| 位置 | 内容 |
+|---|---|
+| `src/source.ts:37-41` | 九个 label 作为 `MessageSourceMap` 的合并扩展项（`interface MessageSourceMap extends InjectionSourceMap`） |
+| `src/source.ts:60` | **新增** `injectionSource(kind, formed?)`：`{ kind: injectionLabel(kind), ...formed }`——注入 source 的唯一构造点 |
+
+### 70.4 新旧卡片标题对照
+
+| 注入 | 旧卡片标题（GUI 折叠行） | 新卡片标题 | 内容首行（R56，不变） |
+|---|---|---|---|
+| 相关记忆 | 上下文注入 supermemory | 上下文注入 **supermemory-相关记忆** | `[supermemory-相关记忆]` |
+| 相关记忆补充 | 上下文注入 supermemory | 上下文注入 **supermemory-相关记忆补充** | `[supermemory-相关记忆补充]` |
+| 相关话题 | 上下文注入 supermemory | 上下文注入 **supermemory-相关话题** | `[supermemory-相关话题]` |
+| 相关话题候选 | 上下文注入 supermemory | 上下文注入 **supermemory-相关话题候选** | `[supermemory-相关话题候选]` |
+| 相关分支会话 | 上下文注入 supermemory · SuperMemory 中枢分支概览 | 上下文注入 **supermemory-相关分支会话** | `[supermemory-相关分支会话]` |
+| 相关能力 | 上下文注入 supermemory · SuperMemory 中枢分支概览 | 上下文注入 **supermemory-相关能力** | `[supermemory-相关能力]` |
+| 中枢角色提示 | （systemPrompt，无折叠行） | 名字仍登记为 `supermemory-hub-role` | `[supermemory-hub-role]` |
+| 插件提示 | （systemPrompt，无折叠行） | 名字仍登记为 `supermemory-plugin-prompt` | `[supermemory-plugin-prompt]` |
+| 中断公告 | （relay 卡，由插件客户端卡片渲染） | 名字仍登记为 `supermemory-notice` | `[supermemory-notice]` |
+
+「SuperMemory 中枢分支概览」不是独立注入：它就是分支清单卡（`renderHubBranchesCard`）的 `source.summary`，与「相关分支会话」是同一张卡，所以归入同一条注册项 `supermemory-相关分支会话`，不再保留概览 summary。若将来拆出独立的概览卡，按同族规则登记 `supermemory-相关分支会话概览`。
+
+### 70.5 渲染接线（文件:行）
+
+| 位置 | 改动 |
+|---|---|
+| `src/prestep.ts:39` | import `injectionSource` |
+| `src/prestep.ts:103-107` | `build(text, kind)`：`injectionSource(kind, { form: 'recall' })` |
+| `src/prestep.ts:115-119` | `buildNotice(text, kind)`：`injectionSource(kind)`（无 form → 宿主不追加 summary 段） |
+| `src/prestep.ts:219` | 开场召回卡传 `'memory'` |
+| `src/prestep.ts:224 / 225` | 分支卡传 `'branch'`、能力索引卡传 `'capability'` |
+| `src/prestep.ts:251` | 过程内补充卡传 `'memoryRepeat'` |
+| `src/route.ts:62` | `RouteOutcome.cardKind`：卡片与 kind 一起返回 |
+| `src/route.ts:123 / 137 / 142` | 话题卡返回 `cardKind: 'topic'` |
+| `src/route.ts:164` | 候选提示卡返回 `cardKind: 'topicCandidate'` |
+| `src/route.ts:243-245` | source 按 kind 构造：`injectionSource('topic' \| 'topicCandidate', { form: 'recall' })` |
+
+旧实现两处被删：`prestep.ts` 的 `source: { kind: 'supermemory', form: 'notice', summary: 'SuperMemory 中枢分支概览' }` 与 `route.ts` 的 `source: { kind: 'supermemory', form: 'recall' }`。
+
+**不动的部分**：relay / 派发 / 续跑的消息传输头与它们的 `source.kind`（`observe.ts:226` 以 kind `supermemory` + `deliveryId` 确认投递；`chat-card.ts:80` 以 kind `supermemory` + form relay 识别插件卡片），以及 systemPrompt 形态的中枢角色提示/插件提示。
+
+历史消息不回写：升级前落库的消息 `source.kind='supermemory'`，GUI 仍显示「上下文注入 supermemory」。
+
+### 70.6 测试（R57-1 ~ R57-4）
+
+- **R57-1**（mechanism）：九类注入的卡片 label 精确匹配 `EXPECTED_LABELS`、彼此唯一、无方括号、匹配 `INJECTION_LABEL_PATTERN`；内容首行 = `'[' + label + ']'`。
+- **R57-2**（mechanism）：`injectionSource(kind).kind === injectionLabel(kind)`（九类）；`injectionSource('memory', { form: 'recall' })` 保留 form；分支卡 source 只有 label 一个键（无 summary 段）；召回/分支卡首行与 label 同源；四类 label 卡都不会被 `isDispatchInput` 认成派发输入。
+- **R57-3**（mechanism）：**注入调用参数**断言——`prestep.ts` 传 `build(card,'memory')` / `build(text,'memoryRepeat')` / `buildNotice(branchesCard,'branch')` / `buildNotice(capabilityCard,'capability')`，`route.ts` 传 `injectionSource('topic')` / `injectionSource('topicCandidate')`；两文件不得出现 `kind: 'supermemory'`；prestep 不得再声明 notice form。
+- **R57-4**（mechanism）：旧卡片标题段 `SuperMemory 中枢分支概览` 在 `src/`（ts/tsx）与 `lib/`（js）为 0；构建产物携带新 label。
+- 既有断言更新：R56-4 的构建产物断言改查 **label** 字面量（方括号标题在运行时拼接，bundle 里的持久字面量是 label）；R25-1 汇总行注明新卡用注册 label 作 kind；`client-sim-smoke` 的 context 委托用例增加 `supermemory-相关记忆` / `supermemory-相关分支会话` / `supermemory-相关能力` 三种 label-kind 行（插件卡片必须把它们交回宿主渲染，不得吞掉）。
+
+### 70.7 闸门（真跑）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；宿主 **13 文件 931.14 kB**（`lib/supermemory.js` 554.53 kB）；client `lib/client.js` 181.81 kB，wrap 后 **175717 B**。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **120** / webui **35** / client-sim `SIM SMOKE OK` / capability **20** 组 / workspace-scope **6** 组 / skill **27** 组。
+
+### 70.8 发布资产（release/ 本地生成，不入库）
+
+| 资产 | 字节 | sha256 |
+|---|---|---|
+| `dsh-supermemory-1.3.5.zip` | 2,036,091 | `4274748568cce1fab4288f6f1c10a7b0de33a153ed463e9fc5ed5f2e2219723e` |
+| `dsh-supermemory-1.3.5.tgz` | 821,554 | `28ac94e44f66c063ec64ccc0dccefec8a331257d106f753caf13d428fd89b945` |
+| `dsh-supermemory.tgz`（稳定别名） | 821,554 | 同上（字节一致） |
+
+- tgz（npm-pack 结构）：**97 条目**；`package/package.json`（version=1.3.5）、`package/lib/supermemory.js`、`package/lib/client.js`、`package/cordis.patch.yml` 齐全；**反斜杠路径 0**；`package/src/injection-titles.ts` 与 `package/src/source.ts` 已打包；`package/lib/model-*.js` 携带九个 label，旧 summary 字符串 0。
+- zip（手动安装）：**906 文件**（解压根目录 `dsh-supermemory-1.3.5/`）、`package.json`=1.3.5、`CHANGELOG.md` 含 `[1.3.5]`、`INSTALL.md` 含 1.3.5、`lib/supermemory.js` / `lib/client.js` / `cordis.patch.yml` / `scripts/install-into-dsh.mjs` 齐全、`node_modules/`（`@deepseek-ai` / `zod` / `@standard-schema`）内置；条目分隔符为反斜杠（Windows 手动安装专用，同前几版）。
+- 安装自检：临时空目录 `pnpm add F:/10-SuperMemory/release/dsh-supermemory-1.3.5.tgz` → exit 0，安装版本 **1.3.5**，`main=lib/supermemory.js`，`files=["lib","locale","src","cordis.patch.yml"]`，安装后的 `lib/model-*.js` 携带新 label。
+
+### 70.9 提交、tag 与双推（按 docs/git-sync.md）
+
+- 单条提交（R57 源码 + 测试 + 版本号 + CHANGELOG/README/INSTALL/DEV-NOTES + `lib/` 构建产物；`release/` 二进制按 `.gitignore` 不入库），提交信息写文件后 `git commit -F`。
+- 附注 tag `v1.3.5`（标注：v1.3.5 — R57 注入卡卡片标题按内容区分（source.kind = 注册 label））。
+- 双推 `pnpm git:sync`（GitHub 首位 + Gitee）推 main 与 tag；逐端核验 **main commit + tag 对象 SHA + tag 指向 commit** 三者一致。GitHub git 面被阻断时改用 `scripts/github-api-release.mjs` 走 API 补推与 Release。
+- Release：三资产（版本 zip、版本 tgz、稳定别名 tgz）上传，`state=uploaded`、`digest` 与本地 sha256 一致；核验 `/releases/latest` = v1.3.5、稳定 URL GET 200 且 sha256 一致；前端被阻断时按 docs/git-sync.md §12 用 `api.github.com` 资产端点并注明。v1.3.0–v1.3.4 的 tag 与 Release 资产不动。
+
+### 70.10 用户验收（必须完全退出并重启 DSH Desktop）
+
+1. 普通会话问一句与历史结论相关的话：折叠行应显示「上下文注入 **supermemory-相关记忆**」；同一请求内后补的卡显示「上下文注入 **supermemory-相关记忆补充**」。
+2. 激活/命中话题集：折叠行「上下文注入 **supermemory-相关话题**」；只提示不切换的候选卡「上下文注入 **supermemory-相关话题候选**」。
+3. 中枢会话派发过分支后：「上下文注入 **supermemory-相关分支会话**」（不再有「SuperMemory 中枢分支概览」段）；能力目录非空时另有「上下文注入 **supermemory-相关能力**」。
+4. 展开任意一张卡：内容首行仍是 R56 的 `[supermemory-…]` 标题（与折叠行同源）。
+5. 历史会话里的旧注入卡仍显示「上下文注入 supermemory」，属正常（不回写历史）。
+
+### 70.11 剩余风险
+
+- 卡片标题由 `source.kind` 决定：仓库外若有脚本按 `source.kind === 'supermemory'` 识别本插件的**注入卡**，升级后会漏判（relay/派发消息的 kind 未变；本仓库内已归零）。
+- 历史消息不回写：同一会话里会同时出现旧「上下文注入 supermemory」与新 label 两种折叠行，属预期。
+- label 是自由字符串：宿主不校验 kind，拼错只会显示错标题而不报错——R57-2/3 的注册表 + 调用参数断言就是防线。
+- R57-3 的调用参数扫描是源码静态闸门，只覆盖本仓库；宿主的渲染行为由 DSH 版本决定（本版核验于 0.2.2-rc.3，宿主源码即使变化也只会影响 label 的呈现方式，不影响我们落库的 kind）。
+

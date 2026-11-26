@@ -13,6 +13,7 @@ import type { UserMessage, createUserMessage as CreateUserMessage } from '@deeps
 import { loadHostModule } from './host.ts'
 import { clipWithNote } from './clip.ts'
 import { injectionTitle } from './injection-titles.ts'
+import { injectionSource } from './source.ts'
 import { tokenize } from './recall.ts'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
@@ -57,6 +58,8 @@ interface RouteOutcome {
   topicSetId?: string
   created?: string
   card?: string
+  /** R57: which registered card the `card` text is — the source label follows it. */
+  cardKind?: 'topic' | 'topicCandidate'
 }
 
 /** The session cwd of a pre-step payload's agent. */
@@ -117,7 +120,7 @@ export async function routeBatch(
         await setRouting(store, sessionId, { activeTopicSetId: id, driftCount: 0 })
         await touchTopicSet(store, id)
         if (deps.ctx) noteTopicSetActivated({ ctx: deps.ctx, store, logger: deps.logger }, id)
-        return { topicSetId: id, card: renderCard(getTopicSet(store, id)) }
+        return { topicSetId: id, card: renderCard(getTopicSet(store, id)), cardKind: 'topic' }
       }
     }
   }
@@ -131,12 +134,12 @@ export async function routeBatch(
       if (overlap >= config.driftThreshold) {
         await setRouting(store, sessionId, { driftCount: 0 })
         await touchTopicSet(store, routing.activeTopicSetId)
-        return { topicSetId: routing.activeTopicSetId, card: renderCard(active) }
+        return { topicSetId: routing.activeTopicSetId, card: renderCard(active), cardKind: 'topic' }
       }
       const drift = routing.driftCount + 1
       if (drift < config.driftTurns) {
         await setRouting(store, sessionId, { driftCount: drift })
-        return { topicSetId: routing.activeTopicSetId, card: renderCard(active) }
+        return { topicSetId: routing.activeTopicSetId, card: renderCard(active), cardKind: 'topic' }
       }
       // drifted for K consecutive turns → fall through to search
       await setRouting(store, sessionId, { driftCount: 0 })
@@ -158,6 +161,7 @@ export async function routeBatch(
   // the old `.slice(0, 80)` stopped mid-sentence and the hub could not tell.
   const lines = candidates.map((c) => `- 『${c.topicSet.title}』${c.topicSet.summary ? `：${clipWithNote(c.topicSet.summary, 80)}` : ''}`)
   return {
+    cardKind: 'topicCandidate',
     card: [
       injectionTitle('topicCandidate'),
       '检测到可能与当前对话相关的历史话题（未切换，当前对话继续）：',
@@ -234,9 +238,14 @@ export function attachRoute(ctx: Context, deps: RouteDeps): () => void {
       const outcome = await routeBatch(ctx, deps, payload.agent, sessionId, text, payload.signal)
       if (!outcome.card) return decision
       const factory = await ensureFactory()
+      // R57: the card label (host 「上下文注入 <label>」) names the card the same
+      // way its first line does — the registered kind, not a generic kind.
+      const cardSource = outcome.cardKind === 'topicCandidate'
+        ? injectionSource('topicCandidate', { form: 'recall' })
+        : injectionSource('topic', { form: 'recall' })
       const card = factory({
         content: [{ type: 'text', text: outcome.card }],
-        source: { kind: 'supermemory', form: 'recall' },
+        source: cardSource,
       })
       return { ...decision, messages: [...decision.messages, card] }
     } catch (error) {
