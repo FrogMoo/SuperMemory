@@ -40,3 +40,7 @@ release/dsh-supermemory-*/
 release/*.zip
 release/*.tgz
 release/*.tar.gz
+
+# npm 凭据：含 //registry.npmjs.org/:_authToken，禁止入库
+.npmrc
+.npmrc.*
