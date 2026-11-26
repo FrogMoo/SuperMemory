@@ -105,6 +105,7 @@ DSH 会话默认是「一次性」的：上一次对话得出的结论、派发�
 │   └── web/                    # 管理台静态资源：app.js（vanilla JS）、style.css、index.html
 ├── docs/
 │   ├── git-sync.md             # git 同步/提交/推送流程（双远程、凭据、坑与退出码）
+│   ├── release.md              # 发布流程（source-only：只保留 GitHub 自动生成的源码归档）
 │   └── notes/                  # 历史轮次设计/复盘笔记（4 篇）
 ├── scripts/
 │   ├── *-smoke.mjs             # 7 套冒烟：core / mechanism / webui / client-sim / capability / workspace-scope / skill
@@ -148,14 +149,21 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
 
 ## 5. 在 DSH 中安装与重载
 
-### 5.1 用户安装（DSH 插件面板 / Release，推荐）
+### 5.1 用户安装（DSH 插件面板 / 本地包，推荐）
 
-普通用户**不需要克隆仓库、不需要构建**，两种方式任选：
+- **DSH 插件面板（推荐，安装 main 最新源码）**：在「插件 → 安装插件」填 Git 仓库地址
+  `https://github.com/FrogMoo/SuperMemory`。DSH 安装器接受 `kind=git`，会 clone 默认分支并安装；
+  **不要填**裸 `FrogMoo/SuperMemory`（会被当成 npm 包名）、Release 页面 URL 或 `.zip` 资产。
+- **本地安装包（本机/离线/内网）**：在克隆的仓库里执行 `pnpm install && pnpm build && pnpm package-release`，
+  然后在插件面板填本地 `.tgz` 绝对路径（例如 `F:\10-SuperMemory\release\dsh-supermemory.tgz`）；
+  或解压 `release/dsh-supermemory-<版本>.zip` 后执行 `node scripts/install-into-dsh.mjs`。
+  这些本地包内置 `lib/` 与生产依赖 `node_modules/`，安装无需外网。
+- **GitHub Release 只提供源码归档**：`Source code (zip)` / `Source code (tar.gz)` 由 GitHub
+  按 tag 自动生成，**不是可安装的插件包**（不含生产依赖，需自行构建）。仓库自建的
+  `dsh-supermemory*.zip/tgz` 从下一个发布版本起不再随 Release 发布；旧版（≤ v1.3.5）资产仍保留，
+  但旧版安装文档里的稳定 tgz 直链从下个版本起会 404，不要再用它作为安装入口。
 
-- **DSH 插件面板（需能访问 GitHub）**：在「插件 → 安装插件」填 `https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz`（稳定 tgz 别名），或填 Git 仓库地址 `https://github.com/FrogMoo/SuperMemory`。**不要填** release 页面 URL 或 `.zip` 资产——DSH 安装器只接受 git 仓库或 `.tgz/.tar.gz` 直链。
-- **手动 Release 包（离线/内网）**：到 [GitHub Releases](https://github.com/FrogMoo/SuperMemory/releases)（或仓库 `release/` 目录）下载 `dsh-supermemory-<版本>.zip`，解压后进入目录执行 `node scripts/install-into-dsh.mjs`，重启 DSH Desktop。发布包内置 `lib/` 与生产依赖 `node_modules/`，安装无需外网。
-
-完整规则、升级与卸载见 [INSTALL.md](INSTALL.md)。
+完整规则、升级与卸载见 [INSTALL.md](INSTALL.md)；发布流程见 [docs/release.md](docs/release.md)。
 
 ### 5.2 开发期安装（源码工作区）
 
@@ -197,6 +205,7 @@ pnpm git:sync             # 工作区检查 → fetch → rebase（behind>0 时�
 **docs/ 目录**：
 
 - [docs/git-sync.md](docs/git-sync.md) —— git 同步/提交/推送全流程：一键入口、脚本关系、坑与规避（含凭据双键、Gitee 恢复时间线）、安全约束与退出码、提交前闸门、实测记录；
+- [docs/release.md](docs/release.md) —— 发布流程：source-only Release（只保留 GitHub 自动生成的 Source code zip/tar.gz）、附注 tag、双推、源码归档校验、本地安装包与旧 URL 退场；
 - [docs/notes/2026-11-18-branch-session-persistence.md](docs/notes/2026-11-18-branch-session-persistence.md) —— 分支会话重启保留；
 - [docs/notes/2026-11-18-capability-maintenance.md](docs/notes/2026-11-18-capability-maintenance.md) —— 固化能力持续维护；
 - [docs/notes/2026-11-18-workspace-isolation.md](docs/notes/2026-11-18-workspace-isolation.md) —— 工作区隔离；

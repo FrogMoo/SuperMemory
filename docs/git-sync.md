@@ -203,7 +203,7 @@ git remote set-url --add --push origin http://zrynas.7766.org:8418/Zry/SuperMemo
 ## 6. 提交前闸门（提交 / 推送前必须全绿）
 
 1. `pnpm typecheck` —— 0 错；
-2. `pnpm smoke` —— core-smoke / mechanism-smoke / webui-smoke / client-sim-smoke 全绿（`pnpm smoke` 一次跑这四个；也可分别 `pnpm smoke:core` 等）；
+2. `pnpm smoke` —— 七套冒烟全绿（core / mechanism / webui / client-sim / capability / workspace-scope / skill；`pnpm smoke` 一次跑完，也可单独跑 `pnpm smoke:core` / `pnpm smoke:webui` / `pnpm smoke:skill` 或 `node scripts/<名>-smoke.mjs`）；
 3. 提交信息用**中文**写进文件，再 `git commit -F <文件>`（不要用 `-m` 传长消息，避免引号/换行问题）；
 4. 全部通过后，再跑 `pnpm git:sync` 推送。
 
@@ -342,7 +342,10 @@ git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一�
 2. `POST /git/trees`（`base_tree` = GitHub 侧父提交的 tree），tree SHA 与本地比对；
 3. `POST /git/commits`（message / author / committer 全部取自行对象原文），**commit SHA 与本地一致才继续**；
 4. `PATCH /git/refs/heads/main`（`force:false`，仅快进）；
-5. 需要时 `POST /git/tags` + `POST /git/refs`（tag 对象 SHA 与本地比对）、`POST /releases` + 上传发布包资产。
+5. 需要时 `POST /git/tags` + `POST /git/refs`（tag 对象 SHA 与本地比对）、`POST /releases`。
+   **默认 source-only**：只建/复用 Release 元数据，不上传自建资产（GitHub 自动生成
+   Source code zip/tar.gz）；旧的三资产上传只在显式 `--with-assets` 时执行
+   （内网/离线逃生口）。完整发布流程见 [release.md](release.md)。
 
 要点与坑（全部实测）：
 
@@ -351,6 +354,7 @@ git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一�
 - **SHA 逐级校验是防分叉的唯一手段**：任一级不一致立即中止，且校验通过前不写任何 ref——保证 GitHub 与本地永不产生分叉；
 - **只支持单提交快进**：GitHub main 必须恰好等于该提交的父提交；落后多个提交时逐个跑本脚本，或等网络恢复走 `pnpm git:sync`；
 - tag 必须用 `POST /git/tags` 建**附注 tag 对象**（与本地 annotated tag 同 SHA）；不要图省事用 Release 自动创建的轻量标签——否则以后本地推同名 tag 会冲突；
+- **Release 默认不传资产**（R58）：`POST /releases` 后即结束，`source-only` 模式不删除/替换该 Release 已有的自建资产；只有 `--with-assets` 才回到旧的三资产上传；
 - `execSync` 在 Windows 走 cmd.exe：`^` 是 cmd 转义符，`git rev-parse X^{tree}` 会被吃成 `X{tree}` 报 ambiguous argument；脚本用 `git rev-parse X:` 取 tree、`git log --format=%T/%P` 取 tree/parent，全程不用 `^` 与 `%a*`/`%c*` 日期格式。
 
 ### 11.3 v1.0.0 实测记录（2026-11-23）
@@ -364,16 +368,16 @@ git 传输走不通时，用 GitHub git data API 以 `base_tree` 重建**同一�
 
 网络恢复后 GitHub 半边自动回归 `pnpm git:sync` 正常路径，无需任何配置改动；本机 `~/.ssh/id_ed25519` 如需启用 SSH 备用通道，需先在 GitHub 账号 Settings → SSH keys 注册。
 
-## 12. GitHub 前端被阻断时的发布核验（2026-11-26，v1.3.1 轮）
+## 12. GitHub 前端被阻断时的发布核验（source-only，R58 起）
 
 ### 12.1 故障形态
 
 github.com 的**网页面/前端**（`https://github.com/...`，含 `releases/latest` 页面与
-`/releases/latest/download/<asset>` 稳定直链）与 `api.github.com` 是**两个独立的网络面**：
-前者可能连接超时/被重置，后者与 `uploads.github.com` 仍可达（与 §11.1 的 git 阻断同源）。
-表现：对稳定 URL 的 `HEAD`/`GET` 无响应或超时——**这不等于发布失败**，只是前端面不可达。
+`/archive/refs/tags/<tag>.zip|.tar.gz` 源码归档）与 `api.github.com` 是**两个独立的网络面**：
+前者可能连接超时/被重置，后者仍可达（与 §11.1 的 git 阻断同源）。
+表现：对前端 URL 的 `HEAD`/`GET` 无响应或超时——**这不等于发布失败**，只是前端面不可达。
 
-### 12.2 替代核验流程（API + 下载校验）
+### 12.2 替代核验流程（API + 源码归档）
 
 1. **取 latest 与资产清单**（token 从 GCM 取，不落盘）：
 
@@ -383,37 +387,45 @@ github.com 的**网页面/前端**（`https://github.com/...`，含 `releases/la
      https://api.github.com/repos/FrogMoo/SuperMemory/releases/latest
    ```
 
-   核对 `tag_name`（必须是 `vX.Y.Z`）、`assets[].name/size/digest`。GitHub 对上传资产返回
-   `digest: "sha256:<hex>"`，可直接与本地 `sha256sum release/<asset>` 比对。
+   核对 `tag_name`（必须是 `vX.Y.Z`）与 **`assets` 为空数组**：新版本默认 source-only，
+   不再上传自建 zip/tgz。若 `assets` 非空，说明误用了 `--with-assets` 或页面上传了文件。
+   v1.3.5 及以前的历史版本仍有自建资产，属历史保留，不要按新规则删除。
 
-2. **按 asset id 下载字节**（等价于稳定 URL 的字节，不经过前端）：
+2. **源码归档两个 URL**（等价于 Release 页面的 Source code zip/tar.gz）：
 
    ```bash
-   curl -sL -H "Authorization: Bearer $TOKEN" -H 'Accept: application/octet-stream' \
-     -o /tmp/dsh-supermemory.tgz \
-     https://api.github.com/repos/FrogMoo/SuperMemory/releases/assets/<asset-id>
-   sha256sum /tmp/dsh-supermemory.tgz
+   curl -L -o /tmp/sm-src.zip    https://github.com/FrogMoo/SuperMemory/archive/refs/tags/vX.Y.Z.zip
+   curl -L -o /tmp/sm-src.tar.gz https://github.com/FrogMoo/SuperMemory/archive/refs/tags/vX.Y.Z.tar.gz
+   ls -l /tmp/sm-src.zip /tmp/sm-src.tar.gz
+   unzip -l /tmp/sm-src.zip | head
+   tar -tzf /tmp/sm-src.tar.gz | head
    ```
 
-   注意 API 会 302 到 `objects.githubusercontent.com`，必须跟随重定向（`-L`）；该域若单独被阻断，
-   只能等网络恢复后回归前端 URL，或人工在 Release 页面下载。
+   记录 HTTP 状态、字节数、能否列出顶层文件（`package.json` / `README.md` / `lib/` / `src/`）。
+   **`node_modules/` 不应出现在归档里**——它是源码包，不是可安装插件包。
 
-3. **三方口径一致才算有效**：API 的 `digest` == 下载文件 sha256 == 本地 `release/` 同名字节 sha256；
-   同时 `assets` 含稳定别名 `dsh-supermemory.tgz`。
+   API 替代下载（前端不可达时）：`GET /repos/FrogMoo/SuperMemory/zipball/<tag>`（zip）与
+   `GET /repos/FrogMoo/SuperMemory/tarball/<tag>`（tar.gz），均需 `-L` 跟随 302。
 
-4. **tag 指向的 API 证据**（前端被阻断时仍可核）：
+3. **tag 指向的 API 证据**（前端被阻断时仍可核）：
 
    ```bash
    curl -s -H "Authorization: Bearer $TOKEN" https://api.github.com/repos/FrogMoo/SuperMemory/git/refs/tags/vX.Y.Z
    # object.sha = 附注 tag 对象；再取 /git/tags/<object.sha>，其 object.sha = 目标 commit
    ```
 
-5. **网络恢复后回归**：对稳定 URL 做 `HEAD`+`GET`，记录状态码、字节数、sha256、耗时；与 API 证据并列。
+4. **本地安装包（可选，不随 Release 发布）**：`release/` 下的 zip/tgz 只用于本地/离线安装；
+   可在本地做 `sha256sum` 自检，但**不要**把它与 Release assets 比对（新版本没有这些资产）。
+
+5. **网络恢复后回归**：对两个源码归档 URL 做 `HEAD`+`GET`，记录状态码、字节数、耗时；与 API 证据并列。
 
 ### 12.3 记录口径
 
-交付里同时写清：API 返回的 `tag_name` / 每资产 `digest` 与 `size` / 下载文件 sha256 与耗时；
-若前端可用再补 `HEAD`/`GET` 状态。**不要**因为 `HEAD` 失败就判定发布失败或重传资产——
-先验证 `api.github.com` 面，再决定是否需要重试前端。
+交付里写清：API 返回的 `tag_name` / `assets` 是否为空 / 两个源码归档的下载状态与字节数 /
+tag 对象与目标 commit。**不要**因为前端 `HEAD` 失败就判定发布失败或重传资产——
+先验证 `api.github.com` 面（latest、tag ref）与源码归档，再决定是否需要重试前端。
+
+旧稳定 URL `.../releases/latest/download/dsh-supermemory.tgz` 从下一个发布版本起会 404；
+这是 source-only 的预期结果，不是发布失败。
 
 

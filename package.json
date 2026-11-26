@@ -44,6 +44,7 @@
     "git:sync": "node scripts/git-sync-push.mjs",
     "install:dsh": "node scripts/install-into-dsh.mjs",
     "build": "tsdown && tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
+    "package-release": "node scripts/package-release.mjs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "build:host": "tsdown",
     "build:client": "tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",

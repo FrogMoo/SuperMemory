@@ -1,7 +1,14 @@
 #!/usr/bin/env node
 // github-api-release.mjs — GitHub 半边网络阻断（github.com:443 不通、api.github.com 通）
 // 时的补推工具：经 GitHub git/refs/releases API 把「本地单个已提交的提交」推到 GitHub，
-// 并可顺手创建 tag + Release + 上传发布包资产。
+// 并可创建附注 tag + Release。
+//
+// 发布资产策略（R58 起）：
+//   默认 **source-only**：只快进 main、建附注 tag、创建/复用 Release 元数据，
+//   不上传任何自建资产。GitHub 会按 tag 自动生成 Source code (zip) 与
+//   Source code (tar.gz) 两个源码归档——这两个包不是 DSH 可安装的插件包。
+//   需要旧行为（上传 release/dsh-supermemory-<版本>.zip/.tgz 与稳定别名）时，
+//   显式加 --with-assets（内网/离线镜像等逃生口；公开 Release 不要用）。
 //
 // 适用前提（缺一不可，否则脚本拒绝执行）：
 //   1) GitHub 侧 main 恰好等于该提交的父提交（单提交快进；多提交落后时请逐个提交跑，
@@ -12,18 +19,19 @@
 //   - 只快进（force:false），绝不 force；
 //   - blob/tree/commit/tag object 的 SHA 逐级与本地比对，任一不一致即中止，
 //     且在校验通过前不写任何 ref——保证 GitHub 与本地仓库永不产生分叉；
-//   - 令牌只从 GCM 读，不打印、不落盘。
+//   - 令牌只从 GCM 读，不打印、不落盘；
+//   - source-only 模式不删除、不替换 Release 上已有的自建资产。
 //
 // 用法：
-//   node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]
+//   node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file>]
 //   node scripts/github-api-release.mjs 4509e3c                                  # 只推提交
-//   node scripts/github-api-release.mjs 4509e3c --tag v1.0.0 --notes notes.md    # 提交+tag+Release
-//   node scripts/github-api-release.mjs --self-check --tag v1.3.1               # 离线自检（不触网/不读令牌）
-//                                                                                 # 资产默认释放 zip + tgz：
-//                                                                                 # release/dsh-supermemory-<版本>.zip
-//                                                                                 # release/dsh-supermemory-<版本>.tgz
-// 说明：DSH 插件面板只接受 git 仓库或 .tgz/.tar.gz 直链；zip 仅用于手动解压安装。
-// 退出码：0 成功 / 1 失败（含任一 SHA 校验不符）。
+//   node scripts/github-api-release.mjs 4509e3c --tag v1.0.0 --notes notes.md    # 提交+tag+Release（默认 source-only）
+//   node scripts/github-api-release.mjs 4509e3c --tag v1.0.0 --notes notes.md --with-assets [--asset <path>]...
+//                                                                                 # 旧行为：上传 zip/tgz/稳定别名
+//   node scripts/github-api-release.mjs --plan --tag v1.3.5                       # 离线打印发布计划（不触网/不读令牌）
+//   node scripts/github-api-release.mjs --self-check --tag v1.3.1                 # 离线自检（不触网/不读令牌）
+// 说明：发布流程与校验见 docs/release.md；GitHub Release 只保留自动生成的源码归档。
+// 退出码：0 成功 / 1 失败（含任一 SHA 校验不符、参数冲突）。
 // 背景与实测记录见 docs/git-sync.md §11。
 import { execFileSync, execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
@@ -54,33 +62,37 @@ const argv = process.argv.slice(2)
 // Offline self-check mode: proves the tag / commit-ish resolution path works on
 // this host without shell quoting (the R51 bug: cmd.exe ate '^' in X^{commit}).
 const selfCheckMode = argv.includes('--self-check') || argv.includes('--dry-run')
+// Offline plan mode: prints what the real run WOULD do (commit / tag / assets)
+// without touching the network or the GCM token. R58 uses its output in
+// core-smoke to pin "default = source-only, no asset upload".
+const planMode = argv.includes('--plan')
+// R58: public Releases are source-only (GitHub generates Source code zip/tar.gz).
+// --with-assets is the explicit escape hatch that restores the old three-asset
+// upload behavior for an internal/offline mirror.
+const withAssets = argv.includes('--with-assets')
 const commitish = argv[0]
-if (!selfCheckMode && (!commitish || commitish.startsWith('--'))) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file> [--asset <path>]...]')
 function argValue(name) { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined }
 const tagName = argValue('--tag')
-if (selfCheckMode) { selfCheck(tagName); process.exit(0) }
 const notesFile = argValue('--notes')
-const assetPaths = []
+const explicitAssets = []
 for (let i = 1; i < argv.length; i += 1) {
   if (argv[i] !== '--asset') continue
   const value = argv[i + 1]
   if (!value || value.startsWith('--')) fail('--asset 需要一个资产路径')
-  assetPaths.push(value)
+  explicitAssets.push(value)
   i += 1
 }
+
+if (planMode) { printPlan(); process.exit(0) }
+if (selfCheckMode) { selfCheck(tagName); process.exit(0) }
+if (!commitish || commitish.startsWith('--')) fail('用法: node scripts/github-api-release.mjs <commit-ish> [--tag <vX.Y.Z> --notes <file>] [--with-assets [--asset <path>]...]')
 if (tagName && !notesFile) fail('--tag 需要同时给 --notes <release 正文文件>')
-if (tagName && assetPaths.length === 0) {
-  const base = 'release/dsh-supermemory-' + tagName.replace(/^v/, '')
-  // Assets: the zip for manual unzip/install, the versioned tgz for auditing,
-  // and the version-less tgz that backs the stable
-  // /releases/latest/download/dsh-supermemory.tgz URL the docs give the panel.
-  assetPaths.push(base + '.zip', base + '.tgz', resolve(ROOT, 'release', 'dsh-supermemory.tgz'))
-}
-const releaseAssets = tagName === undefined
-  ? []
-  : assetPaths.map((path) => ({ path, file: resolve(ROOT, path), name: basename(path) }))
+if (withAssets && !tagName) fail('--with-assets 需要同时给 --tag <vX.Y.Z>（资产只随 Release 上传）')
+if (explicitAssets.length > 0 && !withAssets) fail('--asset 需要同时给 --with-assets（默认 source-only，不上传自建资产）')
+
+const releaseAssets = plannedAssetPaths().map((path) => ({ path, file: resolve(ROOT, path), name: basename(path) }))
 for (const asset of releaseAssets) {
-  if (!existsSync(asset.file)) fail('资产不存在: ' + asset.file + '（先跑 node scripts/package-release.mjs）')
+  if (!existsSync(asset.file)) fail('资产不存在: ' + asset.file + '（先跑 node scripts/package-release.mjs；该脚本产物仅用于本地/离线安装）')
 }
 
 // ---------- 令牌（GCM，不打印） ----------
@@ -236,7 +248,7 @@ if (newCommit.sha !== local.commit) fail('commit SHA 不一致，中止（未写
 await api('PATCH', '/repos/' + REPO + '/git/refs/heads/main', { sha: newCommit.sha, force: false })
 log('main 已快进到', newCommit.sha)
 
-// ---------- 5. tag + Release + 资产（可选） ----------
+// ---------- 5. tag + Release（默认 source-only；--with-assets 才传资产） ----------
 if (tag) {
   const tagObj = await api('POST', '/repos/' + REPO + '/git/tags', {
     tag: tag.name, message: tag.message, object: newCommit.sha, type: 'commit', tagger: tag.tagger,
@@ -249,7 +261,7 @@ if (tag) {
   const existing = await api('GET', '/repos/' + REPO + '/releases')
   let release = existing.find((r) => r.tag_name === tag.name)
   if (release) {
-    log('Release 已存在，复用:', release.html_url)
+    log('Release 已存在，复用（不更新正文/标题）:', release.html_url)
   } else {
     release = await api('POST', '/repos/' + REPO + '/releases', {
       tag_name: tag.name,
@@ -261,34 +273,80 @@ if (tag) {
     log('Release 已创建:', release.html_url)
   }
   const existingAssets = await api('GET', '/repos/' + REPO + '/releases/' + release.id + '/assets')
-  const uploading = new Set(releaseAssets.map((asset) => asset.name))
-  for (const a of existingAssets) {
-    if (uploading.has(a.name)) {
-      await api('DELETE', '/repos/' + REPO + '/releases/' + release.id + '/assets/' + a.id)
-      log('删除旧资产', a.name)
+  if (releaseAssets.length === 0) {
+    // Default policy (R58): create/reuse only Release metadata. GitHub serves
+    // the auto-generated Source code (zip / tar.gz) archives; nothing here is
+    // deleted or replaced, so old releases keep their historical assets.
+    if (existingAssets.length > 0) {
+      log('source-only：该 Release 已有 ' + existingAssets.length + ' 个自建资产，本模式不删除也不替换')
     }
-  }
-  for (const asset of releaseAssets) {
-    const content = readFileSync(asset.file)
-    const contentType = /\.(?:tgz|tar\.gz)$/i.test(asset.name) ? 'application/gzip' : 'application/zip'
-    const uploadUrl = release.upload_url.replace('{?name,label}', '?name=' + encodeURIComponent(asset.name))
-    const assetRes = await fetch(uploadUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: 'Bearer ' + token,
-        Accept: 'application/vnd.github+Json',
-        'Content-Type': contentType,
-        'User-Agent': 'sm-github-api-release',
-      },
-      body: content,
-    })
-    const assetJson = await assetRes.json()
-    if (!assetRes.ok) fail('资产上传失败 ' + asset.name + ' ' + assetRes.status + ' ' + JSON.stringify(assetJson).slice(0, 400))
-    log('资产已上传:', assetJson.name, (assetJson.size / 1024 / 1024).toFixed(2) + 'MB state=' + assetJson.state)
+    log('source-only：未上传自建资产；Release 只保留 GitHub 自动生成的 Source code (zip/tar.gz)')
+  } else {
+    log('with-assets：显式开启旧上传行为，准备上传 ' + releaseAssets.length + ' 个自建资产')
+    const uploading = new Set(releaseAssets.map((asset) => asset.name))
+    for (const a of existingAssets) {
+      if (uploading.has(a.name)) {
+        await api('DELETE', '/repos/' + REPO + '/releases/' + release.id + '/assets/' + a.id)
+        log('删除旧资产', a.name)
+      }
+    }
+    for (const asset of releaseAssets) {
+      const content = readFileSync(asset.file)
+      const contentType = /\.(?:tgz|tar\.gz)$/i.test(asset.name) ? 'application/gzip' : 'application/zip'
+      const uploadUrl = release.upload_url.replace('{?name,label}', '?name=' + encodeURIComponent(asset.name))
+      const assetRes = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + token,
+          Accept: 'application/vnd.github+Json',
+          'Content-Type': contentType,
+          'User-Agent': 'sm-github-api-release',
+        },
+        body: content,
+      })
+      const assetJson = await assetRes.json()
+      if (!assetRes.ok) fail('资产上传失败 ' + asset.name + ' ' + assetRes.status + ' ' + JSON.stringify(assetJson).slice(0, 400))
+      log('资产已上传:', assetJson.name, (assetJson.size / 1024 / 1024).toFixed(2) + 'MB state=' + assetJson.state)
+    }
   }
   log('完成。Release:', release.html_url)
 } else {
   log('完成（仅提交快进，未建 tag/Release）')
+}
+
+/**
+ * The legacy three-asset list: manual zip, versioned npm tarball, and the
+ * version-less alias. Only used when --with-assets is passed explicitly.
+ */
+function defaultAssetPaths(tag) {
+  const base = 'release/dsh-supermemory-' + tag.replace(/^v/, '')
+  return [base + '.zip', base + '.tgz', resolve(ROOT, 'release', 'dsh-supermemory.tgz')]
+}
+
+/** Assets the real run WOULD upload: none unless --with-assets is explicit. */
+function plannedAssetPaths() {
+  if (!tagName || !withAssets) return []
+  return explicitAssets.length > 0 ? explicitAssets : defaultAssetPaths(tagName)
+}
+
+/** Offline plan output (no network, no GCM token); pinned by R58 tests. */
+function printPlan() {
+  const commitLabel = commitish && !commitish.startsWith('--') ? commitish : '(未指定；真实执行时必需)'
+  log('plan（离线；不触网、不读令牌）:')
+  log('  commit-ish =', commitLabel)
+  log('  tag        =', tagName || '(无：只快进 main)')
+  log('  notes      =', notesFile || '(无)')
+  if (!tagName) {
+    log('  release    = commit-only（不建 tag/Release）')
+    log('  assets     = none')
+  } else if (!withAssets) {
+    log('  release    = source-only（默认；只建/复用 Release 元数据，不上传自建资产）')
+    log('  assets     = none')
+  } else {
+    log('  release    = with-assets（显式逃生口：旧行为，上传自建资产）')
+    log('  assets     = ' + plannedAssetPaths().map((path) => basename(path)).join(', '))
+  }
+  log('  提示       = Release 只保留 GitHub 自动生成的 Source code 源码归档；本地包见 docs/release.md')
 }
 
 /**

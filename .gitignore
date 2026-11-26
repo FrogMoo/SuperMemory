@@ -34,7 +34,8 @@ lib/dev-*.js
 .dsh/capabilities-archive/
 .dsh/r48-delayed-cleanup-*.json
 
-# release binaries are uploaded as Release assets, not committed (scripts/package-release.mjs)
+# local-only release artifacts: never committed and (since R58) never uploaded to Releases;
+# GitHub serves the auto-generated Source code zip/tar.gz instead (scripts/package-release.mjs)
 release/dsh-supermemory-*/
 release/*.zip
 release/*.tgz

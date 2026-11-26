@@ -1222,50 +1222,107 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   ok('R44-1 面板页签结构：中枢页签去掉两张管理卡 + 新增「分支会话」页签（跨话题集/筛选/搜索/沿用行交互）+ 记忆页签去掉增加入口（i18n 同步清理）+ 页签顺序断言')
 }
 
-// ---- R46: release artifacts the DSH plugin panel can actually install ----
-// The host's installer reads a spec as registry name / git repository /
-// .tgz-or-.tar.gz URL or path; it never queries GitHub Releases and refuses a
-// release page or a .zip asset. The release tooling must keep producing an
-// npm-pack tarball (and a version-less alias) next to the manual zip, and the
-// docs must point users at an accepted input.
+// ---- R58: Release is source-only (GitHub-generated archives, no custom assets) ----
+// GitHub auto-generates Source code (zip/tar.gz) for every published Release;
+// uploading our own zip/tgz duplicates those archives and keeps the old stable
+// URL alive. R58 makes source-only the default in the release tooling, keeps
+// --with-assets as an explicit internal/offline escape hatch, and moves the
+// panel install path to the git repository or a locally built .tgz.
 {
-  const { readFileSync } = await import('node:fs')
+  const { existsSync, readFileSync } = await import('node:fs')
+  const { spawnSync } = await import('node:child_process')
   const pkg = JSON.parse(readFileSync('package.json', 'utf8'))
   const packSrc = readFileSync('scripts/package-release.mjs', 'utf8')
   const ghSrc = readFileSync('scripts/github-api-release.mjs', 'utf8')
   const installDoc = readFileSync('INSTALL.md', 'utf8')
   const readme = readFileSync('README.md', 'utf8')
+  const releaseDoc = readFileSync('docs/release.md', 'utf8')
+  const gitSyncDoc = readFileSync('docs/git-sync.md', 'utf8')
+  const planOf = (...args) => spawnSync(process.execPath, ['scripts/github-api-release.mjs', ...args], { encoding: 'utf8' })
 
-  assert.ok(packSrc.includes("'pack', '--pack-destination'"),
-    'R46①: package-release builds an npm-pack tarball (pnpm pack) beside the zip')
-  assert.ok(packSrc.includes('package/lib/supermemory.js') && packSrc.includes('package/cordis.patch.yml'),
-    'R46①: the tarball layout is validated against package/ root files')
-  assert.ok(packSrc.includes("'dsh-supermemory.tgz'"),
-    'R46①: a version-less dsh-supermemory.tgz alias is produced for the stable latest URL')
-  assert.ok(packSrc.includes('String.fromCharCode(92)'),
-    'R46①: backslash tar entries are rejected (portable archive)')
-  assert.ok(packSrc.includes("'--tarball-only'") && packSrc.includes("'--out'"),
-    'R46①: a dry-run mode can rebuild only the tarball without touching the manual zip')
+  // R58①: the default plan is source-only and lists no uploadable assets.
+  const plan = planOf('--plan', '--tag', 'v9.9.9')
+  assert.equal(plan.status, 0, 'R58①: --plan runs offline and exits 0: ' + plan.stderr)
+  assert.match(plan.stdout, /release\s*=\s*source-only/, 'R58①: default plan says source-only')
+  assert.match(plan.stdout, /assets\s*=\s*none/, 'R58①: default plan uploads no assets')
+  assert.ok(!/dsh-supermemory-[0-9]/.test(plan.stdout), 'R58①: default plan names no dsh-supermemory asset')
+  assert.ok(ghSrc.includes("argv.includes('--with-assets')"), 'R58①: --with-assets is parsed explicitly')
+  assert.ok(ghSrc.includes('if (releaseAssets.length === 0)'), 'R58①: an empty asset list is a real branch (no upload loop)')
+  assert.ok(ghSrc.includes('source-only：未上传自建资产'), 'R58①: the run log states source-only explicitly')
 
-  assert.ok(ghSrc.includes("base + '.zip', base + '.tgz'"),
-    'R46②: the release uploader uploads both the manual zip and the panel tgz')
-  assert.ok(ghSrc.includes("'release', 'dsh-supermemory.tgz'"),
-    'R46②: the stable alias is uploaded with each release')
-  assert.ok(ghSrc.includes("'application/gzip'"),
-    'R46②: the tgz asset is uploaded with a tarball content type')
+  // R58②: --with-assets still restores the old three-artifact behavior.
+  const withPlan = planOf('--plan', '--tag', 'v9.9.9', '--with-assets')
+  assert.equal(withPlan.status, 0, 'R58②: --with-assets --plan exits 0: ' + withPlan.stderr)
+  assert.match(withPlan.stdout, /release\s*=\s*with-assets/, 'R58②: the escape hatch is visible in the plan')
+  for (const name of ['dsh-supermemory-9.9.9.zip', 'dsh-supermemory-9.9.9.tgz', 'dsh-supermemory.tgz']) {
+    assert.ok(withPlan.stdout.includes(name), 'R58②: --with-assets plan still lists ' + name)
+  }
+  const conflict = spawnSync(process.execPath, ['scripts/github-api-release.mjs', 'HEAD', '--tag', 'v9.9.9', '--notes', 'x', '--asset', 'x'], { encoding: 'utf8' })
+  assert.equal(conflict.status, 1, 'R58②: --asset without --with-assets is rejected')
+  assert.match(conflict.stderr, /--with-assets/, 'R58②: the rejection tells the user about --with-assets')
 
-  const stableUrl = 'https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz'
-  assert.ok(installDoc.includes(stableUrl), 'R46③: INSTALL documents the stable panel tarball URL')
-  assert.ok(readme.includes(stableUrl), 'R46③: README documents the stable panel tarball URL')
+  // R58③: docs no longer instruct anyone to install from the old stable URL.
+  const oldStable = 'releases/latest/download/dsh-supermemory.tgz'
+  for (const [name, text] of [['README.md', readme], ['INSTALL.md', installDoc]]) {
+    assert.ok(!text.includes(oldStable), 'R58③: ' + name + ' no longer contains the old stable URL at all')
+  }
+  for (const [name, text] of [['docs/release.md', releaseDoc], ['docs/git-sync.md', gitSyncDoc]]) {
+    let from = 0
+    for (;;) {
+      const at = text.indexOf(oldStable, from)
+      if (at < 0) break
+      const around = text.slice(Math.max(0, at - 160), at + oldStable.length + 160)
+      assert.match(around, /404|失效|不再|旧的?|替代/, 'R58③: ' + name + ' mentions the old stable URL only as deprecated')
+      from = at + oldStable.length
+    }
+  }
+  assert.ok(!/填[^`\n]*`[^`]*releases\/latest\/download\/dsh-supermemory\.tgz/.test(readme + installDoc),
+    'R58③: no doc tells users to fill the old stable URL in the panel')
+  assert.ok(installDoc.includes('https://github.com/FrogMoo/SuperMemory'), 'R58③: INSTALL gives the git repository URL')
+  assert.ok(readme.includes('https://github.com/FrogMoo/SuperMemory'), 'R58③: README gives the git repository URL')
+  assert.ok(/pnpm package-release/.test(installDoc) && /pnpm package-release/.test(readme),
+    'R58③: docs point at the local package-release path')
+  assert.ok(/不是可安装[的]?插件包/.test(installDoc) && /不是可安装[的]?插件包/.test(readme),
+    'R58③: docs state the source archives are not installable plugin packages')
+  assert.ok(/Source code/.test(installDoc), 'R58③: INSTALL names the GitHub-generated Source code archives')
   assert.ok(installDoc.includes('a URL must point at a git repository or a tarball'),
-    'R46③: INSTALL quotes the host rule that refuses a release page / .zip asset')
-  assert.ok(installDoc.includes('FrogMoo/SuperMemory') && /裸 owner\/repo|会被当成 npm 包名/.test(installDoc),
-    'R46③: INSTALL warns that a bare owner/repo is read as an npm package name')
-  assert.ok(installDoc.includes('.tgz') && installDoc.includes('.zip'),
-    'R46③: the two artifact roles (panel tgz vs manual zip) are distinguished')
-  assert.equal(pkg.name, 'dsh-supermemory', 'R46: the package keeps its plugin name')
+    'R58③: INSTALL still quotes the host rule that refuses a release page / .zip asset')
+  assert.ok(/裸 owner\/repo|会被当成 npm 包名/.test(installDoc),
+    'R58③: INSTALL still warns that a bare owner/repo is read as an npm package name')
+
+  // R58④: the release doc pins the new source-only flow and both archive URLs.
+  assert.ok(existsSync('docs/release.md'), 'R58④: docs/release.md exists')
+  assert.ok(releaseDoc.includes('archive/refs/tags/') && releaseDoc.includes('.zip') && releaseDoc.includes('.tar.gz'),
+    'R58④: release doc gives both source archive URLs')
+  assert.ok(releaseDoc.includes('source-only') && releaseDoc.includes('--with-assets'),
+    'R58④: release doc documents source-only plus the escape hatch')
+  assert.ok(/`assets` 为空数组/.test(releaseDoc), 'R58④: release doc requires the assets array to be empty')
+  assert.ok(releaseDoc.includes('不再上传') && releaseDoc.includes('dsh-supermemory*.zip'),
+    'R58④: release doc says custom dsh-supermemory zip/tgz are not uploaded')
+  assert.ok(gitSyncDoc.includes('source-only') && gitSyncDoc.includes('archive/refs/tags/'),
+    'R58④: git-sync verification section follows source-only')
+  assert.ok(!gitSyncDoc.includes('同时 `assets` 含稳定别名'), 'R58④: git-sync no longer checks for the stable alias asset')
+
+  // R58⑤: package-release still builds all three local artifacts and labels them local-only.
+  assert.ok(packSrc.includes("'pack', '--pack-destination'"), 'R58⑤: package-release still builds the npm-pack tarball')
+  assert.ok(packSrc.includes('package/lib/supermemory.js') && packSrc.includes('package/cordis.patch.yml'),
+    'R58⑤: the tarball layout is still validated against package/ root files')
+  assert.ok(packSrc.includes("'dsh-supermemory.tgz'") && packSrc.includes('zipPath'),
+    'R58⑤: the zip and version-less alias are still produced')
+  assert.ok(packSrc.includes('String.fromCharCode(92)'), 'R58⑤: backslash tar entries are still rejected')
+  assert.ok(packSrc.includes("'--tarball-only'") && packSrc.includes("'--out'") && packSrc.includes("'--plan'"),
+    'R58⑤: tarball-only / out / plan modes remain')
+  assert.ok(packSrc.includes('不随 Release 发布'), 'R58⑤: package-release prints the local-only notice')
+  const packPlan = spawnSync(process.execPath, ['scripts/package-release.mjs', '--plan'], { encoding: 'utf8' })
+  assert.equal(packPlan.status, 0, 'R58⑤: package-release --plan exits 0: ' + packPlan.stderr)
+  assert.match(packPlan.stdout, /dsh-supermemory-\d+\.\d+\.\d+\.zip/, 'R58⑤: plan lists the manual zip')
+  assert.match(packPlan.stdout, /dsh-supermemory-\d+\.\d+\.\d+\.tgz/, 'R58⑤: plan lists the panel tarball')
+  assert.ok(packPlan.stdout.includes('dsh-supermemory.tgz'), 'R58⑤: plan lists the version-less alias')
+  assert.ok(packPlan.stdout.includes('不随 Release 发布'), 'R58⑤: plan prints the local-only notice')
+  assert.equal(pkg.scripts['package-release'], 'node scripts/package-release.mjs', 'R58⑤: pnpm package-release is wired')
+  assert.equal(pkg.name, 'dsh-supermemory', 'R58: the package keeps its plugin name')
 }
-ok('R46-1 发布资产：zip 之外产出 npm-pack .tgz + 稳定别名，GitHub 上传双资产，文档只给安装器可接受的输入（git 仓库 / .tgz），并说明 zip 与 release 页不接受')
+ok('R58-1 发布策略：默认 source-only（无资产上传）+ --with-assets 逃生口 + 文档不再给旧稳定 URL 安装指引 + package-release 仍产本地三件并打「不随 Release 发布」')
 
 // ---- R47 需求②③: 注入/展示路径的截断修复（预算化 + 显式省略 + 复取线索）----
 // 旧病：中枢 prestep 把整张记忆卡 `.slice(0, maxChars)`、各列表行 `.slice(0, N)`，

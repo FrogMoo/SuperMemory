@@ -1,6 +1,11 @@
 # SuperMemory 安装指南（用户版）
 
-面向 DSH 最终用户：不需要克隆仓库、不需要构建。可以**在 DSH 插件面板直接安装**（方式 A），也可以下载 Release 包手动挂载（方式 B）。
+面向 DSH 最终用户：可以**在 DSH 插件面板直接安装**（方式 A），也可以**本地构建发布包**后手动挂载（方式 B，离线/内网）。
+
+> **自 R58 起**：GitHub Release 只保留 GitHub 自动生成的 `Source code (zip)` / `Source code (tar.gz)`，
+> 不再上传 `dsh-supermemory*.zip/tgz`。源码归档**不是可安装的插件包**；面板安装请用 Git 仓库地址，
+> 或本地 `pnpm package-release` 产出的 `.tgz`。旧版安装文档里的稳定 tgz 直链
+> 从下一个发布版本起会 404（v1.3.5 及以前的资产仍保留）。
 
 ## 环境要求
 
@@ -9,19 +14,16 @@
 | DSH Desktop | `>=0.2.0 <0.3.0`（已初始化过 profile：至少完整打开过一次 DSH Desktop） |
 | Node.js | 22+（DSH 自带运行时亦可） |
 | pnpm | 随 Node 安装或独立安装（`npm i -g pnpm`） |
-| 网络 | 挂载步骤默认**不需要**外网（发布包已内置生产依赖）；仅首次 `pnpm install` 建软链时走本地缓存 |
+| 网络 | 挂载步骤默认**不需要**外网（本地构建的发布包已内置生产依赖）；本地构建首次 `pnpm install` 需能访问 npm registry 或使用已有 pnpm 缓存 |
 
-## 方式 A：在 DSH 插件面板安装（推荐，需能访问 GitHub）
+## 方式 A：在 DSH 插件面板安装（推荐）
 
 打开「侧边栏 → 插件 → 安装插件」，在「包名或地址」填以下**之一**：
 
-1. **发布 tarball（最稳，安装器直接消费）**：
-   `https://github.com/FrogMoo/SuperMemory/releases/latest/download/dsh-supermemory.tgz`
-   （每个新 Release 都会带这个稳定别名；也可填某个版本的具体资产
-   `.../releases/download/v<版本>/dsh-supermemory-<版本>.tgz`。）
-2. **Git 仓库地址（安装 main 最新源码）**：
+1. **Git 仓库地址（推荐，安装 main 最新源码）**：
    `https://github.com/FrogMoo/SuperMemory`
-3. **本机绝对路径**（已下载/解压 tarball 时）：
+   （安装器接受 `kind=git`；安装前有 5 秒 GitHub 连接检查，网络慢会超时。）
+2. **本机 `.tgz` 绝对路径**（先本地构建发布包，见方式 B）：
    例如 `F:\10-SuperMemory\release\dsh-supermemory.tgz`。
 
 安装开始后等它完成；若提示重启，**完全退出并重启 DSH Desktop**。
@@ -33,20 +35,48 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 | 输入 | 是否接受 | 说明 |
 |---|---|---|
 | npm 包名（如 `dsh-plugin-xxx`） | ✅ | 本插件未发布 npm，不适用 |
-| Git 仓库 URL / `github:owner/repo` | ✅ | 会 clone 默认分支；安装前有 5 秒 GitHub 连接检查，网络慢会超时 |
-| `.tgz` / `.tar.gz` 直链或绝对路径 | ✅ | **发布面板安装请用这个** |
+| Git 仓库 URL / `github:owner/repo` | ✅ | 会 clone 默认分支；**推荐入口** |
+| `.tgz` / `.tar.gz` 本地绝对路径 | ✅ | 先用 `pnpm package-release` 在本地生成；Release 不再提供自建 tgz |
+| `.tgz` / `.tar.gz` 直链 | ✅ | 只适用于旧版（≤ v1.3.5）仍存在的资产；新 Release 不再提供 |
 | `FrogMoo/SuperMemory`（裸 owner/repo） | ❌ | 会被当成 npm 包名，报 invalid spec |
 | `.../releases` 页面 URL | ❌ | 报 “a URL must point at a git repository or a tarball” |
-| Release 里的 `.zip` 资产 | ❌ | 同上；zip 只用于下面的手动安装 |
+| Release 的 `Source code (zip/tar.gz)` | ❌ | 源码归档不是可安装插件包（不含生产依赖） |
+| `.zip` 资产 | ❌ | 同上；zip 只用于下面的手动安装 |
 
-> 自 `v1.2.1` 起，每个 Release 都同时带版本 tgz（`dsh-supermemory-<版本>.tgz`）与稳定别名 `dsh-supermemory.tgz`，上面的稳定 URL 可直接使用。若安装器仍报 404（CDN 尚未刷新），改用 Git 地址，或按方式 B 手动安装。
+> 新 Release 只保留两个源码归档；旧版安装文档里的稳定 tgz 直链从下一个发布版本起会 404。
+> 面板安装请填 Git 地址或本地 `.tgz` 绝对路径。
 
-## 方式 B：手动下载 Release 包（离线/内网）
+## 方式 B：本地构建发布包并手动挂载（离线/内网）
 
-### 1. 下载并解压 Release 包
+> Release 不再提供自建 zip/tgz；需要离线包时从源码本地构建。
 
-- GitHub Releases：<https://github.com/FrogMoo/SuperMemory/releases>，下载最新版附件 `dsh-supermemory-<版本>.zip`（如 `dsh-supermemory-1.3.5.zip`）；
-- 或仓库内 `release/` 目录同名文件（内网 Gitee 同步提供）。
+### 1. 取源码并构建本地包
+
+有网络/内网 git 时：
+
+```bash
+git clone https://github.com/FrogMoo/SuperMemory
+cd SuperMemory
+pnpm install
+pnpm build
+pnpm package-release
+```
+
+没有 git 时：下载 Release 的 `Source code (zip)` / `Source code (tar.gz)` 并解压，再执行同样的
+`pnpm install && pnpm build && pnpm package-release`。**源码归档本身不是可安装的插件包**，
+它只是构建输入（不含生产依赖 `node_modules/`）。
+
+产物在仓库 `release/`：
+
+| 产物 | 用途 |
+|---|---|
+| `dsh-supermemory-<版本>.zip` | 解压后手动安装（本方式） |
+| `dsh-supermemory-<版本>.tgz` | 插件面板填绝对路径安装 |
+| `dsh-supermemory.tgz` | 版本无关别名（本地兼容） |
+
+这些包**只用于本地/离线安装，不随 Release 发布**；脚本结束时会打印同样提示。
+
+### 2. 解压 zip 到安装目录
 
 解压到任意**无空格、无中文**的路径，例如：
 
@@ -55,7 +85,7 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 解压后目录应包含：`lib/`（预构建产物）、`node_modules/`（内置依赖）、`package.json`、`cordis.patch.yml`、`scripts/install-into-dsh.mjs`、`README.md`、`CHANGELOG.md`、`LICENSE`、本文件。
 
-### 2. 挂载到 DSH profile
+### 3. 挂载到 DSH profile
 
 进入解压目录执行：
 
@@ -75,7 +105,7 @@ node scripts/install-into-dsh.mjs
 > 自定义 profile：`node scripts/install-into-dsh.mjs --profile <profile 名>`（默认 `desktop`）。
 > 先预演不写盘：追加 `--dry-run`。
 
-### 3. 重启 DSH Desktop
+### 4. 重启 DSH Desktop
 
 1. 完全退出并重启 DSH Desktop（客户端 bundle 图仅在启动时构建，必须重启）；
 2. 「侧边栏 → 插件」页应出现 `dsh-supermemory` 且为**启用**态（列表实时读盘，刷新页面即可见）；
@@ -83,7 +113,9 @@ node scripts/install-into-dsh.mjs
 
 ## 升级
 
-下载新版本 Release 包 → 解压到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向更新到新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
+- **面板 Git 安装**：在插件面板重新安装 `https://github.com/FrogMoo/SuperMemory`，按提示完全重启 DSH。
+- **本地包安装**：拉取/下载新源码 → `pnpm install && pnpm build && pnpm package-release` → 解压新 zip 到**新目录** → 重跑 `node scripts/install-into-dsh.mjs`（脚本会把 profile 里的 link 指向新目录）→ 重启 DSH。旧目录确认无人引用后可删除。
+- Release 页面只提供源码归档，不提供可直接安装的新版本 zip/tgz。
 
 ### 升级到 1.3.5 后要做什么（R57：注入卡折叠标题按内容区分）
 
@@ -147,6 +179,7 @@ node scripts/install-into-dsh.mjs
 | 中枢读 `sm_cap_doc` 被拒（`CAPABILITY_DOC_ROLE_DENIED`） | 当前会话既不是中枢也不是分支。请在话题集的中枢/分支会话中读取，或先让中枢派发分支调查 |
 | 报缺少 `@deepseek-ai/schemastery` | 发布包 `node_modules/` 被解压工具丢弃（部分工具默认跳过点目录/链接）→ 用支持完整解压的工具重新解压，勿删 `node_modules` |
 | 换机器/换目录 | 重跑一次 `node scripts/install-into-dsh.mjs` 即可，link 自动跟随新路径 |
-| 插件面板报“找不到插件 / invalid spec” | 不要填裸 `FrogMoo/SuperMemory`、release 页面或 zip 资产；按方式 A 填完整 git URL 或 `.tgz` 直链 |
-| 插件面板报“无法访问 GitHub / 连接超时” | 安装器对 GitHub 有 5 秒连接检查；网络慢时改用 `.tgz` 直链/本机路径，或走方式 B 手动安装 |
+| 插件面板报“找不到插件 / invalid spec” | 不要填裸 `FrogMoo/SuperMemory`、Release 页面、Source code 归档或 zip 资产；按方式 A 填完整 git URL 或本地 `.tgz` 绝对路径 |
+| 插件面板报“无法访问 GitHub / 连接超时” | 安装器对 GitHub 有 5 秒连接检查；网络慢时改用本地 `.tgz` 绝对路径，或走方式 B 手动安装 |
+| 旧稳定 tgz 链接报 404 | 新 Release 不再上传自建资产，该链接从下一个发布版本起失效；改用 Git 地址或本地 `.tgz`（v1.3.5 及以前的资产仍可直接下载） |
 | 插件面板安装 `.tgz` 后没反应 | 完全退出并重启 DSH Desktop；到插件页确认 `dsh-supermemory` 已启用 |
