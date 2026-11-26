@@ -20,6 +20,14 @@
 
 打开「侧边栏 → 插件 → 安装插件」，在「包名或地址」填以下**之一**：
 
+0. **npm 包名（1.4.0 起，发布到 npm 后可用）**：`@frogmoo/dsh-supermemory`
+   （或带版本 `@frogmoo/dsh-supermemory@^1.4.0`）。这是**唯一**会让插件页出现
+   「版本 → 重新检查 / 可更新到 x」的来源：DSH 0.2.2 只对 registry 来源做版本检查，
+   Git / 本地目录 / tgz 来源都没有检查更新入口。
+   > ⚠️ **npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory`
+   > 是两回事**：面板填前者查 npm registry，填后者走 git 安装；两者装的都是本插件，
+   > 但只有前者能「检查更新」。已用 Git 安装过的机器要改来源，先卸载再按下面的
+   > Git 地址重装，或按 README §5.2 用链接工作区。
 1. **Git 仓库地址（推荐，安装 main 最新源码）**：
    `https://github.com/FrogMoo/SuperMemory`
    （安装器接受 `kind=git`；安装前有 5 秒 GitHub 连接检查，网络慢会超时。）
@@ -34,7 +42,7 @@ DSH 插件面板的安装器**不会**读取 GitHub Releases 的 release 列表�
 
 | 输入 | 是否接受 | 说明 |
 |---|---|---|
-| npm 包名（如 `dsh-plugin-xxx`） | ✅ | 本插件未发布 npm，不适用 |
+| npm 包名（如 `@frogmoo/dsh-supermemory`） | ✅ | 1.4.0 起可发布到 npm（public）；只有 registry 来源才会出现「版本 / 检查更新」 |
 | Git 仓库 URL / `github:owner/repo` | ✅ | 会 clone 默认分支；**推荐入口** |
 | `.tgz` / `.tar.gz` 本地绝对路径 | ✅ | 先用 `pnpm package-release` 在本地生成；Release 不再提供自建 tgz |
 | `.tgz` / `.tar.gz` 直链 | ✅ | 只适用于旧版（≤ v1.3.5）仍存在的资产；新 Release 不再提供 |

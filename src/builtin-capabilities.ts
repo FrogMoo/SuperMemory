@@ -28,6 +28,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { CapabilityInput } from './capability.ts'
 
+/** Package names this plugin is installed under: the published scoped name and the pre-1.4.0 dev name. */
+const PLUGIN_PACKAGE_NAMES: ReadonlySet<string> = new Set(['@frogmoo/dsh-supermemory', 'dsh-supermemory'])
+
 /**
  * 从插件自身位置推导出**本仓库根目录**。
  *
@@ -38,9 +41,10 @@ import type { CapabilityInput } from './capability.ts'
  *
  * 推导链（宿主产物是 ESM，见 tsdown.config.ts format:'esm'，所以 import.meta.url
  * 在 lib/supermemory.js 与各 chunk 里都可用；DSH profile 里的
- * node_modules/dsh-supermemory 是指向源码仓库的符号链接，Node 默认解析 realpath）：
- * import.meta.url → lib/<file>.js → 逐级向上找到含 package.json(name=dsh-supermemory)
- * 的目录即仓库根；找不到时退回「模块目录的上一级」（lib/ 的父目录）。
+ * node_modules/@frogmoo/dsh-supermemory（1.4.0 起的 scoped 名；更早的草稿名是
+ * node_modules/dsh-supermemory）是指向源码仓库的符号链接，Node 默认解析 realpath）：
+ * import.meta.url → lib/<file>.js → 逐级向上找到含 package.json（name 为本包的
+ * scoped 名或旧名）的目录即仓库根；找不到时退回「模块目录的上一级」（lib/ 的父目录）。
  *
  * 兜底说明：安装成副本（非符号链接）时推导值是副本包根——此时该能力本就不适用
  * （入口脚本与 docs 在副本里，不是 git 仓库），能力描述已要求调用前先确认是本仓库。
@@ -51,7 +55,8 @@ export function resolvePluginRepoRoot(moduleUrl: string = import.meta.url): stri
   for (let depth = 0; depth < 4; depth += 1) {
     try {
       const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { name?: unknown }
-      if (pkg?.name === 'dsh-supermemory') return dir
+      // Both spellings: the published scoped name, and the pre-1.4.0 dev-install name.
+      if (typeof pkg?.name === 'string' && PLUGIN_PACKAGE_NAMES.has(pkg.name)) return dir
     } catch { /* 不是包根：继续向上 */ }
     const parent = dirname(dir)
     if (parent === dir) break
@@ -89,13 +94,15 @@ export interface BuiltinCapability extends Omit<CapabilityInput, 'changelog'> {
 export const BUILTIN_CAPABILITIES: readonly BuiltinCapability[] = Object.freeze([
   {
     name: 'git-sync-supermemory',
-    version: 6,
+    // v7: 描述去掉内网 Gitee 主机（公开发布包不得含内部主机名）；版本 +1 让已装实例
+    // 通过 mergeBuiltinCapabilities 升版，把知识面里的主机名一并替换掉。
+    version: 7,
     title: 'git 同步/提交/推送（SuperMemory 仓库）',
     // 描述是模型的路由依据，硬上限 500 字符（capability.ts buildCapabilityRecord）：
     // v4 描述 725 字被该上限静默拒绝 → mergeBuiltinCapabilities 跳过播种
     // （report.seeded=[]）→ capability-smoke C3 / workspace-scope W5 失败。
     // 修改描述后务必重新计数，并把细节（凭据键/恢复流程）留在 docs 里。
-    description: 'SuperMemory 仓库 git 同步/提交/推送固化流程。先确认工作区是本仓库（有 scripts/git-sync-push.sh），否则不触发。优先 pnpm git:sync，不要手敲 fetch/rebase/push。凭据走仓库本地 GCM（helper=manager）；GIT_TERMINAL_PROMPT=0，失败找用户，勿改全局 config/remote。推送（2026-11-23 起双远程）：origin push = GitHub（FrogMoo/SuperMemory，首位）+ Gitee（zrynas.7766.org:8418/Zry/SuperMemory），fetch/pull 只走 Gitee；首个 push URL 失败即中止后续推送，故远程排位即韧性。Gitea 2026-11-22 晚曾重置、已恢复（帐号改名为 Zry）。日常=跑入口；预演=加 --dry-run；提交前闸门 pnpm typecheck + pnpm smoke，提交信息写文件后 commit -F。凭据键坑与恢复流程见 docs/git-sync.md。',
+    description: 'SuperMemory 仓库 git 同步/提交/推送固化流程。先确认工作区是本仓库（有 scripts/git-sync-push.sh），否则不触发。优先 pnpm git:sync，不要手敲 fetch/rebase/push。凭据走仓库本地 GCM（helper=manager）；GIT_TERMINAL_PROMPT=0，失败找用户，勿改全局 config/remote。推送（2026-11-23 起双远程）：origin push = GitHub（FrogMoo/SuperMemory，首位）+ 内网 Gitee 镜像，fetch/pull 只走 Gitee；首个 push URL 失败即中止后续推送，故远程排位即韧性。Gitea 2026-11-22 晚曾重置、已恢复（帐号改名为 Zry）。日常=跑入口；预演=加 --dry-run；提交前闸门 pnpm typecheck + pnpm smoke，提交信息写文件后 commit -F。凭据键坑与恢复流程见 docs/git-sync.md。',
     entry: 'pnpm git:sync',
     doc: 'docs/git-sync.md',
     // v2: 自动推导，不再硬编码克隆路径（换机器/换目录自动跟随）。

@@ -115,7 +115,7 @@ const VERB_TOKENS = new Set([
  * Context/architecture words: useful for retrieval, but never the task's
  * object when a concrete domain noun exists (repo name, client/server half).
  */
-const CONTEXT_OBJECT_NAMES = new Set(['supermemory', 'dsh-supermemory', 'dsh', 'client', 'server', 'frontend', 'backend'])
+const CONTEXT_OBJECT_NAMES = new Set(['supermemory', 'dsh-supermemory', '@frogmoo/dsh-supermemory', 'dsh', 'client', 'server', 'frontend', 'backend'])
 
 const GENERIC_FILE_NAMES = new Set([
   'index', 'main', 'package', 'package-lock', 'pnpm-lock', 'tsconfig', 'readme', 'changelog',

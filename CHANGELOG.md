@@ -2,6 +2,44 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.4.0] - 2026-11-26
+
+发布轮（R59）：**包身份迁移到可发布的 scoped 名 `@frogmoo/dsh-supermemory`（1.4.0）**，为发布到公共 npm registry 做准备——只有 registry 来源在 DSH 插件页才会出现「版本 → 重新检查 / 可更新到 x」。功能、工具协议、存储域（`supermemory` v1）均未变。
+
+### 变更（包身份与发布面）
+
+- `package.json`：name `dsh-supermemory` → `@frogmoo/dsh-supermemory`；去掉 `private`；新增 `publishConfig`（`access: public` + `registry: https://registry.npmjs.org/`，只影响发布、不改安装源）；version 1.3.5 → 1.4.0。
+  - 版本策略：破坏面仅是「安装来源标识」——profile 依赖键、`dsh.profile.bundles` 选择项、客户端模块 id 都随包名变化；用户可见功能 / 存储 / 工具协议不变，故按 **minor** 而不是 major 升。
+- `cordis.patch.yml`：`insert.name` 改为 scoped 包名（loader 行 id 仍是短 slug `supermemory`）。DSH 的 bundle 选择按**包名**记录，安装器会把它写进 `dsh.profile.bundles`。
+- `scripts/wrap-client.mjs`：客户端 bundle 的 `__ModuleLoader__.load({id})` 改为**从 package.json 读取包名**（宿主 clientModules 以清单名生成 `window.__DSH_BOOT__` 与 `/plugins/<id>/client.js`，写死会随改名失效；已装 scoped 插件 `@michengai/dsh-skills-manager` 即此形态）。
+- `src/builtin-capabilities.ts`：仓库根推导同时接受新旧两个包名；`src/task-signature.ts` 的上下文词表补 scoped 名。
+- `scripts/install-into-dsh.mjs`：使用新的依赖键与 bundles 项，并**自动迁移**旧草稿名（`dsh-supermemory`）的依赖项与激活项（避免同一插件挂两次 / 旧行解析不到新 patch）。
+- `scripts/package-release.mjs`：npm 会把 scoped 名归一成 `frogmoo-dsh-supermemory-<v>.tgz`，脚本在本地改名回既有资产约定 `dsh-supermemory-<v>.tgz`（**Release 资产名保持不变**）。
+- 公开发布包脱敏：内置能力描述与整理计划文本里的内网 Gitee 主机名改为占位；内置能力 `git-sync-supermemory` v6 → v7，让已装实例升版时把知识面里的主机名一并替换。
+- `files` 收敛为 `lib` / `cordis.patch.yml` / `CHANGELOG.md` / `INSTALL.md`：**npm 包不再分发 `src/`**（运行时只需 `lib/`；LICENSE、README 由 npm 自动包含）。
+- 清理悬挂条目：仓库没有 `locale/` 目录（语言包在 `src/client/locales.ts` 内随客户端 bundle 发布），因此从 `files` 删掉 `locale`、从 `exports` 删掉 `./locale/*.json` —— 这两处自始就解析不到文件，留着只会误导发布面。（若无 `locale` 目录，`exports` 子路径在安装后也必然 404。）
+- 新增脚本：`prepublishOnly: pnpm run build`（仅 `npm publish` 触发，`pnpm pack` 不触发）与 `publish:npm: npm publish --access public`。
+- 文档：README §5、INSTALL 方式 A、`docs/release.md` §6.5 写清 **npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory` 是两回事**，并给出发布前置（登录 / 2FA / token）、干跑与发布后校验。
+
+### 测试（R59 新增断言）
+
+- core-smoke R58 段：包名 = `@frogmoo/dsh-supermemory`、无 `private`、`publishConfig` 精确、`cordis.patch.yml` 的 `insert.name` = 包名、行 id 仍为 `supermemory`。
+- client-sim：客户端 bundle 的 registration id = `@frogmoo/dsh-supermemory`。
+
+### 闸门（本轮实测）
+
+- `pnpm build` exit 0（宿主 13 文件 931.55 kB；client 181.81 kB；wrapper id = scoped）。
+- `pnpm typecheck` exit 0（宿主 + client 双工程，0 错）。
+- `pnpm smoke` exit 0：core **43** / mechanism **120** / webui **35** / client-sim **OK** / capability **20 组** / workspace-scope **6 组** / skill **27 组**。
+- `pnpm pack`（DSH 自带 pnpm 11.28.5）exit 0：**20 条目 / ≈349 kB**（首次打包 346,729 B；写入本节后 348,887 B），含 `package.json`、`cordis.patch.yml`、README、LICENSE、CHANGELOG、INSTALL 与 `lib/` 14 个文件；**不含** `node_modules/`、`src/`、`scripts/`、`release/`、`.dsh/`、`.git`。
+- 敏感串扫描（解包后全量 grep）：内网主机名 0、内网 IPv4 0、凭据赋值 0、token 前缀 0、私钥 0、用户主目录路径 0；回环地址 4 处（webui 服务器代码）与 1 处 GitHub noreply 邮箱（CHANGELOG 提交身份）为可公开内容。
+- 临时目录安装：`pnpm add <tgz>`（pnpm 11.28.5，`nodeLinker=hoisted`、`autoInstallPeers=false`）exit 0，3.8 s，装出 `@frogmoo/dsh-supermemory@1.4.0`；`import.meta.resolve` 解析 `.` 与 `./client` 成功，`cordis.patch.yml` 可读；保存形态 `file:<tgz 绝对路径>`。
+
+### 升级说明（重要）
+
+- 仍以旧草稿名安装（`link:` 或 `github:`）的机器：**先 `pnpm install:dsh` 再重启 DSH**——它会迁移依赖键与 bundles 项；直接重启会让 scoped 行名在旧 profile 里解析不到，插件整包不加载。
+- 想获得插件页的「检查更新」：改用 npm 包名 `@frogmoo/dsh-supermemory` 安装（Git / 本地目录 / tgz 来源在 DSH 0.2.2 都没有版本检查入口）。
+
 ## [1.3.5] - 2026-11-26
 
 发布轮（R57）：**上下文注入卡的折叠标题（宿主「上下文注入 <label>」的 label）按内容区分**。R56 改的是卡片内容首行；宿主的 label 仍取消息 `source.kind`（一律 `supermemory`），所以 GUI 里所有注入卡的折叠标题只有「上下文注入 supermemory」一种（分支卡再叠加旧 summary「SuperMemory 中枢分支概览」）。本轮让每类注入用**自己的注册 label 作 `source.kind`**：卡片标题即 `上下文注入 supermemory-相关记忆 / 相关话题 / 相关分支会话 / 相关能力 …`，与内容首行同一注册项（同 kind 同源）。全量闸门（typecheck 双工程 + build + 七套冒烟）通过。

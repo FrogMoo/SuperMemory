@@ -6,8 +6,10 @@
 //   （@deepseek-ai/dsh-plugin-manager 的 readBundles 实时读 profile/package.json）。
 //   早期用过的「cordis.patch.yml 路径行 insert」加载方式插件页【不显示】——
 //   插件在跑但页面上看不到，无法启用/禁用/移除。本脚本把安装改成官方 bundle 形态：
-//     1) profile package.json 增加依赖 "dsh-supermemory": "link:<本工作区>"
-//     2) dsh.profile.bundles 追加 "dsh-supermemory"（激活）
+//     1) profile package.json 增加依赖 "@frogmoo/dsh-supermemory": "link:<本工作区>"
+//     2) dsh.profile.bundles 追加 "@frogmoo/dsh-supermemory"（激活）
+//        （1.4.0 起包名改为 scoped；旧草稿名 "dsh-supermemory" 的依赖与激活项会被
+//         迁移掉，否则同一插件会被挂载两次 / 旧行解析不到新 patch）
 //     3) 清理 profile cordis.patch.yml 里指向本插件入口的路径行 insert（防止重复注册）
 //     4) pnpm install 建立符号链接（工作区成为 HMR 监视根，改源码→tsdown→热替换）
 //   之后无论工作区搬到哪里，重跑一次本脚本即可保证插件页一定能看到它。
@@ -27,7 +29,11 @@ const isWin = process.platform === 'win32'
 const repoRoot = fileURLToPath(new URL('../', import.meta.url))
 const pluginRoot = repoRoot.replace(/[\\/]+$/, '')
 const pluginRootPosix = pluginRoot.replace(/\\/g, '/')
-const pkgName = 'dsh-supermemory'
+const pkgName = '@frogmoo/dsh-supermemory'
+// Pre-1.4.0 installs used the unscoped name for the dependency key and the
+// bundle-selection entry. Both are migrated below so the profile never lists
+// the same plugin twice.
+const legacyPkgName = 'dsh-supermemory'
 const entryId = 'supermemory'
 
 const args = process.argv.slice(2)
@@ -92,6 +98,16 @@ if (prevSpec !== linkSpec) {
   if (!dryRun) manifest.dependencies[pkgName] = linkSpec
 } else {
   log('      依赖: ' + pkgName + ' = ' + linkSpec + '（已是最新，跳过）')
+}
+// 迁移：旧草稿名（scoped 之前）的依赖与激活项
+if (manifest.dependencies[legacyPkgName] !== undefined) {
+  log('      迁移: 移除旧名依赖 ' + legacyPkgName + '（' + manifest.dependencies[legacyPkgName] + '）')
+  if (!dryRun) delete manifest.dependencies[legacyPkgName]
+}
+const bundles0 = (manifest.dsh && manifest.dsh.profile && manifest.dsh.profile.bundles) || []
+if (bundles0.includes(legacyPkgName)) {
+  log('      迁移: 从 bundles 移除旧名 ' + legacyPkgName)
+  if (!dryRun) manifest.dsh.profile.bundles = bundles0.filter((n) => n !== legacyPkgName)
 }
 const bundles = (manifest.dsh && manifest.dsh.profile && manifest.dsh.profile.bundles) || []
 if (!bundles.includes(pkgName)) {

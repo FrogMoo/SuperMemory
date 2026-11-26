@@ -1320,7 +1320,16 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.ok(packPlan.stdout.includes('dsh-supermemory.tgz'), 'R58⑤: plan lists the version-less alias')
   assert.ok(packPlan.stdout.includes('不随 Release 发布'), 'R58⑤: plan prints the local-only notice')
   assert.equal(pkg.scripts['package-release'], 'node scripts/package-release.mjs', 'R58⑤: pnpm package-release is wired')
-  assert.equal(pkg.name, 'dsh-supermemory', 'R58: the package keeps its plugin name')
+  assert.equal(pkg.name, '@frogmoo/dsh-supermemory', 'R59: the package publishes under its scoped name')
+  assert.equal(pkg.private, undefined, 'R59: a publishable package declares no private flag')
+  assert.deepEqual(pkg.publishConfig, { access: 'public', registry: 'https://registry.npmjs.org/' },
+    'R59: publishConfig scopes the publish to the public npm registry')
+  // The bundle row's module specifier must equal the package name, or a
+  // registry-installed copy cannot be resolved by its own patch.
+  const patchText = readFileSync('cordis.patch.yml', 'utf8')
+  assert.ok(patchText.includes("name: '@frogmoo/dsh-supermemory'"),
+    'R59: cordis.patch.yml inserts the scoped package name')
+  assert.ok(patchText.includes('id: supermemory'), 'R59: the loader row id stays the short slug')
 }
 ok('R58-1 发布策略：默认 source-only（无资产上传）+ --with-assets 逃生口 + 文档不再给旧稳定 URL 安装指引 + package-release 仍产本地三件并打「不随 Release 发布」')
 

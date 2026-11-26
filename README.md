@@ -154,6 +154,11 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
 - **DSH 插件面板（推荐，安装 main 最新源码）**：在「插件 → 安装插件」填 Git 仓库地址
   `https://github.com/FrogMoo/SuperMemory`。DSH 安装器接受 `kind=git`，会 clone 默认分支并安装；
   **不要填**裸 `FrogMoo/SuperMemory`（会被当成 npm 包名）、Release 页面 URL 或 `.zip` 资产。
+- **npm 包（1.4.0 起，发布后可用）**：面板里填包名 `@frogmoo/dsh-supermemory`（或带版本
+  `@frogmoo/dsh-supermemory@^1.4.0`）。只有以 **registry 来源**安装时，插件页的「版本 → 重新检查 /
+  可更新到 x」才会出现；Git / 本地目录 / tgz 来源在 DSH 0.2.2 里没有版本检查入口（详见 INSTALL.md）。
+  注意：**npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory` 是两回事**，
+  面板按前者查 registry、按后者走 git。
 - **本地安装包（本机/离线/内网）**：在克隆的仓库里执行 `pnpm install && pnpm build && pnpm package-release`，
   然后在插件面板填本地 `.tgz` 绝对路径（例如 `F:\10-SuperMemory\release\dsh-supermemory.tgz`）；
   或解压 `release/dsh-supermemory-<版本>.zip` 后执行 `node scripts/install-into-dsh.mjs`。
@@ -171,7 +176,9 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
 pnpm install:dsh        # 等价于 node scripts/install-into-dsh.mjs
 ```
 
-该脚本把插件安装为 DSH desktop profile 的**官方 bundle 形态**：profile `package.json` 增加 `"dsh-supermemory": "link:<本工作区>"` 依赖、`dsh.profile.bundles` 追加激活、清理 `cordis.patch.yml` 里指向本插件入口的路径行 insert（防止重复注册）、`pnpm install` 建立符号链接——此后**本工作区成为 HMR 监视根**，改源码 → tsdown 重建 → 热替换。
+该脚本把插件安装为 DSH desktop profile 的**官方 bundle 形态**：profile `package.json` 增加 `"@frogmoo/dsh-supermemory": "link:<本工作区>"` 依赖、`dsh.profile.bundles` 追加同名激活项、清理 `cordis.patch.yml` 里指向本插件入口的路径行 insert（防止重复注册）、`pnpm install` 建立符号链接——此后**本工作区成为 HMR 监视根**，改源码 → tsdown 重建 → 热替换。
+
+> 1.4.0 起包名从 `dsh-supermemory` 改为 `@frogmoo/dsh-supermemory`（可发布到 npm）。脚本会自动把旧草稿名的依赖项与 `bundles` 激活项迁移掉；**在跑过一次 `pnpm install:dsh` 之前不要重启 DSH**，否则旧 profile 里的 bundle 行会解析不到新 patch 而整包不加载。
 
 重载的两种方式：
 
@@ -182,7 +189,7 @@ pnpm install:dsh        # 等价于 node scripts/install-into-dsh.mjs
 
 仓库配了**双远程推送**（详见 [docs/git-sync.md](docs/git-sync.md)）：
 
-- `origin` 的 **fetch URL 只有 Gitee**（`http://zrynas.7766.org:8418/Zry/SuperMemory.git`）——pull / rebase / 跟踪分支只走它；
+- `origin` 的 **fetch URL 只有内网 Gitee 镜像**（地址只写在 `docs/git-sync.md` 与本机 git 配置里，不写进公开文档）——pull / rebase / 跟踪分支只走它；
 - `origin` 的 **push URL 两项**：① GitHub（`https://github.com/FrogMoo/SuperMemory.git`，**排首位**）② 上述 Gitee——`git push origin main` 一条命令推两个仓库；
 - 独立远程 `github` 用于单推 GitHub；默认分支 `main`。
 

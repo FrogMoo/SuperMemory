@@ -1,22 +1,24 @@
 {
-  "name": "dsh-supermemory",
-  "version": "1.3.5",
+  "name": "@frogmoo/dsh-supermemory",
+  "version": "1.4.0",
   "description": "SuperMemory — DSH 跨会话记忆插件：话题集记忆、派发归档、过程内再召回与统一能力（知识面 SKILL.md + 执行面 sm_cap_*）。",
-  "private": true,
   "license": "UNLICENSED",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "type": "module",
   "main": "lib/supermemory.js",
   "exports": {
     ".": "./lib/supermemory.js",
     "./client": "./lib/client.js",
-    "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./package.json": "./package.json"
   },
   "files": [
     "lib",
-    "locale",
-    "src",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "CHANGELOG.md",
+    "INSTALL.md"
   ],
   "dependencies": {
     "@deepseek-ai/schemastery": "~3.18.4",
@@ -45,6 +47,8 @@
     "install:dsh": "node scripts/install-into-dsh.mjs",
     "build": "tsdown && tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",
     "package-release": "node scripts/package-release.mjs",
+    "prepublishOnly": "pnpm run build",
+    "publish:npm": "npm publish --access public",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.client.json",
     "build:host": "tsdown",
     "build:client": "tsdown -c tsdown.client.config.ts && node scripts/wrap-client.mjs",

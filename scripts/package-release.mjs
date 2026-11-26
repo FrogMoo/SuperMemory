@@ -25,7 +25,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
-  rmSync, statSync, symlink, unlinkSync, writeFileSync,
+  renameSync, rmSync, statSync, symlink, unlinkSync, writeFileSync,
 } from 'node:fs'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -185,12 +185,24 @@ function packPanelTarball() {
   mkdirSync(releaseDir, { recursive: true })
   const tgzPath = join(releaseDir, bundleName + '.tgz')
   rmSync(tgzPath, { force: true })
+  const before = new Set(readdirSync(releaseDir))
   log('生成插件面板安装包（pnpm pack -> npm tarball）…')
   const packed = spawnSync('pnpm', ['pack', '--pack-destination', releaseDir], {
     cwd: root, stdio: 'inherit', shell: process.platform === 'win32',
   })
   if (packed.error || packed.status !== 0) fail('pnpm pack 失败（本地插件面板安装需要 .tgz）')
-  if (!existsSync(tgzPath)) fail('pnpm pack 未产出 ' + tgzPath + '（检查 package.json 的 version/files）')
+  // npm names the tarball after package.json's `name`: the scoped name
+  // @frogmoo/dsh-supermemory packs as frogmoo-dsh-supermemory-<version>.tgz.
+  // The release-asset name stays the historical dsh-supermemory-<version>.tgz
+  // (existing Releases and install docs refer to it), so rename what pnpm wrote.
+  if (!existsSync(tgzPath)) {
+    const produced = readdirSync(releaseDir).filter((name) => name.endsWith('.tgz') && !before.has(name))
+    if (produced.length !== 1) {
+      fail('pnpm pack 未产出可识别的 .tgz（新文件：' + (produced.join(', ') || '无') + '）')
+    }
+    renameSync(join(releaseDir, produced[0]), tgzPath)
+    log('  资产名沿用旧约定：' + produced[0] + ' -> ' + basename(tgzPath))
+  }
   // cwd + basename avoids GNU tar reading a Windows drive letter as a remote host.
   const listing = spawnSync('tar', ['-tzf', basename(tgzPath)], { cwd: releaseDir, encoding: 'utf8' })
   if (listing.error || listing.status !== 0) {

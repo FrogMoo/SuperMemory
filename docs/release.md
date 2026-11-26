@@ -1,6 +1,8 @@
 # Release 发布流程（SuperMemory）
 
-> 适用范围：本仓库（`dsh-supermemory`）的版本发布。
+> 适用范围：本仓库的版本发布。npm 包名是 `@frogmoo/dsh-supermemory`（1.4.0 起，
+> 可发布到公共 registry），GitHub 仓库名仍是 `FrogMoo/SuperMemory`，本地自建资产名仍是
+> `dsh-supermemory-<版本>.zip/.tgz` —— 三者刻意保持不同，别互相替换。
 >
 > **自 R58 起：GitHub Release 只保留 GitHub 按 tag 自动生成的
 > `Source code (zip)` 与 `Source code (tar.gz)`，不再上传任何自建
@@ -209,6 +211,27 @@ pnpm package-release          # 等价于 node scripts/package-release.mjs
 ```bash
 pnpm package-release --plan
 ```
+
+## 6.5 npm 发布（可选，发布到公共 registry）
+
+> 只在确实要把插件挂到 npm 时执行；它和 GitHub Release 是**两条独立通道**，
+> 互不替代（npm 包让插件页出现「版本 / 检查更新」，Git 地址不提供）。
+
+- **包名**：`@frogmoo/dsh-supermemory`（scoped，public）。`package.json` 已带
+  `publishConfig: { "access": "public", "registry": "https://registry.npmjs.org/" }`，
+  所以发布目标**不受本机全局 registry 镜像影响**，也无需在仓库里放会污染安装的 `.npmrc`。
+- **前置**：npm 账号对 `@frogmoo` scope 有发布权；已登录（`npm login`）或提供
+  `NODE_AUTH_TOKEN`（CI 用 granular/automation token）；账号开了 2FA 时按提示输入 OTP。
+- **干跑**：`npm pack --dry-run` 看内容与体积；`npm publish --dry-run` 看 registry 目标与文件清单
+  （不会写入 registry）。
+- **正式发布**：`pnpm publish:npm`（= `npm publish --access public`）。该命令会触发
+  `prepublishOnly: pnpm run build`，所以**先 `pnpm build` 再发布就会跑两次构建**；CI 里要避免重复，
+  用 `npm publish --ignore-scripts` 并自行保证 `lib/` 是最新的。
+- **发布后校验**：`npm view @frogmoo/dsh-supermemory version dist-tags`；再在一台干净机器上
+  用 DSH 面板按包名安装，确认插件页出现「版本 / 重新检查 / 可更新到 x」。
+- **不要改的东西**：Release 自建资产名保持 `dsh-supermemory-<版本>.zip/.tgz`（见 §1.2/§5）；
+  npm 归一化 tarball 名是 `frogmoo-dsh-supermemory-<版本>.tgz`，`scripts/package-release.mjs`
+  会在本地把它改名回旧约定，别把资产名改成 scoped 形式。
 
 ## 7. 旧版本、旧 URL 与用户告知
 

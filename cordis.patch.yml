@@ -1,4 +1,9 @@
 # SuperMemory bundle layer — inserts the memory plugin.
+#
+# `name` is the installed package's module specifier, so it must equal
+# package.json `name` (`@frogmoo/dsh-supermemory`). The loader row id stays the
+# short slug `supermemory`; DSH's bundle selection (`dsh.profile.bundles`) keys
+# bundles by the package name, and that selection is written by the installer.
 - insert:
     - id: supermemory
-      name: dsh-supermemory
+      name: '@frogmoo/dsh-supermemory'

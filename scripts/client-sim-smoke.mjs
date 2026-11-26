@@ -29,7 +29,8 @@ vm.runInContext(source, sandbox)
 
 if (loaded.length !== 1) throw new Error('expected exactly one __ModuleLoader__.load registration, got ' + loaded.length)
 const registration = loaded[0]
-if (registration.id !== 'dsh-supermemory') throw new Error('wrong registration id: ' + registration.id)
+// R59: the loader id is the package name (scoped), not the old unscoped one.
+if (registration.id !== '@frogmoo/dsh-supermemory') throw new Error('wrong registration id: ' + registration.id)
 
 // R32 需求③: keep the element shape readable so the chat-card component can be
 // rendered headlessly and its dynamic title asserted (not just registered).
