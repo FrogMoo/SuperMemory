@@ -30,6 +30,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Dispatch, TopicSet } from './schema.ts'
 import type { Store } from './store.ts'
+import { titleRow } from './session-title/state.ts'
 import { clipMarked } from './clip.ts'
 import { injectionTitle } from './injection-titles.ts'
 import { resolveRole } from './role.ts'
@@ -44,6 +45,10 @@ export interface HubBranchView {
    * and the web console show the same name.
    */
   title: string
+  /** R59: naming state from session_titles ('' = no row yet). */
+  titleState?: 'provisional' | 'named' | 'user-locked' | 'deferred' | ''
+  /** R59: an automatic title is preserved for "restore auto naming". */
+  autoTitleAvailable?: boolean
   /** R30 需求④: the branch's tags (话题集标签 + 轮次 + 任务性质 + 能力档位). */
   tags: string[]
   /** The latest task dispatched into the branch. */
@@ -189,6 +194,9 @@ function projectBranch(
   if (topicSetId) view.topicSetId = topicSetId
   if (topicSet) view.topicSetTitle = topicSet.title
   if (latest.groupId) view.groupId = latest.groupId
+  const naming = titleRow(store, branchSessionId)
+  view.titleState = naming?.state ?? ''
+  view.autoTitleAvailable = Boolean(naming?.autoTitle || naming?.desiredTitle)
   return view
 }
 

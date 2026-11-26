@@ -78,6 +78,10 @@ function buildApi(ctx: Context): PanelApi | undefined {
     updateSkill: (cwd, name, patch) => call<MutationResult>('updateSkill', cwd, name, patch),
     createTopicSet: (cwd, title, tags, summary) => call('createTopicSet', cwd, title, tags, summary),
     listHubSessions: (cwd) => call<HubSessionView[]>('listHubSessions', cwd),
+    // R59 Phase 1b-2: 会话标题管理。
+    renameSessionTitle: (cwd, sessionId, title) => call<MutationResult>('renameSessionTitle', cwd, sessionId, title),
+    resetSessionTitle: (cwd, sessionId) => call<MutationResult>('resetSessionTitle', cwd, sessionId),
+    repairSessionTitle: (cwd, sessionId) => call<MutationResult>('repairSessionTitle', cwd, sessionId),
     // R19 协同②: the hub's branch association (read model over dispatches).
     listHubBranches: (cwd, hubSessionId, limit) => call<HubBranchView[]>('listHubBranches', cwd, hubSessionId, limit),
     // R30 需求③: the hub manages EVERY topic set (archived included) and sees

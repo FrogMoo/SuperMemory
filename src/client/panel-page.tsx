@@ -319,6 +319,8 @@ export interface MutationResult {
   status: 'ok' | 'error'
   message: string
   id?: string
+  /** R59: the action needs the session opened first (cold; never resumed). */
+  needsOpen?: boolean
 }
 
 /**
@@ -345,6 +347,12 @@ export type SessionBadge =
 export interface HubSessionView {
   sessionId: string
   title: string
+  /** R59: naming state ('' = no session_titles row / pre-R59). */
+  titleState?: 'provisional' | 'named' | 'user-locked' | 'deferred' | ''
+  /** R59: an automatic title is preserved for "restore auto naming". */
+  autoTitleAvailable?: boolean
+  /** R59: "repair title" is meaningful (neutral host / deferred row). */
+  titleRepairable?: boolean
   live: boolean
   updatedAt: number
   createdAt: number
@@ -368,6 +376,9 @@ export interface HubSessionView {
 export interface HubBranchView {
   branchSessionId: string
   title: string
+  /** R59: naming state ('' = no row) + whether a reset can restore an auto title. */
+  titleState?: 'provisional' | 'named' | 'user-locked' | 'deferred' | ''
+  autoTitleAvailable?: boolean
   /** R30 需求④: 分支标签（话题集标签 + 轮次 + 任务性质 + 能力档位）。 */
   tags: string[]
   task: string
@@ -549,6 +560,10 @@ export interface PanelApi {
   declineProposal(cwd: string, id: string): Promise<MutationResult>
   sessionBadge(sessionId: string): Promise<SessionBadge>
   listHubSessions(cwd: string): Promise<HubSessionView[]>
+  // R59 Phase 1b-2: 会话标题管理（重命名 / 恢复自动命名 / 修复）。
+  renameSessionTitle(cwd: string, sessionId: string, title: string): Promise<MutationResult>
+  resetSessionTitle(cwd: string, sessionId: string): Promise<MutationResult>
+  repairSessionTitle(cwd: string, sessionId: string): Promise<MutationResult>
   /** R19 协同②: the branches one hub started (name / state / set / shared). */
   listHubBranches(cwd: string, hubSessionId: string, limit?: number): Promise<HubBranchView[]>
   /**
@@ -610,7 +625,11 @@ const PANEL_CSS = `
 .sm-side-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 6px;font-size:11px;font-weight:600;letter-spacing:.04em;opacity:.55}
 .sm-side-count{font-weight:400;letter-spacing:0}
 .sm-side-list{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:2px}
+.sm-hub-row{display:flex;align-items:center;gap:2px}
 .sm-hub{display:flex;align-items:center;gap:6px;width:100%;padding:7px 8px;border:1px solid transparent;border-radius:8px;background:transparent;color:inherit;font-family:inherit;font-size:12px;text-align:left;cursor:pointer;transition:background .12s ease,border-color .12s ease}
+.sm-hub-row .sm-hub{flex:1;min-width:0;width:auto}
+.sm-hub-more{flex:none;border:1px solid transparent;border-radius:6px;background:transparent;color:inherit;opacity:.45;padding:2px 5px;font-size:12px;line-height:16px;cursor:pointer;font-family:inherit}
+.sm-hub-more:hover{opacity:.9;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}
 .sm-hub:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06))}
 .sm-hub[data-current="true"]{border-color:var(--dsw-alias-link,#7aaaff);background:color-mix(in srgb,var(--dsw-alias-link,#7aaaff) 14%,transparent)}
 .sm-hub-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -854,6 +873,9 @@ function BranchList(props: {
   t: (key: string, params?: Record<string, string | number>) => string
   onOpen: (sessionId: string) => void
   compact?: boolean
+  /** R59: title actions (rename / restore auto) for one branch row. */
+  onRename?: (row: HubBranchView) => void
+  onReset?: (row: HubBranchView) => void
 }): ReactElement {
   // Defensive: a host/remote failure must never blank the panel (an older host
   // may answer a non-array), so the list renders its empty state instead.
@@ -888,6 +910,18 @@ function BranchList(props: {
               // R30 需求④: 分支标签（话题集标签 + 轮次 + 任务性质 + 能力档位）。
               row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
               h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
+              props.onRename || props.onReset
+                ? h('div', { key: 'title-actions', className: 'sm-actions' },
+                    props.onRename
+                      ? h('span', { key: 'rename', onClick: (event: { stopPropagation: () => void }) => event.stopPropagation() },
+                          h(Button, { key: 'b', label: t('title.rename'), onClick: () => props.onRename?.(row) }))
+                      : null,
+                    row.titleState === 'user-locked' && props.onReset
+                      ? h('span', { key: 'reset', onClick: (event: { stopPropagation: () => void }) => event.stopPropagation() },
+                          h(Button, { key: 'b', label: t('title.reset'), onClick: () => props.onReset?.(row) }))
+                      : null,
+                  )
+                : null,
             ),
           ),
         ),
@@ -964,6 +998,11 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   const [summaryDraft, setSummaryDraft] = useState<string | undefined>()
   const [summaryTagsDraft, setSummaryTagsDraft] = useState<string[] | undefined>()
   const [editingMemory, setEditingMemory] = useState<{ id: string; title: string; tags: string[]; text: string; key?: string } | undefined>()
+  // R59 Phase 1b-2: session-title management (rename modal / reset / repair).
+  const [titleEditor, setTitleEditor] = useState<{ sessionId: string; current: string; kind: 'hub' | 'branch' } | undefined>()
+  const [titleDraft, setTitleDraft] = useState('')
+  const [titleError, setTitleError] = useState('')
+  const [titleBusy, setTitleBusy] = useState(false)
   const [editingTool, setEditingTool] = useState<{ id: string; title: string; tags: string[]; description: string; body: string } | undefined>()
   const [confirmDeleteTool, setConfirmDeleteTool] = useState<string | undefined>()
   // R22 需求③: 固化能力可展开看完整定义（入口/文档/适用范围/路由/执行方式/健康度）。
@@ -1347,6 +1386,68 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     }
   }
 
+  // ---- R59 Phase 1b-2: session-title actions --------------------------------
+  const titleBytes = (value: string): number => {
+    try {
+      return typeof TextEncoder !== 'undefined' ? new TextEncoder().encode(value).length : value.length * 3
+    } catch { return value.length * 3 }
+  }
+  const openTitleEditor = (sessionId: string, current: string, kind: 'hub' | 'branch'): void => {
+    setTitleEditor({ sessionId, current, kind })
+    setTitleDraft(current)
+    setTitleError('')
+  }
+  const refreshAfterTitle = (): void => {
+    void refreshHub()
+    if (view.kind === 'chat') openChat(view.id)
+  }
+  const saveTitle = async (): Promise<void> => {
+    if (!titleEditor) return
+    const value = titleDraft.trim()
+    const bytes = titleBytes(value)
+    if (!value) { setTitleError(t('title.empty')); return }
+    if (bytes > 80) { setTitleError(t('title.bytes.over', { bytes })); return }
+    setTitleBusy(true)
+    setTitleError('')
+    try {
+      const result = await api.renameSessionTitle(cwd, titleEditor.sessionId, value)
+      if (result.status !== 'ok') { setTitleError(result.message); return }
+      setNotice(result.message)
+      api.invalidateBadges()
+      setTitleEditor(undefined)
+      refreshAfterTitle()
+    } catch (actionError) {
+      setTitleError(t('title.failed', { message: String(actionError instanceof Error ? actionError.message : actionError) }))
+    } finally {
+      setTitleBusy(false)
+    }
+  }
+  const resetTitle = async (sessionId: string): Promise<void> => {
+    const confirmed = typeof window === 'undefined' || typeof window.confirm !== 'function'
+      || window.confirm(t('title.reset.confirm'))
+    if (!confirmed) return
+    setNotice(undefined)
+    setError(undefined)
+    try {
+      const result = await api.resetSessionTitle(cwd, sessionId)
+      if (result.status === 'ok') { setNotice(result.message); api.invalidateBadges(); refreshAfterTitle() }
+      else setError(result.message)
+    } catch (actionError) {
+      setError(t('title.failed', { message: String(actionError instanceof Error ? actionError.message : actionError) }))
+    }
+  }
+  const repairTitle = async (sessionId: string): Promise<void> => {
+    setNotice(undefined)
+    setError(undefined)
+    try {
+      const result = await api.repairSessionTitle(cwd, sessionId)
+      if (result.status === 'ok') { setNotice(result.message); api.invalidateBadges(); if (!result.needsOpen) refreshAfterTitle() }
+      else setError(result.message)
+    } catch (actionError) {
+      setError(t('title.failed', { message: String(actionError instanceof Error ? actionError.message : actionError) }))
+    }
+  }
+
   // R7: the host catalogs behind the quick launcher (agent presets, model
   // routes, permission presets), read once per mount. A failure leaves the
   // corresponding selector empty — the launcher still works with defaults.
@@ -1706,11 +1807,18 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       )
     : null
 
+  const currentHubRow = sessionId ? hubs.find((row) => row.sessionId === sessionId) : undefined
   const hubView: ReactNode = [
     composerView,
     receiptView,
     // R19 协同②: the current hub's own delegates, with state / set / sharing.
-    BranchList({ rows: hubBranches, t, onOpen: openChat }),
+    BranchList({
+      rows: hubBranches,
+      t,
+      onOpen: openChat,
+      onRename: (row) => openTitleEditor(row.branchSessionId, row.title, 'branch'),
+      onReset: (row) => void resetTitle(row.branchSessionId),
+    }),
     // R22 需求⑦: 中枢会话页签只留「派发 + 回执 + 本中枢的分支 + 当前会话」。
     // 话题集列表、激活话题集、会话数/在线数统计都属于话题集页签，这里不再
     // 重复展示——用户已明确「这部分都在话题集页签里看」。
@@ -1720,6 +1828,24 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         h('span', { className: 'sm-muted' }, sessionId || '—'),
         h(Button, { key: 'refresh', label: t('hub.refresh'), onClick: () => void refreshHub() }),
       ),
+      // R59 Phase 1b-2: 中枢标题管理（重命名 / 恢复自动命名 / 修复）。
+      currentHubRow
+        ? h('div', { key: 'title-row', className: 'sm-sub' }, t('title.rename.current', { title: currentHubRow.title }))
+        : null,
+      currentHubRow
+        ? h('div', { key: 'title-actions', className: 'sm-actions' },
+            h(Button, {
+              key: 'rename', label: t('title.rename'),
+              onClick: () => openTitleEditor(currentHubRow.sessionId, currentHubRow.title, 'hub'),
+            }),
+            currentHubRow.titleState === 'user-locked'
+              ? h(Button, { key: 'reset', label: t('title.reset'), onClick: () => void resetTitle(currentHubRow.sessionId) })
+              : null,
+            currentHubRow.titleRepairable
+              ? h(Button, { key: 'repair', label: t('title.repair'), onClick: () => void repairTitle(currentHubRow.sessionId) })
+              : null,
+          )
+        : null,
     ),
   ]
 
@@ -1776,6 +1902,15 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
               ),
               row.tags && row.tags.length > 0 ? tagChips(row.tags) : null,
               h('div', { key: 'id', className: 'sm-sub' }, row.branchSessionId),
+              // R59 Phase 1b-2: 分支行标题操作（重命名 / 恢复自动命名）。
+              h('div', { key: 'title-actions', className: 'sm-actions' },
+                h('span', { key: 'rename', onClick: (event: { stopPropagation: () => void }) => event.stopPropagation() },
+                  h(Button, { key: 'b', label: t('title.rename'), onClick: () => openTitleEditor(row.branchSessionId, row.title, 'branch') })),
+                row.titleState === 'user-locked'
+                  ? h('span', { key: 'reset', onClick: (event: { stopPropagation: () => void }) => event.stopPropagation() },
+                      h(Button, { key: 'b', label: t('title.reset'), onClick: () => void resetTitle(row.branchSessionId) }))
+                  : null,
+              ),
             ),
           ),
     ),
@@ -2561,7 +2696,14 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         chatData?.note ? h('div', { key: 'note', className: 'sm-muted' }, chatData.note) : null,
         // R19 协同②: a hub's conversation shows its linked branches right above
         // the messages; a branch's conversation shows none (it owns no branches).
-        chatBranches.length > 0 ? BranchList({ rows: chatBranches, t, onOpen: openChat, compact: true }) : null,
+        chatBranches.length > 0 ? BranchList({
+          rows: chatBranches,
+          t,
+          onOpen: openChat,
+          compact: true,
+          onRename: (row) => openTitleEditor(row.branchSessionId, row.title, 'branch'),
+          onReset: (row) => void resetTitle(row.branchSessionId),
+        }) : null,
         (chatData?.messages ?? []).length === 0 && !chatData?.note
           ? h(EmptyState, { key: 'empty', label: t('chat.empty'), hint: t('chat.empty.hint') })
           : h('div', { key: 'msgs', className: 'sm-list' },
@@ -2727,28 +2869,36 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
             // old OR compared BOTH, so opening any hub in the panel highlighted
             // that row AND the shell session's row (two highlights at once).
             const current = isRailCurrent(view, hubRow.sessionId, sessionId)
-            return h('button', {
-              key: hubRow.sessionId,
-              type: 'button',
-              className: 'sm-hub',
-              'data-current': String(current),
-              title: `${hubRow.title}${hubRow.topicSetTitle ? ` · 话题集 ${hubRow.topicSetTitle}` : ''} · ${hubRow.sessionId}`,
-              onClick: () => openChat(hubRow.sessionId),
-            },
-              hubRow.live
-                ? h('span', { key: 'dot', className: 'sm-dot', title: t('side.running') })
-                : null,
-              h('span', { key: 'title', className: 'sm-hub-title' }, hubRow.title || hubRow.sessionId.slice(-4)),
-              hubRow.topicSetTitle
-                ? h('span', { key: 'set', className: 'sm-hub-meta sm-hub-set', title: `${t('badge.hubSet.tip', { title: hubRow.topicSetTitle })}` }, hubRow.topicSetTitle)
-                : null,
-              hubRow.branches > 0
-                ? h('span', {
-                    key: 'branches', className: 'sm-hub-meta',
-                    title: t('side.branches', { count: hubRow.branches, working: hubRow.workingBranches }),
-                  }, hubRow.workingBranches > 0 ? `${hubRow.branches}·${hubRow.workingBranches}` : String(hubRow.branches))
-                : null,
-              current ? h('span', { key: 'cur', className: 'sm-hub-meta' }, t('side.current')) : null,
+            return h('div', { key: hubRow.sessionId, className: 'sm-hub-row' },
+              h('button', {
+                key: 'open',
+                type: 'button',
+                className: 'sm-hub',
+                'data-current': String(current),
+                title: `${hubRow.title}${hubRow.topicSetTitle ? ` · 话题集 ${hubRow.topicSetTitle}` : ''} · ${hubRow.sessionId}`,
+                onClick: () => openChat(hubRow.sessionId),
+              },
+                hubRow.live
+                  ? h('span', { key: 'dot', className: 'sm-dot', title: t('side.running') })
+                  : null,
+                h('span', { key: 'title', className: 'sm-hub-title' }, hubRow.title || hubRow.sessionId.slice(-4)),
+                hubRow.topicSetTitle
+                  ? h('span', { key: 'set', className: 'sm-hub-meta sm-hub-set', title: `${t('badge.hubSet.tip', { title: hubRow.topicSetTitle })}` }, hubRow.topicSetTitle)
+                  : null,
+                hubRow.branches > 0
+                  ? h('span', {
+                      key: 'branches', className: 'sm-hub-meta',
+                      title: t('side.branches', { count: hubRow.branches, working: hubRow.workingBranches }),
+                    }, hubRow.workingBranches > 0 ? `${hubRow.branches}·${hubRow.workingBranches}` : String(hubRow.branches))
+                  : null,
+                current ? h('span', { key: 'cur', className: 'sm-hub-meta' }, t('side.current')) : null,
+              ),
+              // R59 Phase 1b-2: per-row rename (reset/repair live in the hub tab).
+              h('button', {
+                key: 'rename', type: 'button', className: 'sm-hub-more',
+                title: t('title.rename'), 'aria-label': t('title.rename'),
+                onClick: () => openTitleEditor(hubRow.sessionId, hubRow.title, 'hub'),
+              }, '⋯'),
             )
           }),
         ),
@@ -2826,6 +2976,43 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
       )
     : null
 
+  // R59 Phase 1b-2: rename dialog — current title, byte counter, explicit error.
+  const titleModal: ReactNode = titleEditor
+    ? h('div', {
+        key: 'title-modal', className: 'sm-modal-backdrop',
+        onClick: () => setTitleEditor(undefined),
+      },
+        h('div', {
+          key: 'dialog', className: 'sm-modal', role: 'dialog', 'aria-modal': 'true',
+          onClick: (event: { stopPropagation: () => void }) => event.stopPropagation(),
+        },
+          h('h3', { key: 'title' }, t('title.rename.title')),
+          h('p', { key: 'hint', className: 'sm-modal-hint' }, t('title.rename.hint')),
+          h('div', { key: 'current', className: 'sm-sub' }, t('title.rename.current', { title: titleEditor.current })),
+          h('input', {
+            key: 'input', className: 'sm-input', value: titleDraft, autoFocus: true,
+            onChange: (event: { target: { value: string } }) => { setTitleDraft(event.target.value); setTitleError('') },
+          }),
+          h('div', {
+            key: 'bytes',
+            className: titleBytes(titleDraft) > 80 ? 'sm-error' : 'sm-sub',
+          },
+            titleBytes(titleDraft) > 80
+              ? t('title.bytes.over', { bytes: titleBytes(titleDraft) })
+              : t('title.bytes', { bytes: titleBytes(titleDraft) })),
+          titleError ? h('div', { key: 'err', className: 'sm-error' }, titleError) : null,
+          h('div', { key: 'actions', className: 'sm-actions' },
+            h(Button, {
+              key: 'save', variant: 'primary', label: t('title.save'),
+              disabled: titleBusy || !titleDraft.trim() || titleBytes(titleDraft) > 80,
+              onClick: () => void saveTitle(),
+            }),
+            h(Button, { key: 'cancel', label: t('title.cancel'), onClick: () => setTitleEditor(undefined) }),
+          ),
+        ),
+      )
+    : null
+
   // Compact head (R18 需求⑥): one row — brand, workspace selector, count pills.
   const main = h('main', { key: 'main', className: 'sm-main' },
     h('div', { key: 'head', className: 'sm-head' },
@@ -2863,5 +3050,6 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   return h('div', { className: 'sm-panel', 'data-sm-panel': 'true' },
     h('div', { key: 'shell', className: 'sm-shell' }, sideRail, main),
     memoryModal,
+    titleModal,
   )
 }

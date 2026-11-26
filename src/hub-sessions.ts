@@ -64,11 +64,18 @@ import {
 } from './session-title/policy.ts'
 import { isOpenDispatch } from './hub-branches.ts'
 import { resolveSessionTitle } from './session-title/resolve.ts'
+import { titleRow } from './session-title/state.ts'
 
 /** One hub-session row of the panel's left rail. */
 export interface HubSessionView {
   sessionId: string
   title: string
+  /** R59: naming state from session_titles ('' = no row yet / pre-R59 row). */
+  titleState?: 'provisional' | 'named' | 'user-locked' | 'deferred' | ''
+  /** R59: an automatic title is preserved, so "restore auto naming" can work. */
+  autoTitleAvailable?: boolean
+  /** R59: the host title is neutral/legacy or the naming row is deferred. */
+  titleRepairable?: boolean
   /**
    * R22 需求⑧: the session is RUNNING a turn right now — the green dot. This is
    * `Agent.status === 'running'`, not "attached to the host": a finished but
@@ -459,9 +466,18 @@ export async function listHubSessions(
     // panel rail and the web console both call this list, so they agree.
     const hostTitle = title?.title ?? fallbackTitle(sessionId)
     const shown = resolveSessionTitle(ctx, store, sessionId) || hostTitle
+    const naming = titleRow(store, sessionId)
+    // "Repair" is meaningful while the host carries no topic, or the naming row
+    // is still deferred/pending; a named non-neutral host needs no repair.
+    const hostNeedsName = !title?.title
+      || isNeutralHubTitle(title.title, sessionCwd)
+      || isLegacyHubTitle(title.title)
     return {
       sessionId,
       title: shown,
+      titleState: naming?.state ?? '',
+      autoTitleAvailable: Boolean(naming?.autoTitle || naming?.desiredTitle),
+      titleRepairable: Boolean(naming?.state !== 'user-locked' && (!naming || naming.state === 'deferred' || hostNeedsName)),
       live: isRunning(sessionId),
       online: record.live === true,
       // The header has no updatedAt; the latest title event is the only cheap

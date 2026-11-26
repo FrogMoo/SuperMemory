@@ -75,6 +75,7 @@ async function adoptHostTitle(deps: TitleDeps, row: SessionTitleRow | undefined,
   await patchTitleRow(store, sessionId, {
     state: 'named',
     desiredTitle: title,
+    autoTitle: title,
     desiredFull: title,
     lastWrittenTitle: title,
     ...(typeof seq === 'number' ? { lastTitleSeq: seq } : {}),
@@ -111,12 +112,10 @@ async function onHostTitle(deps: TitleDeps, sessionId: string, title: string, se
     return
   }
   if (row.state === 'user-locked') {
-    // A human renamed again (or a pending manual write landed): keep the lock,
-    // adopt the new text as the intent so "restore auto naming" still knows it.
-    if (row.desiredTitle !== title) {
+    // A human renamed again: keep the lock and the AUTO title; only the human
+    // name and the last-written marker move. "Restore auto naming" still works.
+    if (row.lastWrittenTitle !== title) {
       await patchTitleRow(store, sessionId, {
-        desiredTitle: title,
-        desiredFull: title,
         lastWrittenTitle: title,
         ...(typeof seq === 'number' ? { lastTitleSeq: seq } : {}),
         lockedReason: row.lockedReason || 'manual',
@@ -143,11 +142,13 @@ async function onHostTitle(deps: TitleDeps, sessionId: string, title: string, se
     return
   }
   // A topic-bearing title the plugin did not write → a human renamed the
-  // session outside the plugin. Automatic naming stops for it.
+  // session outside the plugin. Automatic naming stops, but the automatic
+  // title is PRESERVED so "restore auto naming" can bring it back.
+  const autoTitle = String(row.autoTitle ?? '').trim()
+    || (row.desiredTitle && row.desiredTitle !== title ? row.desiredTitle : '')
   await patchTitleRow(store, sessionId, {
     state: 'user-locked',
-    desiredTitle: title,
-    desiredFull: title,
+    ...(autoTitle ? { autoTitle, desiredTitle: autoTitle } : {}),
     lastWrittenTitle: title,
     ...(typeof seq === 'number' ? { lastTitleSeq: seq } : {}),
     lockedReason: 'external-rename',

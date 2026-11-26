@@ -55,9 +55,8 @@ export async function reconcileSessionTitle(
     // never unlock). This keeps the persisted intent current for a future
     // explicit "restore auto naming".
     if (host && !hostNeutral && hostTitle !== row.lastWrittenTitle && hostTitle !== row.desiredTitle) {
+      // Keep the auto intent; only the human name / last-written marker move.
       await patchTitleRow(store, sessionId, {
-        desiredTitle: hostTitle,
-        desiredFull: hostTitle,
         lastWrittenTitle: hostTitle,
         lastTitleSeq: host.seq,
         lockedReason: row.lockedReason || 'manual',
@@ -87,6 +86,7 @@ export async function reconcileSessionTitle(
     if (row.state !== 'named') {
       await patchTitleRow(store, sessionId, {
         state: 'named',
+        autoTitle: row.autoTitle || desired,
         lastWrittenTitle: desired,
         lastTitleSeq: host?.seq,
         attempts: 0,
@@ -99,10 +99,11 @@ export async function reconcileSessionTitle(
 
   // ---- a different topic-bearing host title we did not write = external rename ----
   if (!hostNeutral && hostTitle !== row.lastWrittenTitle) {
+    const autoTitle = String(row.autoTitle ?? '').trim()
+      || (row.desiredTitle && row.desiredTitle !== hostTitle ? row.desiredTitle : '')
     await patchTitleRow(store, sessionId, {
       state: 'user-locked',
-      desiredTitle: hostTitle,
-      desiredFull: hostTitle,
+      ...(autoTitle ? { autoTitle, desiredTitle: autoTitle } : {}),
       lastWrittenTitle: hostTitle,
       lastTitleSeq: host?.seq,
       lockedReason: 'external-rename',

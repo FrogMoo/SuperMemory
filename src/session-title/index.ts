@@ -16,6 +16,10 @@ export { applySessionTitle, renameSession, resetAutoTitle, claimHostWrite, pendi
 export { deferTitleTask, retryReentrant, MAX_TITLE_WRITE_ATTEMPTS } from './defer.ts'
 export { attachSessionTitleObserver, firstUserMessageSeq, contentText } from './observe.ts'
 export { ensureMemberTitle, type MemberTitleOptions } from './member.ts'
+export {
+  syncDurableTitles, titleKindOf, renameSessionWithDurables, resetSessionWithDurables,
+  type DurableSync, type TitleMutationResult,
+} from './durable.ts'
 export { reconcileSessionTitle, reconcileTitles, type ReconcileSummary } from './reconcile.ts'
 export {
   migrateSessionTitles, settleSessionTitlePendingId, sessionTitlesMarker,

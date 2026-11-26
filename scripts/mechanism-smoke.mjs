@@ -1479,6 +1479,9 @@ const fakeCtx = (services) => ({
     }
     const railRows = await listHubSessions(railCtx, store, WORKSPACE)
     assert.equal(railRows[0]?.title, WS_LABEL + ' · 镜像主题', 'the rail uses the same resolver as the cards/header')
+    assert.equal(railRows[0]?.titleState, 'deferred', 'the rail carries the naming state for the title actions')
+    assert.equal(railRows[0]?.autoTitleAvailable, true, 'the rail knows a reset can restore an auto title')
+    assert.equal(railRows[0]?.titleRepairable, true, 'a neutral host is repairable')
     R.titles.set('session-resolve', '宿主主题')
     assert.equal(resolveSessionTitle(R.ctx, store, 'session-resolve'), '宿主主题', 'a topic-bearing host wins')
     ok('R59-13 展示回落：中性宿主→hub 镜像；面板/左栏/卡片同一解析顺序；非中性宿主优先')
@@ -1532,6 +1535,240 @@ const fakeCtx = (services) => ({
     assert.equal(D.titles.get('session-deferred'), WS_LABEL + ' · 冷会话补名')
     assert.deepEqual(store.meta.get('session-titles').sessionTitlesPendingIds, [], 'the first live activity drains pending')
     ok('R59-15 冷会话首次活动：deferred 行出栈重试成功并移出 pending')
+  }
+
+  // R59-16: a manual rename preserves the automatic title; reset restores it.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    H.live('session-auto')
+    seedHub(store, 'session-auto')
+    const deps = { ctx: H.ctx, store, logger: quiet }
+    await applySessionTitle(deps, {
+      sessionId: 'session-auto', workspaceKey: WORKSPACE, kind: 'hub', topicText: '自动主题', source: 'first-message',
+    })
+    const auto = H.titles.get('session-auto')
+    assert.ok(auto && auto.endsWith('自动主题'))
+    const manual = await renameSession(deps, { sessionId: 'session-auto', title: '人工名字' })
+    assert.equal(manual.outcome, 'host')
+    let row = store.sessionTitles.get('session-auto')
+    assert.equal(row.state, 'user-locked')
+    assert.equal(row.autoTitle, auto, 'the automatic title is preserved')
+    assert.equal(row.desiredTitle, auto, 'desiredTitle keeps the automatic intent')
+    assert.equal(row.lastWrittenTitle, '人工名字')
+    assert.equal(H.titles.get('session-auto'), '人工名字')
+    assert.equal(store.hubs.get('session-auto').title, '人工名字', 'the hub mirror follows the human name')
+    // Automatic events must not overwrite the lock.
+    const writesBefore = titleWrites.length
+    await applySessionTitle(deps, {
+      sessionId: 'session-auto', workspaceKey: WORKSPACE, kind: 'hub', topicText: '另一个主题', source: 'first-message',
+    })
+    assert.equal(titleWrites.length, writesBefore, 'a locked row is never auto-renamed')
+    assert.equal(H.titles.get('session-auto'), '人工名字')
+    // Restore: back to the automatic title, still the same mirror.
+    const reset = await resetAutoTitle(deps, { sessionId: 'session-auto' })
+    assert.equal(reset.outcome, 'host')
+    assert.equal(H.titles.get('session-auto'), auto)
+    row = store.sessionTitles.get('session-auto')
+    assert.equal(row.state, 'named')
+    assert.equal(row.autoTitle, auto)
+    assert.equal(store.hubs.get('session-auto').title, auto)
+    ok('R59-16 手动改名保留 autoTitle：state=user-locked、自动事件不覆盖、reset 写回自动标题与镜像')
+  }
+
+  // R59-17: a host-GUI rename locks but also keeps the automatic title.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    H.live('session-gui')
+    seedHub(store, 'session-gui')
+    const deps = { ctx: H.ctx, store, logger: quiet }
+    await applySessionTitle(deps, {
+      sessionId: 'session-gui', workspaceKey: WORKSPACE, kind: 'hub', topicText: '自动命名', source: 'first-message',
+    })
+    const auto = H.titles.get('session-gui')
+    attachSessionTitles(deps)
+    // Simulate a rename in the host GUI: set the title and publish the event.
+    const session = H.sessions.get('session-gui')
+    H.titles.set('session-gui', 'GUI 起的名字')
+    H.emit('session-gui', {
+      type: 'session/title', seq: (session.seq ?? 0) + 1, time: Date.now(),
+      data: { title: 'GUI 起的名字', messageSeqs: [], source: { kind: 'user' } },
+    })
+    await flush()
+    let row = store.sessionTitles.get('session-gui')
+    assert.equal(row.state, 'user-locked')
+    assert.equal(row.lockedReason, 'external-rename')
+    assert.equal(row.autoTitle, auto, 'the outside rename also preserves the auto title')
+    assert.equal(row.lastWrittenTitle, 'GUI 起的名字')
+    const reset = await resetAutoTitle(deps, { sessionId: 'session-gui' })
+    assert.equal(reset.outcome, 'host')
+    assert.equal(H.titles.get('session-gui'), auto)
+    assert.equal(store.hubs.get('session-gui').title, auto)
+    ok('R59-17 宿主 GUI 改名：lock + 保留 autoTitle，之后 reset 可恢复')
+  }
+
+  // R59-18: panel rename/reset/repair — branch durable copies stay in step.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    const autoHub = WS_LABEL + ' · 面板自动中枢'
+    const autoBranch = WS_LABEL + ' · 面板自动分支'
+    H.live('session-panel-hub')
+    seedHub(store, 'session-panel-hub')
+    await store.sessionTitles.put('session-panel-hub', {
+      workspaceKey: WORKSPACE, sessionId: 'session-panel-hub', kind: 'hub', state: 'named',
+      desiredTitle: autoHub, autoTitle: autoHub, desiredFull: autoHub, topic: '',
+      lastWrittenTitle: autoHub, source: 'panel', attempts: 0, lastError: '', lockedReason: '',
+      createdAt: now, updatedAt: now,
+    })
+    H.titles.set('session-panel-hub', autoHub)
+    H.live('branch-panel')
+    await store.topicsets.put('ts-panel', {
+      workspaceKey: WORKSPACE, title: '面板话题集', summary: '', keywords: [], status: 'active',
+      members: [{ sessionId: 'branch-panel', kind: 'fork', title: autoBranch, summary: '', status: 'idle', modelOverridden: false, lastActiveAt: now }],
+      createdAt: now, updatedAt: now, lastActiveAt: now,
+    })
+    await store.dispatches.put('d-panel', {
+      topicSetId: 'ts-panel', branchSessionId: 'branch-panel', task: '面板任务', hubSessionId: 'session-panel-hub',
+      startSeq: 0, status: 'delivered', title: autoBranch, tags: [], capability: 'full', createdAt: now, updatedAt: now,
+    })
+    await store.sessionTitles.put('branch-panel', {
+      workspaceKey: WORKSPACE, sessionId: 'branch-panel', kind: 'branch', state: 'named',
+      desiredTitle: autoBranch, autoTitle: autoBranch, desiredFull: autoBranch, topic: '',
+      lastWrittenTitle: autoBranch, source: 'dispatch', attempts: 0, lastError: '', lockedReason: '',
+      createdAt: now, updatedAt: now,
+    })
+    H.titles.set('branch-panel', autoBranch)
+    const services = { typert: { register: () => () => {} } }
+    const panelCtx = {
+      ...H.ctx,
+      provide: (key, value) => { services[key] = value },
+      effect: (fn) => { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
+      get: (name) => (name === 'sessionTitle' ? H.service : name === 'typert' ? services.typert : H.services[name]),
+    }
+    attachPanel(panelCtx, store)
+    const panel = services.supermemoryPanel
+    // Hub rename: host + mirror (and the member/auto title is preserved).
+    const hubRename = await panel.renameSessionTitle(WORKSPACE, 'session-panel-hub', '人工中枢')
+    assert.equal(hubRename.status, 'ok')
+    assert.equal(H.titles.get('session-panel-hub'), '人工中枢')
+    assert.equal(store.hubs.get('session-panel-hub').title, '人工中枢')
+    let hubRow = store.sessionTitles.get('session-panel-hub')
+    assert.equal(hubRow.state, 'user-locked')
+    assert.equal(hubRow.autoTitle, autoHub)
+    // Branch rename: host + dispatch.title + member.title = ONE final string.
+    const branchRename = await panel.renameSessionTitle(WORKSPACE, 'branch-panel', '人工分支')
+    assert.equal(branchRename.status, 'ok')
+    assert.equal(H.titles.get('branch-panel'), '人工分支')
+    assert.equal(store.dispatches.get('d-panel').title, '人工分支', 'dispatch.title follows the rename')
+    assert.equal(store.topicsets.get('ts-panel').members[0].title, '人工分支', 'member.title follows the rename')
+    assert.equal(store.sessionTitles.get('branch-panel').autoTitle, autoBranch)
+    // Over 80 bytes is an explicit error, never a silent cut.
+    const tooLong = await panel.renameSessionTitle(WORKSPACE, 'session-panel-hub', '长'.repeat(30))
+    assert.equal(tooLong.status, 'error')
+    assert.ok(tooLong.message.includes('80'))
+    // Restore both: host + mirror + durables go back to the auto titles.
+    const hubReset = await panel.resetSessionTitle(WORKSPACE, 'session-panel-hub')
+    assert.equal(hubReset.status, 'ok')
+    assert.equal(H.titles.get('session-panel-hub'), autoHub)
+    assert.equal(store.hubs.get('session-panel-hub').title, autoHub)
+    assert.equal(store.sessionTitles.get('session-panel-hub').state, 'named')
+    const branchReset = await panel.resetSessionTitle(WORKSPACE, 'branch-panel')
+    assert.equal(branchReset.status, 'ok')
+    assert.equal(H.titles.get('branch-panel'), autoBranch)
+    assert.equal(store.dispatches.get('d-panel').title, autoBranch)
+    assert.equal(store.topicsets.get('ts-panel').members[0].title, autoBranch)
+    // A cold repair never resumes; it returns needsOpen.
+    seedHub(store, 'session-cold-panel')
+    const coldRepair = await panel.repairSessionTitle(WORKSPACE, 'session-cold-panel')
+    assert.equal(coldRepair.status, 'ok')
+    assert.equal(coldRepair.needsOpen, true)
+    assert.equal(H.titles.has('session-cold-panel'), false, 'a cold session is never written by repair')
+    // No auto title: reset is an explicit error and nothing is written.
+    H.live('session-noauto')
+    await store.sessionTitles.put('session-noauto', {
+      workspaceKey: WORKSPACE, sessionId: 'session-noauto', kind: 'hub', state: 'user-locked',
+      desiredTitle: '人工标题', autoTitle: '', desiredFull: '', topic: '',
+      lastWrittenTitle: '人工标题', source: 'manual', attempts: 0, lastError: '', lockedReason: 'manual',
+      createdAt: now, updatedAt: now,
+    })
+    H.titles.set('session-noauto', '人工标题')
+    const noAuto = await panel.resetSessionTitle(WORKSPACE, 'session-noauto')
+    assert.equal(noAuto.status, 'error')
+    assert.ok(noAuto.message.includes('没有可恢复'), 'a missing auto title is reported, not invented')
+    assert.equal(H.titles.get('session-noauto'), '人工标题', 'nothing is written without an auto title')
+    ok('R59-18 面板远程：中枢/分支重命名宿主+镜像+dispatch+member 同串；reset 三处恢复；80 字节报错；冷修复 needsOpen；无 autoTitle 明确报错')
+  }
+
+  // R59-19: live repair + legacy auto-title recovery + cold ops need open.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    const services = { typert: { register: () => () => {} } }
+    const panelCtx = {
+      ...H.ctx,
+      provide: (key, value) => { services[key] = value },
+      effect: (fn) => { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
+      get: (name) => (name === 'sessionTitle' ? H.service : name === 'typert' ? services.typert : H.services[name]),
+    }
+    attachPanel(panelCtx, store)
+    const panel = services.supermemoryPanel
+    // A live DEFERRED hub with a neutral host is repaired directly.
+    H.live('session-repair')
+    seedHub(store, 'session-repair', WS_LABEL + ' · 镜像主题')
+    H.titles.set('session-repair', '新会话')
+    await store.sessionTitles.put('session-repair', {
+      workspaceKey: WORKSPACE, sessionId: 'session-repair', kind: 'hub', state: 'deferred',
+      desiredTitle: WS_LABEL + ' · 镜像主题', autoTitle: WS_LABEL + ' · 镜像主题', desiredFull: '', topic: '',
+      lastWrittenTitle: '', source: 'migration', attempts: 0, lastError: 'session-not-live', lockedReason: '',
+      createdAt: now, updatedAt: now,
+    })
+    const repaired = await panel.repairSessionTitle(WORKSPACE, 'session-repair')
+    assert.equal(repaired.status, 'ok')
+    assert.equal(H.titles.get('session-repair'), WS_LABEL + ' · 镜像主题')
+    assert.equal(store.sessionTitles.get('session-repair').state, 'named')
+    // A LEGACY locked row (no autoTitle) recovers from the hub mirror.
+    H.live('session-legacy-lock')
+    seedHub(store, 'session-legacy-lock', WS_LABEL + ' · 旧自动名')
+    H.titles.set('session-legacy-lock', '人工旧名')
+    await store.sessionTitles.put('session-legacy-lock', {
+      workspaceKey: WORKSPACE, sessionId: 'session-legacy-lock', kind: 'hub', state: 'user-locked',
+      desiredTitle: '人工旧名', autoTitle: '', desiredFull: '', topic: '',
+      lastWrittenTitle: '人工旧名', source: 'manual', attempts: 0, lastError: '', lockedReason: 'external-rename',
+      createdAt: now, updatedAt: now,
+    })
+    const legacy = await panel.resetSessionTitle(WORKSPACE, 'session-legacy-lock')
+    assert.equal(legacy.status, 'ok')
+    assert.equal(H.titles.get('session-legacy-lock'), WS_LABEL + ' · 旧自动名', 'the mirror supplies the missing auto title')
+    // A branch legacy row recovers from its stored topic.
+    H.live('branch-legacy-lock')
+    await store.sessionTitles.put('branch-legacy-lock', {
+      workspaceKey: WORKSPACE, sessionId: 'branch-legacy-lock', kind: 'branch', state: 'user-locked',
+      desiredTitle: '人工分支', autoTitle: '', desiredFull: '', topic: '真实任务主题',
+      lastWrittenTitle: '人工分支', source: 'manual', attempts: 0, lastError: '', lockedReason: 'manual',
+      createdAt: now, updatedAt: now,
+    })
+    H.titles.set('branch-legacy-lock', '人工分支')
+    const branchLegacy = await panel.resetSessionTitle(WORKSPACE, 'branch-legacy-lock')
+    assert.equal(branchLegacy.status, 'ok')
+    assert.equal(H.titles.get('branch-legacy-lock'), composeBranchTitle('真实任务主题'), 'the stored topic recomposes')
+    // Cold manual rename / reset: explicit needsOpen, never a host write.
+    seedHub(store, 'session-cold-ops')
+    await store.sessionTitles.put('session-cold-ops', {
+      workspaceKey: WORKSPACE, sessionId: 'session-cold-ops', kind: 'hub', state: 'deferred',
+      desiredTitle: WS_LABEL + ' · 冷自动', autoTitle: WS_LABEL + ' · 冷自动', desiredFull: '', topic: '',
+      lastWrittenTitle: '', source: 'migration', attempts: 0, lastError: 'session-not-live', lockedReason: '',
+      createdAt: now, updatedAt: now,
+    })
+    const coldRename = await panel.renameSessionTitle(WORKSPACE, 'session-cold-ops', '冷改名')
+    assert.equal(coldRename.status, 'error')
+    assert.equal(coldRename.needsOpen, true)
+    const coldReset = await panel.resetSessionTitle(WORKSPACE, 'session-cold-ops')
+    assert.equal(coldReset.status, 'error')
+    assert.equal(coldReset.needsOpen, true)
+    assert.equal(H.titles.has('session-cold-ops'), false, 'cold ops never write the host')
+    ok('R59-19 live 修复/deferred 对齐；legacy locked 无 autoTitle 时从镜像/主题恢复；冷重命名与 reset 均 needsOpen 不写宿主')
   }
 }
 

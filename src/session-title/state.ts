@@ -51,6 +51,7 @@ export async function ensureTitleRow(
     kind: input.kind ?? 'other',
     state: 'provisional',
     desiredTitle: '',
+    autoTitle: '',
     desiredFull: '',
     topic: '',
     lastWrittenTitle: '',
@@ -97,6 +98,20 @@ export async function setTitleState(
   extra: Partial<Omit<SessionTitleRow, 'sessionId' | 'createdAt'>> = {},
 ): Promise<SessionTitleRow | undefined> {
   return patchTitleRow(store, sessionId, { ...extra, state })
+}
+
+/** The recorded title of one topic-set member (root or fork), if any. */
+export function memberTitleOf(store: Store | undefined, sessionId: string): string {
+  if (!store || !sessionId) return ''
+  try {
+    for (const [, topicSet] of store.topicsets.entries()) {
+      const member = (topicSet.members ?? []).find((row) => row.sessionId === sessionId)
+      if (member && typeof member.title === 'string' && member.title.trim()) return member.title.trim()
+    }
+  } catch {
+    // A partly materialized table only loses the fallback.
+  }
+  return ''
 }
 
 /**

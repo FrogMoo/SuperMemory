@@ -24,10 +24,11 @@ import {
   composeBranchTitleFull,
   composeHubTitle,
   composeHubTitleFull,
+  isLegacyTitle,
   isNeutralTitle,
   validateManualTitle,
 } from './policy.ts'
-import { ensureTitleRow, mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
+import { ensureTitleRow, hubRecord, memberTitleOf, mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
 import type { TitleDeps, TitleIntent, TitleKind, TitleResult, TitleState } from './types.ts'
 
 /** Claims of writes this process started, so the observer can attribute them. */
@@ -113,6 +114,37 @@ function composeIntent(
 }
 
 /**
+ * The automatic title a reset should restore, or '' when none is known.
+ *
+ * Order: the preserved `autoTitle`, the stored desired (unless it is the human's
+ * own lastWritten), the durable mirror, the topic-set member title, then the
+ * stored topic recomposed under the current policy. A legacy user-locked row
+ * (desired was overwritten with the human title) therefore still recovers.
+ */
+function recoverAutoTitle(store: Store, row: SessionTitleRow, kind: TitleKind, workspace: string): string {
+  const preserved = String(row.autoTitle ?? '').trim()
+  if (preserved) return preserved
+  const desired = String(row.desiredTitle ?? '').trim()
+  if (desired && (row.state !== 'user-locked' || desired !== row.lastWrittenTitle)) return desired
+  const usable = (value: string): string => {
+    const text = String(value ?? '').trim()
+    if (!text || isNeutralTitle(text, workspace) || isLegacyTitle(text)) return ''
+    return clipTitleBytes(text)
+  }
+  const mirror = usable(hubRecord(store, row.sessionId)?.title ?? '')
+  if (mirror) return mirror
+  const member = usable(memberTitleOf(store, row.sessionId))
+  if (member) return member
+  const topic = String(row.topic ?? '').trim()
+  if (topic) {
+    if (kind === 'branch') return composeBranchTitle(topic)
+    if (kind === 'hub') return composeHubTitle(workspace, topic)
+    return clipTitleBytes(topic)
+  }
+  return ''
+}
+
+/**
  * One host write with the re-entrant retry loop, optionally deferred out of the
  * current stack. The claim is registered immediately so the observer can
  * attribute the resulting `session/title` event even when the write is deferred.
@@ -144,6 +176,7 @@ async function recordDeferred(
   await patchTitleRow(deps.store as Store, sessionId, {
     state: 'deferred',
     desiredTitle: composed.desired || row.desiredTitle,
+    autoTitle: composed.desired || row.autoTitle,
     desiredFull: composed.full,
     topic: composed.topic || row.topic,
     ...(intent.kind ? { kind: intent.kind } : {}),
@@ -197,26 +230,43 @@ async function applyInner(deps: TitleDeps, intent: TitleIntent): Promise<TitleRe
   const kind: TitleKind = intent.kind ?? row.kind
   const workspace = String(intent.workspaceKey ?? row.workspaceKey ?? '')
 
-  // ---- manual rename: validate, lock, write ----
+  // ---- manual rename: validate, lock, write; PRESERVE the automatic title ----
   if (intent.mode === 'manual') {
     const validated = validateManualTitle(intent.explicitTitle ?? intent.topicText ?? '')
     if (!validated.ok) return { outcome: 'skipped', title: row.desiredTitle, reason: validated.error }
+    // The host cannot rename a cold session. Never resume it here: the panel
+    // reports "open the session first" instead of pretending the rename landed.
+    if (!isSessionLive(deps.ctx, sessionId)) {
+      return { outcome: 'skipped', title: row.desiredTitle || row.autoTitle || '', reason: 'session-not-live' }
+    }
+    // Preserve the automatic title BEFORE the human title replaces the host name.
+    // A row created from an existing host name keeps that name as the baseline.
+    let autoTitle = recoverAutoTitle(store, row, kind, workspace)
+    if (!autoTitle) {
+      const before = readHostTitle(deps.ctx, sessionId)?.title
+      if (before && !isNeutralTitle(before, workspace) && !isLegacyTitle(before)) autoTitle = clipTitleBytes(before)
+    }
     const { result } = await runHostWrite(deps, sessionId, validated.title, { defer: intent.defer })
     if (result.outcome === 'none') {
-      const deferred = await recordDeferred(
-        deps, sessionId, row,
-        { desired: validated.title, full: validated.title, topic: row.topic },
-        { ...intent, source: 'manual' }, result,
-      )
-      await patchTitleRow(store, sessionId, { state: 'user-locked', lockedReason: 'manual' })
-      return { ...deferred, state: 'user-locked', reason: deferred.reason }
+      // Keep the prior state and the recovered intent: the manual rename did
+      // not land, so the UI retries rather than showing a false success.
+      await patchTitleRow(store, sessionId, {
+        ...(autoTitle ? { autoTitle } : {}),
+        attempts: (row.attempts ?? 0) + 1,
+        lastError: (result.error ?? 'host-write-failed').slice(0, 300),
+      })
+      return {
+        outcome: 'deferred',
+        title: row.desiredTitle || autoTitle,
+        state: row.state,
+        reason: result.error ?? 'host-write-failed',
+      }
     }
     const accepted = result.accepted ?? validated.title
     await patchTitleRow(store, sessionId, {
       state: 'user-locked',
       kind,
-      desiredTitle: accepted,
-      desiredFull: validated.title,
+      ...(autoTitle ? { autoTitle, desiredTitle: autoTitle, desiredFull: row.desiredFull || autoTitle } : {}),
       lastWrittenTitle: accepted,
       lastTitleSeq: readHostTitle(deps.ctx, sessionId)?.seq,
       source: 'manual',
@@ -253,11 +303,13 @@ async function applyInner(deps: TitleDeps, intent: TitleIntent): Promise<TitleRe
     // outside the plugin (the host pins on every rename, and our own writes are
     // claimed). Automatic naming stops for it; a manual reset can unlock later.
     if (current && current !== row.lastWrittenTitle && !currentNeutral && current !== composed.desired) {
+      // Preserve the automatic intent: a human rename must not destroy the name
+      // a later "restore auto naming" should bring back.
+      const autoTitle = recoverAutoTitle(store, row, kind, workspace)
       await patchTitleRow(store, sessionId, {
         state: 'user-locked',
         kind,
-        desiredTitle: current,
-        desiredFull: current,
+        ...(autoTitle ? { autoTitle, desiredTitle: autoTitle } : {}),
         lastWrittenTitle: current,
         lastTitleSeq: host?.seq,
         lockedReason: 'external-rename',
@@ -296,6 +348,7 @@ async function applyInner(deps: TitleDeps, intent: TitleIntent): Promise<TitleRe
     kind,
     ...(intent.workspaceKey ? { workspaceKey: intent.workspaceKey } : {}),
     desiredTitle: accepted,
+    autoTitle: accepted,
     desiredFull: composed.full,
     topic: composed.topic || row.topic,
     lastWrittenTitle: accepted,
@@ -332,14 +385,23 @@ export async function resetAutoTitle(
   deps: TitleDeps,
   input: { sessionId: string; workspaceKey?: string; kind?: TitleKind; defer?: boolean },
 ): Promise<TitleResult> {
-  const row = titleRow(deps.store, input.sessionId)
+  const store = deps.store as Store
+  const row = titleRow(store, input.sessionId)
   if (!row) return { outcome: 'skipped', title: '', reason: 'no-row' }
   const kind = input.kind ?? row.kind
+  const workspace = input.workspaceKey ?? row.workspaceKey
+  const autoTitle = recoverAutoTitle(store, row, kind, workspace)
+  if (!autoTitle) {
+    return { outcome: 'skipped', title: '', state: row.state, reason: 'no-auto-title' }
+  }
+  if (!isSessionLive(deps.ctx, row.sessionId)) {
+    return { outcome: 'skipped', title: autoTitle, state: row.state, reason: 'session-not-live' }
+  }
   return applySessionTitle(deps, {
     sessionId: input.sessionId,
-    workspaceKey: input.workspaceKey ?? row.workspaceKey,
+    workspaceKey: workspace,
     kind,
-    topicText: row.topic,
+    explicitTitle: autoTitle,
     mode: 'reset',
     force: true,
     defer: input.defer,

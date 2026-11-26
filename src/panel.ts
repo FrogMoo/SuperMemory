@@ -22,6 +22,11 @@ import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
 import { ensureMemberTitle } from './session-title/member.ts'
 import { applySessionTitle } from './session-title/gate.ts'
 import { resolveSessionTitle } from './session-title/resolve.ts'
+import { renameSessionWithDurables, resetSessionWithDurables, titleKindOf } from './session-title/durable.ts'
+import { isSessionLive, readHostTitle } from './session-title/host.ts'
+import { reconcileSessionTitle } from './session-title/reconcile.ts'
+import { clipTitleBytes, composeHubTitle, isNeutralTitle, validateManualTitle } from './session-title/policy.ts'
+import { hubRecord, memberTitleOf, titleRow } from './session-title/state.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
@@ -44,7 +49,7 @@ import {
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
-import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
+import { isLegacyHubTitle, isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
 // R36 需求①②: 中枢白名单（默认拒绝）的读写；R39：动态目录按来源分组。
 import {
   DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, LOCKED_HUB_TOOLS,
@@ -356,6 +361,8 @@ export interface MutationResult {
   status: 'ok' | 'error'
   message: string
   id?: string
+  /** R59: the operation needs the session opened first (cold; never resumed). */
+  needsOpen?: boolean
 }
 
 /**
@@ -1208,6 +1215,133 @@ export class SupermemoryPanelService {
       const topicSet = this.store.topicsets.get(row.topicSetId)
       return !topicSet || topicSet.workspaceKey === workspaceKey
     })
+  }
+
+  /**
+   * R59 Phase 1b-2: manually rename a hub or a work branch from the panel.
+   *
+   * One final string (validated by the policy, ≤ 80 UTF-8 bytes) is written to
+   * the host + hub mirror by the gate and then into the durable copies
+   * (`dispatches.title` and the topic-set member title) by the service, so the
+   * rail, the card and the host sidebar never split. A cold session is NOT
+   * resumed: the caller gets `needsOpen` instead of a false success.
+   */
+  async renameSessionTitle(cwd: string, sessionId: string, title: string): Promise<MutationResult> {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return { status: 'error', message: '缺少会话 id。' }
+    const ctx = this.ctx
+    if (!ctx) return { status: 'error', message: '宿主上下文不可用，无法改名。' }
+    const validated = validateManualTitle(String(title ?? ''))
+    if (!validated.ok) return { status: 'error', message: validated.error }
+    const row = titleRow(this.store, id)
+    const kind = titleKindOf(this.store, id, row?.kind)
+    const result = await renameSessionWithDurables({ ctx, store: this.store, logger: panelTitleLogger }, {
+      sessionId: id,
+      title: validated.title,
+      workspaceKey: row?.workspaceKey || this.wk(cwd),
+      kind,
+      defer: true,
+    })
+    if (result.outcome === 'skipped' && result.reason === 'session-not-live') {
+      return { status: 'error', message: '会话未运行：打开该会话后再重命名（不会在后台恢复会话）。', id, needsOpen: true }
+    }
+    if (result.outcome === 'host' || result.outcome === 'fallback' || result.outcome === 'already') {
+      return { status: 'ok', message: '已重命名为「' + result.title + '」。', id }
+    }
+    return { status: 'error', message: '重命名失败：' + (result.reason ?? '宿主未接受该标题'), id }
+  }
+
+  /**
+   * R59 Phase 1b-2: restore the AUTOMATIC title preserved by a manual / external
+   * rename. The host + mirror + durable copies are rewritten together. A row
+   * whose automatic title is unknown (legacy adoption) is reported explicitly and
+   * left untouched — never replaced by the human title.
+   */
+  async resetSessionTitle(cwd: string, sessionId: string): Promise<MutationResult> {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return { status: 'error', message: '缺少会话 id。' }
+    const ctx = this.ctx
+    if (!ctx) return { status: 'error', message: '宿主上下文不可用，无法恢复自动命名。' }
+    const row = titleRow(this.store, id)
+    const kind = titleKindOf(this.store, id, row?.kind)
+    const result = await resetSessionWithDurables({ ctx, store: this.store, logger: panelTitleLogger }, {
+      sessionId: id,
+      workspaceKey: row?.workspaceKey || this.wk(cwd),
+      kind,
+      defer: true,
+    })
+    if (result.outcome === 'skipped') {
+      if (result.reason === 'no-auto-title') {
+        return { status: 'error', message: '没有可恢复的自动标题（该会话尚未记录自动命名）；请直接重命名。', id }
+      }
+      if (result.reason === 'session-not-live') {
+        return { status: 'error', message: '会话未运行：打开会话后再恢复自动命名（不会在后台恢复会话）。', id, needsOpen: true }
+      }
+      if (result.reason === 'no-row') {
+        return { status: 'error', message: '该会话没有命名记录，无法恢复自动命名。', id }
+      }
+    }
+    if (result.outcome === 'host' || result.outcome === 'fallback' || result.outcome === 'already') {
+      return { status: 'ok', message: '已恢复自动命名：「' + result.title + '」。', id }
+    }
+    return { status: 'error', message: '恢复自动命名失败：' + (result.reason ?? '宿主未接受该标题'), id }
+  }
+
+  /**
+   * R59 Phase 1b-2: repair a neutral/deferred title through the same reconcile
+   * path used at startup. A cold session is never resumed — the caller gets
+   * `needsOpen` and the first live event / next startup repairs it.
+   */
+  async repairSessionTitle(cwd: string, sessionId: string): Promise<MutationResult> {
+    const id = String(sessionId ?? '').trim()
+    if (!id) return { status: 'error', message: '缺少会话 id。' }
+    const ctx = this.ctx
+    if (!ctx) return { status: 'error', message: '宿主上下文不可用，无法修复标题。' }
+    if (!isSessionLive(ctx, id)) {
+      return {
+        status: 'ok',
+        message: '会话未运行：打开该会话后会自动修复标题（不会在后台恢复会话）。',
+        id,
+        needsOpen: true,
+      }
+    }
+    const row = titleRow(this.store, id)
+    if (row?.state === 'user-locked') {
+      return { status: 'error', message: '标题已被人工锁定；请使用「恢复自动命名」。', id }
+    }
+    const workspace = row?.workspaceKey || this.wk(cwd)
+    const kind = titleKindOf(this.store, id, row?.kind)
+    const host = readHostTitle(ctx, id)?.title ?? ''
+    if (!row && host && !isNeutralTitle(host, workspace) && !isLegacyHubTitle(host)) {
+      return { status: 'ok', message: '当前标题已包含主题，无需修复。', id }
+    }
+    let result = await reconcileSessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, id, {
+      reason: 'panel-repair',
+      defer: true,
+    })
+    if (!result) {
+      const mirror = hubRecord(this.store, id)?.title ?? ''
+      const target = (mirror && !isNeutralTitle(mirror, workspace)) ? clipTitleBytes(mirror)
+        : (row?.autoTitle || row?.desiredTitle || '')
+          || (kind === 'hub' ? composeHubTitle(workspace, '') : memberTitleOf(this.store, id))
+      if (!target) return { status: 'error', message: '没有可修复的标题（没有镜像或自动标题）。', id }
+      result = await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
+        sessionId: id,
+        workspaceKey: workspace,
+        kind,
+        explicitTitle: target,
+        source: 'reconcile',
+        force: true,
+        defer: true,
+      })
+    }
+    if (result.outcome === 'host' || result.outcome === 'fallback' || result.outcome === 'already') {
+      return { status: 'ok', message: '已修复标题：「' + result.title + '」。', id }
+    }
+    if (result.outcome === 'locked') {
+      return { status: 'error', message: '宿主标题已被外部改名，已标记为用户锁定；可用「恢复自动命名」。', id }
+    }
+    return { status: 'error', message: '修复失败：' + (result.reason ?? result.outcome), id }
   }
 
   /**
@@ -2417,6 +2551,40 @@ const PANEL_DESCRIPTORS = Object.freeze([
     result: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionRows', create: () => ({ parse: (v: unknown) => v }) },
     parameters: [
       { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R59 Phase 1b-2: rename one hub/branch title (host + mirror + durables).
+    id: 'dsh-supermemory#supermemoryPanel/renameSessionTitle',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'renameSessionTitle',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionId', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'title', wire: 'title', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#TitleText', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R59 Phase 1b-2: restore the preserved AUTOMATIC title.
+    id: 'dsh-supermemory#supermemoryPanel/resetSessionTitle',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'resetSessionTitle',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionId', create: () => ({ parse: (v: unknown) => v }) } },
+    ],
+  },
+  {
+    // R59 Phase 1b-2: repair a neutral/deferred title (cold -> needsOpen).
+    id: 'dsh-supermemory#supermemoryPanel/repairSessionTitle',
+    service: 'supermemoryPanel', namespace: 'supermemoryPanel', method: 'repairSessionTitle',
+    invocation: { kind: 'direct' },
+    result: { mode: 'strict', typeSymbol: 'dsh-supermemory#MutationResult', create: () => ({ parse: (v: unknown) => v }) },
+    parameters: [
+      { name: 'cwd', wire: 'cwd', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#Cwd', create: () => ({ parse: (v: unknown) => v }) } },
+      { name: 'sessionId', wire: 'sessionId', source: 'json', codec: { mode: 'strict', typeSymbol: 'dsh-supermemory#HubSessionId', create: () => ({ parse: (v: unknown) => v }) } },
     ],
   },
   {

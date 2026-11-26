@@ -65,6 +65,10 @@ export const PANEL_REMOTE = Object.freeze({
     method('createTopicSet', [param('cwd'), param('title'), param('tags', true), param('summary', true)]),
     method('suggestMemoryShape', [param('text')]),
     method('listHubSessions', [param('cwd')]),
+    // R59 Phase 1b-2: 会话标题管理（重命名 / 恢复自动命名 / 修复）。
+    method('renameSessionTitle', [param('cwd'), param('sessionId'), param('title')]),
+    method('resetSessionTitle', [param('cwd'), param('sessionId')]),
+    method('repairSessionTitle', [param('cwd'), param('sessionId')]),
     // R19 协同②: hub → branches association (name / state / shared / set).
     method('listHubBranches', [param('cwd'), param('hubSessionId'), param('limit', true)]),
     // R30 需求③: 中枢管理全部话题集（含归档）+ 查看全部分支会话（跨话题集）。

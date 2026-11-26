@@ -392,6 +392,12 @@ export async function buildSchemas() {
     state: z.enum(['provisional', 'named', 'user-locked', 'deferred']).default('provisional'),
     /** The final title the plugin wants (already byte-clipped, same string the host holds). */
     desiredTitle: z.string().default(''),
+    /**
+     * R59 Phase 1b-2: the AUTOMATIC title preserved while a human owns the name.
+     * Reset restores this; an external lock must not erase it. '' = unknown (a
+     * legacy/adopted row; reset then recomputes from the mirror/topic).
+     */
+    autoTitle: z.string().default(''),
     /** The unclipped composition, for diagnostics only (never written to the host). */
     desiredFull: z.string().default(''),
     /** The raw topic/task text the composition came from (so reset can recompute). */

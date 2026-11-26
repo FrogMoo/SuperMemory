@@ -21,7 +21,7 @@ import type { Store } from '../store.ts'
 import type { TopicSet } from '../schema.ts'
 import { readHostTitle } from './host.ts'
 import { isNeutralTitle } from './policy.ts'
-import { hubRecord, titleRow } from './state.ts'
+import { hubRecord, memberTitleOf, titleRow } from './state.ts'
 
 /** A topic-bearing, non-legacy title, trimmed; '' otherwise. */
 function usable(title: string | undefined, workspace: string): string {
@@ -29,20 +29,6 @@ function usable(title: string | undefined, workspace: string): string {
   if (!value) return ''
   if (isNeutralTitle(value, workspace)) return ''
   return value
-}
-
-/** The recorded title of one topic-set member, if any. */
-function memberTitle(store: Store | undefined, sessionId: string): string {
-  if (!store || !sessionId) return ''
-  try {
-    for (const [, topicSet] of store.topicsets.entries() as IterableIterator<[string, TopicSet]>) {
-      const member = (topicSet.members ?? []).find((row) => row.sessionId === sessionId)
-      if (member && typeof member.title === 'string' && member.title.trim()) return member.title.trim()
-    }
-  } catch {
-    // A partly materialized table only loses the fallback.
-  }
-  return ''
 }
 
 /**
@@ -83,7 +69,7 @@ export interface TitleReadHost {
  */
 export function sessionTitleOf(ctx: TitleReadHost | undefined, store: Store | undefined, sessionId: string): string {
   const resolved = resolveSessionTitle(ctx as unknown as Context | undefined, store, sessionId)
-  return resolved || memberTitle(store, sessionId)
+  return resolved || memberTitleOf(store, sessionId)
 }
 
 /** Explicit alias for the display-layer entry (same resolution order). */
