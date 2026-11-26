@@ -18,8 +18,10 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   topicSetIdsOf, touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
-import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, ensureMemberTitle } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis } from './title.ts'
+import { ensureMemberTitle } from './session-title/member.ts'
 import { applySessionTitle } from './session-title/gate.ts'
+import { resolveSessionTitle } from './session-title/resolve.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
@@ -1270,15 +1272,18 @@ export class SupermemoryPanelService {
     } catch {
       query = undefined
     }
-    let title = id.slice(-4)
+    let observedTitle = ''
     try {
       if (query?.readTitleSnapshots) {
         const observations = await query.readTitleSnapshots([id])
         const observed = observations.find((row) => row.status === 'fulfilled' && row.sessionId === id)
-        const observedTitle = observed?.value?.title?.title
-        if (typeof observedTitle === 'string' && observedTitle.trim()) title = observedTitle.trim()
+        const value = observed?.value?.title?.title
+        if (typeof value === 'string' && value.trim()) observedTitle = value.trim()
       }
     } catch { /* a title failure keeps the id suffix */ }
+    // R59 Phase 1b: a neutral host title falls back to the hub mirror, so the
+    // panel chat header says the same thing as the rail and the branch cards.
+    let title = resolveSessionTitle(ctx, this.store, id) || observedTitle || id.slice(-4)
     if (!query?.readSurface) {
       return {
         sessionId: id, title, live, messages: [], truncated: false,

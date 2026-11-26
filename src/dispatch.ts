@@ -19,8 +19,10 @@ import {
   findVerifyTopicSet, matchTopicSetForTask, renderTopicSetConfirm, verifyTopicSetTitle,
 } from './topicset-match.ts'
 import {
-  TOPIC_SET_TITLE_MAX_CHARS, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine, sessionTitleOf,
+  TOPIC_SET_TITLE_MAX_CHARS, cleanTitleText, clipEllipsis, firstLine,
 } from './title.ts'
+import { sessionTitleOf } from './session-title/resolve.ts'
+import { ensureMemberTitle } from './session-title/member.ts'
 import { applySessionTitle } from './session-title/gate.ts'
 import { dispatchSource } from './chat-card.ts'
 import { hubSelection, type ModelSelection } from './model.ts'

@@ -19,7 +19,8 @@ import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
 import { clipRelayResult, episodeResult } from './relay-text.ts'
 import { updateMember } from './topicsets.ts'
 import { relaySource, type ChatCardKind } from './chat-card.ts'
-import { sessionTitleOf, type TitleHost } from './title.ts'
+import type { TitleHost } from './title.ts'
+import { sessionTitleOf } from './session-title/resolve.ts'
 
 export interface ObserveConfig {
   enabled: boolean

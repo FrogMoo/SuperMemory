@@ -1,37 +1,38 @@
 /**
- * R59: reconcile the naming state with the host (startup / reload / repair).
+ * R59 Phase 1b: reconcile the naming state with the host (startup / reload /
+ * first live event).
  *
- * STATUS (Phase 1a): DRAFT, NOT WIRED. Nothing calls `reconcileTitles` yet;
- * the live paths (gate/observer) already repair a neutral host title. Phase 1b
- * reviews the full pass and wires it into startup and the panel repair action.
+ * A session can drift from its intent without any plugin bug: the host was
+ * restarted between the intent and the write (the write stayed deferred), a cold
+ * session never got its rename, or a human renamed the session in the host GUI.
+ * Reconcile is idempotent and NEVER resumes a session:
+ *   - user-locked → no-op (a human owns the name);
+ *   - host == desired → named, and the id leaves the migration pending set;
+ *   - host neutral → re-assert the SAME desiredTitle (deferred out of any
+ *     publication stack);
+ *   - host topic-bearing and different from lastWrittenTitle → external rename
+ *     → user-locked;
+ *   - cold → keep the intent deferred (the first live event retries it).
  *
- * A session can drift from its intent without any plugin bug: the host may
- * have been restarted between the intent and the write (the write was
- * `deferred`), a cold session never got its rename, or a human renamed the
- * session in the host GUI. Reconcile is idempotent:
- *   - `user-locked` + a pending manual write → flush it once the session is live;
- *   - `user-locked` + the host carries a different topic → adopt (a human rename);
- *   - `named` + the host went neutral → re-assert the intent;
- *   - `named` + the host carries a DIFFERENT topic → user-locked (external);
- *   - `deferred` / `provisional` → retry the write (live) or stay deferred (cold).
- *
- * It NEVER resumes a session (a bulk resume would start agents as a side
- * effect); cold sessions wait for their first live event or the panel's
- * explicit "repair" action.
  * @module supermemory/session-title/reconcile
  */
 import type { SessionTitleRow } from '../schema.ts'
 import type { Store } from '../store.ts'
-import { applySessionTitle, clearPendingWrite, renameSession } from './gate.ts'
+import { applySessionTitle } from './gate.ts'
 import { isSessionLive, readHostTitle } from './host.ts'
+import { settleSessionTitlePendingId } from './migrate.ts'
 import { isNeutralTitle } from './policy.ts'
 import { mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
 import type { TitleDeps, TitleResult } from './types.ts'
 
 /** How many rows one reconcile pass looks at (a runaway table must stay bounded). */
-const RECONCILE_LIMIT = 200
+const RECONCILE_LIMIT = 300
 
-/** Reconcile ONE session. Returns undefined when there is nothing to do. */
+/**
+ * Reconcile ONE session. Returns undefined when there is nothing to do.
+ * The host write (if any) still goes through the SINGLE gate entry; this module
+ * only decides what the intent is.
+ */
 export async function reconcileSessionTitle(
   deps: TitleDeps,
   sessionId: string,
@@ -42,112 +43,95 @@ export async function reconcileSessionTitle(
   const row = titleRow(store, sessionId)
   if (!row) return undefined
   const workspace = row.workspaceKey
+  const live = isSessionLive(deps.ctx, sessionId)
   const host = readHostTitle(deps.ctx, sessionId)
+  const hostTitle = host?.title ?? ''
+  const desired = String(row.desiredTitle ?? '').trim()
+  const hostNeutral = !hostTitle || isNeutralTitle(hostTitle, workspace)
 
-  // ---- user-locked: flush a pending manual write, adopt a human rename ----
+  // ---- user-locked: a human owns the name ----
   if (row.state === 'user-locked') {
-    if (!host) {
-      // Still cold: keep the intent for the first live event.
-      if (row.desiredTitle && row.lastWrittenTitle !== row.desiredTitle) {
-        deps.logger.info('supermemory: pending manual title for ' + sessionId + ' waits for the session to become live')
-      }
-      return undefined
-    }
-    const pendingManual = Boolean(row.desiredTitle) && row.lastWrittenTitle !== row.desiredTitle
-    if (pendingManual) {
-      clearPendingWrite(sessionId)
-      return renameSession(deps, {
-        sessionId,
-        title: row.desiredTitle,
-        workspaceKey: workspace,
-        kind: row.kind,
-        defer: options.defer,
-      })
-    }
-    if (host.title !== row.lastWrittenTitle && !isNeutralTitle(host.title, workspace)) {
-      // A human renamed it in the host GUI while the row was locked.
+    // Adopt a NEW outside name for display/mirror only (never write the host,
+    // never unlock). This keeps the persisted intent current for a future
+    // explicit "restore auto naming".
+    if (host && !hostNeutral && hostTitle !== row.lastWrittenTitle && hostTitle !== row.desiredTitle) {
       await patchTitleRow(store, sessionId, {
-        desiredTitle: host.title,
-        desiredFull: host.title,
-        lastWrittenTitle: host.title,
+        desiredTitle: hostTitle,
+        desiredFull: hostTitle,
+        lastWrittenTitle: hostTitle,
         lastTitleSeq: host.seq,
         lockedReason: row.lockedReason || 'manual',
       })
-      if (row.kind === 'hub') await mirrorHubTitle(store, sessionId, host.title, workspace)
-      return { outcome: 'locked', title: host.title, state: 'user-locked', reason: 'adopted-external' }
+      if (row.kind === 'hub') await mirrorHubTitle(store, sessionId, hostTitle, workspace)
     }
     return undefined
   }
 
-  // ---- cold session: keep the intent, mark it deferred ----
-  if (!host) {
-    if (row.desiredTitle && row.state !== 'deferred') {
-      await patchTitleRow(store, sessionId, { state: 'deferred', lastError: row.lastError || 'session-not-live' })
-      return { outcome: 'deferred', title: row.desiredTitle, state: 'deferred', reason: 'session-not-live' }
-    }
-    return undefined
-  }
-
-  const desired = String(row.desiredTitle ?? '').trim()
+  // No stored intent (a provisional row with no topic yet): nothing to align.
   if (!desired) return undefined
 
-  const desiredNeutral = isNeutralTitle(desired, workspace)
-  const hostNeutral = isNeutralTitle(host.title, workspace)
-
-  if (host.title === desired) {
-    if (row.state !== 'named' && !desiredNeutral) {
-      await patchTitleRow(store, sessionId, { state: 'named', lastWrittenTitle: host.title, lastTitleSeq: host.seq, attempts: 0, lastError: '' })
-      return { outcome: 'already', title: host.title, state: 'named' }
-    }
-    if (row.state === 'deferred') {
-      await patchTitleRow(store, sessionId, { state: desiredNeutral ? 'provisional' : 'named', lastWrittenTitle: host.title, lastTitleSeq: host.seq, attempts: 0, lastError: '' })
+  // ---- cold: keep the intent deferred, never resume ----
+  if (!live) {
+    if (row.state !== 'deferred') {
+      await patchTitleRow(store, sessionId, {
+        state: 'deferred',
+        lastError: row.lastError || 'session-not-live',
+      })
+      return { outcome: 'deferred', title: desired, state: 'deferred', reason: 'session-not-live' }
     }
     return undefined
   }
 
-  // A neutral INTENT is only re-asserted over a neutral host (never over a
-  // topic-bearing name somebody else chose).
-  if (desiredNeutral && !hostNeutral) {
-    await patchTitleRow(store, sessionId, {
-      state: 'user-locked',
-      desiredTitle: host.title,
-      desiredFull: host.title,
-      lastWrittenTitle: host.title,
-      lastTitleSeq: host.seq,
-      lockedReason: 'external-rename',
-    })
-    return { outcome: 'locked', title: host.title, state: 'user-locked', reason: 'external-rename' }
+  // ---- host already holds the intent ----
+  if (hostTitle === desired) {
+    if (row.state !== 'named') {
+      await patchTitleRow(store, sessionId, {
+        state: 'named',
+        lastWrittenTitle: desired,
+        lastTitleSeq: host?.seq,
+        attempts: 0,
+        lastError: '',
+      })
+    }
+    await settleSessionTitlePendingId(store, sessionId)
+    return { outcome: 'already', title: desired, state: 'named' }
   }
 
-  // A topic-bearing host title we did not write → external rename.
-  if (!hostNeutral && host.title !== row.lastWrittenTitle) {
+  // ---- a different topic-bearing host title we did not write = external rename ----
+  if (!hostNeutral && hostTitle !== row.lastWrittenTitle) {
     await patchTitleRow(store, sessionId, {
       state: 'user-locked',
-      desiredTitle: host.title,
-      desiredFull: host.title,
-      lastWrittenTitle: host.title,
-      lastTitleSeq: host.seq,
+      desiredTitle: hostTitle,
+      desiredFull: hostTitle,
+      lastWrittenTitle: hostTitle,
+      lastTitleSeq: host?.seq,
       lockedReason: 'external-rename',
     })
-    if (row.kind === 'hub') await mirrorHubTitle(store, sessionId, host.title, workspace)
+    if (row.kind === 'hub') await mirrorHubTitle(store, sessionId, hostTitle, workspace)
+    await settleSessionTitlePendingId(store, sessionId)
     deps.logger.info('supermemory: reconcile locked ' + sessionId + ' (renamed outside the plugin)')
-    return { outcome: 'locked', title: host.title, state: 'user-locked', reason: 'external-rename' }
+    return { outcome: 'locked', title: hostTitle, state: 'user-locked', reason: 'external-rename' }
   }
 
-  // Host neutral/legacy (or an older write of ours): re-assert the intent.
+  // ---- host neutral (or our own previous write): re-assert the SAME intent ----
   const result = await applySessionTitle(deps, {
     sessionId,
     kind: row.kind,
     workspaceKey: workspace,
     explicitTitle: desired,
-    topicText: row.topic,
     source: 'reconcile',
     force: true,
-    defer: options.defer,
+    defer: options.defer ?? true,
   })
+  if (result.outcome === 'host' || result.outcome === 'fallback' || result.outcome === 'already') {
+    await settleSessionTitlePendingId(store, sessionId)
+  } else if (result.outcome === 'locked') {
+    // The gate saw a race with a human rename; the row is locked and settled.
+    await settleSessionTitlePendingId(store, sessionId)
+  }
   deps.logger.info(
     'supermemory: reconcile ' + (options.reason ? '(' + options.reason + ') ' : '')
-    + 're-asserted ' + sessionId + ' → ' + result.outcome,
+    + sessionId + ' → ' + result.outcome,
   )
   return result
 }
@@ -162,8 +146,8 @@ export interface ReconcileSummary {
 }
 
 /**
- * Reconcile every naming row (bounded). Safe to run on startup/reload and from
- * the panel's explicit "repair" action.
+ * Reconcile every naming row (bounded). Safe on startup/reload and from the
+ * panel's explicit repair action. Cold sessions are counted but never resumed.
  */
 export async function reconcileTitles(
   deps: TitleDeps,
@@ -183,13 +167,11 @@ export async function reconcileTitles(
     return summary
   }
   for (const row of rows) {
-    if (row.kind === 'other' && row.state !== 'deferred') continue
-    if (!isSessionLive(deps.ctx, row.sessionId) && row.state !== 'user-locked') {
-      // Cold: reconcile still records the deferred state, but never resumes.
-      if (row.desiredTitle && row.state !== 'deferred') {
-        await patchTitleRow(store, row.sessionId, { state: 'deferred', lastError: row.lastError || 'session-not-live' })
-        summary.deferred += 1
-      }
+    if (row.kind === 'other') continue
+    if (row.state === 'user-locked') continue
+    if (row.state === 'provisional') continue
+    if (!isSessionLive(deps.ctx, row.sessionId)) {
+      if (row.state === 'deferred') summary.deferred += 1
       continue
     }
     summary.checked += 1
@@ -204,7 +186,7 @@ export async function reconcileTitles(
       deps.logger.warn('supermemory: reconcile failed for ' + row.sessionId + ': ' + String(error).slice(0, 160))
     }
   }
-  if (summary.checked > 0 || summary.deferred > 0) {
+  if (summary.checked > 0 || summary.deferred > 0 || summary.locked > 0 || summary.failed > 0) {
     deps.logger.info(
       'supermemory: title reconcile — checked ' + summary.checked + ', repaired ' + summary.repaired
       + ', deferred ' + summary.deferred + ', locked ' + summary.locked + ', failed ' + summary.failed,

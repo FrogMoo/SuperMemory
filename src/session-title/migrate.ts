@@ -1,64 +1,80 @@
 /**
- * R59: one-time migration of the existing title corpus into the naming service.
+ * R59 Phase 1b: one-time migration of the existing title corpus into the naming
+ * service — MARKER v1 of the new 'session-titles' row (never the R42
+ * 'hub-titles' v3 marker, which has already converged).
  *
- * STATUS (Phase 1a): DRAFT, NOT WIRED. The plugin does not call
- * `startupSessionTitles`, so no marker is written and no corpus is touched in
- * this round; Phase 1b reviews this pass, writes docs and wires the startup run.
- * The module is kept because it typechecks and is the reviewed starting point.
+ * Rules per hub_sessions row:
+ *   a. a user-locked row is never touched;
+ *   b. a topic-bearing, non-legacy host title is adopted (desired = host,
+ *      lastWritten = host, mirror = host) with NO host write;
+ *   c. a neutral/legacy host title + a topic-bearing mirror → desired is the
+ *      policy-normalized composition (workspace prefix once, ≤ 80 UTF-8 bytes);
+ *   d. a neutral host title + a topic-less mirror → provisional
+ *      '<工作区> · 新会话';
+ *   e. a LIVE session gets a deferred rename; a COLD session is stored as
+ *      deferred and recorded in the marker's pending set. Cold sessions are
+ *      NEVER resumed.
  *
- * The pre-R59 world had three generations of names and one broken upgrade hook:
- *   - host titles with the old brand prefix or `新会话 · <id>` (legacy);
- *   - plugin hubs whose host title is a bare/qualified neutral name while the
- *     `hub_sessions` mirror already carries the topic (the R43 failure state);
- *   - host titles a human or the host's LLM chose (topic-bearing) — these are
- *     ADOPTED and never rewritten.
- *
- * The pass is marker-guarded (meta row `session-titles`, version 1) and
- * idempotent by content:
- *   - durable dispatch/member/hub titles are normalized to the 80-byte rule;
- *   - a topic-bearing host title is adopted as-is;
- *   - a neutral/legacy host title is renamed to the composed title when the
- *     session is LIVE (deferred out of any publication stack), or recorded as
- *     `deferred` (cold) so the first live event / panel repair finishes it;
- *   - user-locked rows (none before R59, but a panel rename may race the pass)
- *     are never touched.
+ * Marker/convergence: version + processed/pending id sets. A processed id is
+ * never scanned again; cold ids stay pending and are retried on their first live
+ * event (see observe.ts / reconcile.ts). The marker is written even while
+ * pending is non-empty, so "no renamable live item left" is the convergence
+ * condition — not "pending is empty". Repeated startups are idempotent.
  * @module supermemory/session-title/migrate
  */
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from '../store.ts'
 import { workspaceKeyOf } from '../store.ts'
 import { isPluginBranchId } from '../hub-sessions.ts'
+import { cleanTitleText, stripLeadingDescription } from '../title.ts'
 import { applySessionTitle } from './gate.ts'
 import { isSessionLive, readHostTitle } from './host.ts'
 import {
-  composeBranchTitle,
-  composeBranchTitleFull,
+  clipTitleBytes,
   composeHubTitle,
-  composeHubTitleFull,
+  composeRecordedHubTitle,
   isLegacyTitle,
   isNeutralTitle,
-  clipTitleBytes,
 } from './policy.ts'
 import { ensureTitleRow, mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
-import type { TitleDeps, TitleKind } from './types.ts'
-import { describeSessionTitle } from '../title.ts'
+import type { TitleDeps } from './types.ts'
 
 /** Bump when the migration rules change; an older marker re-runs the pass. */
 export const SESSION_TITLES_MIGRATION_VERSION = 1
 
-/** The meta-table row key of the migration marker. */
+/** The meta-table row key of the new migration marker. */
 const MARKER_KEY = 'session-titles'
 
 /** Bound on scanned candidates (a diagnostics pass, not an archive walk). */
 const CANDIDATE_LIMIT = 300
 
-/** Marker shape (declared fields live in schema.ts `meta`). */
+/** Bound on the recorded id sets (diagnostics, not an archive). */
+const ID_CAP = 500
+
+/** Marker shape (declared fields live in schema.ts meta). */
 export interface SessionTitlesMarker {
   sessionTitlesMigrationVersion?: number
   sessionTitlesMigratedAt?: number
   sessionTitlesMigrated?: number
   sessionTitlesAdopted?: number
   sessionTitlesDeferred?: number
+  sessionTitlesSkipped?: number
+  sessionTitlesCleaned?: number
+  sessionTitlesProcessedIds?: string[]
+  sessionTitlesPendingIds?: string[]
+}
+
+/** One planned mapping, exposed for dry-run and the read-only verification. */
+export interface SessionTitlesPlanItem {
+  sessionId: string
+  kind: 'hub'
+  workspaceKey: string
+  hostTitle: string
+  mirrorTitle: string
+  desiredTitle: string
+  action: 'adopt' | 'rename' | 'provisional' | 'deferred' | 'locked' | 'skip' | 'unknown'
+  live: boolean
+  reason: string
 }
 
 export interface SessionTitlesMigrationResult {
@@ -69,13 +85,15 @@ export interface SessionTitlesMigrationResult {
   deferred: number
   skipped: number
   cleaned: number
+  processed: number
+  pending: number
+  plan: SessionTitlesPlanItem[]
 }
 
 interface Candidate {
   sessionId: string
-  kind: TitleKind
   workspaceKey: string
-  /** The durable mirror title this session already has (hub record / dispatch row). */
+  /** The durable mirror title this session already has (hub_sessions.title). */
   mirrorTitle: string
 }
 
@@ -87,7 +105,6 @@ interface TitleSnapshotLike {
 
 interface SessionQueryLike {
   readTitleSnapshots?(sessionIds: readonly string[]): Promise<TitleSnapshotLike[]>
-  readSurface?(sessionId: string): Promise<{ events?: Array<{ type?: string; seq?: number; data?: unknown }> }>
 }
 
 function serviceOf<T>(ctx: Context | undefined, name: string): T | undefined {
@@ -99,7 +116,41 @@ function serviceOf<T>(ctx: Context | undefined, name: string): T | undefined {
   }
 }
 
-/** All topic-set titles (prefix stripping evidence). */
+/** The persisted marker, or undefined when the pass never ran. */
+export function sessionTitlesMarker(store: Store | undefined): SessionTitlesMarker | undefined {
+  if (!store) return undefined
+  try {
+    return store.meta?.get?.(MARKER_KEY) as SessionTitlesMarker | undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Remove one id from the pending set after a successful live write (called by
+ * the reconcile/first-event path). Content-idempotent; a missing marker is a
+ * no-op.
+ */
+export async function settleSessionTitlePendingId(store: Store | undefined, sessionId: string): Promise<void> {
+  if (!store || !sessionId) return
+  const marker = sessionTitlesMarker(store)
+  if (!marker) return
+  // Only a PENDING id needs settling. This keeps a healthy startup from doing a
+  // meta write per already-named row (reconcile calls this for every row).
+  if (!(marker.sessionTitlesPendingIds ?? []).includes(sessionId)) return
+  const pending = (marker.sessionTitlesPendingIds ?? []).filter((id) => id !== sessionId)
+  const processed = [...new Set([...(marker.sessionTitlesProcessedIds ?? []), sessionId])].slice(-ID_CAP)
+  try {
+    await store.meta.put(MARKER_KEY, {
+      ...marker,
+      sessionTitlesMigratedAt: Date.now(),
+      sessionTitlesProcessedIds: processed,
+      sessionTitlesPendingIds: pending.slice(-ID_CAP),
+    })
+  } catch { /* a closing store keeps the row; the next live event retries */ }
+}
+
+/** All topic-set titles (prefix stripping evidence for durable titles). */
 function topicTitlesOf(store: Store | undefined): string[] {
   const titles: string[] = []
   if (!store) return titles
@@ -123,8 +174,9 @@ export function stripTopicPrefix(title: string, topicTitles: readonly string[]):
 }
 
 /**
- * Normalize the durable copies (dispatch rows, fork member titles, hub records)
- * to the direct-description + 80-byte rule. Content-idempotent.
+ * Normalize the DURABLE copies (dispatch rows + fork member titles) to the
+ * direct-description + 80-byte rule. Content-idempotent; hub mirrors are NOT
+ * touched here — the hub rules below own that string.
  */
 async function normalizeDurableTitles(store: Store | undefined, topicTitles: readonly string[]): Promise<number> {
   if (!store) return 0
@@ -132,7 +184,7 @@ async function normalizeDurableTitles(store: Store | undefined, topicTitles: rea
   const cleanOnce = (title: string): string | undefined => {
     const raw = String(title ?? '').trim()
     if (!raw) return undefined
-    const next = clipTitleBytes(describeSessionTitle(stripTopicPrefix(raw, topicTitles)))
+    const next = clipTitleBytes(stripLeadingDescription(cleanTitleText(stripTopicPrefix(raw, topicTitles))))
     return next && next !== raw ? next : undefined
   }
   try {
@@ -158,66 +210,7 @@ async function normalizeDurableTitles(store: Store | undefined, topicTitles: rea
       cleaned += 1
     }
   } catch { /* best effort */ }
-  try {
-    for (const [id, row] of store.hubs.entries()) {
-      const next = cleanOnce(row.title)
-      if (!next) continue
-      await store.hubs.update(id, (record) => ({ ...record, title: next }))
-      cleaned += 1
-    }
-  } catch { /* best effort */ }
   return cleaned
-}
-
-/** Join one message's text blocks. */
-function contentText(content: unknown): string {
-  if (!Array.isArray(content)) return ''
-  const parts: string[] = []
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue
-    const row = block as { type?: string; text?: string }
-    if (row.type === 'text' && typeof row.text === 'string' && row.text.trim()) parts.push(row.text)
-  }
-  return parts.join(String.fromCharCode(10)).trim()
-}
-
-/** The first user message of one session (cold sessions included). */
-async function firstUserMessageText(ctx: Context | undefined, sessionId: string): Promise<string> {
-  const query = serviceOf<SessionQueryLike>(ctx, 'sessionQuery')
-  if (!query || typeof query.readSurface !== 'function') return ''
-  try {
-    const surface = await query.readSurface(sessionId)
-    for (const event of surface?.events ?? []) {
-      if (event?.type !== 'user/message') continue
-      const data = event.data as { content?: unknown } | undefined
-      const text = contentText(data?.content)
-      if (text) return text
-    }
-  } catch { /* unreadable message = no content evidence */ }
-  return ''
-}
-
-/** Batch host titles (live snapshot preferred, cold titles from the query seam). */
-async function readTitles(ctx: Context | undefined, sessionIds: readonly string[]): Promise<Map<string, string>> {
-  const titles = new Map<string, string>()
-  const query = serviceOf<SessionQueryLike>(ctx, 'sessionQuery')
-  if (query && typeof query.readTitleSnapshots === 'function') {
-    try {
-      const observations = await query.readTitleSnapshots(sessionIds)
-      for (const observation of observations) {
-        if (!observation || observation.status !== 'fulfilled') continue
-        const id = String(observation.sessionId ?? '')
-        const title = observation.value?.title?.title
-        if (id && typeof title === 'string' && title.trim()) titles.set(id, title.trim())
-      }
-    } catch { /* fall back to the live registry below */ }
-  }
-  for (const sessionId of sessionIds) {
-    if (titles.has(sessionId)) continue
-    const live = readHostTitle(ctx, sessionId)?.title
-    if (live) titles.set(sessionId, live)
-  }
-  return titles
 }
 
 /** Live workspace key of one session (header cwd), when readable. */
@@ -235,57 +228,65 @@ function liveWorkspaceKey(ctx: Context | undefined, sessionId: string): string {
 function candidatesOf(store: Store | undefined): Candidate[] {
   const out: Candidate[] = []
   const seen = new Set<string>()
-  const push = (candidate: Candidate): void => {
-    if (!candidate.sessionId || seen.has(candidate.sessionId) || out.length >= CANDIDATE_LIMIT) return
-    seen.add(candidate.sessionId)
-    out.push(candidate)
-  }
   if (!store) return out
   try {
     for (const [, row] of store.hubs.entries()) {
-      push({
-        sessionId: String(row.sessionId ?? ''),
-        kind: 'hub',
+      const sessionId = String(row.sessionId ?? '')
+      if (!sessionId || seen.has(sessionId) || out.length >= CANDIDATE_LIMIT) continue
+      if (isPluginBranchId(sessionId)) continue
+      seen.add(sessionId)
+      out.push({
+        sessionId,
         workspaceKey: String(row.workspaceKey ?? ''),
         mirrorTitle: String(row.title ?? ''),
       })
     }
   } catch { /* no hub table */ }
-  try {
-    for (const [, topicSet] of store.topicsets.entries()) {
-      for (const member of topicSet.members ?? []) {
-        push({
-          sessionId: member.sessionId,
-          kind: member.kind === 'fork' ? 'branch' : 'hub',
-          workspaceKey: String(topicSet.workspaceKey ?? ''),
-          mirrorTitle: String(member.title ?? ''),
-        })
-      }
-    }
-  } catch { /* no topic-set table */ }
-  try {
-    for (const [, row] of store.dispatches.entries()) {
-      const branch = String(row.branchSessionId ?? '')
-      if (!branch) continue
-      let workspaceKey = ''
-      try { workspaceKey = String(store.topicsets.get(row.topicSetId ?? '')?.workspaceKey ?? '') } catch { /* keep '' */ }
-      push({ sessionId: branch, kind: 'branch', workspaceKey, mirrorTitle: String(row.title ?? '') })
-    }
-  } catch { /* no dispatch table */ }
   return out
 }
 
+/**
+ * Batch host titles (live snapshot preferred, cold titles from the query seam).
+ * A missing/rejected observation stays UNKNOWN (undefined) — the pass never
+ * renames a session whose current title cannot be read.
+ */
+async function readTitles(ctx: Context | undefined, sessionIds: readonly string[]): Promise<Map<string, string>> {
+  const titles = new Map<string, string>()
+  const query = serviceOf<SessionQueryLike>(ctx, 'sessionQuery')
+  if (query && typeof query.readTitleSnapshots === 'function') {
+    try {
+      const observations = await query.readTitleSnapshots(sessionIds)
+      for (const observation of observations) {
+        if (!observation || observation.status !== 'fulfilled') continue
+        const id = String(observation.sessionId ?? '')
+        const title = observation.value?.title?.title
+        if (!id || typeof title !== 'string') continue
+        titles.set(id, title.trim())
+      }
+    } catch { /* fall back to the live registry below */ }
+  }
+  for (const sessionId of sessionIds) {
+    if (titles.has(sessionId)) continue
+    const live = readHostTitle(ctx, sessionId)?.title
+    if (live) titles.set(sessionId, live.trim())
+  }
+  return titles
+}
+
 /** A mirror title usable as a topic (topic-bearing, non-legacy). */
-function usableTitle(title: string, workspaceKey: string): string {
+function usableMirror(title: string, workspaceKey: string): boolean {
   const value = String(title ?? '').trim()
-  if (!value) return ''
-  if (isNeutralTitle(value, workspaceKey) || isLegacyTitle(value)) return ''
-  return value
+  if (!value) return false
+  if (isNeutralTitle(value, workspaceKey) || isLegacyTitle(value)) return false
+  return true
 }
 
 /**
- * Run the migration pass. Startup calls it with no options (marker-guarded and
- * best-effort); tests call it with `ignoreMarker` / `dryRun`.
+ * Run the migration pass.
+ *
+ * @param deps - host context + store + logger (the gate owns every host write).
+ * @param options - dryRun returns the mapping without writing; ignoreMarker
+ *   forces a full scan (manual re-run / tests).
  */
 export async function migrateSessionTitles(
   deps: TitleDeps,
@@ -293,128 +294,213 @@ export async function migrateSessionTitles(
 ): Promise<SessionTitlesMigrationResult> {
   const { store } = deps
   const empty: SessionTitlesMigrationResult = {
-    status: 'applied', scanned: 0, adopted: 0, renamed: 0, deferred: 0, skipped: 0, cleaned: 0,
+    status: 'applied', scanned: 0, adopted: 0, renamed: 0, deferred: 0,
+    skipped: 0, cleaned: 0, processed: 0, pending: 0, plan: [],
   }
   if (!store) return { ...empty, status: 'no-store' }
-  if (!options.ignoreMarker) {
-    const marker = store.meta?.get?.(MARKER_KEY) as SessionTitlesMarker | undefined
-    if (marker && (marker.sessionTitlesMigrationVersion ?? 0) >= SESSION_TITLES_MIGRATION_VERSION) {
-      return { ...empty, status: 'already-done' }
-    }
-  }
-  const topicTitles = topicTitlesOf(store)
-  const cleaned = options.dryRun ? 0 : await normalizeDurableTitles(store, topicTitles)
+
+  const marker = sessionTitlesMarker(store)
+  const known = !options.ignoreMarker
+    && (marker?.sessionTitlesMigrationVersion ?? 0) >= SESSION_TITLES_MIGRATION_VERSION
+  const processed = new Set(marker?.sessionTitlesProcessedIds ?? [])
+  const pending = new Set(marker?.sessionTitlesPendingIds ?? [])
   const candidates = candidatesOf(store)
-  const titles = await readTitles(deps.ctx, candidates.map((candidate) => candidate.sessionId))
-  let adopted = 0
-  let renamed = 0
-  let deferred = 0
-  let skipped = 0
+  const byId = new Map(candidates.map((candidate) => [candidate.sessionId, candidate]))
 
-  for (const candidate of candidates) {
-    const existing = titleRow(store, candidate.sessionId)
-    if (existing) {
-      // The new service already owns this session (a previous partial pass or a
-      // panel rename): reconcile — never re-decide here.
-      skipped += 1
+  // A converged marker with an empty pending set has nothing to do.
+  if (known && pending.size === 0) return { ...empty, status: 'already-done' }
+
+  // Full scan on the first run (or a forced re-run); afterwards only pending ids.
+  const scanIds: string[] = known
+    ? [...pending].filter((id) => byId.has(id))
+    : candidates.map((candidate) => candidate.sessionId).filter((id) => options.ignoreMarker || !processed.has(id))
+  if (known) {
+    for (const id of [...pending]) if (!byId.has(id)) pending.delete(id)
+  }
+  if (scanIds.length === 0) {
+    if (!options.dryRun) {
+      await writeMarker(store, marker, {
+        processed, pending, cleaned: 0,
+        counts: { migrated: 0, adopted: 0, deferred: 0, skipped: 0 },
+      })
+    }
+    return { ...empty, status: 'applied', processed: processed.size, pending: pending.size }
+  }
+
+  const titles = await readTitles(deps.ctx, scanIds)
+  const topicTitles = topicTitlesOf(store)
+  const cleaned = options.dryRun || known ? 0 : await normalizeDurableTitles(store, topicTitles)
+  const result: SessionTitlesMigrationResult = { ...empty, scanned: scanIds.length, cleaned }
+  const plan = result.plan
+
+  for (const sessionId of scanIds) {
+    const candidate = byId.get(sessionId)
+    if (!candidate) continue
+    const workspaceKey = candidate.workspaceKey || liveWorkspaceKey(deps.ctx, sessionId)
+    const hostTitle = titles.get(sessionId)
+    const live = isSessionLive(deps.ctx, sessionId)
+    const mirrorTitle = candidate.mirrorTitle
+    const base = { sessionId, kind: 'hub' as const, workspaceKey, hostTitle: hostTitle ?? '', mirrorTitle, live }
+
+    // ---- a. user-locked: never touched ----
+    const row = titleRow(store, sessionId)
+    if (row?.state === 'user-locked') {
+      result.skipped += 1
+      processed.add(sessionId)
+      pending.delete(sessionId)
+      plan.push({ ...base, desiredTitle: row.desiredTitle, action: 'locked', reason: row.lockedReason || 'user-locked' })
       continue
     }
-    const workspaceKey = candidate.workspaceKey || liveWorkspaceKey(deps.ctx, candidate.sessionId)
-    const hostTitle = String(titles.get(candidate.sessionId) ?? '').trim()
-    if (hostTitle && !isNeutralTitle(hostTitle, workspaceKey) && !isLegacyTitle(hostTitle)) {
-      // A topic-bearing title (host LLM / human / a good older generation): ADOPT.
-      await ensureTitleRow(store, {
-        sessionId: candidate.sessionId, workspaceKey, kind: candidate.kind, source: 'migration',
-      })
-      await patchTitleRow(store, candidate.sessionId, {
-        state: 'named',
-        desiredTitle: hostTitle,
-        desiredFull: hostTitle,
-        lastWrittenTitle: hostTitle,
-        lastTitleSeq: readHostTitle(deps.ctx, candidate.sessionId)?.seq,
-        source: 'migration',
-        attempts: 0,
-        lastError: '',
-      })
-      if (candidate.kind === 'hub') await mirrorHubTitle(store, candidate.sessionId, hostTitle, workspaceKey)
-      adopted += 1
+
+    // Unknown host title: never rename what we cannot read. The observer adopts
+    // a later session/title event and the first user message creates the row.
+    if (hostTitle === undefined) {
+      result.skipped += 1
+      processed.add(sessionId)
+      pending.delete(sessionId)
+      plan.push({ ...base, desiredTitle: row?.desiredTitle ?? '', action: 'unknown', reason: 'host-title-unreadable' })
       continue
     }
 
-    const mirrorTopic = usableTitle(candidate.mirrorTitle, workspaceKey)
-    const firstMessage = mirrorTopic ? '' : await firstUserMessageText(deps.ctx, candidate.sessionId)
-    const topic = mirrorTopic || firstMessage
-    const desired = candidate.kind === 'hub'
-      ? composeHubTitle(workspaceKey, topic)
-      : composeBranchTitle(topic || candidate.mirrorTitle)
-    const full = candidate.kind === 'hub'
-      ? composeHubTitleFull(workspaceKey, topic)
-      : composeBranchTitleFull(topic || candidate.mirrorTitle)
-    await ensureTitleRow(store, {
-      sessionId: candidate.sessionId, workspaceKey, kind: candidate.kind, source: 'migration',
-    })
-    await patchTitleRow(store, candidate.sessionId, {
-      topic,
-      desiredTitle: desired,
-      desiredFull: full,
-      source: 'migration',
-      state: isNeutralTitle(desired, workspaceKey) ? 'provisional' : 'named',
-    })
-    if (candidate.kind === 'hub' && desired !== hostTitle) {
-      await mirrorHubTitle(store, candidate.sessionId, desired, workspaceKey)
-    }
-    if (!desired || desired === hostTitle) {
-      if (desired === hostTitle) {
-        await patchTitleRow(store, candidate.sessionId, {
-          state: isNeutralTitle(desired, workspaceKey) ? 'provisional' : 'named',
-          lastWrittenTitle: desired,
+    // ---- b. a topic-bearing host title is ADOPTED, never rewritten ----
+    if (!isNeutralTitle(hostTitle, workspaceKey) && !isLegacyTitle(hostTitle)) {
+      result.adopted += 1
+      processed.add(sessionId)
+      pending.delete(sessionId)
+      plan.push({ ...base, desiredTitle: hostTitle, action: 'adopt', reason: 'host-title-topic-bearing' })
+      if (!options.dryRun) {
+        await ensureTitleRow(store, { sessionId, workspaceKey, kind: 'hub', source: 'migration' })
+        await patchTitleRow(store, sessionId, {
+          state: 'named',
+          kind: 'hub',
+          ...(workspaceKey ? { workspaceKey } : {}),
+          desiredTitle: hostTitle,
+          desiredFull: hostTitle,
+          lastWrittenTitle: hostTitle,
+          lastTitleSeq: readHostTitle(deps.ctx, sessionId)?.seq,
+          source: 'migration',
+          lockedReason: '',
+          attempts: 0,
+          lastError: '',
         })
+        await mirrorHubTitle(store, sessionId, hostTitle, workspaceKey)
       }
-      skipped += 1
       continue
     }
-    if (!isSessionLive(deps.ctx, candidate.sessionId)) {
-      await patchTitleRow(store, candidate.sessionId, { state: 'deferred', lastError: 'session-not-live' })
-      deferred += 1
-      continue
-    }
+
+    // ---- c/d. neutral/legacy host: compose the intended final string ----
+    const mirrorTopic = usableMirror(mirrorTitle, workspaceKey)
+    const desiredTitle = mirrorTopic
+      ? composeRecordedHubTitle(workspaceKey, mirrorTitle)
+      : composeHubTitle(workspaceKey, '')
+    const desiredNeutral = isNeutralTitle(desiredTitle, workspaceKey)
+    const action: SessionTitlesPlanItem['action'] = live ? (desiredNeutral ? 'provisional' : 'rename') : 'deferred'
+    plan.push({
+      ...base,
+      desiredTitle,
+      action,
+      reason: mirrorTopic ? 'neutral-host-mirror-topic' : 'neutral-host-no-topic',
+    })
+
     if (options.dryRun) continue
-    const result = await applySessionTitle(deps, {
-      sessionId: candidate.sessionId,
-      kind: candidate.kind,
+
+    if (!live) {
+      // ---- e. cold: store the intent, wait for the first live event ----
+      await ensureTitleRow(store, { sessionId, workspaceKey, kind: 'hub', source: 'migration' })
+      await patchTitleRow(store, sessionId, {
+        state: 'deferred',
+        kind: 'hub',
+        ...(workspaceKey ? { workspaceKey } : {}),
+        desiredTitle,
+        desiredFull: desiredTitle,
+        topic: mirrorTopic ? String(mirrorTitle ?? '').trim() : '',
+        source: 'migration',
+        lastError: 'session-not-live',
+      })
+      if (!desiredNeutral) await mirrorHubTitle(store, sessionId, desiredTitle, workspaceKey)
+      pending.add(sessionId)
+      processed.add(sessionId)
+      result.deferred += 1
+      continue
+    }
+
+    const applied = await applySessionTitle(deps, {
+      sessionId,
+      kind: 'hub',
       workspaceKey,
-      explicitTitle: desired,
-      topicText: topic,
+      explicitTitle: desiredTitle,
       source: 'migration',
       force: true,
       defer: true,
     })
-    if (result.outcome === 'host' || result.outcome === 'fallback') renamed += 1
-    else deferred += 1
+    if (applied.outcome === 'locked') {
+      result.skipped += 1
+      processed.add(sessionId)
+      pending.delete(sessionId)
+      continue
+    }
+    if (applied.outcome === 'deferred' || applied.outcome === 'none' || applied.outcome === 'skipped') {
+      pending.add(sessionId)
+      processed.add(sessionId)
+      result.deferred += 1
+      continue
+    }
+    result.renamed += 1
+    processed.add(sessionId)
+    pending.delete(sessionId)
   }
 
   if (!options.dryRun) {
-    try {
-      await store.meta.put(MARKER_KEY, {
-        sessionTitlesMigrationVersion: SESSION_TITLES_MIGRATION_VERSION,
-        sessionTitlesMigratedAt: Date.now(),
-        sessionTitlesMigrated: renamed,
-        sessionTitlesAdopted: adopted,
-        sessionTitlesDeferred: deferred,
-      } satisfies SessionTitlesMarker)
-    } catch { /* the next start re-plans; the pass is content-idempotent */ }
+    await writeMarker(store, marker, {
+      processed,
+      pending,
+      cleaned,
+      counts: {
+        migrated: result.renamed,
+        adopted: result.adopted,
+        deferred: result.deferred,
+        skipped: result.skipped,
+      },
+    })
   }
+  result.processed = processed.size
+  result.pending = pending.size
   deps.logger.info(
-    'supermemory: session titles migrated — scanned ' + candidates.length + ', adopted ' + adopted
-    + ', renamed ' + renamed + ', deferred ' + deferred + ', skipped ' + skipped + ', cleaned ' + cleaned,
+    'supermemory: session titles migrated — scanned ' + result.scanned + ', adopted ' + result.adopted
+    + ', renamed ' + result.renamed + ', deferred ' + result.deferred + ', skipped ' + result.skipped
+    + ', cleaned ' + result.cleaned + ', pending ' + result.pending,
   )
-  return {
-    status: 'applied',
-    scanned: candidates.length,
-    adopted,
-    renamed,
-    deferred,
-    skipped,
-    cleaned,
-  }
+  return result
+}
+
+/** Write the converged marker (always, even while pending is non-empty). */
+async function writeMarker(
+  store: Store,
+  previous: SessionTitlesMarker | undefined,
+  input: {
+    processed: Set<string>
+    pending: Set<string>
+    cleaned: number
+    counts: {
+      migrated?: number
+      adopted?: number
+      deferred?: number
+      skipped?: number
+    }
+  },
+): Promise<void> {
+  try {
+    await store.meta.put(MARKER_KEY, {
+      ...previous,
+      sessionTitlesMigrationVersion: SESSION_TITLES_MIGRATION_VERSION,
+      sessionTitlesMigratedAt: Date.now(),
+      sessionTitlesMigrated: input.counts.migrated ?? 0,
+      sessionTitlesAdopted: input.counts.adopted ?? 0,
+      sessionTitlesDeferred: input.counts.deferred ?? 0,
+      sessionTitlesSkipped: input.counts.skipped ?? 0,
+      sessionTitlesCleaned: input.cleaned,
+      sessionTitlesProcessedIds: [...input.processed].slice(-ID_CAP),
+      sessionTitlesPendingIds: [...input.pending].slice(-ID_CAP),
+    })
+  } catch { /* the next start re-plans; the pass is content-idempotent */ }
 }

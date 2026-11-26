@@ -21,8 +21,8 @@ import type { ToolizeConfig } from './toolize.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
-import { attachPendingHubTitleRename, migrateHubSessionTitles } from './hub-title-migration.ts'
-import { attachSessionTitles } from './session-title/index.ts'
+import { migrateHubSessionTitles } from './hub-title-migration.ts'
+import { attachSessionTitles, startupSessionTitles } from './session-title/index.ts'
 import { knownWorkspaceKeys, migrateHubSessionRecords } from './hub-records-migration.ts'
 import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
@@ -520,17 +520,17 @@ export async function apply(ctx: Context, config: Config) {
 
     // 「R31：」「R32 」「项目：」「背景：」 tokens; durable dispatch/member/hub
     // titles are cleaned too. Marker-guarded (meta row 'hub-titles', version 3),
-    // reads the live title so a human rename is never overwritten. R42: the
-    // marker CONVERGES — a not-yet-attached candidate is recorded as pending
-    // (renamed on its first live event by attachPendingHubTitleRename) instead
-    // of keeping the marker unwritten, which used to rescan every startup.
+    // reads the live title so a human rename is never overwritten. R42 made the
+    // marker converge; R59 RETIRES its pending-rename hook — the naming service
+    // (session_titles deferred + the new marker) owns cold ids now, so two
+    // owners can never rename one session on its first event.
     // Before a branded hub is renamed it receives its positive hub record — the
     // R35 hub-record migration used that prefix as evidence, and the record is
     // what role resolution actually reads. The record migration still runs after
     // this one (it also covers hubs whose title never carried the prefix).
 
 
-    const hubTitlePass = migrateHubSessionTitles({ ctx, store, logger })
+    void migrateHubSessionTitles({ ctx, store, logger })
       .catch((error) => {
         logger.warn('supermemory: hub title migration failed: ' + String(error).slice(0, 160))
       })
@@ -538,17 +538,25 @@ export async function apply(ctx: Context, config: Config) {
       .catch((error) => {
         logger.warn('supermemory: hub record migration failed: ' + String(error).slice(0, 160))
       })
-    // R42: a COLD session keeps its legacy host title until something attaches
-    // to it (applySessionTitle needs a live session). The v3 marker records
-    // those ids as pending instead of blocking convergence; this hook renames
-    // each one on its first live event, so the set drains without a rescan.
-    ctx.effect(() => attachPendingHubTitleRename(ctx, store, logger, hubTitlePass), 'supermemory: pending-hub-titles')
+    // R59 Phase 1b: the old R42 pending-title hook is RETIRED. The naming
+    // service owns cold ids now (session_titles deferred + the new marker's
+    // pending set); keeping the old hook would let two owners rename the same
+    // session on its first event. The legacy pass above stays marker-guarded for
+    // the pre-R59 durable cleanup only.
     // R59: the naming service replaces the R43 first-message hook. It owns the
     // durable intent (session_titles), the single host write entry (gate) and
     // the deferred observer — a listener never writes inside the host's event
-    // publication stack (that is how the R43 hook lost every rename). The
-    // legacy pending-title pass above still feeds the same gate.
-    ctx.effect(() => attachSessionTitles({ ctx, store, logger }), 'supermemory: session-titles')
+    // publication stack (that is how the R43 hook lost every rename).
+    const titleDeps = { ctx, store, logger }
+    ctx.effect(() => attachSessionTitles(titleDeps), 'supermemory: session-titles')
+    // R59 Phase 1b: migrate the existing corpus once (new 'session-titles' v1
+    // marker: adopt topic-bearing host titles, repair neutral hosts from the
+    // mirror, cold ids into pending), then reconcile named/deferred rows. Both
+    // halves are detached and best-effort: a naming failure never blocks load.
+    // Every host write is deferred by the gate; cold sessions are never resumed.
+    void startupSessionTitles(titleDeps).catch((error) => {
+      logger.warn('supermemory: session-title startup pass failed: ' + String(error).slice(0, 200))
+    })
     // R23: one-time memory re-layout into the R22 collection model. Marker-
     // guarded (meta row `organize-<digest>`), only targets this plugin
     // repo's workspace, and every destructive step is SHA-guarded against

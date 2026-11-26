@@ -44,15 +44,6 @@ export const TITLE_MAX_CHARS = 80
  */
 export const TITLE_TASK_SNIPPET_CHARS = 48
 
-/**
- * R43 需求③: the task budget of a WORK BRANCH title. The user reported branch
- * names as over-truncated (48 characters cut a task mid-clause), so a branch
- * keeps up to 60 characters of its task — the topic-set members, the host
- * session title and the rail badge all read the same value, and the rail
- * ellipsizes visually anyway (the stored title stays complete).
- */
-export const TITLE_BRANCH_TASK_CHARS = 60
-
 /** Fallback title when both the topic-set title and the task are empty. */
 export const TITLE_FALLBACK = '新会话'
 
@@ -204,46 +195,6 @@ export function sessionTitleFor(
 }
 
 /**
- * Persist the member title for one topic-set branch, computing it only when the
- * member has no title yet (a reused branch keeps its first stable name).
- * @param store - plugin store.
- * @param topicSetId - owning topic set.
- * @param member - branch identity and kind.
- * @param topicTitle - topic-set title fallback when the row is gone.
- * @param task - task text used for the snippet.
- * @param options - `taskOnly` names a WORK BRANCH: the title is the task
- *   itself (no topic-set prefix), matching 「会话名称直接描述工作内容」.
- *   R43 需求③ widened that budget to {@link TITLE_BRANCH_TASK_CHARS} so the
- *   topic is not cut mid-clause.
- * @returns the title now stored on the member.
- */
-export async function ensureMemberTitle(
-  store: Store,
-  topicSetId: string,
-  member: NamedMember,
-  topicTitle: string,
-  task: string,
-  options: { taskOnly?: boolean } = {},
-): Promise<string> {
-  const record = store.topicsets.get(topicSetId)
-  if (!record) return options.taskOnly ? describeSessionTitle(task, TITLE_BRANCH_TASK_CHARS) : sessionTitleFor(topicTitle, task)
-  const current = record.members.find((entry) => entry.sessionId === member.sessionId)
-  if (current && current.title.trim()) return current.title
-  const others = record.members
-    .filter((entry) => entry.sessionId !== member.sessionId)
-    .map((entry) => entry.title)
-  const title = options.taskOnly
-    ? describeSessionTitle(task, TITLE_BRANCH_TASK_CHARS)
-    : sessionTitleFor(record.title || topicTitle, task, others)
-  if (current) {
-    await updateMember(store, topicSetId, member.sessionId, { title })
-  } else {
-    await addMember(store, topicSetId, { sessionId: member.sessionId, kind: member.kind, title })
-  }
-  return title
-}
-
-/**
  * R59: read-only compatibility surface for the legacy callers that still ask
  * "what does the host show?" and "what should a card label this session?".
  * WRITES are forbidden here — every host title write goes through
@@ -262,31 +213,4 @@ export interface TitleHost {
  */
 export function currentSessionTitle(ctx: TitleHost, sessionId: string): string | undefined {
   return readHostTitle(ctx as unknown as Parameters<typeof readHostTitle>[0], sessionId)?.title
-}
-
-/**
- * R32 需求③: the best available title for a message's SOURCE session.
- *
- * Reads the live host title first, then the plugin's durable topic-set member
- * title (a branch can be detached/reloaded while its dispatch row still carries
- * the name), and returns '' when neither knows one — the card then falls back to
- * the id's last four characters (see chat-card.ts).
- */
-export function sessionTitleOf(ctx: TitleHost, store: Store | undefined, sessionId: string): string {
-  if (!sessionId) return ''
-  const live = currentSessionTitle(ctx, sessionId)
-  if (live && live.trim()) return live.trim()
-  if (!store) return ''
-  try {
-    for (const [, topicSet] of store.topicsets.entries()) {
-      for (const member of topicSet.members) {
-        if (member.sessionId === sessionId && typeof member.title === 'string' && member.title.trim()) {
-          return member.title.trim()
-        }
-      }
-    }
-  } catch {
-    // A partly materialized table only loses the fallback label, never the card.
-  }
-  return ''
 }

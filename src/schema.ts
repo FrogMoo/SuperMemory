@@ -478,6 +478,14 @@ export async function buildSchemas() {
     sessionTitlesMigrated: z.number().int().optional(),
     sessionTitlesAdopted: z.number().int().optional(),
     sessionTitlesDeferred: z.number().int().optional(),
+    sessionTitlesSkipped: z.number().int().optional(),
+    sessionTitlesCleaned: z.number().int().optional(),
+    // R59 Phase 1b: the id sets that make the pass converge. A processed id is
+    // never scanned again; a pending id is a COLD session with a stored intent,
+    // retried on its first live event. Both are capped (diagnostics, not an
+    // archive) and the marker is written even when pending is non-empty.
+    sessionTitlesProcessedIds: z.array(z.string()).optional(),
+    sessionTitlesPendingIds: z.array(z.string()).optional(),
     // R55 marker (meta row 'hub-policy-locked'): the one-time merge of the
     // locked hub entries (sm_cap_doc) into stored hub_policies rows. Declared
     // here because the meta schema strips unknown marker keys on load.

@@ -56,8 +56,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
-import { TITLE_FALLBACK, clipEllipsis, describeSessionTitle } from './title.ts'
+import {
+  composeHubTitle,
+  isLegacyTitle,
+  isNeutralTitle,
+  workspaceLabel,
+} from './session-title/policy.ts'
 import { isOpenDispatch } from './hub-branches.ts'
+import { resolveSessionTitle } from './session-title/resolve.ts'
 
 /** One hub-session row of the panel's left rail. */
 export interface HubSessionView {
@@ -121,17 +127,12 @@ export const HUB_TITLE_PREFIX = 'SuperMemory 中枢'
 export const LEGACY_HUB_TITLE_PREFIX = '新会话'
 
 /**
- * R42: does this HOST title still carry a legacy shape the plugin no longer
- * generates? Two patterns: the brand prefix (SuperMemory 中枢 · <id4>, with or
- * without the id token) and the pre-R31 neutral format (新会话 · <id4>). A bare
- * 「新会话」 is the CURRENT neutral name (R41) and is NOT legacy — this
- * distinction keeps the rail fallback from fighting an already-clean title.
+ * R59 Phase 1b: the legacy/neutral predicates are the POLICY's — the rail, the
+ * panel, the migration and the gate must never disagree about what counts as a
+ * topic-less name. Kept as named wrappers for the existing callers.
  */
 export function isLegacyHubTitle(title: string): boolean {
-  const value = String(title ?? '').trim()
-  if (!value) return false
-  if (value.startsWith(HUB_TITLE_PREFIX)) return true
-  return new RegExp('^' + LEGACY_HUB_TITLE_PREFIX + '\\s*·\\s*.+$').test(value)
+  return isLegacyTitle(title)
 }
 
 /**
@@ -159,22 +160,10 @@ export function durableHubTitle(store: Store | undefined, sessionId: string): st
 }
 
 /**
- * R43 需求②③: the total budget of a hub session title — the workspace label,
- * the separator and the topic summary share it. Longer than a plain task
- * snippet (48) because the user asked for names that say the whole topic.
+ * R59 Phase 1b: the hub budget is the policy's {@link TITLE_MAX_BYTES} (80 UTF-8
+ * bytes). The old 60-character constants are gone — see hubSessionTitle.
  */
-export const HUB_TITLE_MAX_CHARS = 60
-
-/** The topic-summary budget inside a hub title (before the workspace prefix). */
-export const HUB_TITLE_TOPIC_CHARS = 48
-
-/** The readable label of a workspace path: its last segment (no drive/UNC). */
-export function workspaceLabel(cwd: string): string {
-  const value = String(cwd ?? '').replace(/[\\/]+$/, '')
-  if (!value) return ''
-  const segments = value.split(/[\\/]/).filter((segment) => segment.length > 0)
-  return segments.length > 0 ? segments[segments.length - 1] : ''
-}
+export { workspaceLabel }
 
 /**
  * R41 需求③ / R43 需求②③: the title a plugin-created hub session gets.
@@ -185,24 +174,20 @@ export function workspaceLabel(cwd: string): string {
  * even made the shell's New-session capture interceptor treat the chat card of
  * such a hub as a 新建会话 control. R43 makes the name meaningful by default:
  *
- *   `<工作区名> · <主题/首条消息摘要>`   (clipped to {@link HUB_TITLE_MAX_CHARS})
+ *   `<工作区名> · <主题/首条消息摘要>`   (≤ 80 UTF-8 bytes, see policy)
  *   `<工作区名> · 新会话`                (no topic yet — still says WHICH workspace)
  *
- * No brand prefix and no id token. When no workspace path is available the
- * shape degrades to the topic alone / the bare fallback, exactly as R41 did.
+ * R59 Phase 1b: the composition is the POLICY's ({@link composeHubTitle}) — no
+ * local budget, no second truncation rule. A durable copy written by this helper
+ * is therefore byte-identical to what the gate writes to the host.
  *
  * @param _sessionId - kept in the signature for callers/tests; an id suffix is
  *   not a description and is never part of the title.
  * @param firstMessage - opening message used as the work summary.
  * @param cwd - workspace path (or its canonical key) for the label.
  */
-export function hubSessionTitle(sessionId: string, firstMessage = '', cwd = ''): string {
-  const workspace = workspaceLabel(cwd)
-  const topic = describeSessionTitle(firstMessage, HUB_TITLE_TOPIC_CHARS)
-  if (topic && topic !== TITLE_FALLBACK) {
-    return workspace ? clipEllipsis(`${workspace} · ${topic}`, HUB_TITLE_MAX_CHARS) : topic
-  }
-  return workspace ? `${workspace} · ${TITLE_FALLBACK}` : TITLE_FALLBACK
+export function hubSessionTitle(_sessionId: string, firstMessage = '', cwd = ''): string {
+  return composeHubTitle(cwd, firstMessage)
 }
 
 /**
@@ -216,14 +201,7 @@ export function hubSessionTitle(sessionId: string, firstMessage = '', cwd = ''):
  *     workspace when the path is unknown).
  */
 export function isNeutralHubTitle(title: string, cwd = ''): boolean {
-  const value = String(title ?? '').trim()
-  if (!value) return true
-  if (value === TITLE_FALLBACK) return true
-  if (value.startsWith(HUB_TITLE_PREFIX)) return true
-  if (/^新会话\s*·/.test(value)) return true
-  const workspace = workspaceLabel(cwd)
-  if (workspace) return value === `${workspace} · ${TITLE_FALLBACK}`
-  return /·\s*新会话$/.test(value)
+  return isNeutralTitle(title, cwd)
 }
 
 /**
@@ -475,20 +453,12 @@ export async function listHubSessions(
     const sessionCwd = String(record.header.cwd ?? cwd)
     const owner = topicSetOfRootMember(store, sessionId)
     const branchStats = branchStatsOf(store, sessionId)
-    // R42: a COLD session (never opened since the rename pass) still carries
-    // its legacy host title, and applySessionTitle can only rename a LIVE
-    // session. When the recorded title is already the direct description, show
-    // THAT instead of the stale host name — pure store data, no live session.
-    // R43 需求②: the same applies to the NEW neutral default
-    // 「<工作区名> · 新会话」 — a hub whose record already carries a topic must
-    // not show the topic-less host name just because it has not been opened
-    // since the rename.
+    // R59 Phase 1b: ONE resolution rule for every surface. A cold session may
+    // still carry a neutral/legacy host title; the resolver falls back to the
+    // durable mirror (hub record / member) instead of showing 「新会话」. The
+    // panel rail and the web console both call this list, so they agree.
     const hostTitle = title?.title ?? fallbackTitle(sessionId)
-    const durable = durableHubTitle(store, sessionId)
-    const stale = isLegacyHubTitle(hostTitle) || isNeutralHubTitle(hostTitle, sessionCwd)
-    const shown = stale && durable
-      ? describeSessionTitle(durable) || hostTitle
-      : hostTitle
+    const shown = resolveSessionTitle(ctx, store, sessionId) || hostTitle
     return {
       sessionId,
       title: shown,

@@ -17,7 +17,6 @@
  * @module supermemory/session-title/policy
  */
 import {
-  TITLE_BRANCH_TASK_CHARS,
   TITLE_FALLBACK,
   cleanTitleText,
   describeSessionTitle,
@@ -115,10 +114,40 @@ export function composeHubTitle(workspace: string, topicText: string): string {
   return clipTitleBytes(composeHubTitleFull(workspace, topicText))
 }
 
-/** The UNCLIPPED branch composition (diagnostics only). */
+/**
+ * Remove the workspace prefix from a RECORDED title (`<label> · <topic>`).
+ * Used by the migration so a mirror title is composed ONCE, never doubled.
+ */
+export function stripWorkspacePrefix(title: string, workspace: string): string {
+  const value = String(title ?? '').trim()
+  const label = workspaceLabel(workspace)
+  if (!label) return value
+  const prefix = label + ' · '
+  return value.startsWith(prefix) ? value.slice(prefix.length).trim() : value
+}
+
+/**
+ * Normalize a RECORDED hub title (the `hub_sessions.title` mirror) under the
+ * current policy: the workspace prefix is preserved exactly once and the result
+ * is byte-clipped. A neutral/empty record yields the provisional composition.
+ */
+export function composeRecordedHubTitle(workspace: string, recorded: string): string {
+  const topic = topicOf(stripWorkspacePrefix(recorded, workspace))
+  if (!topic || topic === TITLE_FALLBACK) return composeHubTitle(workspace, '')
+  return clipTitleBytes(composeHubTitleFull(workspace, topic))
+}
+
+/**
+ * The UNCLIPPED branch composition (diagnostics only).
+ *
+ * R59 Phase 1b: the branch budget is the SAME 80 UTF-8 bytes as every host
+ * title. The old 60-CHARACTER cut (R43) is gone: it could still produce a
+ * 180-byte durable title that the host silently clipped, leaving the dispatch /
+ * member / host copies disagreeing. Truncation now happens once, in bytes.
+ */
 export function composeBranchTitleFull(task: string): string {
   const topic = topicOf(task)
-  return topic ? describeSessionTitle(topic, TITLE_BRANCH_TASK_CHARS) : TITLE_FALLBACK
+  return topic || TITLE_FALLBACK
 }
 
 /** Compose a work-branch title: the task's first line, byte-clipped. */
@@ -159,8 +188,10 @@ export function isNeutralTitle(title: string, workspace = ''): boolean {
   if (value.startsWith(LEGACY_BRAND_PREFIX)) return true
   if (/^新会话\s*·/.test(value)) return true
   const label = workspaceLabel(workspace)
-  if (label) return value === label + ' · ' + TITLE_FALLBACK
-  return /·\s*新会话$/.test(value)
+  // Any "<label> · 新会话" is the neutral default, whichever workspace label it
+  // carries (a stale title may name a path that no longer matches).
+  if (/·\s*新会话$/.test(value)) return true
+  return label ? value === label + ' · ' + TITLE_FALLBACK : false
 }
 
 /** A title the plugin may freely (re)write: neutral, legacy, or absent. */

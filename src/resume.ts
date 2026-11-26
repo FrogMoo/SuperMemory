@@ -33,7 +33,7 @@ import { newId } from './store.ts'
 import { updateMember } from './topicsets.ts'
 import { loadHostModule } from './host.ts'
 import { dispatchSource } from './chat-card.ts'
-import { sessionTitleOf } from './title.ts'
+import { sessionTitleOf } from './session-title/resolve.ts'
 
 export interface ResumeDeps {
   ctx: Context

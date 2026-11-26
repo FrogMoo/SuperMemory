@@ -19,6 +19,7 @@ import type { SessionEventLike } from '../events.ts'
 import type { UserMessageLike } from '../events.ts'
 import { deferTitleTask } from './defer.ts'
 import { applySessionTitle, takeOwnWrite } from './gate.ts'
+import { reconcileSessionTitle } from './reconcile.ts'
 import { hubRecord, ensureTitleRow, mirrorHubTitle, patchTitleRow, titleRow } from './state.ts'
 import { isNeutralTitle } from './policy.ts'
 import type { TitleDeps } from './types.ts'
@@ -206,9 +207,24 @@ async function onUserMessage(deps: TitleDeps, sessionId: string, seq: number, te
 export function attachSessionTitleObserver(deps: TitleDeps): () => void {
   const ctx: Context | undefined = deps.ctx
   if (!ctx || typeof ctx.on !== 'function' || !deps.store) return () => {}
+  // One retry per session per plugin load (the migration marker keeps the
+  // durable pending set; this is only the in-process fast path).
+  const retried = new Set<string>()
   return ctx.on('session/event', (session: { id?: unknown }, event: SessionEventLike) => {
     const sessionId = String(session?.id ?? '')
     if (!sessionId) return
+    // R59 Phase 1b: the first activity of a DEFERRED (cold migration) row
+    // retries its stored intent; the write is deferred out of this stack and
+    // the gate settles the migration pending id on success.
+    if (!retried.has(sessionId)) {
+      const pendingRow = titleRow(deps.store, sessionId)
+      if (pendingRow?.state === 'deferred') {
+        retried.add(sessionId)
+        void deferTitleTask(() => reconcileSessionTitle(deps, sessionId, { reason: 'first-event', defer: true })).catch((error) => {
+          deps.logger.warn('supermemory: deferred title retry failed for ' + sessionId + ': ' + String(error).slice(0, 160))
+        })
+      }
+    }
     if (event?.type === 'user/message') {
       const data = event.data as UserMessageLike | undefined
       const kind = data?.source?.kind

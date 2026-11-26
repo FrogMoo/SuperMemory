@@ -24,15 +24,15 @@
  */
 import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
-import { TITLE_BRANCH_TASK_CHARS, clipEllipsis, describeSessionTitle } from './title.ts'
+import { clipEllipsis } from './title.ts'
+import { composeBranchTitle } from './session-title/policy.ts'
 
 /**
- * Character budget of a branch title (the task's first line). R43 需求③ raised
- * it from 48 to {@link TITLE_BRANCH_TASK_CHARS} (60): users reported branch
- * names as over-truncated, and the rail ellipsizes visually while the stored
- * title stays complete.
+ * R59 Phase 1b: the branch budget is {@link TITLE_MAX_BYTES} (80 UTF-8 bytes),
+ * composed ONCE by the policy — the same string the host title and the topic-set
+ * member carry. The R43 60-character budget is gone: it could cut a title that
+ * the host then clipped differently, so durable and host copies disagreed.
  */
-export const BRANCH_TITLE_MAX_CHARS = TITLE_BRANCH_TASK_CHARS
 
 /** Maximum tags carried per branch (index, not a taxonomy). */
 export const BRANCH_TAGS_MAX = 8
@@ -46,11 +46,12 @@ const ROUND_TOKEN = /(?:^|[^A-Za-z0-9])((?:R|r)\d{1,3}(?:-[A-Za-z]{1,3})?)/g
 /**
  * The explicit branch title for one dispatch: the task's first line, markup
  * stripped, descriptive lead-ins (「R31：」「任务：」「分支 · 」…) removed, and
- * ellipsis-clipped to {@link BRANCH_TITLE_MAX_CHARS}. When the task carries no
- * readable line the neutral 「新会话」 fallback is returned.
+ * byte-clipped to 80 UTF-8 bytes ({@link TITLE_MAX_BYTES}) by the naming policy.
+ * When the task carries no readable line the neutral 「新会话」 fallback is
+ * returned.
  */
 export function branchTitleFor(task: string): string {
-  return describeSessionTitle(task, BRANCH_TITLE_MAX_CHARS)
+  return composeBranchTitle(task)
 }
 
 /**

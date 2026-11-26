@@ -230,7 +230,8 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 
 
 // ---- requirement C: session naming ----
-const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle } = await import('../src/title.ts')
+const { sessionTitleFor, cleanTitleText, truncateChars } = await import('../src/title.ts')
+const { ensureMemberTitle } = await import('../src/session-title/member.ts')
 
 {
   const title = sessionTitleFor('导出功能', '## 修复 **CSV** 导出' + String.fromCharCode(10) + '第二行说明', [])
@@ -970,8 +971,9 @@ const fakeCtx = (services) => ({
 
 // ---- R43: card click must not become 新建 + hub/branch names say the topic ----
 {
-  const { hubSessionTitle, isNeutralHubTitle, workspaceLabel, HUB_TITLE_MAX_CHARS, listHubSessions } = await import('../src/hub-sessions.ts')
-  const { TITLE_BRANCH_TASK_CHARS, describeSessionTitle } = await import('../src/title.ts')
+  const { hubSessionTitle, isNeutralHubTitle, workspaceLabel, listHubSessions } = await import('../src/hub-sessions.ts')
+  const { describeSessionTitle } = await import('../src/title.ts')
+  const { composeBranchTitle, TITLE_MAX_BYTES } = await import('../src/session-title/policy.ts')
   const cwd = 'F:\\10-SuperMemory'
   const ws = workspaceLabel(cwd)
   assert.equal(ws, '10-SuperMemory', 'the workspace label is the last path segment')
@@ -983,8 +985,8 @@ const fakeCtx = (services) => ({
   assert.equal(hubSessionTitle('session-x', 'R43：修卡片跳转'), '修卡片跳转',
     'without a workspace path the topic stands alone (R41 shape)')
   const long = 'R43 需求：把分支卡片点击从跳新建改成打开对应会话，并让中枢与分支名称说清楚主题且允许更长'
-  assert.equal(hubSessionTitle('session-x', long, cwd).length <= HUB_TITLE_MAX_CHARS, true,
-    'the workspace-qualified title respects the 60-char budget')
+  assert.equal(Buffer.byteLength(hubSessionTitle('session-x', long, cwd), 'utf8') <= TITLE_MAX_BYTES, true,
+    'the workspace-qualified title respects the 80-byte budget')
   assert.ok(hubSessionTitle('session-x', long, cwd).startsWith('10-SuperMemory · '), 'the workspace prefix survives clipping')
 
   // 2) neutral detection: what may be upgraded, what must be kept.
@@ -997,12 +999,14 @@ const fakeCtx = (services) => ({
   assert.equal(isNeutralHubTitle('我自己起的名字', cwd), false, 'a human rename is kept')
   assert.equal(isNeutralHubTitle('重载后只读核验', cwd), false, 'a host/LLM title is kept')
 
-  // 3) branch budget: 60 chars, not 48 (the user asked for the whole topic).
-  assert.equal(TITLE_BRANCH_TASK_CHARS, 60)
-  const task48 = 'R43 需求：把分支卡片点击从跳新建改成打开对应会话，并让中枢与分支会话名称都说清楚主题且允许更长一些，避免过度截断'
-  assert.ok(describeSessionTitle(task48, 48).endsWith('…'), '48 chars still clipped (the old behaviour)')
-  assert.ok(!describeSessionTitle(task48, TITLE_BRANCH_TASK_CHARS).endsWith('…'),
-    '60 chars keep a normal one-line task whole')
+  // 3) branch budget: ONE byte rule (80 UTF-8 bytes), no 60-character cut.
+  const taskLong = 'R43 需求：把分支卡片点击从跳新建改成打开对应会话，并让中枢与分支会话名称都说清楚主题且允许更长一些，避免过度截断'
+  const branch = composeBranchTitle(taskLong)
+  assert.ok(Buffer.byteLength(branch, 'utf8') <= TITLE_MAX_BYTES, 'the branch title respects the host byte budget')
+  assert.ok(branch.startsWith('把分支卡片点击'), 'descriptive lead-in stripped')
+  assert.equal(branch.includes('\uFFFD'), false, 'no half character')
+  assert.equal(composeBranchTitle('R43：修卡片跳转'), '修卡片跳转', 'a short task stays whole')
+  assert.equal(describeSessionTitle('R43：修卡片跳转'), '修卡片跳转', 'the text helper still strips')
 
   // 5) the rail: a COLD hub whose host title is the new neutral default still
   //    shows the DURABLE topic (the R42 fallback, widened to the R43 shape).
@@ -1022,7 +1026,7 @@ const fakeCtx = (services) => ({
   assert.equal(railRows2[0]?.title, '重载后只读核验',
     'a neutral host title yields to the durable record title (R42 fallback widened to the R43 shape)')
 
-  ok('R43-1 命名规则：中枢「<工作区名> · <主题>」（无主题=工作区+新会话，60 字预算）+ 中性名判定（可升级/须保留）+ 分支任务预算 60（R59 起宿主写入口由 gate 接管，见 R59 段）')
+  ok('R43-1 命名规则：中枢「<工作区名> · <主题>」（无主题=工作区+新会话）+ 中性名判定（可升级/须保留）+ 分支 80 字节预算（R59 起宿主写入口由 gate 接管，见 R59 段）')
 }
 }
 
@@ -1030,8 +1034,12 @@ const fakeCtx = (services) => ({
 {
   const {
     applySessionTitle, attachSessionTitles, deferTitleTask, renameSession, resetAutoTitle,
+    migrateSessionTitles, reconcileSessionTitle, resolveSessionTitle, sessionTitleOf, ensureMemberTitle,
   } = await import('../src/session-title/index.ts')
-  const { clipTitleBytes, composeHubTitle, validateManualTitle } = await import('../src/session-title/policy.ts')
+  const {
+    clipTitleBytes, composeHubTitle, composeBranchTitle, validateManualTitle, TITLE_MAX_BYTES,
+  } = await import('../src/session-title/policy.ts')
+  const { branchTitleFor } = await import('../src/branch-meta.ts')
   const { finishPendingHubTitle } = await import('../src/hub-title-migration.ts')
 
   const WORKSPACE = 'F:\\10-SuperMemory'
@@ -1310,8 +1318,222 @@ const fakeCtx = (services) => ({
     assert.equal(inline, false)
     ok('R59-9 架构：host.ts 之外无 sessionTitle.rename / session-titles append；deferTitleTask 永不内联执行')
   }
-}
 
+  // R59-11: migration — adopt / neutral+mirror repair / cold pending / marker.
+  {
+    const M = makeHost()
+    const store = fakeStore()
+    const putHub = (id, mirror) => store.hubs.put(id, {
+      workspaceKey: WORKSPACE, sessionId: id, title: mirror, source: 'panel', lastSource: 'panel',
+      createdAt: now, updatedAt: now,
+    })
+    putHub('session-m-adopt', '')
+    putHub('session-m-repair', WS_LABEL + ' · ' + '修复中枢会话命名'.repeat(6))
+    putHub('session-m-cold', WS_LABEL + ' · 冷会话主题')
+    putHub('session-m-plain', '')
+    putHub('session-m-locked', WS_LABEL + ' · 锁定主题')
+    putHub('session-m-unknown', WS_LABEL + ' · 未知主题')
+    const snapshots = new Map([
+      ['session-m-adopt', '中枢会话页签布局优化'],
+      ['session-m-repair', '新会话'],
+      ['session-m-cold', '新会话'],
+      ['session-m-plain', '新会话'],
+      ['session-m-locked', '新会话'],
+    ])
+    M.services.sessionQuery = {
+      readTitleSnapshots: async (ids) => ids.map((id) => {
+        const title = M.titles.has(id) ? M.titles.get(id) : snapshots.get(id)
+        return title === undefined
+          ? { sessionId: id, status: 'rejected' }
+          : { sessionId: id, status: 'fulfilled', value: { title: { title } } }
+      }),
+    }
+    M.live('session-m-repair')
+    M.live('session-m-plain')
+    await store.sessionTitles.put('session-m-locked', {
+      workspaceKey: WORKSPACE, sessionId: 'session-m-locked', kind: 'hub', state: 'user-locked',
+      desiredTitle: '人工名字', desiredFull: '人工名字', topic: '', lastWrittenTitle: '人工名字',
+      attempts: 0, lastError: '', lockedReason: 'manual', createdAt: now, updatedAt: now,
+    })
+    const deps = { ctx: M.ctx, store, logger: quiet }
+    const run = await migrateSessionTitles(deps, { ignoreMarker: true })
+    assert.equal(run.status, 'applied')
+    assert.equal(run.plan.length, 6, 'every hub record is mapped')
+    const adopt = run.plan.find((row) => row.sessionId === 'session-m-adopt')
+    assert.equal(adopt.action, 'adopt', 'a topic-bearing host title is adopted')
+    assert.equal(store.sessionTitles.get('session-m-adopt').state, 'named')
+    assert.equal(store.sessionTitles.get('session-m-adopt').desiredTitle, '中枢会话页签布局优化')
+    assert.equal(titleWrites.filter((w) => w[0] === 'session-m-adopt').length, 0, 'adoption never writes the host')
+    const repair = store.sessionTitles.get('session-m-repair')
+    assert.equal(repair.state, 'named')
+    assert.ok(repair.desiredTitle.startsWith(WS_LABEL + ' · 修复中枢会话命名'), 'the workspace prefix is preserved once')
+    assert.equal(repair.desiredTitle.startsWith(WS_LABEL + ' · ' + WS_LABEL), false, 'the prefix is never doubled')
+    assert.ok(Buffer.byteLength(repair.desiredTitle, 'utf8') <= TITLE_MAX_BYTES, 'the normalized mirror is ≤80 bytes')
+    assert.equal(M.titles.get('session-m-repair'), repair.desiredTitle, 'the live host gets the normalized title')
+    assert.equal(store.hubs.get('session-m-repair').title, repair.desiredTitle, 'the mirror follows the host')
+    const cold = store.sessionTitles.get('session-m-cold')
+    assert.equal(cold.state, 'deferred', 'a cold hub stores its intent as deferred')
+    assert.equal(store.hubs.get('session-m-cold').title, cold.desiredTitle, 'the cold mirror keeps the topic visible')
+    assert.equal(M.titles.get('session-m-cold'), undefined, 'a cold session is never renamed')
+    const plain = store.sessionTitles.get('session-m-plain')
+    assert.equal(plain.state, 'provisional')
+    assert.equal(plain.desiredTitle, WS_LABEL + ' · 新会话')
+    assert.equal(M.titles.get('session-m-plain'), WS_LABEL + ' · 新会话')
+    assert.equal(store.sessionTitles.get('session-m-locked').state, 'user-locked', 'user-locked is untouched')
+    assert.equal(store.hubs.get('session-m-locked').title, WS_LABEL + ' · 锁定主题')
+    assert.equal(store.sessionTitles.get('session-m-unknown'), undefined, 'an unreadable host title is never renamed')
+    const marker = store.meta.get('session-titles')
+    assert.equal(marker.sessionTitlesMigrationVersion, 1)
+    assert.ok(marker.sessionTitlesProcessedIds.includes('session-m-adopt'))
+    assert.ok(marker.sessionTitlesPendingIds.includes('session-m-cold'))
+    assert.equal(marker.sessionTitlesPendingIds.includes('session-m-repair'), false)
+    const writesAfterFirst = titleWrites.length
+    const again = await migrateSessionTitles(deps)
+    assert.equal(again.status, 'applied')
+    assert.equal(titleWrites.length, writesAfterFirst, 'a cold pending id is not written while cold')
+    assert.ok(store.meta.get('session-titles').sessionTitlesPendingIds.includes('session-m-cold'))
+    assert.equal(store.meta.get('session-titles').sessionTitlesMigrationVersion, 1)
+    M.live('session-m-cold')
+    const drained = await migrateSessionTitles(deps)
+    assert.equal(drained.pending, 0, 'the cold id leaves pending once it is live')
+    assert.equal(M.titles.get('session-m-cold'), cold.desiredTitle, 'the cold hub is renamed on its first live retry')
+    assert.deepEqual(store.meta.get('session-titles').sessionTitlesPendingIds, [])
+    const converged = await migrateSessionTitles(deps)
+    assert.equal(converged.status, 'already-done', 'a converged marker is a no-op')
+    ok('R59-11 迁移：收养不重写 / 中性宿主+镜像规范化（前缀一次、≤80B、live 延迟写、cold 进 pending）/ user-locked 不动 / 不可读跳过 / marker 幂等收敛')
+  }
+
+  // R59-12: reconcile — host==desired, neutral re-assert, external lock, locked no-op.
+  {
+    const R = makeHost()
+    const store = fakeStore()
+    const putRow = (id, over) => store.sessionTitles.put(id, {
+      workspaceKey: WORKSPACE, sessionId: id, kind: 'hub', state: 'named',
+      desiredTitle: '', desiredFull: '', topic: '', lastWrittenTitle: '', attempts: 0, lastError: '',
+      lockedReason: '', createdAt: now, updatedAt: now, ...over,
+    })
+    const deps = { ctx: R.ctx, store, logger: quiet }
+    await putRow('session-r-repair', { desiredTitle: WS_LABEL + ' · 对账主题' })
+    R.live('session-r-repair')
+    R.titles.set('session-r-repair', '新会话')
+    await store.meta.put('session-titles', {
+      sessionTitlesMigrationVersion: 1,
+      sessionTitlesProcessedIds: [],
+      sessionTitlesPendingIds: ['session-r-repair'],
+    })
+    const repaired = await reconcileSessionTitle(deps, 'session-r-repair')
+    assert.equal(repaired.outcome, 'host')
+    assert.equal(R.titles.get('session-r-repair'), WS_LABEL + ' · 对账主题')
+    assert.deepEqual(store.meta.get('session-titles').sessionTitlesPendingIds, [], 'successful repair settles pending')
+    await putRow('session-r-same', { desiredTitle: WS_LABEL + ' · 已有主题', lastWrittenTitle: WS_LABEL + ' · 已有主题' })
+    R.live('session-r-same')
+    R.titles.set('session-r-same', WS_LABEL + ' · 已有主题')
+    const writesBefore = titleWrites.length
+    const same = await reconcileSessionTitle(deps, 'session-r-same')
+    assert.equal(same.outcome, 'already')
+    assert.equal(titleWrites.length, writesBefore, 'an aligned row is a no-op')
+    await putRow('session-r-ext', { desiredTitle: WS_LABEL + ' · 旧主题', lastWrittenTitle: WS_LABEL + ' · 旧主题' })
+    R.live('session-r-ext')
+    R.titles.set('session-r-ext', '我自己起的名字')
+    const external = await reconcileSessionTitle(deps, 'session-r-ext')
+    assert.equal(external.outcome, 'locked')
+    assert.equal(R.titles.get('session-r-ext'), '我自己起的名字', 'an outside rename is never overwritten')
+    assert.equal(store.sessionTitles.get('session-r-ext').state, 'user-locked')
+    await putRow('session-r-locked', { state: 'user-locked', desiredTitle: '人工名字', lastWrittenTitle: '人工名字', lockedReason: 'manual' })
+    R.live('session-r-locked')
+    R.titles.set('session-r-locked', '人工名字')
+    assert.equal(await reconcileSessionTitle(deps, 'session-r-locked'), undefined)
+    await putRow('session-r-cold', { state: 'deferred', desiredTitle: WS_LABEL + ' · 冷' })
+    assert.equal(await reconcileSessionTitle(deps, 'session-r-cold'), undefined)
+    assert.equal(R.titles.has('session-r-cold'), false)
+    ok('R59-12 对账：宿主中性重写同一意图 / 相等不动 / 外部非中性 lock / user-locked no-op / 冷会话保持 deferred')
+  }
+
+  // R59-13: the display resolver — neutral host falls back to the mirror.
+  {
+    const store = fakeStore()
+    await store.hubs.put('session-resolve', {
+      workspaceKey: WORKSPACE, sessionId: 'session-resolve', title: WS_LABEL + ' · 镜像主题',
+      source: 'panel', lastSource: 'panel', createdAt: now, updatedAt: now,
+    })
+    await store.sessionTitles.put('session-resolve', {
+      workspaceKey: WORKSPACE, sessionId: 'session-resolve', kind: 'hub', state: 'deferred',
+      desiredTitle: WS_LABEL + ' · 意图主题', desiredFull: WS_LABEL + ' · 意图主题', topic: '',
+      lastWrittenTitle: '', attempts: 0, lastError: '', lockedReason: '', createdAt: now, updatedAt: now,
+    })
+    const R = makeHost()
+    R.live('session-resolve')
+    R.titles.set('session-resolve', '新会话')
+    assert.equal(resolveSessionTitle(R.ctx, store, 'session-resolve'), WS_LABEL + ' · 镜像主题',
+      'a neutral host falls back to the durable mirror')
+    assert.equal(sessionTitleOf(R.ctx, store, 'session-resolve'), WS_LABEL + ' · 镜像主题')
+    const { listHubSessions } = await import('../src/hub-sessions.ts')
+    const railCtx = {
+      get: (name) => (name === 'sessionQuery'
+        ? {
+            listSessions: async () => [{ header: { id: 'session-resolve', cwd: WORKSPACE } }],
+            readTitleSnapshots: async () => [{ sessionId: 'session-resolve', status: 'fulfilled', value: { title: { title: '新会话' } } }],
+          }
+        : undefined),
+      sessions: { get: (id) => R.sessions.get(id) },
+    }
+    const railRows = await listHubSessions(railCtx, store, WORKSPACE)
+    assert.equal(railRows[0]?.title, WS_LABEL + ' · 镜像主题', 'the rail uses the same resolver as the cards/header')
+    R.titles.set('session-resolve', '宿主主题')
+    assert.equal(resolveSessionTitle(R.ctx, store, 'session-resolve'), '宿主主题', 'a topic-bearing host wins')
+    ok('R59-13 展示回落：中性宿主→hub 镜像；面板/左栏/卡片同一解析顺序；非中性宿主优先')
+  }
+
+  // R59-14: branch durable title = host title = 80 UTF-8 bytes, no 60-char cut.
+  {
+    const store = fakeStore()
+    await store.topicsets.put('ts-r59', {
+      workspaceKey: WORKSPACE, title: '导出功能', summary: '', keywords: [], status: 'active',
+      members: [], createdAt: now, updatedAt: now, lastActiveAt: now,
+    })
+    const task = 'R59 需求：把分支会话的 durable 标题与宿主标题统一到同一个 80 字节预算，避免一个显示完整另一个被宿主截断'
+    const durable = await ensureMemberTitle(store, 'ts-r59', { sessionId: 'branch-r59', kind: 'fork' }, '导出功能', task, { taskOnly: true })
+    assert.ok(Buffer.byteLength(durable, 'utf8') <= TITLE_MAX_BYTES, 'the branch durable title respects the byte budget')
+    assert.equal(durable.includes('\uFFFD'), false, 'no half character')
+    assert.ok(durable.endsWith('…'), 'the clip is marked')
+    assert.equal(branchTitleFor(task), durable, 'the dispatch title is the same string')
+    const B = makeHost()
+    B.live('branch-r59')
+    const applied = await applySessionTitle({ ctx: B.ctx, store, logger: quiet }, {
+      sessionId: 'branch-r59', kind: 'branch', explicitTitle: durable, source: 'dispatch',
+    })
+    assert.equal(applied.title, durable)
+    assert.equal(B.titles.get('branch-r59'), durable, 'host and durable copies are identical')
+    assert.equal(store.topicsets.get('ts-r59').members[0].title, durable)
+    ok('R59-14 分支标题：宿主=dispatch=member（同一 80 字节串、多字节安全、无 60 字截断）')
+  }
+
+  // R59-15: the first activity of a deferred row retries out of the stack.
+  {
+    const D = makeHost()
+    const store = fakeStore()
+    D.live('session-deferred')
+    seedHub(store, 'session-deferred')
+    await store.sessionTitles.put('session-deferred', {
+      workspaceKey: WORKSPACE, sessionId: 'session-deferred', kind: 'hub', state: 'deferred',
+      desiredTitle: WS_LABEL + ' · 冷会话补名', desiredFull: WS_LABEL + ' · 冷会话补名', topic: '冷会话补名',
+      lastWrittenTitle: '', attempts: 0, lastError: 'session-not-live', lockedReason: '', createdAt: now, updatedAt: now,
+    })
+    await store.meta.put('session-titles', {
+      sessionTitlesMigrationVersion: 1, sessionTitlesProcessedIds: [], sessionTitlesPendingIds: ['session-deferred'],
+    })
+    attachSessionTitles({ ctx: D.ctx, store, logger: quiet })
+    const writesBefore = titleWrites.length
+    D.state.publishing = true
+    D.emit('session-deferred', { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } } })
+    assert.equal(titleWrites.length, writesBefore, 'the retry never writes inside the publication stack')
+    D.state.publishing = false
+    await flush()
+    assert.equal(D.titles.get('session-deferred'), WS_LABEL + ' · 冷会话补名')
+    assert.deepEqual(store.meta.get('session-titles').sessionTitlesPendingIds, [], 'the first live activity drains pending')
+    ok('R59-15 冷会话首次活动：deferred 行出栈重试成功并移出 pending')
+  }
+}
 
 // ---- R59-10: the panel create path writes through the same gate ----
 {
@@ -2576,10 +2798,11 @@ const { groupRelayText } = await import('../src/group.ts')
   const now3 = Date.now()
   const { branchTitleFor, branchTagsFor, roundTokensOf, latestBranchMeta } = await import('../src/branch-meta.ts')
   assert.equal(branchTitleFor('## 【R30-B：中枢-分支协同】\n第二行'), '中枢-分支协同', '标题取任务首行（去标记/去轮次前缀）')
-  // R43 需求③: the branch budget is 60 (was 48) — the user reported names as
-  // over-truncated, so a normal one-line task now stays whole.
-  assert.equal(branchTitleFor('任'.repeat(80)).length, 60, '标题 60 字预算并以 … 标记截断')
-  assert.ok(branchTitleFor('任'.repeat(80)).endsWith('…'), '截断以 … 标记')
+  // R59 Phase 1b: ONE budget for every copy — 80 UTF-8 bytes, not 60 chars.
+  const longBranch = branchTitleFor('任'.repeat(80))
+  assert.ok(Buffer.byteLength(longBranch, 'utf8') <= 80, '标题 80 UTF-8 字节预算')
+  assert.ok(longBranch.endsWith('…'), '截断以 … 标记')
+  assert.equal(longBranch.includes('\uFFFD'), false, '不劈多字节字符')
   assert.deepEqual(roundTokensOf('【R30-B：…】与 R30 相关'), ['R30-B', 'R30'], '轮次令牌含裸轮次')
   assert.deepEqual(
     branchTagsFor({ topicTags: ['supermemory'], task: '【R30-B：…】', kind: 'verify', capability: 'full' }),
