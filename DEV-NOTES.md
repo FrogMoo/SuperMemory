@@ -4456,3 +4456,75 @@ source 构造 `src/source.ts`：
 - label 是自由字符串：宿主不校验 kind，拼错只会显示错标题而不报错——R57-2/3 的注册表 + 调用参数断言就是防线。
 - R57-3 的调用参数扫描是源码静态闸门，只覆盖本仓库；宿主的渲染行为由 DSH 版本决定（本版核验于 0.2.2-rc.3，宿主源码即使变化也只会影响 label 的呈现方式，不影响我们落库的 kind）。
 
+
+## 71. R59：会话命名独立化（核心服务 / 迁移对账 / 重命名恢复 UI / 文档与矩阵）（2026-11-27）
+
+R43 的「中枢名字恒为 新会话」来自一个具体的宿主约束错误：在 `session/event` 监听器里同步
+append/rename，被宿主的重入保护拒绝，而空 logger 把错误吞掉、镜像却已写成主题。R59 把命名拆成
+**状态表 + 单写入口 + 延迟调度 + 观察者**，并补上迁移/对账/展示回落/面板操作与完整验收矩阵。
+
+### 71.1 提交（本地，双推见 71.8）
+
+| 提交 | 内容 |
+|---|---|
+| `c6e7841` | Phase 1a：`src/session-title/`（types/policy/state/host/defer/gate/observe）、`session_titles` 表 + domain v2（compatibleVersions [1]）、单写入口、延迟写、80 bytes、R59-1..10 |
+| `f6caae0` | Phase 1b-1：`session-titles` v1 迁移（processed/pending、cold 不阻塞）、启动对账/首次活动重试、resolve 展示回落、分支 durable 80 bytes、旧 hub-titles pending 钩子退役、R59-11..15 |
+| `4fc8c9e` | Phase 1b-2a：`autoTitle`（同 v2 加字段）、手动/外部 lock 保留自动标题、reset/rename/repair remote + 面板 UI、分支 host+dispatch+member 同串、R59-16..19 |
+| 本轮 docs 提交 | `docs/session-title.md`（含 A–J 矩阵）+ 本 §71 + panel/continue 自动化补齐（R59-20..22） |
+
+### 71.2 关键文件
+
+- 服务：`src/session-title/{types,policy,state,host,defer,gate,observe,migrate,reconcile,resolve,member,durable,index}.ts`
+- 接线：`src/index.ts`（observer + startupSessionTitles）、`src/panel.ts`（remote）、`src/client/*`（UI/locales）
+- 复用：`src/hub-sessions.ts`（rail/管理台同源 resolver + 视图状态）、`src/hub-branches.ts`（分支行 titleState）
+- 文档：`docs/session-title.md`（根因/状态机/80 bytes/defer/迁移/UI/domain/排障/A–J 矩阵）
+
+### 71.3 行为要点
+
+- 宿主标题唯一权威；`hub_sessions.title` 同串镜像；分支 `dispatches.title`/`members[].title` 同串。
+- 状态机 provisional→named 只一次；named 自动 no-op；宿主中性重置可重写同一 desired；
+  外部非中性 → user-locked；locked 自动 no-op；`autoTitle` 在手动/外部 lock 时保留，供 reset。
+- 所有事件内写走 `deferTitleTask`（microtask + 重入 setTimeout 重试 ≤3）；claim 区分自写/外部改名。
+- 80 UTF-8 bytes：code point 安全、前缀保留、`…` 计入预算；手动输入超限报错不截断。
+- 迁移 `session-titles` v1：收养非中性宿主、修复中性宿主+镜像、cold pending 不阻塞收敛；
+  旧 `hub-titles` pending 钩子退役，避免双写。
+- 面板：中转行/分支行重命名；hub 当前卡 reset/repair；cold → `needsOpen`（不 resume、不写）。
+- continue/resume：member 标题稳定；dispatch 新行 title 对齐稳定串（`syncDispatchTitle`），不自动改名。
+
+### 71.4 测试（本轮实测）
+
+- `pnpm typecheck`：宿主 + client 双工程 **0 错**（exit 0）。
+- `pnpm build`：exit 0；client 185,090 bytes（含新 UI/locales）。
+- `pnpm smoke`：七套全绿——core **43** / mechanism **141** / webui **35** / client-sim OK /
+  capability **20 组** / workspace-scope **6 组** / skill **27 组**。
+- R59 用例：1..22（状态机、defer、80B、迁移、对账、展示、durable、面板 remote、重载、continue、
+  autoTitle、live repair/legacy 回落）；R59-9 为架构扫描（host.ts 外无宿主标题写）。
+
+### 71.5 只读迁移验证（不写线上 store）
+
+- 线上 store 复制到临时目录后跑最终代码 dry-run：3 个受影响中枢（`session-mwuqyqdd-wfvw5w` /
+  `session-mwuqyr57-pf6x14` / `session-mwuqysn0-48ykb4`）宿主=新会话、镜像有主题 →
+  desired 单前缀、80/78/79 bytes、cold=deferred / live=rename；快照 SHA 前后一致，线上 store SHA 未变。
+- Phase 0 记录 2 个，1b-1 快照实测 3 个（含本轮中枢）；规则一致处理。
+
+### 71.6 风险 / 边界
+
+- domain version 2 写后，降级到 pre-R59（只接受 v1）会 `version-mismatch`；回滚前备份/迁移介质。
+- `autoTitle` 加在同一 v2（未再升版）；旧行无该字段时 reset 从镜像/member/topic 回落，仍无则明确报错。
+- 分支 rename/reset 会重写该分支全部 dispatch 的 `title`（保留 `task`）。
+- cold 修复不直接 rename（无安全 API），依赖打开会话/首次 live 事件/下次启动。
+- 真实 reload/重启无法在分支内执行；插件当前仍是旧代码，需中枢侧重载后按 71.7 验收。
+
+### 71.7 人工验收（中枢重载后）
+
+1. 重载插件并刷新 GUI；新建**不发言**中枢 → 「<工作区> · 新会话」。
+2. 在该会话 shell 发首条消息 → 「<工作区> · <主题>」，只变一次；面板首条消息同样。
+3. 面板重命名 → 宿主侧栏/镜像同步；自动事件/重载不覆盖；「恢复自动命名」写回 auto。
+4. 派发一个分支并 continue：分支卡片/宿主/成员标题一致且不变；超 80 bytes 有明确错误。
+5. 冷会话点「修复标题」→ 提示打开；打开后自动修复；旧「新会话」中枢迁移后正确。
+6. 对照 `docs/session-title.md` 附录 A 矩阵逐项打勾。
+
+### 71.8 双推
+
+按 `docs/git-sync.md` / 固化能力 `git-sync-supermemory`：先 dry-run，再真实 push Gitee + GitHub，
+逐端核验 main commit 一致；GitHub 端点失败时按能力文档 API 补推路径处理，不强推。结果以本轮报告为准。
