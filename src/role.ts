@@ -199,11 +199,16 @@ export async function recordHubSession(
     if (!table || typeof table.put !== 'function') return
     const existing = typeof table.get === 'function' ? table.get(sessionId) : undefined
     const now = Date.now()
+    // R59: the FIRST writer owns the provenance (a later dispatch/refresh does
+    // not relabel a panel-created hub); the most recent writer is audited in
+    // lastSource.
+    const source = existing?.source ?? input.source ?? 'panel'
     await table.put(sessionId, {
       workspaceKey: String(input.workspaceKey || existing?.workspaceKey || 'unknown'),
       sessionId,
       title: String(input.title ?? existing?.title ?? ''),
-      source: input.source ?? existing?.source ?? 'panel',
+      source,
+      lastSource: input.source ?? existing?.lastSource ?? source,
       createdAt: Number(existing?.createdAt) || now,
       updatedAt: now,
     })

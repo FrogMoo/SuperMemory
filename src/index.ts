@@ -21,7 +21,8 @@ import type { ToolizeConfig } from './toolize.ts'
 import { runReconciliation } from './reconcile.ts'
 import { renderBranchRestoreSummary, restoreBranchSessions } from './branch-restore.ts'
 import { migrateTruncatedTitles } from './title-migration.ts'
-import { attachPendingHubTitleRename, attachHubTitleFromFirstMessage, migrateHubSessionTitles } from './hub-title-migration.ts'
+import { attachPendingHubTitleRename, migrateHubSessionTitles } from './hub-title-migration.ts'
+import { attachSessionTitles } from './session-title/index.ts'
 import { knownWorkspaceKeys, migrateHubSessionRecords } from './hub-records-migration.ts'
 import { applyMemoryOrganize } from './memory-organize.ts'
 import { PLUGIN_REPO_ROOT } from './builtin-capabilities.ts'
@@ -542,12 +543,12 @@ export async function apply(ctx: Context, config: Config) {
     // those ids as pending instead of blocking convergence; this hook renames
     // each one on its first live event, so the set drains without a rescan.
     ctx.effect(() => attachPendingHubTitleRename(ctx, store, logger, hubTitlePass), 'supermemory: pending-hub-titles')
-    // R43 需求②: a hub opened from the rail and then used IN THE SHELL never
-    // went through the panel's send path, so its title stayed the neutral
-    // 「新会话」 (the R41 gap the user reported). This hook names it from the
-    // user's first message wherever it is typed — same rule as creation, and
-    // only while the title carries no topic.
-    ctx.effect(() => attachHubTitleFromFirstMessage(ctx, store, logger), 'supermemory: hub-title-first-message')
+    // R59: the naming service replaces the R43 first-message hook. It owns the
+    // durable intent (session_titles), the single host write entry (gate) and
+    // the deferred observer — a listener never writes inside the host's event
+    // publication stack (that is how the R43 hook lost every rename). The
+    // legacy pending-title pass above still feeds the same gate.
+    ctx.effect(() => attachSessionTitles({ ctx, store, logger }), 'supermemory: session-titles')
     // R23: one-time memory re-layout into the R22 collection model. Marker-
     // guarded (meta row `organize-<digest>`), only targets this plugin
     // repo's workspace, and every destructive step is SHA-guarded against

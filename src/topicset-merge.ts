@@ -22,7 +22,8 @@ import type { Store } from './store.ts'
 import { newId } from './store.ts'
 import { normalizeTags } from './retrieval.ts'
 import { findVerifyTopicSet, topicSetPairScore, verifyTopicSetTitle } from './topicset-match.ts'
-import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, sessionTitleFor } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, currentSessionTitle, sessionTitleFor } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 import { clipMarked } from './clip.ts'
 
 /** Bump when the merge rules change; an older marker re-runs. */
@@ -661,6 +662,7 @@ export async function applyPlanToStore(
  */
 export async function applyPlanToHost(
   ctx: Context,
+  store: Store,
   plan: TopicSetMergePlan,
   logger: { warn: (msg: string) => void; info: (msg: string) => void },
 ): Promise<{ renamed: number; skipped: number }> {
@@ -675,8 +677,14 @@ export async function applyPlanToHost(
           logger.info('supermemory: merge title skip ' + change.sessionId + ' — the host title was renamed by somebody else')
           continue
         }
-        const outcome = applySessionTitle(ctx, change.sessionId, change.to, logger, { force: true })
-        if (outcome === 'host' || outcome === 'fallback') renamed += 1
+        const outcome = await applySessionTitle({ ctx, store, logger }, {
+          sessionId: change.sessionId,
+          kind: 'other',
+          explicitTitle: change.to,
+          source: 'topicset-merge',
+          force: true,
+        })
+        if (outcome.outcome === 'host' || outcome.outcome === 'fallback') renamed += 1
       } catch (error) {
         logger.warn('supermemory: merge host title failed for ' + change.sessionId + ': ' + String(error).slice(0, 160))
       }
@@ -701,7 +709,7 @@ export async function mergeTopicSets(
   }
   if (options.dryRun !== false) return { ...plan, status: 'planned', applied: zeros }
   const storeResult = await applyPlanToStore(deps.store, plan)
-  const host = await applyPlanToHost(deps.ctx, plan, deps.logger)
+  const host = await applyPlanToHost(deps.ctx, deps.store, plan, deps.logger)
   deps.logger.info(
     'supermemory: topic-set merge applied — clusters ' + plan.clusters.length
     + ', archived ' + storeResult.archived.length

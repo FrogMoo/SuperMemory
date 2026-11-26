@@ -28,13 +28,13 @@ import type { Dispatch } from './schema.ts'
 import type { Store } from './store.ts'
 import {
   TOPIC_SET_TITLE_MAX_CHARS,
-  applySessionTitle,
   cleanTitleText,
   clipEllipsis,
   currentSessionTitle,
   firstLine,
   sessionTitleFor,
 } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 
 /** Bump when the repair rules change; a marker of an older version re-runs. */
 export const TITLES_MIGRATION_VERSION = 1
@@ -246,6 +246,7 @@ export async function applyPlanToStore(store: Store, plan: TitlesMigrationPlan):
  */
 export async function applyPlanToHost(
   ctx: Context,
+  store: Store,
   plan: TitlesMigrationPlan,
   logger: { warn: (msg: string) => void; info: (msg: string) => void },
 ): Promise<{ renamed: number; skipped: number }> {
@@ -259,8 +260,14 @@ export async function applyPlanToHost(
         logger.info('supermemory: title migration skipped ' + item.sessionId + ' — the host title was renamed by somebody else')
         continue
       }
-      const outcome = applySessionTitle(ctx, item.sessionId, item.to, logger, { force: true })
-      if (outcome === 'host' || outcome === 'fallback') renamed += 1
+      const outcome = await applySessionTitle({ ctx, store, logger }, {
+        sessionId: item.sessionId,
+        kind: 'other',
+        explicitTitle: item.to,
+        source: 'migration',
+        force: true,
+      })
+      if (outcome.outcome === 'host' || outcome.outcome === 'fallback') renamed += 1
     } catch (error) {
       logger.warn('supermemory: title migration host apply failed for ' + item.sessionId + ': ' + String(error).slice(0, 160))
     }
@@ -298,7 +305,7 @@ export async function migrateTruncatedTitles(
   const plan = planTitlesMigration(store)
   if (options.dryRun) return { ...plan, status: 'planned', applied: zeros }
   await applyPlanToStore(store, plan)
-  const host = await applyPlanToHost(ctx, plan, logger)
+  const host = await applyPlanToHost(ctx, store, plan, logger)
   await writeTitlesMigrationMarker(store)
   logger.info(
     'supermemory: title migration applied — topic sets ' + plan.topicSets.length

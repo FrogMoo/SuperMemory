@@ -2,25 +2,17 @@
  * Session naming (requirement C): every session the plugin CREATES gets a
  * stable, readable title instead of showing up unnamed in the GUI session list.
  *
- * Host capability (verified against the @deepseek-ai/dsh 0.2.2-rc.3 docs and the
- * running 0.2.2-rc.3 host, sources under app.asar/dsh):
- * - There IS a title write API: `ctx.sessionTitle.rename(session, title)`
- *   (`@deepseek-ai/dsh-session-title`) appends the log-only `session/title`
- *   event with `source: { kind: 'user' }`, which also PINS the title so automatic
- *   title generation stops overwriting it. `ctx.sessionTitle.get(session)` reads
- *   the latest folded title. The GUI session list renders the `title` projection
- *   row (`session_projcache/.../title.val`), which is folded from that event, so a
- *   host rename is what actually removes the "unnamed" state in the sidebar.
- * - The AGENT API GATEWAY also exposes `SessionService.rename(request)` (Remote
- *   'rename', "rename one Session after explicitly resuming it") for client-side
- *   renames; a plugin should use the host service instead of the client Remote.
- * - The session HEADER has no writable title: it is the immutable creation header
- *   (version/id/createdAt/cwd/lineage). Title lives only in the log event fold.
- * - Degraded path: when the title service is absent (headless/minimal profile),
- *   `session.append('session/title', { title, messageSeqs: [], source: { kind: 'user' } })`
- *   writes the exact shape `rename` writes. If even `append` is unavailable the
- *   plugin still names the topic-set member (panel + /memory output), but the GUI
- *   list keeps showing it unnamed; that limitation is reported, never faked.
+ * R59: HOST TITLE WRITES NO LONGER LIVE HERE. The whole write path moved to
+ * `src/session-title/` (policy composes under the host's 80-byte budget, the
+ * gate is the single write entry, the observer defers every write out of the
+ * `session/event` publication stack). This module keeps only the PURE text
+ * helpers and the durable topic-set member title (`ensureMemberTitle`).
+ *
+ * Host facts the naming service relies on (verified against the running host): the host
+ * exposes `ctx.sessionTitle.rename` (writes `session/title` with
+ * `source:{kind:'user'}`, which PINS the session), requires a LIVE session,
+ * silently truncates to `maxTitleBytes: 80`, and rejects an append made while
+ * it is publishing an event.
  *
  * Naming rule (stable, readable, bounded):
  *   <topic-set title> · <first line of the task, markdown/brackets stripped>
@@ -33,6 +25,7 @@
  */
 import type { Store } from './store.ts'
 import { addMember, updateMember } from './topicsets.ts'
+import { readHostTitle } from './session-title/host.ts'
 
 /**
  * Hard character cap of a plugin-assigned session title. The host rename
@@ -71,22 +64,6 @@ export const TITLE_FALLBACK = '新会话'
  * used to slice to 12–40 characters with no marker at all.
  */
 export const TOPIC_SET_TITLE_MAX_CHARS = 60
-
-/** Lifecycle access the title path needs from the host context. */
-export interface TitleSessionLike {
-  append?(type: string, data: unknown): unknown
-}
-
-/** Structural view of the host context (compile-time only; never shadows it). */
-export interface TitleHost {
-  get?(name: string): unknown
-  sessions?: {
-    get(id: string): (TitleSessionLike & Record<string, unknown>) | undefined
-  }
-}
-
-/** Where a title ended up: host event, direct log append, or nowhere. */
-export type SessionTitleOutcome = 'already' | 'host' | 'fallback' | 'none'
 
 /** One topic-set member identity. */
 export interface NamedMember {
@@ -267,93 +244,33 @@ export async function ensureMemberTitle(
 }
 
 /**
- * Apply a title to the HOST session so the GUI session list stops showing it
- * unnamed. Prefers `ctx.sessionTitle.rename` (host-owned normalization + pin),
- * falls back to the exact `session/title` log append, and never throws.
- * @param ctx - host context (structural view).
- * @param sessionId - live session to name.
- * @param title - proposed title (normalized again here).
- * @param logger - warning sink.
- * @returns where the title landed.
+ * R59: read-only compatibility surface for the legacy callers that still ask
+ * "what does the host show?" and "what should a card label this session?".
+ * WRITES are forbidden here — every host title write goes through
+ * `src/session-title/gate.ts`; this module only reads.
  */
-export function applySessionTitle(
-  ctx: TitleHost,
-  sessionId: string,
-  title: string,
-  logger: { warn: (msg: string) => void },
-  options: { force?: boolean } = {},
-): SessionTitleOutcome {
-  const clean = clipEllipsis(firstLine(cleanTitleText(title)), TITLE_MAX_CHARS)
-  if (!clean) return 'none'
-  const session = ctx.sessions?.get(sessionId)
-  if (!session) return 'none'
-  const service = (() => {
-    try { return ctx.get?.('sessionTitle') } catch { return undefined }
-  })() as
-    | { get?(session: unknown): { title?: string } | undefined; rename?(session: unknown, text: string): unknown }
-    | undefined
-  // The 'already' guard keeps a first naming from overwriting an existing
-  // title; the one-time title migration passes force to refresh a stale one.
-  if (!options.force) {
-    try {
-      if (service && typeof service.get === 'function') {
-        const current = service.get(session)
-        if (current && typeof current.title === 'string' && current.title.trim()) return 'already'
-      }
-    } catch (error) {
-      logger.warn('supermemory: session title read skipped: ' + String(error).slice(0, 160))
-    }
+export interface TitleHost {
+  get?(name: string): unknown
+  sessions?: {
+    get(id: string): unknown
   }
-  try {
-    if (service && typeof service.rename === 'function') {
-      service.rename(session, clean)
-      return 'host'
-    }
-  } catch (error) {
-    logger.warn('supermemory: sessionTitle.rename failed, falling back to the log event: ' + String(error).slice(0, 160))
-  }
-  try {
-    const append = session.append
-    if (typeof append === 'function') {
-      append.call(session, 'session/title', { title: clean, messageSeqs: [], source: { kind: 'user' } })
-      return 'fallback'
-    }
-  } catch (error) {
-    logger.warn('supermemory: session title log append failed: ' + String(error).slice(0, 160))
-  }
-  return 'none'
 }
 
 /**
  * The live HOST title of one session, or undefined when the session is not
- * tracked, carries no title, or the title service is unavailable. The
- * one-time title migration uses it to detect a title that somebody else
- * renamed, so it never overwrites a human's choice.
+ * tracked, carries no title, or the title service is unavailable.
  */
 export function currentSessionTitle(ctx: TitleHost, sessionId: string): string | undefined {
-  const session = ctx.sessions?.get(sessionId)
-  if (!session) return undefined
-  try {
-    const service = ctx.get?.('sessionTitle') as
-      | { get?(target: unknown): { title?: string } | undefined }
-      | undefined
-    const current = service?.get?.(session)
-    if (current && typeof current.title === 'string' && current.title.trim()) return current.title
-  } catch { /* no title service: treat as untitled */ }
-  return undefined
+  return readHostTitle(ctx as unknown as Parameters<typeof readHostTitle>[0], sessionId)?.title
 }
+
 /**
  * R32 需求③: the best available title for a message's SOURCE session.
  *
- * Reads the live host title first, then the plugin's durable branch title
- * mapping (a branch can be detached/reloaded while its dispatch row still
- * carries the name), and returns '' when neither knows one — the card then
- * falls back to the id's last four characters (see chat-card.ts).
- *
- * @param ctx - host context (structural view; never throws).
- * @param store - durable plugin store (optional).
- * @param sessionId - session whose title should label a card.
- * @returns a trimmed title, or ''.
+ * Reads the live host title first, then the plugin's durable topic-set member
+ * title (a branch can be detached/reloaded while its dispatch row still carries
+ * the name), and returns '' when neither knows one — the card then falls back to
+ * the id's last four characters (see chat-card.ts).
  */
 export function sessionTitleOf(ctx: TitleHost, store: Store | undefined, sessionId: string): string {
   if (!sessionId) return ''
@@ -373,4 +290,3 @@ export function sessionTitleOf(ctx: TitleHost, store: Store | undefined, session
   }
   return ''
 }
-

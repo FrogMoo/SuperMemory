@@ -45,9 +45,8 @@ import type { Store } from './store.ts'
 import { workspaceKeyOf } from './store.ts'
 import { HUB_TITLE_PREFIX, LEGACY_HUB_TITLE_PREFIX, hubSessionTitle, isLegacyHubTitle, isNeutralHubTitle, isPluginBranchId } from './hub-sessions.ts'
 import { recordHubSession } from './role.ts'
-import type { SessionEventLike, UserMessageLike } from './events.ts'
-import type { HubSession } from './schema.ts'
-import { applySessionTitle, currentSessionTitle, describeSessionTitle, stripLeadingDescription } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
+import { currentSessionTitle, describeSessionTitle, stripLeadingDescription } from './title.ts'
 
 /**
  * Bump when the rename rules change; a marker of an older version re-runs.
@@ -415,7 +414,19 @@ export async function finishPendingHubTitle(
       await settlePendingId(store, id)
       return 'skipped'
     }
-    const outcome = applySessionTitle(ctx, id, to, logger, { force: true })
+    // R59: the gate is the only host write entry; this hook runs from a
+    // session/event listener, so the write is deferred out of the publication
+    // stack (the R43 synchronous write was rejected by the host and lost).
+    const applied = await applySessionTitle({ ctx, store, logger }, {
+      sessionId: id,
+      kind: 'hub',
+      workspaceKey: workspace,
+      explicitTitle: to,
+      source: 'migration',
+      force: true,
+      defer: true,
+    })
+    const outcome = applied.outcome
     if (outcome !== 'host' && outcome !== 'fallback') return 'failed'
     await settlePendingId(store, id)
     logger.info('supermemory: pending hub title renamed for ' + id)
@@ -465,73 +476,6 @@ export function attachPendingHubTitleRename(
       .catch((error) => {
         logger.warn('supermemory: pending hub title hook failed: ' + String(error).slice(0, 160))
       })
-  })
-  return off
-}
-
-/**
- * R43 需求②: name a hub from the user's first message, WHEREVER that message
- * is typed. The panel's send path upgrades the title itself
- * (`refreshHubTitleFromMessage`), but a hub opened from the sidebar and then
- * used in the shell never went through it — that is the documented R41 gap
- * behind 「中枢会话名称固定显示新会话」. This hook closes it: on the first
- * `user/message` event of a plugin hub whose title still carries NO topic, the
- * title becomes the same value creation would have produced.
- *
- * Guards (a hook that renames on every message would fight the user):
- *   - only sessions with a plugin `hub_sessions` record (a hub this plugin
- *     created), so an ordinary conversation is never renamed;
- *   - only `source.kind === 'user'` — a relay, a notice or a tool receipt is
- *     not the user's own words and must not name the session;
- *   - only while the title is neutral ({@link isNeutralHubTitle}), so a name a
- *     person or the host title service chose is kept;
- *   - one upgrade per session per process (a Set), plus the neutral check.
- *
- * @returns the listener disposer; never throws.
- */
-export function attachHubTitleFromFirstMessage(
-  ctx: Context | undefined,
-  store: Store | undefined,
-  logger: { warn: (msg: string) => void; info: (msg: string) => void },
-): () => void {
-  if (!ctx || !store || typeof ctx.on !== 'function') return () => {}
-  const upgraded = new Set<string>()
-  const off = ctx.on('session/event', (session: { id?: unknown }, event: SessionEventLike) => {
-    if (event?.type !== 'user/message') return
-    const id = String(session?.id ?? '')
-    if (!id || upgraded.has(id)) return
-    let record: HubSession | undefined
-    try {
-      record = store.hubs.get(id)
-    } catch {
-      return
-    }
-    if (!record) return
-    const data = event.data as UserMessageLike | undefined
-    // Only the user's own words name a session (the panel path uses kind
-    // 'user'; relays/notices carry kind 'supermemory').
-    const kind = data?.source?.kind
-    if (kind && kind !== 'user') return
-    const text = contentText(data?.content)
-    if (!text.trim()) return
-    upgraded.add(id)
-    const workspace = record.workspaceKey
-    const current = currentSessionTitle(ctx, id) ?? record.title
-    if (!isNeutralHubTitle(current, workspace)) return
-    const title = hubSessionTitle(id, text, workspace)
-    if (!title || isNeutralHubTitle(title, workspace)) return
-    try {
-      applySessionTitle(ctx, id, title, { warn: () => {} }, { force: true })
-      void recordHubSession(store, {
-        sessionId: id,
-        workspaceKey: workspace,
-        title,
-        source: record.source,
-      }).catch(() => { /* the host title already landed; the record is a cache */ })
-      logger.info(`supermemory: hub ${id.slice(0, 20)} named from its first message 「${title}」`)
-    } catch (error) {
-      logger.warn('supermemory: hub first-message naming failed for ' + id + ': ' + String(error).slice(0, 160))
-    }
   })
   return off
 }
@@ -631,6 +575,7 @@ export async function migrateHubSessionTitles(
   // cold session waits for its first live event instead of blocking convergence.
   const settled = new Set<string>()
   const unfinished = new Set<string>()
+  const hubIds = new Set(hubTargets.map((target) => target.sessionId))
   for (const item of plan) {
     try {
       // Re-read the LIVE title: the batch read above may be stale, and a title
@@ -642,7 +587,15 @@ export async function migrateHubSessionTitles(
         logger.info(`supermemory: title migration skipped ${item.sessionId} — the host title was renamed by somebody else`)
         continue
       }
-      const outcome = applySessionTitle(ctx, item.sessionId, item.to, logger, { force: true })
+      const applied = await applySessionTitle({ ctx, store, logger }, {
+        sessionId: item.sessionId,
+        kind: hubIds.has(item.sessionId) ? 'hub' : 'branch',
+        workspaceKey: store?.hubs?.get?.(item.sessionId)?.workspaceKey ?? '',
+        explicitTitle: item.to,
+        source: 'migration',
+        force: true,
+      })
+      const outcome = applied.outcome
       if (outcome === 'host' || outcome === 'fallback') {
         renamed += 1
         settled.add(item.sessionId)

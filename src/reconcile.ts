@@ -14,7 +14,8 @@ import type { SessionEventLike, UserMessageLike } from './events.ts'
 import { loadHostModule } from './host.ts'
 import type { Store } from './store.ts'
 import { branchHandles } from './dispatch.ts'
-import { applySessionTitle, ensureMemberTitle, sessionTitleOf } from './title.ts'
+import { ensureMemberTitle, sessionTitleOf } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 import { dispatchSource, relaySource } from './chat-card.ts'
 import { flushObserve, isDispatchInput, relayCardFields, settleOpenDispatches } from './observe.ts'
 import { openQuestionsOfDispatch, renderQuestionsBlock } from './questions.ts'
@@ -164,7 +165,13 @@ export function runReconciliation(deps: ReconcileDeps): void {
                 try {
                   const topicTitle = store.topicsets.get(record.topicSetId)?.title ?? ''
                   const named = await ensureMemberTitle(store, record.topicSetId, { sessionId: record.branchSessionId, kind: 'root' }, topicTitle, record.task, { taskOnly: true })
-                  applySessionTitle(ctx, record.branchSessionId, named, logger)
+                  await applySessionTitle({ ctx, store, logger }, {
+                    sessionId: record.branchSessionId,
+                    kind: 'branch',
+                    explicitTitle: named,
+                    source: 'reconcile',
+                    defer: true,
+                  })
                 } catch { /* naming is best-effort on recovery */ }
               }
             } catch (error) {

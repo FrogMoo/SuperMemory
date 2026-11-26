@@ -18,7 +18,8 @@ import {
   addMember, createTopicSet, getRouting, getTopicSet, listTopicSets, setRouting,
   topicSetIdsOf, touchTopicSet, updateTopicSetSummary,
 } from './topicsets.ts'
-import { TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, clipEllipsis, currentSessionTitle, ensureMemberTitle } from './title.ts'
+import { TOPIC_SET_TITLE_MAX_CHARS, clipEllipsis, ensureMemberTitle } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { branchHandles, compositionSetup } from './dispatch.ts'
 import {
@@ -41,7 +42,7 @@ import {
 // R27 需求④.2: 面板粘贴长文同样整形为原子记忆（与 memory_remember 同一条路径）。
 import { splitMemoryEntries } from './memory-split.ts'
 import { TITLE_MAX, assessConclusion, deriveTitle, mergeTags, normalizeTags, tagsOfBody } from './retrieval.ts'
-import { isPluginBranchId, isNeutralHubTitle, listHubSessions, hubSessionTitle, type HubSessionView } from './hub-sessions.ts'
+import { isPluginBranchId, listHubSessions, type HubSessionView } from './hub-sessions.ts'
 // R36 需求①②: 中枢白名单（默认拒绝）的读写；R39：动态目录按来源分组。
 import {
   DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, LOCKED_HUB_TOOLS,
@@ -59,6 +60,16 @@ import { defaultModelFor, readModelDefaults, writeModelDefaults, type ModelDefau
 import {
   type SkillView,
 } from './skill-forge.ts'
+
+/**
+ * R59: the naming gate's logger. The old naming paths passed
+ * `{ warn: () => {} }`, which is exactly why the R43 write failure stayed
+ * invisible for weeks — a title failure is always reported now.
+ */
+const panelTitleLogger = {
+  warn: (msg: string) => console.warn(msg),
+  info: (msg: string) => console.info(msg),
+}
 
 export interface TopicSetView {
   id: string
@@ -1439,13 +1450,21 @@ export class SupermemoryPanelService {
         await touchTopicSet(this.store, id)
       }
       await touchTopicSet(this.store, ids[0])
-      applySessionTitle(ctx, sessionId, named, { warn: () => {} })
+      // R59: one write entry — the gate composes/clips and records the intent.
+      const applied = await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
+        sessionId,
+        workspaceKey: workspaceKeyOf(cwd),
+        kind: 'hub',
+        explicitTitle: named,
+        source: 'topicset-root',
+      })
       // R33 需求②: a topic-set conversation is a POSITIVE hub mark (root member
-      // + explicit record), never inferred from its missing parentSession.
+      // + explicit record), never inferred from its missing parentSession. The
+      // mirror carries the gate's accepted string, so host and record agree.
       await recordHubSession(this.store, {
         sessionId,
         workspaceKey: workspaceKeyOf(cwd),
-        title: named,
+        title: applied.title || named,
         source: 'topicset-root',
       })
       try {
@@ -1478,14 +1497,10 @@ export class SupermemoryPanelService {
     }
     const created = await this.createSessionWithOptions(cwd, resolvedOptions)
     if ('error' in created) return { status: 'error', message: created.error }
-    // R41 需求③a / R43 需求②③: the name is the work itself — the opening
-    // message (48-char clip) qualified by the workspace name, or
-    // 「<工作区名> · 新会话」 when there is no content yet. Never a bare
-    // 「新会话」 (it said nothing, and it made the shell's New-session capture
-    // interceptor fire on this hub's chat cards), never a brand prefix, never
-    // an id token.
-    const title = hubSessionTitle(created.sessionId, firstMessage, cwd)
-    await this.finishSession(created.sessionId, cwd, title)
+    // R59: the naming service composes the title (no local string building):
+    // 「<工作区名> · <主题>」, or 「<工作区名> · 新会话」 (provisional) when the
+    // composer is empty. The first user message later finalizes it ONCE.
+    const title = await this.finishSession(created.sessionId, cwd, firstMessage)
     // R33 需求②: the plugin created this hub — record the positive mark.
     await recordHubSession(this.store, {
       sessionId: created.sessionId,
@@ -1500,12 +1515,10 @@ export class SupermemoryPanelService {
   }
 
   /**
-   * R41 需求③a / R43 需求②: upgrade a hub's neutral title from the first message
-   * the user sends in the panel. Only titles that carry NO topic (the bare
-   * fallback, the R43 「<工作区名> · 新会话」 default, the old brand prefix, the
-   * pre-R31 「新会话 · id」) are upgraded — a title a person or the host title
-   * service chose is kept. The new name uses the SAME rule as creation, so the
-   * panel path and the shell path (attachHubTitleFromFirstMessage) agree.
+   * R59: the panel send path notifies the naming gate. The gate owns every
+   * guard (neutral-only upgrade, human name kept, one final name, external
+   * rename lock) and writes OUTSIDE this call stack (defer) — so this path and
+   * the shell's session/event observer can never double-write or fight.
    */
   private async refreshHubTitleFromMessage(sessionId: string, text: string): Promise<void> {
     const ctx = this.ctx
@@ -1513,17 +1526,13 @@ export class SupermemoryPanelService {
     try {
       const record = this.store?.hubs?.get?.(sessionId)
       if (!record) return
-      const workspace = record.workspaceKey
-      const current = currentSessionTitle(ctx, sessionId) ?? record.title
-      if (!isNeutralHubTitle(current, workspace)) return
-      const title = hubSessionTitle(sessionId, text, workspace)
-      if (!title || isNeutralHubTitle(title, workspace)) return
-      applySessionTitle(ctx, sessionId, title, { warn: () => {} }, { force: true })
-      await recordHubSession(this.store, {
+      await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
         sessionId,
-        workspaceKey: workspace,
-        title,
-        source: record.source,
+        workspaceKey: record.workspaceKey,
+        kind: 'hub',
+        topicText: text,
+        source: 'panel',
+        defer: true,
       })
     } catch { /* naming is best-effort; the message already went through */ }
   }
@@ -1589,14 +1598,25 @@ export class SupermemoryPanelService {
     return { sessionId, handle }
   }
 
-  /** Name the host session and attach it to its workspace (best-effort). */
-  private async finishSession(sessionId: string, cwd: string, title: string): Promise<void> {
+  /**
+   * R59: name the host session through the SINGLE write entry (the gate decides
+   * provisional vs final from `topicText`) and attach it to its workspace.
+   * @returns the title the naming service put in force ('' when it could not).
+   */
+  private async finishSession(sessionId: string, cwd: string, topicText = ''): Promise<string> {
     const ctx = this.ctx
-    if (!ctx) return
-    applySessionTitle(ctx, sessionId, title, { warn: () => {} })
+    if (!ctx) return ''
+    const result = await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
+      sessionId,
+      workspaceKey: workspaceKeyOf(cwd),
+      kind: 'hub',
+      topicText,
+      source: 'panel',
+    })
     try {
       await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
     } catch { /* workspace attach is best-effort */ }
+    return result.title
   }
 
   /**
@@ -1716,7 +1736,12 @@ export class SupermemoryPanelService {
         return { status: 'error', message: `创建分支失败：${String(error).slice(0, 200)}` }
       }
       const named = await ensureMemberTitle(this.store, topicSetId, { sessionId, kind: 'root' }, topicSet.title, body)
-      applySessionTitle(ctx, sessionId, named, { warn: () => {} })
+      await applySessionTitle({ ctx, store: this.store, logger: panelTitleLogger }, {
+        sessionId,
+        kind: 'branch',
+        explicitTitle: named,
+        source: 'panel',
+      })
       try {
         await attachBranchToWorkspace(ctx, sessionId, cwd, { warn: () => {}, info: () => {} })
       } catch { /* best-effort */ }

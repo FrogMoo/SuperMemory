@@ -9,7 +9,7 @@ import type * as StorageDomain from '@deepseek-ai/dsh-storage-domain'
 import { loadHostModule } from './host.ts'
 import {
   buildSchemas,
-  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type HubPolicy, type HubSession, type Memory, type ModelDefaults, type MemoryCollection, type MemoryVersion, type Meta, type OutboxItem, type Question, type Requirement, type Routing, type Signal, type ToolMemory, type TopicSet,
+  type Dispatch, type Episode, type FileMapEntry, type Hotcache, type HubPolicy, type HubSession, type Memory, type ModelDefaults, type MemoryCollection, type MemoryVersion, type Meta, type OutboxItem, type Question, type Requirement, type Routing, type SessionTitleRow, type Signal, type ToolMemory, type TopicSet,
 } from './schema.ts'
 
 /** Structural view of one KvTable handle (the domain layer's runtime type). */
@@ -24,10 +24,18 @@ export interface Table<V> {
   deleteMany(keys: readonly string[]): Promise<number>
 }
 
-/** The declared domain spec, narrowed to its literal type. */
+/**
+ * The declared domain spec, narrowed to its literal type.
+ *
+ * R59 bumped the DOMAIN version to 2 to introduce the `session_titles` table.
+ * `compatibleVersions: [1]` keeps every existing medium (stored version 1)
+ * readable: the backend admits it, the record schemas default the new fields,
+ * and the next write stamps 2. No data migration is required because the new
+ * table only ever gains rows (an absent table = no naming state yet).
+ */
 export type SupermemorySpec = StorageDomain.DomainSpec & {
   readonly name: 'supermemory'
-  readonly version: 1
+  readonly version: 2
 }
 
 export interface Store {
@@ -57,6 +65,8 @@ export interface Store {
   meta: Table<Meta>
   /** R33 需求②: positive hub records (never inferred from a missing parent). */
   hubs: Table<HubSession>
+  /** R59: the session-naming state machine (one row per named session). */
+  sessionTitles: Table<SessionTitleRow>
   close(): Promise<void>
 }
 
@@ -134,7 +144,10 @@ export function supermemorySpec(
 ): SupermemorySpec {
   return sd.defineDomain({
     name: 'supermemory',
-    version: 1,
+    version: 2,
+    // R59: v1 media stays readable (new table absent = empty, new fields
+    // defaulted); the next write stamps 2.
+    compatibleVersions: [1],
     tables: {
       topicsets: sd.domainTable(schemas.topicsets),
       memories: sd.domainTable(schemas.memories),
@@ -154,6 +167,7 @@ export function supermemorySpec(
       hub_sessions: sd.domainTable(schemas.hub_sessions),
       hub_policies: sd.domainTable(schemas.hub_policies),
       model_defaults: sd.domainTable(schemas.model_defaults),
+      session_titles: sd.domainTable(schemas.session_titles),
     },
   }) as SupermemorySpec
 }
@@ -192,6 +206,7 @@ export async function openStore(
     hubs: table<HubSession>('hub_sessions'),
     hubPolicies: table<HubPolicy>('hub_policies'),
     modelDefaults: table<ModelDefaults>('model_defaults'),
+    sessionTitles: table<SessionTitleRow>('session_titles'),
     close: () => domain.close(),
   }
 }

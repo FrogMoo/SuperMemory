@@ -32,7 +32,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Store } from './store.ts'
 import { branchHandles, compositionSetup, hubComposition, parseMemberModel } from './dispatch.ts'
 import { isPluginBranchId } from './hub-sessions.ts'
-import { applySessionTitle, ensureMemberTitle } from './title.ts'
+import { ensureMemberTitle } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 import { attachBranchToWorkspace } from './workspace.ts'
 import { updateMember } from './topicsets.ts'
 
@@ -247,9 +248,15 @@ async function restoreOne(
       target.task,
       { taskOnly: true },
     )
-    // 'already' inside applySessionTitle keeps a human rename from being
-    // overwritten; a session the host never named gets the ledger title.
-    applySessionTitle(ctx, id, named || target.memberTitle, logger)
+    // R59: one write entry. The gate keeps a human rename from being
+    // overwritten and defers the host write out of any publication stack.
+    await applySessionTitle({ ctx, store, logger }, {
+      sessionId: id,
+      kind: 'branch',
+      explicitTitle: named || target.memberTitle,
+      source: 'restore',
+      defer: true,
+    })
   } catch (error) {
     logger.warn('supermemory: branch restore naming skipped for ' + id.slice(0, 13) + ': ' + String(error).slice(0, 140))
   }

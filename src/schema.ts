@@ -371,7 +371,41 @@ export async function buildSchemas() {
     /** How the hub was marked (audit only; resolution trusts every source). */
     // R35: 'title-migration' is the one-time migration that marks pre-R33
     // panel-created hubs from their host title; 'migration' stays for older rows.
+    // R59: FIRST WRITE WINS (a dispatch no longer overwrites an existing
+    // provenance); the most recent writer is recorded in `lastSource`.
     source: z.enum(['panel', 'topicset-root', 'dispatch', 'migration', 'title-migration']).default('panel'),
+    /** R59: most recent writer (audit only; '' on pre-R59 rows). */
+    lastSource: z.string().default(''),
+    createdAt: z.number().int(),
+    updatedAt: z.number().int(),
+  })
+
+  // R59: the session-naming state machine. One row per session the plugin
+  // names (hubs + work branches); ordinary conversations have no row. The
+  // table is the SINGLE durable state of the naming service: the host title is
+  // the only authority for display, this row says what the plugin intends,
+  // what it last wrote, and whether a human owns the name now.
+  const sessionTitles = z.object({
+    workspaceKey: z.string().default(''),
+    sessionId: z.string(),
+    kind: z.enum(['hub', 'branch', 'other']).default('other'),
+    state: z.enum(['provisional', 'named', 'user-locked', 'deferred']).default('provisional'),
+    /** The final title the plugin wants (already byte-clipped, same string the host holds). */
+    desiredTitle: z.string().default(''),
+    /** The unclipped composition, for diagnostics only (never written to the host). */
+    desiredFull: z.string().default(''),
+    /** The raw topic/task text the composition came from (so reset can recompute). */
+    topic: z.string().default(''),
+    /** The exact title the host accepted at the last successful write. */
+    lastWrittenTitle: z.string().default(''),
+    /** Seq of the last session/title event the plugin accounted for. */
+    lastTitleSeq: z.number().int().nonnegative().optional(),
+    /** Who produced the current intent (panel/first-message/dispatch/migration/manual/...). */
+    source: z.string().default(''),
+    attempts: z.number().int().nonnegative().default(0),
+    lastError: z.string().default(''),
+    /** Why the row is user-locked (manual / external-rename). */
+    lockedReason: z.string().default(''),
     createdAt: z.number().int(),
     updatedAt: z.number().int(),
   })
@@ -436,6 +470,14 @@ export async function buildSchemas() {
     roleGuardFailedAt: z.number().int().optional(),
     roleGuardVersion: z.number().int().optional(),
     roleGuardError: z.string().optional(),
+    // R59 marker (meta row 'session-titles'): the one-time adoption/migration
+    // of existing session titles into the naming state machine. Declared here
+    // because the meta schema strips unknown marker keys on load.
+    sessionTitlesMigrationVersion: z.number().int().optional(),
+    sessionTitlesMigratedAt: z.number().int().optional(),
+    sessionTitlesMigrated: z.number().int().optional(),
+    sessionTitlesAdopted: z.number().int().optional(),
+    sessionTitlesDeferred: z.number().int().optional(),
     // R55 marker (meta row 'hub-policy-locked'): the one-time merge of the
     // locked hub entries (sm_cap_doc) into stored hub_policies rows. Declared
     // here because the meta schema strips unknown marker keys on load.
@@ -450,6 +492,7 @@ export async function buildSchemas() {
     episodes, requirements, filemap,
     tool_memory: toolMemory, signals, dispatches, questions, outbox, routing, hotcache, meta,
     hub_sessions: hubSessions, hub_policies: hubPolicies, model_defaults: modelDefaults,
+    session_titles: sessionTitles,
   }
 }
 
@@ -471,6 +514,8 @@ export type Signal = z.infer<Schemas['signals']>
 export type Dispatch = z.infer<Schemas['dispatches']>
 /** R33 需求②: one positive hub record (workspace-scoped). */
 export type HubSession = z.infer<Schemas['hub_sessions']>
+/** R59: the durable session-naming state machine row. */
+export type SessionTitleRow = z.infer<Schemas['session_titles']>
 export type Question = z.infer<Schemas['questions']>
 export type OutboxItem = z.infer<Schemas['outbox']>
 export type Routing = z.infer<Schemas['routing']>

@@ -84,6 +84,8 @@ const fakeStore = (seed = {}) => ({
   hubPolicies: table(seed.hubPolicies ?? []),
   // R41: per-workspace default models (settings tab).
   modelDefaults: table(seed.modelDefaults ?? []),
+  // R59: the durable session-naming state machine.
+  sessionTitles: table(seed.sessionTitles ?? []),
 })
 const obs = (name, text, isError = false) => ({ name, args: {}, text, isError })
 const quiet = { ...repeat, hotSignal: false }
@@ -228,7 +230,7 @@ const ok = (label) => { passed += 1; console.log('ok - ' + label) }
 
 
 // ---- requirement C: session naming ----
-const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, applySessionTitle } = await import('../src/title.ts')
+const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle } = await import('../src/title.ts')
 
 {
   const title = sessionTitleFor('导出功能', '## 修复 **CSV** 导出' + String.fromCharCode(10) + '第二行说明', [])
@@ -265,22 +267,6 @@ const { sessionTitleFor, cleanTitleText, truncateChars, ensureMemberTitle, apply
   const again = await ensureMemberTitle(store, 'ts-1', { sessionId: 'branch-1', kind: 'root' }, '导出功能', '完全不同的任务')
   assert.equal(again, title, 'reuse keeps the first stable name')
   ok('C3 dispatch 后 member title 被设置（复用保持首次命名）')
-}
-
-{
-  const calls = []
-  const session = { append(type, data) { calls.push([type, data]) } }
-  const host = { sessions: { get: () => session }, get: () => ({ get: () => undefined, rename: (_s, t) => { calls.push(['rename', t]) } }) }
-  assert.equal(applySessionTitle(host, 's', '标题 · 任务', logger), 'host')
-  assert.deepEqual(calls[0], ['rename', '标题 · 任务'])
-  const already = { sessions: { get: () => session }, get: () => ({ get: () => ({ title: '旧标题' }), rename: () => { throw new Error('must not rename') } }) }
-  assert.equal(applySessionTitle(already, 's', '新标题', logger), 'already')
-  const fallback = { sessions: { get: () => session }, get: () => undefined }
-  assert.equal(applySessionTitle(fallback, 's', '回退标题', logger), 'fallback')
-  assert.deepEqual(calls[calls.length - 1][0], 'session/title')
-  assert.equal(calls[calls.length - 1][1].source.kind, 'user')
-  assert.equal(applySessionTitle({ sessions: { get: () => undefined } }, 's', 'x', logger), 'none')
-  ok('C4 宿主命名优先；无服务时回退 session/title 日志事件；已有标题不覆盖')
 }
 
 // ---- title migration: repair rows damaged by the legacy truncation ----
@@ -985,7 +971,6 @@ const fakeCtx = (services) => ({
 // ---- R43: card click must not become 新建 + hub/branch names say the topic ----
 {
   const { hubSessionTitle, isNeutralHubTitle, workspaceLabel, HUB_TITLE_MAX_CHARS, listHubSessions } = await import('../src/hub-sessions.ts')
-  const { attachHubTitleFromFirstMessage } = await import('../src/hub-title-migration.ts')
   const { TITLE_BRANCH_TASK_CHARS, describeSessionTitle } = await import('../src/title.ts')
   const cwd = 'F:\\10-SuperMemory'
   const ws = workspaceLabel(cwd)
@@ -1019,59 +1004,6 @@ const fakeCtx = (services) => ({
   assert.ok(!describeSessionTitle(task48, TITLE_BRANCH_TASK_CHARS).endsWith('…'),
     '60 chars keep a normal one-line task whole')
 
-  // 4) the first-message hook: names a neutral hub from the user's own message
-  //    wherever it is typed (the shell path the panel never covered).
-  const titles = new Map([['session-hub1', '新会话']])
-  const writes = []
-  const titleService = {
-    get: (session) => ({ title: titles.get(session.id) ?? '' }),
-    rename: (session, text) => { writes.push([session.id, text]); titles.set(session.id, text) },
-  }
-  const recordTitle = new Map()
-  const hubStore = {
-    hubs: {
-      get: (id) => (id === 'session-hub1'
-        ? { sessionId: id, workspaceKey: cwd, title: '新会话', source: 'panel', createdAt: 1, updatedAt: 1 }
-        : undefined),
-    },
-  }
-  const hookCtx = {
-    sessions: { get: (id) => (titles.has(id) ? { id, append: () => {} } : undefined) },
-    get: (name) => (name === 'sessionTitle' ? titleService : undefined),
-    on: (_type, cb) => { hookListener = cb; return () => {} },
-  }
-  let hookListener
-  const off = attachHubTitleFromFirstMessage(hookCtx, hubStore, { warn: () => {}, info: () => {} })
-  assert.equal(typeof hookListener, 'function', 'the hook registers one session/event listener')
-  const userMessage = (text, kind = 'user') => ({
-    type: 'user/message', seq: 1, time: 1,
-    data: { id: 'm1', role: 'user', content: [{ type: 'text', text }], source: { kind } },
-  })
-  await new Promise((resolve) => { hookListener({ id: 'session-hub1' }, userMessage('R43：修卡片跳转')); setTimeout(resolve, 10) })
-  assert.equal(titles.get('session-hub1'), '10-SuperMemory · 修卡片跳转', 'the shell-path first message names the hub')
-  assert.equal(writes.length, 1, 'exactly one rename')
-  // A second message must not rename again (the Set + the neutral check).
-  await new Promise((resolve) => { hookListener({ id: 'session-hub1' }, userMessage('第二条消息')); setTimeout(resolve, 10) })
-  assert.equal(writes.length, 1, 'a second message never renames')
-  // A relay/notice (kind supermemory) is not the user's words.
-  await new Promise((resolve) => { hookListener({ id: 'session-hub2' }, userMessage('分支回报正文', 'supermemory')); setTimeout(resolve, 10) })
-  assert.equal(writes.length, 1, 'a relay must not name a session')
-  // An ordinary conversation (no hub record) is never touched.
-  await new Promise((resolve) => { hookListener({ id: 'session-plain' }, userMessage('普通对话')); setTimeout(resolve, 10) })
-  assert.equal(writes.length, 1, 'a session without a plugin hub record is never renamed')
-  // A title a person chose is kept even though the message arrives.
-  titles.set('session-hub3', '我自己起的名字')
-  const hubStore3 = {
-    hubs: { get: (id) => (id === 'session-hub3' ? { sessionId: id, workspaceKey: cwd, title: '我自己起的名字', source: 'panel', createdAt: 1, updatedAt: 1 } : undefined) },
-  }
-  let listener3
-  const off3 = attachHubTitleFromFirstMessage(
-    { ...hookCtx, on: (_t, cb) => { listener3 = cb; return () => {} } },
-    hubStore3, { warn: () => {}, info: () => {} },
-  )
-  await new Promise((resolve) => { listener3({ id: 'session-hub3' }, userMessage('R43：新消息')); setTimeout(resolve, 10) })
-  assert.equal(titles.get('session-hub3'), '我自己起的名字', 'a human rename is never overwritten by the hook')
-  assert.equal(writes.length, 1)
   // 5) the rail: a COLD hub whose host title is the new neutral default still
   //    shows the DURABLE topic (the R42 fallback, widened to the R43 shape).
   const railHubStore = {
@@ -1090,10 +1022,330 @@ const fakeCtx = (services) => ({
   assert.equal(railRows2[0]?.title, '重载后只读核验',
     'a neutral host title yields to the durable record title (R42 fallback widened to the R43 shape)')
 
-  off(); off3()
-  ok('R43-1 命名规则：中枢「<工作区名> · <主题>」（无主题=工作区+新会话，60 字预算）+ 中性名判定（可升级/须保留）+ 分支任务预算 60 + shell 路径首条消息补名（只认 user 消息、只升中性名、一次性）')
+  ok('R43-1 命名规则：中枢「<工作区名> · <主题>」（无主题=工作区+新会话，60 字预算）+ 中性名判定（可升级/须保留）+ 分支任务预算 60（R59 起宿主写入口由 gate 接管，见 R59 段）')
 }
 }
+
+// ---- R59: session-naming service — one write entry, deferred host writes ----
+{
+  const {
+    applySessionTitle, attachSessionTitles, deferTitleTask, renameSession, resetAutoTitle,
+  } = await import('../src/session-title/index.ts')
+  const { clipTitleBytes, composeHubTitle, validateManualTitle } = await import('../src/session-title/policy.ts')
+  const { finishPendingHubTitle } = await import('../src/hub-title-migration.ts')
+
+  const WORKSPACE = 'F:\\10-SuperMemory'
+  const WS_LABEL = '10-SuperMemory'
+  const quiet = { warn: () => {}, info: () => {} }
+  const flush = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms))
+  const titleWrites = []
+
+  // A fake host with the REAL contract: any append/rename while it publishes an
+  // event throws the exact re-entrant error (this is what the R43 hook ignored).
+  const makeHost = () => {
+    const titles = new Map()
+    const sessions = new Map()
+    const listeners = []
+    const state = { publishing: false, failReentrantOnce: false }
+    const emitTitle = (id, title) => {
+      const s = sessions.get(id)
+      s.seq = (s.seq ?? 0) + 1
+      for (const cb of listeners) {
+        cb({ id }, { type: 'session/title', seq: s.seq, time: Date.now(), data: { title, messageSeqs: [], source: { kind: 'user' } } })
+      }
+    }
+    const service = {
+      get: (s) => ({ title: titles.get(s.id) ?? '', eventSeq: s.seq ?? 0 }),
+      rename: (s, value) => {
+        if (state.publishing || state.failReentrantOnce) {
+          state.failReentrantOnce = false
+          throw new Error('session append cannot reenter while another append is being published')
+        }
+        titleWrites.push([s.id, value])
+        titles.set(s.id, value)
+        emitTitle(s.id, value)
+      },
+    }
+    const live = (id) => {
+      if (!sessions.has(id)) {
+        sessions.set(id, {
+          id,
+          seq: 0,
+          append(type, data) {
+            if (state.publishing) throw new Error('session append cannot reenter while another append is being published')
+            titleWrites.push([id, type])
+            return data
+          },
+        })
+      }
+      return sessions.get(id)
+    }
+    const services = {}
+    const ctx = {
+      sessions: { get: (id) => sessions.get(id) },
+      get: (name) => (name === 'sessionTitle' ? service : services[name]),
+      on: (_type, cb) => { listeners.push(cb); return () => {} },
+    }
+    const emit = (id, event) => {
+      for (const cb of listeners) cb({ id }, event)
+    }
+    return { ctx, titles, sessions, live, state, services, service, emit }
+  }
+  const seedHub = (store, id, title = '') => {
+    store.hubs.put(id, {
+      workspaceKey: WORKSPACE, sessionId: id, title, source: 'panel', lastSource: 'panel',
+      createdAt: now, updatedAt: now,
+    })
+  }
+
+  // R59-1: provisional -> final, exactly once, host and mirror in agreement.
+  {
+    const A = makeHost()
+    const store = fakeStore()
+    A.live('session-r59')
+    seedHub(store, 'session-r59')
+    const deps = { ctx: A.ctx, store, logger: quiet }
+    const provisional = await applySessionTitle(deps, { sessionId: 'session-r59', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    assert.equal(provisional.title, WS_LABEL + ' · 新会话', 'an empty hub is provisional, never nameless')
+    assert.equal(provisional.state, 'provisional')
+    assert.equal(A.titles.get('session-r59'), provisional.title, 'the host holds the exact composed string')
+    assert.equal(store.hubs.get('session-r59')?.title, provisional.title, 'hub_sessions mirrors the same final string')
+    const final = await applySessionTitle(deps, { sessionId: 'session-r59', workspaceKey: WORKSPACE, kind: 'hub', topicText: 'R59：命名核心重构', source: 'first-message' })
+    assert.equal(final.title, WS_LABEL + ' · 命名核心重构')
+    assert.equal(final.state, 'named')
+    assert.equal(store.hubs.get('session-r59')?.title, final.title, 'the mirror follows the final name')
+    const writesAfterFinal = titleWrites.length
+    const second = await applySessionTitle(deps, { sessionId: 'session-r59', workspaceKey: WORKSPACE, kind: 'hub', topicText: '第二条完全不同的消息', source: 'first-message' })
+    assert.equal(second.outcome, 'already', 'a named hub is finalized ONCE')
+    assert.equal(titleWrites.length, writesAfterFinal, 'no host write on the second message')
+    assert.equal(A.titles.get('session-r59'), final.title)
+    ok('R59-1 provisional→final 只一次：空中枢「<工作区> · 新会话」，首条消息升级，宿主与 hub_sessions 同串')
+  }
+
+  // R59-2: a session/event listener never writes inside the publication stack.
+  {
+    const B = makeHost()
+    const store = fakeStore()
+    B.live('session-stack')
+    seedHub(store, 'session-stack')
+    const deps = { ctx: B.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-stack', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    attachSessionTitles(deps)
+    const neutral = B.titles.get('session-stack')
+    const message = (seq, text, kind = 'user') => ({
+      type: 'user/message', seq, time: 1,
+      data: { id: 'm' + seq, role: 'user', content: [{ type: 'text', text }], source: { kind } },
+    })
+    B.state.publishing = true
+    B.emit('session-stack', message(1, 'R59：事件栈内命名'))
+    assert.equal(B.titles.get('session-stack'), neutral, 'no host write inside the publication stack')
+    B.state.publishing = false
+    await flush()
+    assert.equal(B.titles.get('session-stack'), WS_LABEL + ' · 事件栈内命名', 'the deferred write lands after the stack unwinds')
+    const afterFirst = titleWrites.length
+    B.state.publishing = true
+    B.emit('session-stack', message(2, '第二条消息'))
+    B.state.publishing = false
+    await flush()
+    assert.equal(titleWrites.length, afterFirst, 'a second message never renames')
+    ok('R59-2 延迟写：发布栈内的 user/message 不在栈内写宿主，出栈后 final 一次')
+  }
+
+  // R59-3: a re-entrant refusal retries on a macrotask (bounded).
+  {
+    const C = makeHost()
+    const store = fakeStore()
+    C.live('session-retry')
+    seedHub(store, 'session-retry')
+    const deps = { ctx: C.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-retry', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    C.state.failReentrantOnce = true
+    const retried = await applySessionTitle(deps, { sessionId: 'session-retry', workspaceKey: WORKSPACE, kind: 'hub', topicText: '重入重试成功', source: 'first-message' })
+    assert.equal(retried.outcome, 'host', 'the re-entrant refusal is retried, not swallowed')
+    assert.equal(C.titles.get('session-retry'), WS_LABEL + ' · 重入重试成功')
+    assert.equal(store.sessionTitles.get('session-retry')?.state, 'named')
+    ok('R59-3 重入重试：宿主拒绝发布中 append 时换 macrotask 重试并成功')
+  }
+
+  // R59-4: the 80 UTF-8 byte budget — no host re-clip, no split character.
+  {
+    const D = makeHost()
+    const store = fakeStore()
+    D.live('session-long')
+    seedHub(store, 'session-long')
+    const longTopic = '一二三四五六七八九十'.repeat(12)
+    const composed = composeHubTitle(WORKSPACE, longTopic)
+    assert.ok(Buffer.byteLength(composed, 'utf8') <= 80, 'the composition respects the host byte budget')
+    assert.ok(composed.startsWith(WS_LABEL + ' · '), 'the workspace prefix survives')
+    assert.ok(composed.endsWith('…'), 'an over-long topic is marked with an ellipsis')
+    const noSplit = clipTitleBytes('中'.repeat(40), 10)
+    assert.ok(Buffer.byteLength(noSplit, 'utf8') <= 10, 'the marker counts toward the budget')
+    assert.equal(noSplit.includes('\uFFFD'), false, 'no half character ever appears')
+    for (const character of noSplit) assert.ok('中…'.includes(character), 'only whole code points survive')
+    const result = await applySessionTitle({ ctx: D.ctx, store, logger: quiet }, {
+      sessionId: 'session-long', workspaceKey: WORKSPACE, kind: 'hub', topicText: longTopic, source: 'first-message',
+    })
+    assert.ok(Buffer.byteLength(result.title, 'utf8') <= 80)
+    assert.equal(D.titles.get('session-long'), result.title, 'the host and the mirror hold the same clipped string')
+    assert.equal(store.sessionTitles.get('session-long')?.lastWrittenTitle, result.title)
+    ok('R59-4 80 UTF-8 bytes：保留工作区前缀、优先截主题、加省略号、不劈多字节字符，宿主=镜像')
+  }
+
+  // R59-5: an outside rename locks; a manual input is validated, never silently cut.
+  {
+    const E = makeHost()
+    const store = fakeStore()
+    E.live('session-lock')
+    seedHub(store, 'session-lock')
+    const deps = { ctx: E.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-lock', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    await applySessionTitle(deps, { sessionId: 'session-lock', workspaceKey: WORKSPACE, kind: 'hub', topicText: '插件起的名字', source: 'first-message' })
+    E.titles.set('session-lock', '我自己起的名字')
+    const locked = await applySessionTitle(deps, { sessionId: 'session-lock', workspaceKey: WORKSPACE, kind: 'hub', topicText: '自动改名', source: 'first-message' })
+    assert.equal(locked.outcome, 'locked', 'an outside rename wins')
+    assert.equal(E.titles.get('session-lock'), '我自己起的名字')
+    assert.equal(store.sessionTitles.get('session-lock')?.state, 'user-locked')
+    const again = await applySessionTitle(deps, { sessionId: 'session-lock', workspaceKey: WORKSPACE, kind: 'hub', topicText: '再来一次', source: 'first-message' })
+    assert.equal(again.outcome, 'locked', 'user-locked is a no-op until reset')
+    assert.equal(validateManualTitle('一'.repeat(26)).ok, true, '78 bytes is accepted')
+    assert.equal(validateManualTitle('一'.repeat(27)).ok, false, '81 bytes is rejected with an explanation')
+    const tooLong = await renameSession(deps, { sessionId: 'session-lock', title: '长'.repeat(30) })
+    assert.equal(tooLong.outcome, 'skipped', 'an over-long manual title is an explicit error, never cut')
+    assert.equal(store.sessionTitles.get('session-lock')?.state, 'user-locked')
+    const restored = await resetAutoTitle(deps, { sessionId: 'session-lock' })
+    assert.equal(restored.outcome, 'host', 'reset drops the lock and recomputes')
+    assert.equal(E.titles.get('session-lock'), WS_LABEL + ' · 插件起的名字')
+    assert.equal(store.sessionTitles.get('session-lock')?.state, 'named')
+    const manual = await renameSession(deps, { sessionId: 'session-lock', title: '新的人工名字' })
+    assert.equal(manual.outcome, 'host')
+    assert.equal(E.titles.get('session-lock'), '新的人工名字')
+    assert.equal(store.sessionTitles.get('session-lock')?.state, 'user-locked')
+    ok('R59-5 外部改名 lock / 人工改名校验（空、超 80 字节报错不静默截断）/ reset 恢复自动命名')
+  }
+
+  // R59-6: the host falling back to a neutral name may be repaired with the same intent.
+  {
+    const F = makeHost()
+    const store = fakeStore()
+    F.live('session-neutral')
+    seedHub(store, 'session-neutral')
+    const deps = { ctx: F.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-neutral', workspaceKey: WORKSPACE, kind: 'hub', topicText: '中性重置', source: 'first-message' })
+    F.titles.set('session-neutral', WS_LABEL + ' · 新会话')
+    const repaired = await applySessionTitle(deps, { sessionId: 'session-neutral', workspaceKey: WORKSPACE, kind: 'hub', topicText: '中性重置', source: 'first-message' })
+    assert.equal(repaired.outcome, 'host', 'a neutral host title is re-asserted')
+    assert.equal(F.titles.get('session-neutral'), WS_LABEL + ' · 中性重置')
+    const different = await applySessionTitle(deps, { sessionId: 'session-neutral', workspaceKey: WORKSPACE, kind: 'hub', topicText: '换一个主题', source: 'first-message' })
+    assert.equal(different.outcome, 'already', 'a different topic never re-finalizes a named row')
+    ok('R59-6 宿主中性重置可重写同一 desiredTitle；非中性不改名')
+  }
+
+  // R59-7: the observer only acts on the user's own first message.
+  {
+    const G = makeHost()
+    const store = fakeStore()
+    G.live('session-observe')
+    seedHub(store, 'session-observe')
+    const deps = { ctx: G.ctx, store, logger: quiet }
+    await applySessionTitle(deps, { sessionId: 'session-observe', workspaceKey: WORKSPACE, kind: 'hub', source: 'panel' })
+    attachSessionTitles(deps)
+    const writesBefore = titleWrites.length
+    G.emit('session-observe', { type: 'user/message', seq: 1, data: { content: [{ type: 'text', text: '分支回报正文' }], source: { kind: 'supermemory' } } })
+    await flush()
+    assert.equal(titleWrites.length, writesBefore, 'a supermemory relay never names a session')
+    G.emit('session-observe', { type: 'user/message', seq: 2, data: { content: [{ type: 'text', text: 'R59：观察者命名' }], source: { kind: 'user' } } })
+    await flush()
+    assert.equal(G.titles.get('session-observe'), WS_LABEL + ' · 观察者命名')
+    assert.equal(store.sessionTitles.get('session-observe')?.state, 'named')
+    const writesAfter = titleWrites.length
+    G.emit('session-observe', { type: 'user/message', seq: 3, data: { content: [{ type: 'text', text: '再来一条' }], source: { kind: 'user' } } })
+    await flush()
+    assert.equal(titleWrites.length, writesAfter, 'only the first message finalizes')
+    ok('R59-7 observe：跳过 supermemory relay、只认 user/message、只 final 一次')
+  }
+
+  // R59-8: the legacy pending-title finish stays async and outside the stack.
+  {
+    const H = makeHost()
+    const store = fakeStore()
+    H.live('session-pending')
+    seedHub(store, 'session-pending')
+    H.services.sessionQuery = {
+      readSurface: async () => ({ events: [{ type: 'user/message', seq: 1, data: { message: { content: [{ type: 'text', text: '冷会话补名' }] } } }] }),
+    }
+    await store.meta.put('hub-titles', { hubTitlesMigrationVersion: 3, hubTitlesPendingIds: ['session-pending'] })
+    H.titles.set('session-pending', '新会话 · old')
+    const writesBefore = titleWrites.length
+    H.state.publishing = true
+    const pending = finishPendingHubTitle({ ctx: H.ctx, store, logger: quiet }, 'session-pending')
+    setTimeout(() => { H.state.publishing = false }, 0)
+    assert.equal(titleWrites.length, writesBefore, 'finishPendingHubTitle never writes synchronously')
+    assert.equal(await pending, 'renamed', 'the deferred write survives a publication that outlives the call')
+    assert.equal(H.titles.get('session-pending'), WS_LABEL + ' · 冷会话补名')
+    ok('R59-8 finishPendingHubTitle 保持异步：发布栈内调用不写宿主，出栈后改名成功')
+  }
+
+  // R59-9: architecture — host.ts is the ONLY module that writes a host title.
+  {
+    const { readdirSync } = await import('node:fs')
+    const walk = (dir) => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (
+      entry.isDirectory()
+        ? walk(dir + '/' + entry.name)
+        : (entry.name.endsWith('.ts') ? [dir + '/' + entry.name] : [])
+    ))
+    const stripComments = (source) => source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+    const offenders = []
+    for (const file of walk('src')) {
+      if (file.endsWith('session-title/host.ts')) continue
+      const code = stripComments(readFileSync(file, 'utf8'))
+      if (/sessionTitle\??\.rename\s*\(/.test(code) || /append\s*\(\s*['"]session\/title['"]/.test(code) || /['"]session\/title['"]\s*,/.test(code)) {
+        offenders.push(file)
+      }
+    }
+    assert.deepEqual(offenders, [], 'no module outside session-title/host.ts writes a host title')
+    let inline = true
+    const deferred = deferTitleTask(() => { inline = false })
+    assert.equal(inline, true, 'deferTitleTask never runs the task inline')
+    await deferred
+    assert.equal(inline, false)
+    ok('R59-9 架构：host.ts 之外无 sessionTitle.rename / session-titles append；deferTitleTask 永不内联执行')
+  }
+}
+
+
+// ---- R59-10: the panel create path writes through the same gate ----
+{
+  const services = { typert: { register: () => () => {} } }
+  const titles = new Map()
+  const sessions = new Map()
+  const titleService = {
+    get: (session) => ({ title: titles.get(session.id) ?? '', eventSeq: session.seq ?? 0 }),
+    rename: (session, value) => { titles.set(session.id, value) },
+  }
+  const store = fakeStore()
+  const ctx = {
+    provide: (key, value) => { services[key] = value },
+    effect: (fn) => { const dispose = fn(); return typeof dispose === 'function' ? dispose : () => {} },
+    get: (name) => (name === 'typert' ? services.typert : name === 'sessionTitle' ? titleService : services[name]),
+    sessions: { get: (id) => sessions.get(id) },
+    agents: {
+      create: async ({ sessionId }) => {
+        sessions.set(sessionId, { id: sessionId, seq: 0, append() {} })
+        return { agent: { followup() {} } }
+      },
+      get: () => undefined,
+    },
+  }
+  attachPanel(ctx, store)
+  const panel = services.supermemoryPanel
+  const created = await panel.createHubSession('F:\\10-SuperMemory', {}, '')
+  assert.equal(created.status, 'ok')
+  assert.equal(titles.get(created.id), '10-SuperMemory · 新会话', 'the panel create writes the provisional name through the gate')
+  assert.equal(store.hubs.get(created.id)?.title, '10-SuperMemory · 新会话', 'the hub mirror holds the same string')
+  assert.equal(store.sessionTitles.get(created.id)?.state, 'provisional', 'the durable row is provisional until the first message')
+  ok('R59-10 面板 createHubSession 走 gate：空中枢 provisional，宿主与 hub_sessions 同串')
+}
+
 
 {
   const { readModelDefaults, writeModelDefaults, defaultModelFor } = await import('../src/model-defaults.ts')

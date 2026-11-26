@@ -19,8 +19,9 @@ import {
   findVerifyTopicSet, matchTopicSetForTask, renderTopicSetConfirm, verifyTopicSetTitle,
 } from './topicset-match.ts'
 import {
-  TOPIC_SET_TITLE_MAX_CHARS, applySessionTitle, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine, sessionTitleOf,
+  TOPIC_SET_TITLE_MAX_CHARS, cleanTitleText, clipEllipsis, ensureMemberTitle, firstLine, sessionTitleOf,
 } from './title.ts'
+import { applySessionTitle } from './session-title/gate.ts'
 import { dispatchSource } from './chat-card.ts'
 import { hubSelection, type ModelSelection } from './model.ts'
 import { defaultModelFor } from './model-defaults.ts'
@@ -590,9 +591,14 @@ async function dispatchOne(
     // R41 需求③b: the branch title is the task itself — no topic-set prefix and
     // no 「R31：」lead-in; the host title and the member title read the same.
     const named = await ensureMemberTitle(store, topicSetId, { sessionId: branchSessionId, kind }, topicSet.title, task, { taskOnly: true })
-    const applied = applySessionTitle(ctx, branchSessionId, named, logger)
-    if (applied === 'host' || applied === 'fallback') {
-      logger.info(`supermemory: named branch ${branchSessionId.slice(0, 20)} 「${named}」 via ${applied}`)
+    const applied = await applySessionTitle({ ctx, store, logger }, {
+      sessionId: branchSessionId,
+      kind: 'branch',
+      explicitTitle: named,
+      source: 'dispatch',
+    })
+    if (applied.outcome === 'host' || applied.outcome === 'fallback') {
+      logger.info(`supermemory: named branch ${branchSessionId.slice(0, 20)} 「${applied.title}」 via ${applied.outcome}`)
     }
   } catch (error) {
     logger.warn(`supermemory: branch naming failed for ${branchSessionId}: ${String(error).slice(0, 160)}`)
