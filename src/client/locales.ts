@@ -277,6 +277,9 @@ export const zh = {
   'hubPolicy.note.capabilityDoc.tip': '固化能力的知识面：中枢只读检查（判断是否适用），执行必须派发到分支；该项默认允许且不可在面板移除。',
   'hubPolicy.note.capabilityExecDenied': '中枢不可执行',
   'hubPolicy.note.capabilityExecDenied.tip': '固化能力执行面（sm_cap_*）：中枢调用会被 HUB_CAPABILITY_EXEC_DENIED 拒绝，请用 memory_dispatch 派发到分支执行（默认预演，写操作 confirm=true）。即使在此勾选也不会让中枢获得执行权。',
+  // R60: 会话历史只读族（session_*）：默认放行，仅搜索/追溯/读取，无写操作。
+  'hubPolicy.note.sessionReadonly': '只读',
+  'hubPolicy.note.sessionReadonly.tip': '会话历史工具（session_*）：只读检索/追溯/读取历史会话，按调用 agent 做工作区授权，没有任何写操作；默认放行，可在此关闭。',
   'hubPolicy.custom.placeholder': '添加自定义工具名（未知工具默认拒绝，可在此放行）',
   'hubPolicy.custom.add': '添加',
   // R39: 动态目录 = 运行时工具按来源分组；来源缺声明时按命名规则推断。
@@ -298,6 +301,7 @@ export const zh = {
   'hubPolicy.source.supermemory': 'SuperMemory 插件',
   'hubPolicy.source.composite': '固化能力（SuperMemory）',
   'hubPolicy.source.schedule': '调度',
+  'hubPolicy.source.session': '会话历史（只读）',
   'hubPolicy.source.hostSession': '宿主会话工具',
   'hubPolicy.source.host': '宿主内置 / 未归属',
   'hubPolicy.source.mcp': 'MCP · {server}',
@@ -612,6 +616,9 @@ export const en: Record<string, string> = {
   'hubPolicy.note.capabilityDoc.tip': 'A capability knowledge face: a hub reads it to decide whether it applies; execution must be dispatched to a branch. Always allowed and not removable in the panel.',
   'hubPolicy.note.capabilityExecDenied': 'Cannot run from a hub',
   'hubPolicy.note.capabilityExecDenied.tip': 'The capability execution face (sm_cap_*). A hub call is refused with HUB_CAPABILITY_EXEC_DENIED; dispatch it to a branch (dry-run by default, write operations need confirm=true). Ticking it here does not grant hub execution.',
+  // R60: the read-only session-history family (session_*): allowed by default.
+  'hubPolicy.note.sessionReadonly': 'Read-only',
+  'hubPolicy.note.sessionReadonly.tip': 'Session-history tools (session_*): read-only search / trace / read of prior sessions, authorized from the calling agent workspace, with no write surface. Allowed by default; switchable off here.',
   'hubPolicy.custom.placeholder': 'Add a custom tool name (unknown tools are denied until whitelisted here)',
   'hubPolicy.custom.add': 'Add',
   // R39: dynamic catalog grouped by (inferred) source; stale entries are listed apart.
@@ -633,6 +640,7 @@ export const en: Record<string, string> = {
   'hubPolicy.source.supermemory': 'SuperMemory plugin',
   'hubPolicy.source.composite': 'Composite capabilities (SuperMemory)',
   'hubPolicy.source.schedule': 'Scheduling',
+  'hubPolicy.source.session': 'Session history (read-only)',
   'hubPolicy.source.hostSession': 'Host session tools',
   'hubPolicy.source.host': 'Host built-in / unattributed',
   'hubPolicy.source.mcp': 'MCP · {server}',

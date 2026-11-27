@@ -2,7 +2,7 @@
 
 DeepSeek Harness（DSH）的跨会话记忆插件：把「结论性事实、话题集、派发归档、固化能力」持久化到存储域，让中枢/分支会话协同工作跨会话可续、可追溯、可召回。
 
-- **包名**：`dsh-supermemory`　**版本**：`1.3.5`（最新 Release，tag `v1.3.5`；首个正式版为 `v1.0.0`）　**许可**：专有许可 All Rights Reserved（见 [LICENSE](LICENSE)）
+- **包名**：`@frogmoo/dsh-supermemory`　**版本**：`1.5.0`（最新 Release，tag `v1.5.0`；首个正式版为 `v1.0.0`，npm 首发 `1.4.1`）　**许可**：MIT（见 [LICENSE](LICENSE)）
 - **宿主要求**：DSH `>=0.2.0 <0.3.0`（见 `package.json` 的 `engines.dsh`）
 - **产物形态**：ESM。宿主半边 `lib/supermemory.js`，浏览器半边 `lib/client.js`（DSH 侧边栏/主区面板）
 - **存储**：DSH `storageDomain` 域 `supermemory`（version 1），表定义集中在 `src/schema.ts`；所有业务表按工作区隔离（`workspaceKey`，决策 D4）
@@ -155,7 +155,7 @@ pnpm smoke          # 7 套冒烟一次跑完（见下）
   `https://github.com/FrogMoo/SuperMemory`。DSH 安装器接受 `kind=git`，会 clone 默认分支并安装；
   **不要填**裸 `FrogMoo/SuperMemory`（会被当成 npm 包名）、Release 页面 URL 或 `.zip` 资产。
 - **npm 包（scoped 名自 1.4.0 起；npm 首发 1.4.1）**：面板里填包名 `@frogmoo/dsh-supermemory`（或带版本
-  `@frogmoo/dsh-supermemory@^1.4.0`）。只有以 **registry 来源**安装时，插件页的「版本 → 重新检查 /
+  `@frogmoo/dsh-supermemory@^1.5.0`）。只有以 **registry 来源**安装时，插件页的「版本 → 重新检查 /
   可更新到 x」才会出现；Git / 本地目录 / tgz 来源在 DSH 0.2.2 里没有版本检查入口（详见 INSTALL.md）。
   注意：**npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory` 是两回事**，
   面板按前者查 registry、按后者走 git。

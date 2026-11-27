@@ -21,7 +21,7 @@
 打开「侧边栏 → 插件 → 安装插件」，在「包名或地址」填以下**之一**：
 
 0. **npm 包名（scoped 名自 1.4.0 起；npm 首发 1.4.1）**：`@frogmoo/dsh-supermemory`
-   （或带版本 `@frogmoo/dsh-supermemory@^1.4.0`）。这是**唯一**会让插件页出现
+   （或带版本 `@frogmoo/dsh-supermemory@^1.5.0`）。这是**唯一**会让插件页出现
    「版本 → 重新检查 / 可更新到 x」的来源：DSH 0.2.2 只对 registry 来源做版本检查，
    Git / 本地目录 / tgz 来源都没有检查更新入口。
    > ⚠️ **npm 包名 `@frogmoo/dsh-supermemory` 与 GitHub 仓库名 `FrogMoo/SuperMemory`

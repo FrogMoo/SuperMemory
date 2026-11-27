@@ -826,11 +826,24 @@ const legacyCapSpec = {
   assert.ok(panelSrc.includes("entry.noteKey === 'capabilityDoc'")
     && panelSrc.includes("entry.noteKey === 'capabilityExecDenied'"),
   'the hub-permission tab renders both capability badges')
+  // R60: the read-only session-history badge is wired the same way.
+  assert.ok(panelSrc.includes("entry.noteKey === 'sessionReadonly'"),
+    'the hub-permission tab renders the session read-only badge')
+  assert.ok(panelSrc.includes("group.id === 'source:session'"),
+    'the hub-permission tab localizes the session-history group label')
   const localesSrc = readFileSync(new URL('../src/client/locales.ts', import.meta.url), 'utf8')
   assert.ok(localesSrc.includes("'hubPolicy.note.capabilityDoc': '只读路由，锁定'"),
     'the locked read-only badge is localized')
   assert.ok(localesSrc.includes("'hubPolicy.note.capabilityExecDenied': '中枢不可执行'"),
     'the hub-cannot-execute badge is localized')
+  assert.ok(localesSrc.includes("'hubPolicy.note.sessionReadonly': '只读'"),
+    'the session read-only badge is localized (zh)')
+  assert.ok(localesSrc.includes("'hubPolicy.note.sessionReadonly': 'Read-only'"),
+    'the session read-only badge is localized (en)')
+  assert.ok(localesSrc.includes("'hubPolicy.source.session': '会话历史（只读）'"),
+    'the session-history group label is localized (zh)')
+  assert.ok(localesSrc.includes("'hubPolicy.source.session': 'Session history (read-only)'"),
+    'the session-history group label is localized (en)')
   ok('R55-3 路由与提示：HUB_ROLE_TEXT 能力检查+派发指令；索引卡「中枢只读，执行需派发分支」；面板锁定/不可执行徽标已接线')
 }
 

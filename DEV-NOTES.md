@@ -4528,3 +4528,48 @@ append/rename，被宿主的重入保护拒绝，而空 logger 把错误吞掉�
 
 按 `docs/git-sync.md` / 固化能力 `git-sync-supermemory`：先 dry-run，再真实 push Gitee + GitHub，
 逐端核验 main commit 一致；GitHub 端点失败时按能力文档 API 补推路径处理，不强推。结果以本轮报告为准。
+
+---
+
+## 72. R60：中枢权限放行会话历史只读工具（session_* 默认勾选 + 独立分组 + 只读徽标）（2026-11-27）
+
+对应需求（用户裁决选项 2）：5 个 `session_*` 工具（宿主 `@deepseek-ai/dsh-tool-session-query`，全局注册、只读、按调用 agent 做工作区授权）此前落在「宿主内置 / 未归属」组且默认拒绝；本轮改为**默认放行 + 独立「会话历史（只读）」分组 + 只读徽标**。
+
+### 72.1 实现（src/hub-policy.ts）
+
+- `HUB_CATALOG_GROUPS.session = 'source:session'`；`inferHubToolSource` 在 `schedule_*` 之后、兜底之前新增 `session_*` 前缀规则（`kind:'session'`、`label:'会话历史（只读）'`、`inferred:true`）；动态与回退两条目录路径共用该函数，分组一致。
+- `hubSourceRank`：`session` 排 4（调度之后、声明来源之前），既有组相对顺序不变；`HubCatalogSourceKind` 增加 `'session'`。
+- 新增 `SESSION_HISTORY_TOOLS`（5 个显式名，依据=包源码 apply() 恰好注册这 5 个）+ `isSessionHistoryTool()`：**前缀管分组、名单管徽标与默认白名单**。
+- `hubCapabilityNoteKey` 升级为 `hubCatalogNoteKey`（新增 `sessionReadonly` 返回值），4 个调用点同步；`DEFAULT_HUB_TOOLS` 在「只读查看」段并入 `...SESSION_HISTORY_TOOLS`（与 read/glob/grep 同列）。
+- **未锁定、未进 HOST_SESSION_TOOLS**：存盘行可关闭、恢复默认即回；清理语义与普通运行时工具一致（运行时在→保留，不在→清，不误判失效）。
+
+### 72.2 面板（src/client/panel-page.tsx / locales.ts）
+
+- 组标签 `source:session` → 「会话历史（只读）」（中英）；新徽标 `noteKey==='sessionReadonly'` → 「只读」+ hover 说明（中英）；R39 规则注释补 `session_*`。
+
+### 72.3 断言与闸门（实测）
+
+- core-smoke：`ALLOWED_DEFAULT` +5；R39-1 假运行时加入 2 个 session 定义，组顺序插入 session 组，断言标签/推断/徽标/勾选跟随/可用/非失效；清理断言（在→保留、不在→清 3 项）；回退目录断言（组+徽标+默认启用+非合成）；默认谓词 5 项全放行，R36-1 的 hub guard 循环随之覆盖（不再返回 HUB_TOOL_NOT_IN_ALLOWLIST）。
+- mechanism-smoke：R39-1 面板服务断言 session 组/徽标（存盘行决定勾选态）；新增 R60 块——无存盘行时五项默认勾选、可关闭、恢复默认回、清理不误判失效。
+- capability-smoke：面板徽标/组标签接线 + 中英文案断言（zh/en 各 3 条）。
+- 独立实证（/tmp 脚本，非仓库文件）：resolveRole=hub 下 5 工具全部 ALLOW；`brand_new_future_tool`/`bash` 仍 DENY `HUB_TOOL_NOT_IN_ALLOWLIST`；分支会话不受影响。
+- 闸门：`pnpm typecheck` 双端 0 错；`pnpm build` exit 0（宿主 13 文件 991.46 kB + client 192.45 kB，wrap 185924 bytes）；`pnpm smoke` 七套件全绿（core/mechanism 链式 exit 0 且 R60 断言 ok；webui 35 checks；client-sim SIM SMOKE OK；capability 20；workspace-scope 6；skill 27）。
+
+### 72.4 假设与已知限制
+
+- 徽标只给 5 个已验证只读的工具；未来新 `session_*` 工具仍进该组，但无徽标直至加入名单（前缀规则自动分组）。
+- 默认放行≠锁定：用户可在面板关闭，guard 按行现读生效；恢复默认即回。
+- 若宿主卸载该包，白名单项转失效并被「一键清理」移除——与普通运行时工具同一语义（设计行为）。
+- 未重载插件、未 commit/push（由集成轮处理）。
+
+### 72.5 发布轮（v1.5.0，2026-11-27）
+
+- **版本**：1.4.1 → **1.5.0**。依据：R60 是行为新增（默认放行 5 个工具 + 新来源组 + 只读徽标），按 semver 走 minor；npm registry 现有最新为 1.4.1，1.5.0 未被占用。
+- **文档同步**：CHANGELOG 新增 `[1.5.0]`；README 头部把「包名 / 版本 / 许可」从 1.3.5 + 专有许可一举修正为 `@frogmoo/dsh-supermemory` / 1.5.0 / MIT（该头部自 1.4.0 改名与 1.4.1 换许可后一直没同步）；README §5.1 与 INSTALL 方式 A 的安装示例版本范围 `^1.4.0` → `^1.5.0`。
+- **闸门（真跑）**：`pnpm typecheck` 双工程 0 错 exit 0；`pnpm build` exit 0（宿主 13 文件 991.46 kB + client 192.45 kB，wrap 185,924 bytes）；`pnpm smoke` 七套全绿（core 43 / mechanism 142 / webui 35 / client-sim OK / capability 20 组 / workspace-scope 6 组 / skill 27 组）；`npm pack --dry-run` **20 条目 / 367.0 kB**，只含 `lib/` 14 文件 + package.json / cordis.patch.yml / README / LICENSE / CHANGELOG / INSTALL，无凭据/临时文件。
+- **提交与 tag**：单条提交（R60 源码 + 测试 + 文档 + 版本号 + `lib/` 重建），中文提交信息写文件后 `git commit -F`；附注 tag `v1.5.0`。
+- **推送**：按 [docs/git-sync.md](../docs/git-sync.md) / 固化能力 `git-sync-supermemory`，先 `pnpm git:sync --dry-run` 看计划、再真跑推 main；tag 单独推，逐端核验 main commit / tag 对象 SHA / tag 指向 commit。
+- **Release**：GitHub **source-only**（git 面不可用时走 `scripts/github-api-release.mjs` 的 API 兜底），不上传自建 zip/tgz。
+- **npm**：`npm publish --access public`（本机为 granular token，package:write + bypass 2FA）；registry / access 以 `publishConfig` 为准。
+- 各远端最终 SHA、npm tarball / shasum / dist-tags、Release URL 属于**可变运行时事实**，不写进 tag 指向的提交（否则每次发布都要为写哈希再改一次版本）；以本轮发布报告与 SuperMemory 记忆为准。
+

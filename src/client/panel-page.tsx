@@ -2264,8 +2264,9 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
   // -------------------------------------------------------------------------
   // R39: 「中枢权限」页签 —— 动态目录（每次调用即时生成，按来源分组，默认拒绝）。
   // 宿主工具定义不带来源字段，所以分组是「可解释的推断」：定义自带来源字段优先
-  // （标为非推断），否则 mcp__<server>__ / memory_* / sm_cap_* / schedule_*
-  // 依次判定，其余归宿主内置/未归属。白名单有、运行时无的条目单列失效组并可
+  // （标为非推断），否则 mcp__<server>__ / memory_* / sm_cap_* / schedule_* /
+  // session_*（R60：会话历史只读族）依次判定，其余归宿主内置/未归属。白名单有、
+  // 运行时无的条目单列失效组并可
   // 一键清理；枚举失败时宿主回退内置清单并告警（页面不白屏），默认路径始终动态。
   // -------------------------------------------------------------------------
   const hubPolicySelected = (name: string, prefix = false): boolean => {
@@ -2311,6 +2312,7 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
     if (group.id === 'source:supermemory') return t('hubPolicy.source.supermemory')
     if (group.id === 'source:composite') return t('hubPolicy.source.composite')
     if (group.id === 'source:schedule') return t('hubPolicy.source.schedule')
+    if (group.id === 'source:session') return t('hubPolicy.source.session')
     if (group.id === 'source:host-session') return t('hubPolicy.source.hostSession')
     if (group.id === 'source:host') return t('hubPolicy.source.host')
     if (group.id.startsWith('source:mcp:')) return t('hubPolicy.source.mcp', { server: group.id.slice('source:mcp:'.length) })
@@ -2381,6 +2383,10 @@ export function SupermemoryPanelPage(props: PanelPageProps): ReactElement {
         : null,
       entry.noteKey === 'capabilityExecDenied'
         ? h('span', { key: 'capexec', className: 'sm-badge', title: t('hubPolicy.note.capabilityExecDenied.tip') }, t('hubPolicy.note.capabilityExecDenied'))
+        : null,
+      // R60: the verified read-only session-history family (default-allowed).
+      entry.noteKey === 'sessionReadonly'
+        ? h('span', { key: 'sessionro', className: 'sm-badge', title: t('hubPolicy.note.sessionReadonly.tip') }, t('hubPolicy.note.sessionReadonly'))
         : null,
       prefixCovered ? h('span', { key: 'prefix', className: 'sm-badge' }, t('hubPolicy.viaPrefix')) : null,
       entry.risk === true ? h('span', { key: 'risk', className: 'sm-badge' }, t('hubPolicy.risk')) : null,

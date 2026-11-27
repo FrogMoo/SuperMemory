@@ -430,7 +430,7 @@ passed += await runMemoryOrganizeChecks({ ok, now })
     GUARD_ERROR_NAME, ROLE_GUARD_VERSION,
   } = await import('../src/role-guard.ts')
   const {
-    DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, HOST_SESSION_TOOLS, HUB_CATALOG_GROUPS, HUB_EXECUTION_TOOLS, LOCKED_HUB_TOOLS,
+    DEFAULT_HUB_PREFIXES, DEFAULT_HUB_TOOLS, HOST_SESSION_TOOLS, SESSION_HISTORY_TOOLS, HUB_CATALOG_GROUPS, HUB_EXECUTION_TOOLS, LOCKED_HUB_TOOLS,
     buildFallbackHubCatalog, buildHubCatalog, cleanStaleHubPolicy,
     isHubAllowedTool, readHubPolicy, resetHubPolicy, writeHubPolicy,
   } = await import('../src/hub-policy.ts')
@@ -689,6 +689,8 @@ passed += await runMemoryOrganizeChecks({ ok, now })
     'skill', 'todo_write', 'present', 'run_code', 'plugin_manager',
     // R55: read-only capability knowledge face (locked; execution is denied).
     'sm_cap_doc',
+    // R60 (user decision): the read-only session-history family, same tier as read/glob/grep.
+    'session_search', 'session_event_search', 'session_trace', 'session_event_trace', 'session_event_read',
   ]
   assert.equal(DEFAULT_HUB_TOOLS.length, ALLOWED_DEFAULT.length,
     'the default whitelist has exactly the documented members (adding/removing one must fail this line)')
@@ -712,6 +714,11 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.equal(isHubAllowedTool('brand_new_future_tool', defaultPolicy), false,
     'an unknown/future tool is denied by default (the R36 core requirement)')
   assert.equal(isHubAllowedTool('', defaultPolicy), false, 'an empty name is never allowed')
+  // R60: the read-only session-history family is allowed by DEFAULT (user decision).
+  for (const name of SESSION_HISTORY_TOOLS) {
+    assert.equal(isHubAllowedTool(name, defaultPolicy), true,
+      'a session-history tool is on the default whitelist: ' + name)
+  }
 
   // The 20 R33 hands-on tools: denied for a hub, still executable for everyone else.
   for (const name of HUB_EXECUTION_TOOLS) {
@@ -826,6 +833,9 @@ passed += await runMemoryOrganizeChecks({ ok, now })
     { name: 'mcp__rea__analyze_function', description: 'Analyze a native function' },
     { name: 'brand_new_tool', description: 'A tool nobody reviewed' },
     { name: 'bash', description: 'Run a shell command' },
+    // R60: the session-history family is globally registered by the host.
+    { name: 'session_search', description: 'Search prior sessions in the caller workspace.' },
+    { name: 'session_event_read', description: 'Read one full unabridged event.' },
   ]
   const allow = ['memory_recall', 'read', 'retired_tool', ...LOCKED_HUB_TOOLS]
   const dynamic = buildHubCatalog({
@@ -844,10 +854,11 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.deepEqual(dynamic.groups.map((group) => group.id), [
     HUB_CATALOG_GROUPS.supermemory,
     HUB_CATALOG_GROUPS.mcpPrefix + 'rea',
+    HUB_CATALOG_GROUPS.session,
     HUB_CATALOG_GROUPS.hostSession,
     HUB_CATALOG_GROUPS.host,
     HUB_CATALOG_GROUPS.stale,
-  ], 'runtime tools are grouped by source, with the synthetic host-session group before host and the stale bucket last')
+  ], 'runtime tools are grouped by source, with the read-only session group before the synthetic host-session group and the stale bucket last')
   const groupOf = (id) => dynamic.groups.find((group) => group.id === id)
   const itemOf = (id, name) => groupOf(id)?.items.find((entry) => entry.name === name)
   assert.equal(itemOf(HUB_CATALOG_GROUPS.supermemory, 'memory_recall')?.enabled, true)
@@ -872,6 +883,27 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.equal(afterCheck.groups.flatMap((group) => group.items).find((entry) => entry.name === 'brand_new_tool')?.enabled, true,
     'checking an unknown tool whitelists it on the next generation')
   assert.equal(itemOf(HUB_CATALOG_GROUPS.host, 'bash')?.risk, true, 'hands-on tools keep the risk note')
+  // R60: session_* forms its own inferred group, carries the read-only badge,
+  // and follows the stored whitelist like any other tool.
+  const sessionGroup = groupOf(HUB_CATALOG_GROUPS.session)
+  assert.ok(sessionGroup, 'session_* tools form their own source group (no longer 未归属)')
+  assert.equal(sessionGroup.label, '会话历史（只读）', 'the session group is labelled read-only')
+  assert.equal(sessionGroup.inferred, true, 'the session attribution is labelled as inference')
+  const sessionItem = itemOf(HUB_CATALOG_GROUPS.session, 'session_search')
+  assert.equal(sessionItem?.enabled, false, 'a session tool is denied until the policy allows it')
+  assert.equal(sessionItem?.noteKey, 'sessionReadonly', 'the session tool carries the read-only badge')
+  assert.equal(sessionItem?.available, true, 'a real session definition is available')
+  assert.equal(sessionItem?.stale, undefined, 'a present session tool is never stale')
+  const sessionChecked = buildHubCatalog({
+    tools: runtimeDefs,
+    allowTools: [...allow, ...SESSION_HISTORY_TOOLS],
+    prefixes: ['schedule_'],
+    now: catalogNow,
+  })
+  const checkedSession = sessionChecked.groups
+    .find((group) => group.id === HUB_CATALOG_GROUPS.session)?.items
+    .find((entry) => entry.name === 'session_search')
+  assert.equal(checkedSession?.enabled, true, 'checking a session tool whitelists it on the next generation')
   const synthetic = itemOf(HUB_CATALOG_GROUPS.hostSession, 'run_code')
   assert.equal(synthetic?.locked, true, 'the PTC transport is synthesized, locked, and stays out of the stale group')
   assert.equal(synthetic?.synthetic, true, 'the run_code entry is labelled as synthetic')
@@ -957,6 +989,20 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   assert.deepEqual(syntheticOnly.tools, [...HOST_SESSION_TOOLS],
     'a cleanup with an empty global runtime keeps every synthetic host/session entry')
   assert.deepEqual(syntheticOnly.removedNames, [], 'no synthetic entry is ever reported as removed')
+  // R60: session-history entries are ORDINARY runtime tools (globally registered,
+  // not synthesized): present at runtime they survive, absent (host package
+  // unmounted) they clean like any other non-locked name.
+  const cleanedSession = cleanStaleHubPolicy({
+    allowTools: [...SESSION_HISTORY_TOOLS, 'memory_dispatch'],
+    prefixes: [],
+    runtimeNames: ['session_search', 'session_trace', 'memory_recall'],
+  })
+  assert.deepEqual(cleanedSession.tools, ['session_search', 'session_trace', 'memory_dispatch'],
+    'session entries present at runtime survive cleanup')
+  assert.deepEqual(cleanedSession.removedNames.sort(),
+    ['session_event_read', 'session_event_search', 'session_event_trace'],
+    'session entries absent at runtime are cleaned like any other non-locked name')
+  assert.equal(cleanedSession.removed, 3)
 
   // FALLBACK (built-in list) is kept as coverage, not as the default path: it
   // still lists every default entry and every hands-on note, never drops a
@@ -986,6 +1032,19 @@ passed += await runMemoryOrganizeChecks({ ok, now })
   }
   assert.ok(fallbackFlat.some((entry) => entry.name === 'bash' && entry.risk === true),
     'the fallback keeps hands-on risk notes')
+  // R60: the fallback re-infers the session family into its own group and keeps
+  // the read-only badge + default-enabled state.
+  const fallbackSession = fallback.groups.find((group) => group.id === HUB_CATALOG_GROUPS.session)
+  assert.ok(fallbackSession, 'the fallback renders the session-history group')
+  assert.equal(fallbackSession.label, '会话历史（只读）')
+  assert.equal(fallbackSession.inferred, true, 'the fallback session attribution is an inference')
+  assert.equal(fallbackSession.items.length, SESSION_HISTORY_TOOLS.length,
+    'the fallback lists the whole session family')
+  for (const entry of fallbackSession.items) {
+    assert.equal(entry.noteKey, 'sessionReadonly', 'the fallback session badge: ' + entry.name)
+    assert.equal(entry.enabled, true, 'the fallback session entry is default-enabled: ' + entry.name)
+    assert.equal(entry.synthetic, undefined, 'a session entry is never synthetic: ' + entry.name)
+  }
   assert.ok(fallbackFlat.some((entry) => entry.name === 'retired_tool' && entry.enabled === true),
     'the fallback never silently drops a whitelist entry it does not know')
   assert.equal(fallback.groups.some((group) => group.id === HUB_CATALOG_GROUPS.stale), false,

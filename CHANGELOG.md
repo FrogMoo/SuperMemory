@@ -2,6 +2,38 @@
 
 本仓库采用[语义化版本](https://semver.org/lang/zh-CN/)。首个正式 Release 之前的所有开发轮次（R1–R31，2026-11-16 → 2026-11-23）合并计入 `v1.0.0`。
 
+## [1.5.0] - 2026-11-27
+
+发布轮（R60）：**中枢权限默认放行宿主的会话历史只读族 `session_*`**（`session_search` / `session_event_search` / `session_trace` / `session_event_trace` / `session_event_read`），并在面板里给它们独立的来源组「会话历史（只读）」与「只读」徽标。这五个工具此前落在「宿主内置 / 未归属」组、默认拒绝——用户想在中枢里查历史会话，得先手工勾选五个看不出归属的工具。
+
+### 变更（R60：session_* 默认勾选 + 独立分组 + 只读徽标）
+
+- `src/hub-policy.ts`：新增 `SESSION_HISTORY_TOOLS`（5 个显式名；依据是宿主 `@deepseek-ai/dsh-tool-session-query` 的 `apply()` 恰好注册这五个、全部只读、按调用 agent 的工作区授权）与 `isSessionHistoryTool()`；`DEFAULT_HUB_TOOLS` 在「只读查看」段并入该族（与 `read` / `glob` / `grep` 同列）。
+- 分组：`HUB_CATALOG_GROUPS.session = 'source:session'`（label「会话历史（只读）」）；`inferHubToolSource` 在 `schedule_*` 之后、兜底之前新增 `session_*` 前缀规则，动态与回退两条目录路径分组一致；`hubSourceRank` 把 session 排在调度之后、声明来源之前（既有组相对顺序不变）。
+- 徽标：`hubCapabilityNoteKey` 升级为 `hubCatalogNoteKey`，新增 `sessionReadonly` 返回值（面板「只读」徽标 + hover 说明），4 个调用点同步。
+- 面板：`src/client/panel-page.tsx` 接线 `source:session` 组标签与 `sessionReadonly` 徽标；`src/client/locales.ts` 补中文 / 英文文案。
+- **默认放行 ≠ 锁定**：五项未进 `HOST_SESSION_TOOLS`、未加锁——存盘行可关闭、恢复默认即回；清理语义与普通运行时工具一致（运行时在→保留，不在→清，不误判失效）。
+- `lib/` 重建：宿主 13 文件 991.46 kB + client 192.45 kB（wrap 185,924 bytes）。
+
+### 测试（R60 新增断言）
+
+- core-smoke：默认白名单 +5；R39-1 假运行时加入 2 个 session 定义，断言新组 / 标签 / 推断 / 徽标 / 勾选跟随 / 可用 / 非失效；清理断言（在→保留、不在→清）；回退目录断言（组 + 徽标 + 默认启用 + 非合成）；默认谓词五项全放行。
+- mechanism-smoke：R39-1 面板服务断言 session 组 / 徽标（存盘行决定勾选态）；新增 R60 块——无存盘行时五项默认勾选、可关闭、恢复默认回、清理不误判失效。
+- capability-smoke：面板徽标 / 组标签接线 + 中文 / 英文文案断言。
+- 独立实证（临时脚本，非仓库文件）：hub 角色下五项全部 ALLOW；`brand_new_future_tool` 与 `bash` 仍 DENY `HUB_TOOL_NOT_IN_ALLOWLIST`（默认拒绝未削弱）；分支会话不受白名单约束。
+
+### 闸门（本轮实测）
+
+- `pnpm typecheck` **exit 0**（宿主 + client 双工程，0 错）。
+- `pnpm build` **exit 0**（宿主 13 文件 991.46 kB + client 192.45 kB；wrapper id = `@frogmoo/dsh-supermemory`）。
+- `pnpm smoke` **exit 0**：core **43** / mechanism **142** / webui **35** / client-sim **OK** / capability **20 组** / workspace-scope **6 组** / skill **27 组断言**。
+- `npm pack --dry-run`：版本 **1.5.0**、**20 条目** / **367.0 kB**（`lib/` 14 文件 + package.json / cordis.patch.yml / README / LICENSE / CHANGELOG / INSTALL），**不含** `src/`、`scripts/`、`node_modules/`、`release/`、`.dsh/`、`.git`。
+
+### 发布方式
+
+- GitHub：单条提交 + 附注 tag `v1.5.0` + **source-only** Release（不上传自建资产，仅 GitHub 自动生成的源码归档）。
+- npm：`npm publish --access public` 把 `@frogmoo/dsh-supermemory@1.5.0` 推到公共 registry（registry / access 以 `publishConfig` 为准，dist-tag `latest`）。
+
 ## [1.4.1] - 2026-11-26
 
 发布轮（R59b）：**许可证改为 MIT**（此前是自定义专有「保留所有权利」声明），并把版本抬到 **1.4.1** 作为 **npm 首发版本**。

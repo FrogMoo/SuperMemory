@@ -2162,6 +2162,9 @@ const serviceCtx = (services = {}) => ({
     { name: 'read', description: '读取文件' },
     { name: 'mcp__rea__analyze_function', description: '分析函数' },
     { name: 'brand_new_tool', description: '未来工具' },
+    // R60: the session-history family is globally registered by the host.
+    { name: 'session_search', description: '检索历史会话' },
+    { name: 'session_event_read', description: '读取单条事件' },
   ]
   const store = fakeStore({
     hubPolicies: [['hub-policy-dyn', {
@@ -2198,6 +2201,18 @@ const serviceCtx = (services = {}) => ({
     'only the first description line is projected')
   assert.equal(first.catalog.find((group) => group.id === 'source:supermemory').inferred, true,
     'the memory_* attribution is labelled as inference')
+  // R60: session_* gets its own inferred read-only group (no longer 未归属),
+  // carries the read-only badge, and follows the STORED whitelist.
+  const sessionGroup = first.catalog.find((group) => group.id === 'source:session')
+  assert.ok(sessionGroup, 'the session-history family forms its own group through the panel service')
+  assert.equal(sessionGroup.label, '会话历史（只读）', 'the session group label is read-only')
+  assert.equal(sessionGroup.inferred, true, 'the session attribution is an inference')
+  const sessionEntry = sessionGroup.items.find((item) => item.name === 'session_search')
+  assert.equal(sessionEntry?.noteKey, 'sessionReadonly', 'the session entry carries the read-only badge')
+  assert.equal(sessionEntry?.available, true, 'a registered session tool is available')
+  assert.equal(sessionEntry?.stale, undefined, 'a registered session tool is never stale')
+  assert.equal(sessionEntry?.enabled, false,
+    'the stored row decides: this workspace row has not ticked the session family')
 
   // Refresh: a tool registered after the first call appears on the next one,
   // and the schedule_ prefix stops being stale because it now matches.
@@ -2253,6 +2268,67 @@ const serviceCtx = (services = {}) => ({
   assert.equal(noTools.getHubPolicy(cwd).catalogMeta.mode, 'fallback',
     'a host without ctx.tools also degrades to the fallback instead of throwing')
   ok('R39-1 中枢权限动态目录：运行时工具按来源分组（推断标注）+ 未知工具默认拒绝且可勾选 + 失效条目单列/可清理 + 刷新反映新增工具 + 枚举失败回退内置清单并告警')
+}
+
+// ---- requirement R60: the read-only session-history family is default-allowed ----
+// The user decision puts session_* on DEFAULT_HUB_TOOLS (same tier as read/glob/
+// grep). With NO stored row the policy read degrades to the built-in default, so
+// the panel shows the whole family ticked; core-smoke R36-1 asserts the guard then
+// lets a hub call them (no HUB_TOOL_NOT_IN_ALLOWLIST). The family is NOT locked:
+// a stored row can switch it off, and restoring the default brings it back.
+{
+  const { workspaceKeyOf } = await import('../src/store.ts')
+  const cwd = 'F:\\ws-r60-session'
+  const sessionDefs = [
+    { name: 'session_search', description: 'Search prior sessions in the caller workspace.' },
+    { name: 'session_event_search', description: 'Search prior events in one session.' },
+    { name: 'session_trace', description: 'Read the session lineage around one session.' },
+    { name: 'session_event_trace', description: 'Read replacements and relationships of one event.' },
+    { name: 'session_event_read', description: 'Read one full unabridged event.' },
+  ]
+  const freshStore = fakeStore()
+  const fresh = new SupermemoryPanelService(freshStore, serviceCtx({ tools: { definitions: () => sessionDefs } }))
+  const defaultView = fresh.getHubPolicy(cwd)
+  assert.equal(defaultView.source, 'default', 'a workspace without a row reads the built-in default')
+  const defaultSession = defaultView.catalog.find((group) => group.id === 'source:session')
+  assert.ok(defaultSession, 'the default view renders the session-history group')
+  assert.equal(defaultSession.items.length, 5, 'the whole family is listed')
+  for (const entry of defaultSession.items) {
+    assert.equal(entry.enabled, true, 'the session tool is ticked by DEFAULT: ' + entry.name)
+    assert.equal(entry.noteKey, 'sessionReadonly', 'the read-only badge: ' + entry.name)
+    assert.equal(entry.locked, undefined, 'the family is default-allowed but NOT locked: ' + entry.name)
+    assert.equal(entry.synthetic, undefined, 'a registered session tool is not synthetic: ' + entry.name)
+  }
+  assert.equal(defaultView.tools.includes('session_search'), true,
+    'the resolved default policy carries the session family (the guard reads the same list)')
+  // Switching the family off is an ordinary save; restoring the default brings it back.
+  assert.equal((await fresh.setHubPolicy(cwd, { tools: ['read'], prefixes: [] })).status, 'ok')
+  const offEntry = fresh.getHubPolicy(cwd).catalog.flatMap((group) => group.items)
+    .find((entry) => entry.name === 'session_search')
+  assert.equal(offEntry?.enabled, false, 'a stored row can switch the session family off')
+  assert.equal((await fresh.setHubPolicy(cwd, { reset: true })).status, 'ok')
+  const resetEntry = fresh.getHubPolicy(cwd).catalog.flatMap((group) => group.items)
+    .find((entry) => entry.name === 'session_search')
+  assert.equal(resetEntry?.enabled, true, 'restoring the default re-enables the session family')
+  // Cleanup: registered session entries are ordinary runtime tools — present ones
+  // are kept, only genuinely vanished names go.
+  const cleanStore = fakeStore({
+    hubPolicies: [['hub-policy-r60', {
+      workspaceKey: workspaceKeyOf(cwd),
+      tools: ['session_search', 'session_trace', 'retired_session_tool'],
+      prefixes: [],
+      updatedAt: now,
+    }]],
+  })
+  const cleanService = new SupermemoryPanelService(cleanStore, serviceCtx({ tools: { definitions: () => sessionDefs } }))
+  const cleaned = await cleanService.cleanupStaleHubPolicy(cwd)
+  assert.equal(cleaned.status, 'ok')
+  assert.match(cleaned.message, /已清理 1 个失效条目/)
+  const cleanRow = [...cleanStore.hubPolicies.entries()][0][1]
+  assert.equal(cleanRow.tools.includes('retired_session_tool'), false, 'the vanished name is cleaned')
+  assert.equal(cleanRow.tools.includes('session_search') && cleanRow.tools.includes('session_trace'), true,
+    'registered session entries are never misjudged stale')
+  ok('R60 会话历史只读族默认放行：无存盘行时五项默认勾选（与 read/glob/grep 同列）+ 只读徽标 + 可关闭/恢复默认 + 清理不误判失效')
 }
 
 // ---- requirement R40: host/session synthetic entries through the REAL panel service ----

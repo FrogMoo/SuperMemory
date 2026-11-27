@@ -77,6 +77,30 @@ export const LOCKED_HUB_TOOLS: readonly string[] = Object.freeze([
 ])
 
 /**
+ * R60: the read-only session-history family — the five tools of the host
+ * package `@deepseek-ai/dsh-tool-session-query` (globally registered, every
+ * result authorized from the calling agent's workspace, NO write surface).
+ *
+ * Why a list, not just the prefix rule: the prefix decides the GROUP, this
+ * list decides the READ-ONLY BADGE and the default whitelist membership. Each
+ * name is backed by the package source (apply() registers exactly these five
+ * through ctx.tools.register); a future session_* tool would still group here
+ * but carry no verified read-only badge until it is added.
+ */
+export const SESSION_HISTORY_TOOLS: readonly string[] = Object.freeze([
+  'session_search',
+  'session_event_search',
+  'session_trace',
+  'session_event_trace',
+  'session_event_read',
+])
+
+/** R60: whether a name is one of the verified read-only session-history tools. */
+export function isSessionHistoryTool(toolName: string): boolean {
+  return SESSION_HISTORY_TOOLS.includes(String(toolName ?? '').trim())
+}
+
+/**
  * The built-in default whitelist (R33's allowed set, unchanged in membership):
  * the memory tools, the dispatch/collect line, the communication tools, the
  * read-only inspection tools, the schedule family (prefix), and the PTC
@@ -108,6 +132,9 @@ export const DEFAULT_HUB_TOOLS: readonly string[] = Object.freeze([
   'read',
   'glob',
   'grep',
+  // R60（用户裁决默认放行）：会话历史只读族——与 read/glob/grep 同列；
+  // 面板独立分组 + 只读徽标；存盘行仍可关闭（非锁定）。
+  ...SESSION_HISTORY_TOOLS,
   // 其它 / AI 传输
   'skill',
   'todo_write',
@@ -195,14 +222,17 @@ export function isCapabilityExecutionTool(toolName: string): boolean {
 }
 
 /**
- * R55: the panel badge a catalog row carries. `capabilityDoc` = read-only
- * routing locked on; `capabilityExecDenied` = a hub must dispatch the execution
- * instead of calling it. Undefined keeps the pre-R55 rendering.
+ * The panel badge a catalog row carries:
+ *   - `capabilityDoc` = read-only routing locked on (R55);
+ *   - `capabilityExecDenied` = a hub must dispatch the execution (R55);
+ *   - `sessionReadonly` = the verified read-only session-history family (R60).
+ * Undefined keeps the plain rendering.
  */
-export function hubCapabilityNoteKey(toolName: string): 'capabilityDoc' | 'capabilityExecDenied' | undefined {
+export function hubCatalogNoteKey(toolName: string): 'capabilityDoc' | 'capabilityExecDenied' | 'sessionReadonly' | undefined {
   const name = String(toolName ?? '').trim()
   if (name === CAPABILITY_DOC_TOOL) return 'capabilityDoc'
   if (isCapabilityExecutionTool(name)) return 'capabilityExecDenied'
+  if (isSessionHistoryTool(name)) return 'sessionReadonly'
   return undefined
 }
 
@@ -383,6 +413,8 @@ export const HUB_CATALOG_GROUPS = Object.freeze({
   supermemory: 'source:supermemory',
   composite: 'source:composite',
   schedule: 'source:schedule',
+  // R60: the read-only session-history family (host dsh-tool-session-query).
+  session: 'source:session',
   hostSession: 'source:host-session',
   host: 'source:host',
   mcpPrefix: 'source:mcp:',
@@ -481,7 +513,7 @@ export const HOST_SESSION_SOURCE: HubCatalogSource = Object.freeze({
 })
 
 /** Where a catalog group came from: a host-declared field or an inference rule. */
-export type HubCatalogSourceKind = 'declared' | 'supermemory' | 'composite' | 'mcp' | 'schedule' | 'host' | 'host-session'
+export type HubCatalogSourceKind = 'declared' | 'supermemory' | 'composite' | 'mcp' | 'schedule' | 'session' | 'host' | 'host-session'
 
 /** One attributed source of a runtime tool. */
 export interface HubCatalogSource {
@@ -600,7 +632,8 @@ const sourceSlug = (value: string): string =>
  *   3. `memory_*` → this plugin;
  *   4. `sm_cap_*` → the capability family (legacy `sm_composite_*` is read the same way; R50 never registers those names);
  *   5. `schedule_*` → the host scheduling plugin;
- *   6. everything else (including names nobody reviewed) → host/未归属.
+ *   6. `session_*` → the read-only session-history family (R60);
+ *   7. everything else (including names nobody reviewed) → host/未归属.
  * Every rule except (1) is an inference and is reported as one.
  */
 export function inferHubToolSource(name: string, declared?: string): HubCatalogSource {
@@ -638,6 +671,12 @@ export function inferHubToolSource(name: string, declared?: string): HubCatalogS
   if (toolName.startsWith('schedule_')) {
     return { id: HUB_CATALOG_GROUPS.schedule, label: '调度', kind: 'schedule', inferred: true, hint: '按 schedule_* 前缀推断（宿主调度插件）' }
   }
+  // R60: the session-history family sits BEFORE the fallback on purpose — these
+  // five tools are globally registered by the host, so without this rule they
+  // would land in 宿主内置/未归属 and read like an unattributed bug.
+  if (toolName.startsWith('session_')) {
+    return { id: HUB_CATALOG_GROUPS.session, label: '会话历史（只读）', kind: 'session', inferred: true, hint: '按 session_* 前缀推断（宿主 dsh-tool-session-query：只读，按调用 agent 做工作区授权）' }
+  }
   return { id: HUB_CATALOG_GROUPS.host, label: '宿主内置 / 未归属', kind: 'host', inferred: true, hint: '未命中已知来源规则：归入宿主内置或未归属（未知名同样默认拒绝）' }
 }
 
@@ -666,9 +705,10 @@ function hubSourceRank(source: HubCatalogSource): number {
     case 'composite': return 1
     case 'mcp': return 2
     case 'schedule': return 3
-    case 'declared': return 4
-    case 'host-session': return 5
-    default: return 6
+    case 'session': return 4
+    case 'declared': return 5
+    case 'host-session': return 6
+    default: return 7
   }
 }
 
@@ -774,7 +814,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
     const source = inferHubToolSource(name, declared)
     sources.set(name, source)
     const description = summarizeHubToolDescription(raw?.description)
-    const noteKey = hubCapabilityNoteKey(name)
+    const noteKey = hubCatalogNoteKey(name)
     runtime.set(name, {
       name,
       ...(description ? { description } : {}),
@@ -802,7 +842,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
       synthetic: true,
       source: HOST_SESSION_SOURCE.id,
       ...(name === 'plugin_manager' ? { noteKey: 'pluginManager' } : {}),
-      ...(hubCapabilityNoteKey(name) ? { noteKey: hubCapabilityNoteKey(name) } : {}),
+      ...(hubCatalogNoteKey(name) ? { noteKey: hubCatalogNoteKey(name) } : {}),
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(HUB_EXECUTION_TOOLS.includes(name) ? { risk: true } : {}),
     })
@@ -843,7 +883,7 @@ export function buildHubCatalog(input: HubCatalogInput): HubCatalogSnapshot {
       source: source.id,
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(HUB_EXECUTION_TOOLS.includes(name) ? { risk: true } : {}),
-      ...(hubCapabilityNoteKey(name) ? { noteKey: hubCapabilityNoteKey(name) } : {}),
+      ...(hubCatalogNoteKey(name) ? { noteKey: hubCatalogNoteKey(name) } : {}),
     })
   }
   for (const prefix of prefixes) {
@@ -908,8 +948,8 @@ export function buildFallbackHubCatalog(input: HubFallbackInput): HubCatalogSnap
           ? { noteKey: entry.noteKey }
           : hostSession && entry.name === 'plugin_manager'
             ? { noteKey: 'pluginManager' }
-            : hubCapabilityNoteKey(entry.name)
-              ? { noteKey: hubCapabilityNoteKey(entry.name) }
+            : hubCatalogNoteKey(entry.name)
+              ? { noteKey: hubCatalogNoteKey(entry.name) }
               : {}),
         enabled: entry.prefix ? prefixes.includes(entry.name) : isHubAllowedTool(entry.name, policy),
         source: source.id,
@@ -933,8 +973,8 @@ export function buildFallbackHubCatalog(input: HubFallbackInput): HubCatalogSnap
       ...(isLockedHubTool(name) ? { locked: true } : {}),
       ...(hostSession && name === 'plugin_manager'
         ? { noteKey: 'pluginManager' }
-        : hubCapabilityNoteKey(name)
-          ? { noteKey: hubCapabilityNoteKey(name) }
+        : hubCatalogNoteKey(name)
+          ? { noteKey: hubCatalogNoteKey(name) }
           : {}),
       enabled: true,
       source: source.id,
